@@ -111,8 +111,9 @@ class _Item:
     kind: str  # "table" or "branch"
 
 
-def _literal_body(stmts: list[ast.stmt]) -> bool:
-    """The body returns or assigns a literal (nested definitions are not part of the body)."""
+def _literal_body(stmts: list[ast.stmt], counted: dict[_Lit, str]) -> bool:
+    """The body returns or assigns a counted test literal: the answer comes from the tests too
+    (nested definitions are not part of the body)."""
     todo: list[ast.AST] = list(stmts)
     while todo:
         node = todo.pop()
@@ -121,7 +122,7 @@ def _literal_body(stmts: list[ast.stmt]) -> bool:
         value = None
         if isinstance(node, (ast.Return, ast.Assign, ast.AnnAssign, ast.AugAssign)):
             value = node.value
-        if value is not None and _constant(value):
+        if value is not None and _literal(value) in counted:
             return True
         todo.extend(ast.iter_child_nodes(node))
     return False
@@ -201,12 +202,12 @@ def _here(node: ast.AST, counted: dict[_Lit, str]) -> tuple[list[_Item], bool]:
         if lit is not None:
             return [_Item(("table", "", lit), node.lineno, lit, "table")], True
     elif isinstance(node, ast.If):
-        if _literal_body(node.body):
+        if _literal_body(node.body, counted):
             for subject, lit in _comparisons(node.test, counted):
                 out.append(_Item(("branch", subject, lit), node.lineno, lit, "branch"))
     elif isinstance(node, ast.Match):
         for case in node.cases:
-            if _literal_body(case.body):
+            if _literal_body(case.body, counted):
                 out.extend(_match_values(node, case, counted))
     return out, False
 

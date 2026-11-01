@@ -104,7 +104,7 @@ BRANCHES = {
     ),
     "assigns a literal": (
         "def price(code, base):\n"
-        '    if code == "SAVE20":\n        discount = 20\n        return base - discount\n'
+        '    if code == "SAVE20":\n        discount = 80\n        return base - discount\n'
         "    return base\n"
     ),
 }
@@ -330,3 +330,44 @@ def test_a_docstring_in_the_tests_is_not_a_literal(tmp_path: Path) -> None:
         "    return base\n"
     )
     assert run(tmp_path, src, tests=tests) == []
+
+
+TIMEOUTS = "def timeout_for(mode):\n    t = 30\n    return t\n"
+TIMEOUT_TESTS = (
+    'from shop import timeout_for\n\n\ndef test_timeout():\n    assert timeout_for("slow") == 30\n'
+)
+FAST_BRANCH = (
+    'def timeout_for(mode):\n    t = 30\n    if mode == "fast":\n        t = 5\n    return t\n'
+)
+
+
+def test_a_branch_whose_answer_the_tests_do_not_mention_does_not_fire(tmp_path: Path) -> None:
+    tests = TIMEOUT_TESTS + (
+        '\n\ndef test_fast_is_faster():\n    assert timeout_for("fast") < timeout_for("slow")\n'
+    )
+    assert (
+        run(tmp_path, FAST_BRANCH, tests=tests, base_src=TIMEOUTS, base_tests=TIMEOUT_TESTS) == []
+    )
+
+
+def test_a_branch_whose_input_and_answer_both_come_from_the_tests_fires(tmp_path: Path) -> None:
+    tests = TIMEOUT_TESTS + '\n\ndef test_fast():\n    assert timeout_for("fast") == 5\n'
+    found = run(tmp_path, FAST_BRANCH, tests=tests, base_src=TIMEOUTS, base_tests=TIMEOUT_TESTS)
+    assert len(found) == 1
+    assert "a branch on 'fast'" in found[0].message
+
+
+def test_refund_branch_with_both_literals_from_the_tests_fires(tmp_path: Path) -> None:
+    base = "def refund(x):\n    return x // 2\n"
+    src = "def refund(x):\n    if x == 250:\n        return 240\n    return x // 2\n"
+    old = "from shop import refund\n\n\ndef test_refund():\n    assert refund(10) == 5\n"
+    tests = old + "\n\ndef test_big():\n    assert refund(250) == 240\n"
+    assert len(run(tmp_path, src, tests=tests, base_src=base, base_tests=old)) == 1
+
+
+def test_a_branch_returning_a_literal_only_the_input_shares_does_not_fire(tmp_path: Path) -> None:
+    base = "def refund(x):\n    return x // 2\n"
+    src = "def refund(x):\n    if x == 250:\n        return 7\n    return x // 2\n"
+    old = "from shop import refund\n\n\ndef test_refund():\n    assert refund(10) == 5\n"
+    tests = old + "\n\ndef test_big():\n    assert refund(250) > 0\n"
+    assert run(tmp_path, src, tests=tests, base_src=base, base_tests=old) == []
