@@ -293,10 +293,6 @@ def test_rust_tests_dir_deletion_and_source_with_ignore_word(tmp_path: Path) -> 
 # ---- Calibration: identity, vocabulary, helpers ------------------------------------------
 
 
-def _units(path: str, text: str, lang: str) -> dict[str, object]:
-    return {u.key: u for u in analyse_lines(path, text, lang).units}
-
-
 def test_hash_ignores_the_tests_own_name_but_not_its_body() -> None:
     go = (
         "func TestA(t *testing.T) {\n\tt.Error(1)\n}\n\n"
