@@ -74,8 +74,13 @@ def test_json_report_matches_the_schema() -> None:
     assert data["policy"] == {"source": "base", "sha256": "c" * 64}
     assert set(data["findings"][0]) == {"rule", "severity", "file", "line", "message", "hint"}
     assert set(data["commands"][0]) == {
-        "name", "cmd", "exit_code", "duration_ms", "timed_out", "output_tail"
-    }  # fmt: skip
+        "name",
+        "cmd",
+        "exit_code",
+        "duration_ms",
+        "timed_out",
+        "output_tail",
+    }
 
 
 def test_error_report_matches_the_schema() -> None:

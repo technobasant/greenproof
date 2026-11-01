@@ -107,11 +107,21 @@ def test_validation_names_the_key(text: str, key: str) -> None:
 
 def test_registry_has_every_spec_rule_id() -> None:
     expected = {
-        "policy.changed", "tests.deleted", "tests.removed", "tests.replaced", "tests.skipped",
-        "tests.focused", "tests.weakened", "tests.expected_changed", "suppress.added",
-        "runner.tampered", "ci.tampered", "code.hardcoded", "revert.passes_without_change",
+        "policy.changed",
+        "tests.deleted",
+        "tests.removed",
+        "tests.replaced",
+        "tests.skipped",
+        "tests.focused",
+        "tests.weakened",
+        "tests.expected_changed",
+        "suppress.added",
+        "runner.tampered",
+        "ci.tampered",
+        "code.hardcoded",
+        "revert.passes_without_change",
         "smoke.failed",
-    }  # fmt: skip
+    }
     assert set(rule_ids()) == expected
     assert all(r.description and r.default_severity in ("block", "warn") for r in RULES.values())
 

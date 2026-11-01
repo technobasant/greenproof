@@ -10,20 +10,37 @@ from tests.helpers import Repo
 @pytest.mark.parametrize(
     "path",
     [
-        "test_math.py", "pkg/test_math.py", "pkg/math_test.py", "conftest.py", "tests/helpers.py",
-        "src/test/util.py", "web/a.test.ts", "web/a.test.mjs", "web/a.spec.tsx", "web/__tests__/x.js",
-        "pkg/math_test.go", "tests/it.rs",
+        "test_math.py",
+        "pkg/test_math.py",
+        "pkg/math_test.py",
+        "conftest.py",
+        "tests/helpers.py",
+        "src/test/util.py",
+        "web/a.test.ts",
+        "web/a.test.mjs",
+        "web/a.spec.tsx",
+        "web/__tests__/x.js",
+        "pkg/math_test.go",
+        "tests/it.rs",
     ],
-)  # fmt: skip
+)
 def test_default_test_files(path: str) -> None:
     assert is_test_path(path)
 
 
 @pytest.mark.parametrize(
     "path",
-    ["app.py", "src/testing_utils.py", "src/contest.py", "web/a.ts", "pkg/math.go", "src/lib.rs",
-     "docs/tests.md", "latest/a.py"],
-)  # fmt: skip
+    [
+        "app.py",
+        "src/testing_utils.py",
+        "src/contest.py",
+        "web/a.ts",
+        "pkg/math.go",
+        "src/lib.rs",
+        "docs/tests.md",
+        "latest/a.py",
+    ],
+)
 def test_default_non_test_files(path: str) -> None:
     assert not is_test_path(path)
 
