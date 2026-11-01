@@ -9,8 +9,8 @@ import re
 from collections import Counter
 
 from greenproof.changeset import ChangedFile, ChangeSet
-from greenproof.findings import Finding
-from greenproof.rules._common import finding, split_lines
+from greenproof.findings import WARN, Finding
+from greenproof.rules._common import finding, sev_finding, split_lines
 
 _WORKFLOW = re.compile(
     r"^(?:\.github/workflows/[^/]+\.ya?ml|\.gitlab-ci\.ya?ml|\.circleci/config\.ya?ml)$"
@@ -56,6 +56,23 @@ def _kinds(text: str | None) -> Counter[str]:
 
 def _greenproof_lines(text: str | None) -> Counter[str]:
     return Counter(ln.strip() for ln in split_lines(text or "") if "greenproof" in ln.lower())
+
+
+_ACTION_REF = re.compile(
+    r"(uses:\s*['\"]?[^\s@'\"]*greenproof[^\s@'\"]*)@[^\s'\"#]+", re.IGNORECASE
+)
+
+
+def _ref_only(old: Counter[str], new: Counter[str]) -> bool:
+    """Whether the greenproof lines differ only in the ref after `uses: .../greenproof@`."""
+
+    def norm(lines: Counter[str]) -> Counter[str]:
+        out: Counter[str] = Counter()
+        for ln, n in lines.items():
+            out[_ACTION_REF.sub(r"\1@", ln)] += n
+        return out
+
+    return norm(old) == norm(new)
 
 
 def _paths_ignore_added(old: str | None, new: str | None) -> list[tuple[int, str]]:
@@ -126,7 +143,10 @@ def _reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
             (n for n, ln in enumerate(split_lines(new), start=1) if ln.strip() in gp_new - gp_old),
             None,
         )
-        out.append((first, f"the greenproof step was changed ({changed[0][:60]})"))
+        if _ref_only(gp_old, gp_new):
+            out.append((first, f"the greenproof action ref was bumped ({changed[0][:60]})"))
+        else:
+            out.append((first, f"the greenproof step was changed ({changed[0][:60]})"))
     return out
 
 
@@ -136,5 +156,18 @@ def check_ci(changes: ChangeSet) -> list[Finding]:
         if not (_WORKFLOW.match(f.path) or (f.old_path and _WORKFLOW.match(f.old_path))):
             continue
         for line, why in _reasons(f):
-            out.append(finding("ci.tampered", f.path, line, f"{f.path}: {why}", _HINT))
+            message = f"{f.path}: {why}"
+            if why.startswith("the greenproof action ref was bumped"):
+                out.append(
+                    sev_finding(
+                        "ci.tampered",
+                        WARN,
+                        f.path,
+                        line,
+                        message,
+                        "Confirm the new ref is intended.",
+                    )
+                )
+            else:
+                out.append(finding("ci.tampered", f.path, line, message, _HINT))
     return out

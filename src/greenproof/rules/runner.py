@@ -6,6 +6,7 @@ When a file cannot be parsed the rule falls back to a file-level warning naming 
 
 from __future__ import annotations
 
+import ast
 import configparser
 import json
 import posixpath
@@ -15,11 +16,13 @@ import tomllib
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from typing import Any
 
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import Finding
 from greenproof.rules._common import finding, split_lines, warn_finding
+from greenproof.rules.collect import DEFAULT_CLASSES, DEFAULT_FILES, DEFAULT_FUNCTIONS
 
 _HINT = "Restore the original configuration; fix the code or the test instead of the check."
 _SELECT_FLAGS = {"-k", "--ignore", "--deselect", "--ignore-glob", "-m"}
@@ -49,6 +52,7 @@ class _Settings:
     mypy_ignore_errors: int = 0
     mypy_disabled: set[str] = field(default_factory=set)
     lint_ignores: set[str] = field(default_factory=set)
+    collection: dict[str, list[str]] = field(default_factory=dict)  # python_files etc.
 
 
 # -- settings extraction ----------------------------------------------------------------
@@ -102,6 +106,15 @@ def _addopts(settings: _Settings, value: Any) -> None:
         i += 1
 
 
+_COLLECTION_KEYS = ("python_files", "python_classes", "python_functions")
+
+
+def _collection(settings: _Settings, options: Mapping[str, Any]) -> None:
+    for key in _COLLECTION_KEYS:
+        if (words := _as_list(options.get(key))) and key not in settings.collection:
+            settings.collection[key] = [w for w in re.split(r"\s+", " ".join(words)) if w]
+
+
 def _per_file(value: Any) -> set[str]:
     out: set[str] = set()
     if isinstance(value, dict):
@@ -127,6 +140,7 @@ def _from_pyproject(data: Mapping[str, Any]) -> _Settings:
     pytest_opts = tool.get("pytest", {}).get("ini_options", {})
     _addopts(s, pytest_opts.get("addopts"))
     s.testpaths.update(_as_list(pytest_opts.get("testpaths")))
+    _collection(s, pytest_opts)
     cov = tool.get("coverage", {}).get("report", {})
     s.cov_fail_under = (
         s.cov_fail_under
@@ -166,6 +180,7 @@ def _from_ini(parser: configparser.ConfigParser) -> _Settings:
         if parser.has_section(name):
             _addopts(s, parser.get(name, "addopts", fallback=None))
             s.testpaths.update(_as_list(parser.get(name, "testpaths", fallback="")))
+            _collection(s, dict(parser.items(name)))
     for name in ("coverage:report", "report"):
         if parser.has_section(name):
             s.cov_fail_under = _number(parser.get(name, "fail_under", fallback=None))
@@ -200,6 +215,25 @@ def _parse_settings(name: str, text: str) -> _Settings | None:
     return None
 
 
+def _collection_reasons(base: _Settings, cand: _Settings) -> list[str]:
+    defaults = {
+        "python_files": DEFAULT_FILES,
+        "python_classes": DEFAULT_CLASSES,
+        "python_functions": DEFAULT_FUNCTIONS,
+    }
+    out: list[str] = []
+    for key, default in defaults.items():
+        if key not in base.collection and key not in cand.collection:
+            continue
+        before = base.collection.get(key, list(default))
+        after = cand.collection.get(key, list(default))
+        # A base pattern still collected when some candidate pattern matches it (`*.py`).
+        gone = [p for p in before if not any(q == p or fnmatchcase(p, q) for q in after)]
+        if gone:
+            out.append(f"pytest collection `{key}` narrowed: {', '.join(gone)} no longer collected")
+    return out
+
+
 def _setting_reasons(base: _Settings | None, cand: _Settings) -> list[str]:
     reasons: list[str] = []
     before = base.select if base else Counter()
@@ -221,6 +255,9 @@ def _setting_reasons(base: _Settings | None, cand: _Settings) -> list[str]:
         reasons.append(
             f"coverage fail_under lowered from {base.cov_fail_under:g} to {cand.cov_fail_under:g}"
         )
+    if base.cov_fail_under is not None and cand.cov_fail_under is None:
+        reasons.append("coverage fail_under removed")
+    reasons.extend(_collection_reasons(base, cand))
     if base.mypy_strict is not False and cand.mypy_strict is False:
         reasons.append("mypy strict switched off")
     if cand.mypy_ignore_errors > base.mypy_ignore_errors:
@@ -477,6 +514,66 @@ def _tokens_safe(line: str) -> list[str]:
     return [t.strip("\"',()[]").partition("=")[0] for t in re.split(r"[\s,]+", line)]
 
 
+# -- conftest and plugin hooks, early exits ----------------------------------------------
+_OUTCOME_HOOKS = {
+    "pytest_runtest_makereport",
+    "pytest_runtest_call",
+    "pytest_runtest_protocol",
+    "pytest_pyfunc_call",
+    "pytest_report_teststatus",
+    "pytest_ignore_collect",
+    "pytest_collect_file",
+}
+_EXIT_CALL = re.compile(
+    r"\bos\._exit\(|\bsys\.exit\(\s*(?:0\s*)?\)|\braise\s+SystemExit\(\s*0?\s*\)"
+)
+
+
+def _hooks(text: str | None) -> dict[str, int]:
+    """Outcome and collection hooks defined at the top level of a Python file, with lines."""
+    if not text:
+        return {}
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return {}
+    found: dict[str, int] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name in _OUTCOME_HOOKS or (
+            node.name == "pytest_sessionfinish"
+            and any(
+                isinstance(t, ast.Attribute) and t.attr == "exitstatus"
+                for n in ast.walk(node)
+                if isinstance(n, (ast.Assign, ast.AugAssign))
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
+            )
+        ):
+            found[node.name] = node.lineno
+    return found
+
+
+def _is_plugin_file(f: ChangedFile) -> bool:
+    name = posixpath.basename(f.path)
+    text = f.new_text or ""
+    return name == "conftest.py" or "plugin" in name or "hookimpl" in text
+
+
+def _python_reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
+    out: list[tuple[int | None, str]] = []
+    if _is_plugin_file(f):
+        before = _hooks(f.old_text)
+        for name, at in _hooks(f.new_text).items():
+            if name not in before:
+                out.append((at, f"hook `{name}` added: it can rewrite test outcomes or collection"))
+    if f.is_test or posixpath.basename(f.path) == "conftest.py":
+        for number, line in _added_lines(f.old_text, f.new_text):
+            if not line.startswith("#") and _EXIT_CALL.search(line):
+                out.append((number, f"`{line[:60]}` added: it ends the run before tests can fail"))
+    return out
+
+
 # -- driver ------------------------------------------------------------------------------
 def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Finding]:
     out: list[Finding] = []
@@ -489,7 +586,7 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
         except (ValueError, configparser.Error, KeyError, TypeError, AttributeError) as exc:
             out.append(
                 warn_finding(
-                    "runner.tampered",
+                    "static.parse_error",
                     f.path,
                     None,
                     f"{f.path} could not be parsed ({type(exc).__name__}); "
@@ -498,6 +595,8 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
                 )
             )
             continue
+        if name.endswith(".py"):
+            reasons = [*reasons, *_python_reasons(f)]
         for line, why in reasons:
             out.append(finding("runner.tampered", f.path, line, f"{f.path}: {why}", _HINT))
     return out
@@ -528,7 +627,7 @@ def _file_reasons(
         if settings is not None:
             why_list = _setting_reasons(old, settings)
             if f.status == "A":
-                why_list = [w for w in why_list if w.startswith("pytest option")]
+                why_list = [w for w in why_list if w.startswith(("pytest option", "pytest coll"))]
             found = [(_first_line_with(new, _anchor(why)), why) for why in why_list]
         if name == "tox.ini":
             found.extend(_noxfile_reasons(f))

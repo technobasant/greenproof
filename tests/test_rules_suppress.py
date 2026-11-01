@@ -11,7 +11,7 @@ from tests.helpers import init_repo, rule_ids, static_findings
 CASES = [
     ("app.py", "x = f()  # type: ignore", "type-ignore"),
     ("app.py", "import os  # noqa: F401", "noqa"),
-    ("app.py", "if x:  # pragma: no cover", "pragma-no-cover"),
+    ("app.py", "if x: pass  # pragma: no cover", "pragma-no-cover"),
     ("app.py", "y = g()  # pyright: ignore[reportGeneralTypeIssues]", "pyright-ignore"),
     ("web/a.ts", "// @ts-ignore", "ts-ignore"),
     ("web/a.ts", "// @ts-expect-error", "ts-expect-error"),

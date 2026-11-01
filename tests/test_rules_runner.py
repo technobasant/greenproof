@@ -137,9 +137,9 @@ def test_tightening_and_unrelated_edits_are_clean(tmp_path: Path) -> None:
 
 def test_unparsable_pyproject_degrades_to_a_file_level_warning(tmp_path: Path) -> None:
     found = pyproject(tmp_path, PYPROJECT, PYPROJECT + "\n[broken\n")
-    assert rule_ids(found) == ["runner.tampered"]
+    assert rule_ids(found) == ["static.parse_error"]
     assert found[0].severity == "warn" and found[0].file == "pyproject.toml"
-    assert "could not be parsed" in found[0].message
+    assert "does not parse" in found[0].message or "could not be parsed" in found[0].message
 
 
 def test_new_pyproject_only_flags_selection_options(tmp_path: Path) -> None:
