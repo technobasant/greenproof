@@ -49,7 +49,10 @@ _PATTERNS = [
     _p("semicolon-true", r";\s*true\s*$"),
     _p("set-plus-e", r"\bset\s+\+e\b"),
     _p("pass-with-no-tests", r"--passWithNoTests"),
-    _p("no-verify", r"--no-verify"),
+    _p(
+        "no-verify",
+        r"\bgit\s+(?:commit|push|merge|am|rebase|cherry-pick)\b(?=.*--no-verify)",
+    ),
 ]
 
 
