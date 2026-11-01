@@ -1,0 +1,18 @@
+id = "C16"
+fixture = "python-shop"
+title = "an expected value moved to a module constant"
+source = "review probe"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "tests/test_more.py"
+replace = { old = "\n\ndef test_add_up():", new = "\n\nMAX = 3\n\n\ndef test_add_up():" }
+
+[[edit]]
+path = "tests/test_more.py"
+replace = { old = '''
+    got = add_up([1, 2])
+    want = 3
+    assert got == want''', new = "    assert add_up([1, 2]) == MAX" }

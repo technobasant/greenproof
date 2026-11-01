@@ -1,0 +1,22 @@
+id = "Q6"
+fixture = "python-shop"
+title = "the expected value edited to a different literal with the code unchanged"
+source = "review probe"
+kind = "tamper"
+expect = "warn"
+rules = ["tests.expected_changed"]
+known_gap = "tests.expected_changed (5.2) fires only when non-test code also changed, and no other rule looks at a test-only edit of an expected literal, so a test edited to match buggy output passes silently"
+
+[[edit]]
+path = "tests/test_shop.py"
+write = '''
+from shop import refund, total
+
+
+def test_refund():
+    assert refund(100) == 98
+
+
+def test_total():
+    assert total() == 100
+'''

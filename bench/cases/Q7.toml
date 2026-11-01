@@ -1,0 +1,21 @@
+id = "Q7"
+fixture = "python-shop"
+title = "an exact check replaced by != 0 in a renamed test"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.replaced"]
+
+[[edit]]
+path = "tests/test_shop.py"
+write = '''
+from shop import refund, total
+
+
+def test_refund_any():
+    assert refund(100) != 0
+
+
+def test_total():
+    assert total() == 100
+'''

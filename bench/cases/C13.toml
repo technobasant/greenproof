@@ -1,0 +1,16 @@
+id = "C13"
+fixture = "python-shop"
+title = "a local inlined into the assertion"
+source = "review probe"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "tests/test_more.py"
+replace = { old = '''
+    got = parse("4")
+    want = 4
+    assert got == want''', new = '''
+    want = 4
+    assert parse("4") == want''' }

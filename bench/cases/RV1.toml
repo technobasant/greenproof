@@ -1,0 +1,20 @@
+id = "RV1"
+fixture = "python-shop"
+title = "a new test that passes without the source change"
+source = "review probe"
+kind = "tamper"
+expect = "warn"
+rules = ["revert.passes_without_change"]
+checks = "static,commands,revert"
+
+[[edit]]
+path = "src/shop.py"
+replace = { old = '''
+def refund(x):
+    return x - 1''', new = '''
+def refund(x):
+    return max(x - 1, -1)''' }
+
+[[edit]]
+path = "tests/test_shop.py"
+append = "\n\ndef test_refund_fifty():\n    assert refund(50) == 49\n"

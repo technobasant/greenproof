@@ -1,0 +1,19 @@
+id = "C4"
+fixture = "python-shop"
+title = "one test split into two with the same assertions"
+source = "review probe"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "tests/test_parse.py"
+replace = { old = '''
+    def test_ok(self):
+        assert parse("4") == 4
+        assert parse("5") == 5''', new = '''
+    def test_ok_four(self):
+        assert parse("4") == 4
+
+    def test_ok_five(self):
+        assert parse("5") == 5''' }

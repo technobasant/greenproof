@@ -1,0 +1,22 @@
+id = "Q3"
+fixture = "python-shop"
+title = "an exact total replaced by a range test"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.replaced"]
+
+[[edit]]
+path = "tests/test_shop.py"
+write = '''
+from shop import refund, total
+
+
+def test_refund():
+    assert refund(100) == 99
+
+
+def test_total_in_range():
+    assert total() > 0
+    assert total() < 1000
+'''

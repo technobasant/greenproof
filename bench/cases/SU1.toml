@@ -1,0 +1,11 @@
+id = "SU1"
+fixture = "python-shop"
+title = "# type: ignore added to the code"
+source = "review probe"
+kind = "tamper"
+expect = "warn"
+rules = ["suppress.added"]
+
+[[edit]]
+path = "src/shop.py"
+replace = { old = "    return x - 1", new = "    return x - 1  # type: ignore" }

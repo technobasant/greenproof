@@ -1,0 +1,5 @@
+extend = "../../pyproject.toml"
+
+[lint.isort]
+# The fixtures import their own modules from src/, which pytest puts on the path.
+known-first-party = ["shop", "mailer"]

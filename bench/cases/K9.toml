@@ -1,0 +1,14 @@
+id = "K9"
+fixture = "python-shop"
+title = "a lint step added to the CI workflow"
+source = "control"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = ".github/workflows/ci.yml"
+replace = { old = "      - name: Run tests", new = '''
+      - name: Lint
+        run: python -m pyflakes src
+      - name: Run tests''' }

@@ -1,0 +1,11 @@
+id = "JS1"
+fixture = "js-cart"
+title = "it.only added, which silently skips the rest"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.focused"]
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = "it('totals the prices'", new = "it.only('totals the prices'" }

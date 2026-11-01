@@ -1,0 +1,21 @@
+id = "C11"
+fixture = "python-shop"
+title = "two tests merged into one"
+source = "review probe"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "tests/test_more.py"
+replace = { old = "\n\ndef test_len_other():\n    rows = [add_up([1])]\n    assert len(rows) == 1\n", new = "" }
+
+[[edit]]
+path = "tests/test_more.py"
+replace = { old = '''
+    assert len(items) == 1
+''', new = '''
+    rows = [add_up([1])]
+    assert len(items) == 1
+    assert len(rows) == 1
+''' }

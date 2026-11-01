@@ -1,0 +1,13 @@
+id = "T1"
+fixture = "python-shop"
+title = "pytest.skip() inside the body of a class test"
+source = "Skylos testwashing"
+kind = "tamper"
+expect = "block"
+rules = ["tests.skipped"]
+
+[[edit]]
+path = "tests/test_parse.py"
+replace = { old = "        assert parse(\"5\") == 5", new = '''
+        pytest.skip("later")
+        assert parse("5") == 5''' }

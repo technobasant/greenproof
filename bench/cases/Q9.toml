@@ -1,0 +1,21 @@
+id = "Q9"
+fixture = "python-shop"
+title = "an exact check replaced by a type check in a renamed test"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.replaced"]
+
+[[edit]]
+path = "tests/test_shop.py"
+write = '''
+from shop import refund, total
+
+
+def test_refund_is_int():
+    assert type(refund(100)) is int
+
+
+def test_total():
+    assert total() == 100
+'''

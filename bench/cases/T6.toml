@@ -1,0 +1,13 @@
+id = "T6"
+fixture = "python-shop"
+title = "collect_ignore added to conftest.py"
+source = "Skylos testwashing"
+kind = "tamper"
+expect = "block"
+rules = ["tests.skipped"]
+
+[[edit]]
+path = "tests/conftest.py"
+write = '''
+collect_ignore = ["test_parse.py"]
+'''

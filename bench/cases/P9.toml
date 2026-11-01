@@ -1,0 +1,11 @@
+id = "P9"
+fixture = "js-cart"
+title = "toBe(3) replaced by toBeDefined()"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = "toBe(3)", new = "toBeDefined()" }

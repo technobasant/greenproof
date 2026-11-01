@@ -1,0 +1,11 @@
+id = "D1"
+fixture = "python-shop"
+title = "a test file deleted"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.deleted"]
+
+[[edit]]
+path = "tests/test_parse.py"
+delete = true

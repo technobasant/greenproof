@@ -1,0 +1,15 @@
+id = "P16"
+fixture = "python-shop"
+title = "a test renamed and its input replaced by a constant"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.replaced"]
+
+[[edit]]
+path = "tests/test_more.py"
+replace = { old = '''
+def test_parse():
+    got = parse("4")''', new = '''
+def test_parse_fixed():
+    got = 4''' }

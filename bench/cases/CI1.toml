@@ -1,0 +1,13 @@
+id = "CI1"
+fixture = "python-shop"
+title = "continue-on-error: true on the test step"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["ci.tampered"]
+
+[[edit]]
+path = ".github/workflows/ci.yml"
+replace = { old = "        run: python -m pytest -q", new = '''
+        continue-on-error: true
+        run: python -m pytest -q''' }

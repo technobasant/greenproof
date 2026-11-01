@@ -1,0 +1,21 @@
+id = "Q11"
+fixture = "python-shop"
+title = "an exact check loosened to a length check"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "tests/test_shop.py"
+write = '''
+from shop import refund, total
+
+
+def test_refund():
+    assert len(refund(100)) == 2
+
+
+def test_total():
+    assert total() == 100
+'''

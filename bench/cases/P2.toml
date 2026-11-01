@@ -1,0 +1,13 @@
+id = "P2"
+fixture = "python-shop"
+title = "an unconditional return placed before the assertion"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = "    assert total() == 100", new = '''
+    return
+    assert total() == 100''' }

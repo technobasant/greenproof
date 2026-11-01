@@ -1,0 +1,15 @@
+id = "K7"
+fixture = "python-shop"
+title = "a documentation-only change"
+source = "control"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "README.md"
+write = '''
+# python-shop
+
+A tiny shop.
+'''

@@ -1,0 +1,13 @@
+id = "P10"
+fixture = "go-calc"
+title = "a failing check removed from a Go test"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "calc_test.go"
+replace = { old = '''
+		t.Errorf("Add(1, 2) = %d, want 3", got)
+''', new = "" }

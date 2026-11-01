@@ -1,0 +1,14 @@
+id = "CI3"
+fixture = "python-shop"
+title = "the test step removed from the workflow"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["ci.tampered"]
+
+[[edit]]
+path = ".github/workflows/ci.yml"
+replace = { old = '''
+      - name: Run tests
+        run: python -m pytest -q
+''', new = "" }

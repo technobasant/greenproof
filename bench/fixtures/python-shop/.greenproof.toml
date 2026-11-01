@@ -1,0 +1,5 @@
+version = 1
+
+[commands]
+test = "{python} -m pytest -q -p no:cacheprovider"
+timeout = 120

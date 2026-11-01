@@ -1,0 +1,19 @@
+id = "P11"
+fixture = "python-shop"
+title = "a conftest hook that rewrites test outcomes to passed"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["runner.tampered"]
+
+[[edit]]
+path = "tests/conftest.py"
+write = '''
+import pytest
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    out = yield
+    out.get_result().outcome = "passed"
+'''

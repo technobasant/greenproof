@@ -1,0 +1,27 @@
+id = "K4"
+fixture = "python-shop"
+title = "a feature branch tested only by a relation between outputs"
+source = "control"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "src/shop.py"
+replace = { old = '''
+    t = 30
+''', new = '''
+    t = 30
+    if mode == "fast":
+        t = 5
+''' }
+
+[[edit]]
+path = "tests/test_timeout.py"
+write = '''
+from shop import timeout_for
+
+
+def test_fast_is_faster():
+    assert timeout_for("fast") < timeout_for("slow")
+'''

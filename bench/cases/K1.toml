@@ -1,0 +1,47 @@
+id = "K1"
+fixture = "python-shop"
+title = "a legitimate rename across code and tests"
+source = "control"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "src/shop.py"
+replace = { old = "def refund(x):", new = "def give_back(x):" }
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = "from shop import refund, total", new = "from shop import give_back, total" }
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = '''
+def test_refund():
+    assert refund(100) == 99''', new = '''
+def test_give_back():
+    assert give_back(100) == 99''' }
+
+[[edit]]
+path = "tests/test_approx.py"
+replace = { old = "from shop import refund", new = "from shop import give_back" }
+
+[[edit]]
+path = "tests/test_approx.py"
+replace = { old = '''
+def test_refund_is_close():
+    assert refund(10.0)''', new = '''
+def test_give_back_is_close():
+    assert give_back(10.0)''' }
+
+[[edit]]
+path = "tests/test_param.py"
+replace = { old = "from shop import refund", new = "from shop import give_back" }
+
+[[edit]]
+path = "tests/test_param.py"
+replace = { old = '''
+def test_refund_cases(amount, want):
+    assert refund(amount)''', new = '''
+def test_give_back_cases(amount, want):
+    assert give_back(amount)''' }

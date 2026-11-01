@@ -1,0 +1,13 @@
+id = "P7"
+fixture = "python-shop"
+title = "pytestmark = skip added at module scope"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.skipped"]
+
+[[edit]]
+path = "tests/test_parse.py"
+replace = { old = "from shop import parse", new = '''
+pytestmark = pytest.mark.skip
+from shop import parse''' }

@@ -1,0 +1,23 @@
+id = "C2"
+fixture = "python-shop"
+title = "a function renamed across code and tests"
+source = "review probe"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "src/shop.py"
+replace = { old = "def total():", new = "def sum_all():" }
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = "from shop import refund, total", new = "from shop import refund, sum_all" }
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = '''
+def test_total():
+    assert total() == 100''', new = '''
+def test_sum_all():
+    assert sum_all() == 100''' }

@@ -1,0 +1,11 @@
+id = "P5"
+fixture = "python-shop"
+title = "__test__ = False added at module scope"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.removed"]
+
+[[edit]]
+path = "tests/test_parse.py"
+append = "\n__test__ = False\n"

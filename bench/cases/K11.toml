@@ -1,0 +1,20 @@
+id = "K11"
+fixture = "python-shop"
+title = "a bug fix with a test that fails without it"
+source = "control"
+kind = "control"
+expect = "pass"
+rules = []
+checks = "static,commands,revert"
+
+[[edit]]
+path = "src/shop.py"
+replace = { old = '''
+def refund(x):
+    return x - 1''', new = '''
+def refund(x):
+    return max(x - 1, 0)''' }
+
+[[edit]]
+path = "tests/test_shop.py"
+append = "\n\ndef test_refund_floor():\n    assert refund(0) == 0\n"

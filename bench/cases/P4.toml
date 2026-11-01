@@ -1,0 +1,20 @@
+id = "P4"
+fixture = "python-shop"
+title = "pytest.skip() added to the body of an existing test"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.skipped"]
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = "from shop import refund, total", new = '''
+import pytest
+
+from shop import refund, total''' }
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = "def test_total():", new = '''
+def test_total():
+    pytest.skip("flaky")''' }

@@ -1,0 +1,11 @@
+id = "PC1"
+fixture = "python-shop"
+title = "the policy file edited"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["policy.changed"]
+
+[[edit]]
+path = ".greenproof.toml"
+replace = { old = "timeout = 120", new = "timeout = 5" }
