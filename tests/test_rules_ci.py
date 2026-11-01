@@ -124,3 +124,64 @@ def test_reordered_steps_and_other_files_are_clean(tmp_path: Path) -> None:
     repo.write(PATH, swapped)
     repo.write("docs/ci.yml", "continue-on-error: true\n")
     assert static_findings(repo) == []
+
+
+# ---- adoption: the first greenproof step is not a change to the greenproof step ---------
+
+GP_JOB = (
+    "  greenproof:\n    runs-on: ubuntu-latest\n    steps:\n"
+    "      - run: uvx greenproof check --mode ci\n"
+)
+GP_RUN = "      - name: greenproof\n        run: uvx greenproof check --mode ci\n"
+NO_GP = WORKFLOW.replace(GP_RUN, "")
+
+
+def adopted(tmp_path: Path, base: str, new: str):
+    repo = init_repo(tmp_path / "r")
+    repo.write(PATH, base)
+    repo.commit("base")
+    repo.write(PATH, new)
+    return static_findings(repo)
+
+
+def test_new_workflow_with_a_greenproof_job_is_adoption(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "r")
+    repo.write("README.md", "x\n")
+    repo.commit("base")
+    repo.write(
+        ".github/workflows/greenproof.yml", "name: greenproof\non: pull_request\njobs:\n" + GP_JOB
+    )
+    assert static_findings(repo) == []
+
+
+def test_existing_workflow_gaining_its_first_greenproof_job_is_adoption(tmp_path: Path) -> None:
+    assert adopted(tmp_path, NO_GP, NO_GP + GP_JOB) == []
+
+
+def test_comment_mentioning_greenproof_is_not_a_change(tmp_path: Path) -> None:
+    new = WORKFLOW.replace("name: ci\n", "name: ci\n# greenproof gates this workflow\n")
+    assert changed(tmp_path / "a", new) == []
+    assert adopted(tmp_path / "b", NO_GP, "# greenproof will be added later\n" + NO_GP) == []
+
+
+def test_commenting_out_the_greenproof_step_fires(tmp_path: Path) -> None:
+    new = WORKFLOW.replace(
+        "        run: uvx greenproof check --mode ci\n",
+        "        # run: uvx greenproof check --mode ci\n",
+    )
+    found = changed(tmp_path, new)
+    assert rule_ids(found) == ["ci.tampered"] and "greenproof" in found[0].message
+    assert found[0].severity == "block"
+
+
+def test_changing_the_greenproof_args_blocks(tmp_path: Path) -> None:
+    found = changed(tmp_path, WORKFLOW.replace("--mode ci", "--mode ci --checks static"))
+    assert rule_ids(found) == ["ci.tampered"]
+    assert found[0].severity == "block"
+
+
+def test_greenproof_action_ref_bump_still_warns(tmp_path: Path) -> None:
+    base = WORKFLOW + "      - uses: example/greenproof@v1\n"
+    found = adopted(tmp_path, base, base.replace("greenproof@v1", "greenproof@v2"))
+    assert rule_ids(found) == ["ci.tampered"]
+    assert found[0].severity == "warn"

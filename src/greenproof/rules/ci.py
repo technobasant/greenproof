@@ -55,7 +55,9 @@ def _kinds(text: str | None) -> Counter[str]:
 
 
 def _greenproof_lines(text: str | None) -> Counter[str]:
-    return Counter(ln.strip() for ln in split_lines(text or "") if "greenproof" in ln.lower())
+    """The non-comment lines that mention greenproof, stripped, counted."""
+    stripped = (ln.strip() for ln in split_lines(text or ""))
+    return Counter(ln for ln in stripped if "greenproof" in ln.lower() and not ln.startswith("#"))
 
 
 _ACTION_REF = re.compile(
@@ -137,7 +139,7 @@ def _reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
         if cand_kinds[kind] < count:
             out.append((None, f"a {kind} step was removed or replaced"))
     gp_old, gp_new = _greenproof_lines(old), _greenproof_lines(new)
-    if gp_old != gp_new:
+    if gp_old and gp_old != gp_new:
         changed = sorted(((gp_new - gp_old) + (gp_old - gp_new)).keys())
         first = next(
             (n for n, ln in enumerate(split_lines(new), start=1) if ln.strip() in gp_new - gp_old),
