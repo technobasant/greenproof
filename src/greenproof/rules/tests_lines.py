@@ -57,6 +57,10 @@ _ASSERTS: dict[str, re.Pattern[str]] = {
     "rust": re.compile(r"\b(?:debug_)?assert(?:_eq|_ne)?!"),
     "python-lines": re.compile(r"^\s*assert\b|\.assert\w*\(", re.MULTILINE),
 }
+# `expect(<literal>)` checks nothing about the code (SPEC 5.4): it is not counted.
+_JS_CONST_EXPECT = re.compile(
+    r"\bexpect\s*\(\s*(?:-?\d[\w.]*|'[^'\n]*'|\"[^\"\n]*\"|`[^`$\n]*`|true|false|null|undefined)\s*\)"
+)
 _JS_STRONG = re.compile(
     r"\.(?:toEqual|toStrictEqual|toMatchObject)\b|\.toBe\s*\(|\.toThrow\s*\(\s*[^)\s]"
 )
@@ -274,17 +278,24 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
             owner.setdefault(ln, span)
     for span in spans:
         body_masked = "\n".join(masked[span.start : span.end + 1])
+        const_hits = (
+            [len(_JS_CONST_EXPECT.findall(code[k])) for k in range(span.start, span.end + 1)]
+            if lang == "js"
+            else [0] * (span.end - span.start + 1)
+        )
         unit = Unit(
             path=path,
             key=span.key,
             line=span.name_line + 1,
             body_hash=digest("".join(code[span.start : span.end + 1])),
             engine=lang,
-            asserts=len(_ASSERTS[lang].findall(body_masked)),
+            asserts=len(_ASSERTS[lang].findall(body_masked)) - sum(const_hits),
+            vacuous=sum(const_hits),
+            vacuous_line=next((span.start + i + 1 for i, h in enumerate(const_hits) if h), 0),
         )
         for k in range(span.start, span.end + 1):
-            hits = len(_ASSERTS[lang].findall(masked[k]))
-            if hits:
+            hits = len(_ASSERTS[lang].findall(masked[k])) - const_hits[k - span.start]
+            if hits > 0:
                 unit.assertion_forms.extend([digest("".join(code[k].split()))] * hits)
         if lang == "js":
             unit.strong = len(_JS_STRONG.findall(body_masked))

@@ -361,3 +361,98 @@ def test_renames_moves_merges_and_splits_stay_clean(
     code, found = check(more_repo, run, tmp_path / "out.json")
     assert code == 0, (name, found)
     assert not any(sev == "block" for _, sev in found), (name, found)
+
+
+# ---- assertions whose inputs are all constants are vacuous (SPEC 5.4) -----------------------
+
+
+def p16(r: Repo) -> None:
+    sub(
+        r,
+        MORE_PATH,
+        'def test_parse():\n    got = parse("4")',
+        "def test_parse_fixed():\n    got = 4",
+    )
+
+
+def p17(r: Repo) -> None:
+    sub(r, MORE_PATH, 'got = parse("4")', "got = 4")
+
+
+def p18(r: Repo) -> None:
+    sub(r, "tests/web.test.js", "expect(add(1, 2)).toBe(3)", "expect(3).toBe(3)")
+
+
+def c13(r: Repo) -> None:
+    sub(
+        r,
+        MORE_PATH,
+        '    got = parse("4")\n    want = 4\n    assert got == want',
+        '    want = 4\n    assert parse("4") == want',
+    )
+
+
+def c14(r: Repo) -> None:
+    sub(r, MORE_PATH, 'got = parse("4")', 'got = parse(" 4 ".strip())')
+
+
+def c15(r: Repo) -> None:
+    sub(
+        r,
+        MORE_PATH,
+        '    items = [parse("1")]\n',
+        '    items = []\n    items.append(parse("1"))\n',
+    )
+
+
+def c16(r: Repo) -> None:
+    sub(r, MORE_PATH, "\n\ndef test_total():", "\n\nMAX = 3\n\n\ndef test_total():")
+    sub(
+        r,
+        MORE_PATH,
+        "    got = total([1, 2])\n    want = 3\n    assert got == want",
+        "    assert total([1, 2]) == MAX",
+    )
+
+
+def c17(r: Repo) -> None:
+    (r.path / MORE_PATH).write_text(MORE + "\n\ndef test_arithmetic():\n    assert 2 + 2 == 4\n")
+
+
+CONSTANT_MISSES: list[tuple[str, Callable[[Repo], None], str, bool]] = [
+    ("P16", p16, "tests.replaced", False),
+    ("P17", p17, "tests.weakened", False),
+    ("P18", p18, "tests.weakened", True),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "mutate", "rule", "js"), CONSTANT_MISSES, ids=[t[0] for t in CONSTANT_MISSES]
+)
+def test_constant_only_assertions_are_vacuous(
+    name, mutate, rule, js, more_repo: Repo, probe_repo: Repo, run, tmp_path: Path
+) -> None:
+    repo = probe_repo if js else more_repo
+    mutate(repo)
+    code, found = check(repo, run, tmp_path / "out.json")
+    assert code == 1, (name, found)
+    assert (rule, "block") in found, (name, found)
+
+
+NOT_CONSTANT: list[tuple[str, Callable[[Repo], None]]] = [
+    ("C13", c13),
+    ("C14", c14),
+    ("C15", c15),
+    ("C16", c16),
+    ("C17", c17),
+]
+
+
+@pytest.mark.parametrize(("name", "mutate"), NOT_CONSTANT, ids=[c[0] for c in NOT_CONSTANT])
+def test_assertions_with_a_live_input_stay_clean(
+    name, mutate, more_repo: Repo, run, tmp_path: Path
+) -> None:
+    mutate(more_repo)
+    code, found = check(more_repo, run, tmp_path / "out.json")
+    assert code == 0, (name, found)
+    assert not any(sev == "block" for _, sev in found), (name, found)
