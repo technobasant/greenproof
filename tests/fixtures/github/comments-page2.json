@@ -1,0 +1,36 @@
+[
+  {
+    "url": "https://api.github.com/repos/acme/widgets/issues/comments/5",
+    "id": 5,
+    "user": {
+      "login": "teammate",
+      "id": 1008,
+      "type": "User",
+      "site_admin": false
+    },
+    "created_at": "2026-11-01T11:00:00Z",
+    "updated_at": "2026-11-01T11:00:00Z",
+    "author_association": "MEMBER",
+    "body": "please explain\n/GREENPROOF ACCEPT DDDDDDDDDDDD because the feature was removed"
+  },
+  {
+    "url": "https://api.github.com/repos/acme/widgets/issues/comments/6",
+    "id": 6,
+    "user": {
+      "login": "collab",
+      "id": 1006,
+      "type": "User",
+      "site_admin": false
+    },
+    "created_at": "2026-11-01T10:00:00Z",
+    "updated_at": "2026-11-01T10:00:00Z",
+    "author_association": "COLLABORATOR",
+    "body": "I think we should /greenproof accept cccccccccccc"
+  },
+  {
+    "id": 7,
+    "body": null,
+    "user": null,
+    "author_association": "OWNER"
+  }
+]

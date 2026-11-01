@@ -1,0 +1,58 @@
+[
+  {
+    "url": "https://api.github.com/repos/acme/widgets/issues/comments/1",
+    "id": 1,
+    "user": {
+      "login": "maintainer",
+      "id": 1010,
+      "type": "User",
+      "site_admin": false
+    },
+    "created_at": "2026-11-01T10:00:00Z",
+    "updated_at": "2026-11-01T10:00:00Z",
+    "author_association": "OWNER",
+    "body": "Looks fine.\n/greenproof accept aaaaaaaaaaaa bbbbbbbbbbbb\nthanks"
+  },
+  {
+    "url": "https://api.github.com/repos/acme/widgets/issues/comments/2",
+    "id": 2,
+    "user": {
+      "login": "ci-bot",
+      "id": 1006,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "created_at": "2026-11-01T10:00:00Z",
+    "updated_at": "2026-11-01T10:00:00Z",
+    "author_association": "MEMBER",
+    "body": "/greenproof accept cccccccccccc"
+  },
+  {
+    "url": "https://api.github.com/repos/acme/widgets/issues/comments/3",
+    "id": 3,
+    "user": {
+      "login": "drive-by",
+      "id": 1008,
+      "type": "User",
+      "site_admin": false
+    },
+    "created_at": "2026-11-01T10:00:00Z",
+    "updated_at": "2026-11-01T10:00:00Z",
+    "author_association": "CONTRIBUTOR",
+    "body": "/greenproof accept cccccccccccc"
+  },
+  {
+    "url": "https://api.github.com/repos/acme/widgets/issues/comments/4",
+    "id": 4,
+    "user": {
+      "login": "stranger",
+      "id": 1008,
+      "type": "User",
+      "site_admin": false
+    },
+    "created_at": "2026-11-01T10:00:00Z",
+    "updated_at": "2026-11-01T10:00:00Z",
+    "author_association": "NONE",
+    "body": "/greenproof accept cccccccccccc"
+  }
+]
