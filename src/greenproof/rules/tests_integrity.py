@@ -8,7 +8,6 @@ by body hash (a rename); only what is left over counts as removed, replaced or d
 
 from __future__ import annotations
 
-import posixpath
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -23,7 +22,6 @@ from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
 from greenproof.rules.tests_python import analyse_python, marker_display
 
 _RUST_TEST_ATTR = re.compile(r"#\[\s*(?:\w+::)*test\b")
-_TEST_MODULE_NAME = re.compile(r"(?:^test_.*\.py|.*_test\.(?:py|go)|.*\.(?:test|spec)\.\w+)$")
 
 
 def analyse(path: str, text: str) -> FileAnalysis | None:
@@ -422,11 +420,8 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
         names = [u for u in s.base.units if id(u) in lost]
         # Deleted, or renamed to a path that is not a test file or that the runner skips.
         if s.cand is None or (not s.cand.collected and s.file.status == "R"):
-            if names or (
-                not s.base.units
-                and _TEST_MODULE_NAME.match(posixpath.basename(s.file.old_path or path))
-            ):
-                listed = ", ".join(u.name for u in names[:5]) or "no test functions"
+            if names:  # a file with no test units (helpers, fixtures) loses nothing (SPEC 5.7)
+                listed = ", ".join(u.name for u in names[:5])
                 more = f" and {len(names) - 5} more" if len(names) > 5 else ""
                 what = "deleted" if s.file.status == "D" else "renamed to a non-test path"
                 out.append(
@@ -441,6 +436,23 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
             continue
         added = added_by_path.get(path, [])
         absorbing = _absorbing(pairing, path) if names else []
+        if added or absorbing:
+            # No counted check at the base (type-only test, "does not throw" smoke test):
+            # nothing to lose, so a file that gained tests only warns (SPEC 5.7).
+            at = added[0].line if added else absorbing[0][1].line
+            for removed in (u for u in names if u.asserts == 0):
+                out.append(
+                    sev_finding(
+                        "tests.replaced",
+                        WARN,
+                        path,
+                        at,
+                        f"test {removed.name} was removed; it had no counted check "
+                        "and the file gained tests",
+                        "Keep the original test; add new tests alongside it, not in its place.",
+                    )
+                )
+            names = [u for u in names if u.asserts > 0]
         if absorbing:
             rewrite = _is_rewrite(
                 [*names, *(b for b, _ in absorbing)], [*added, *(c for _, c in absorbing)]

@@ -611,7 +611,11 @@ def moved_class(tmp_path: Path, body: str):
 def test_moved_test_with_the_same_leaf_pairs_and_is_clean_when_not_weakened(
     tmp_path: Path,
 ) -> None:
-    body = "    def test_neg(self):\n        assert total([-1]) == -1\n        assert total([-2]) == -2\n"
+    body = (
+        "    def test_neg(self):\n"
+        "        assert total([-1]) == -1\n"
+        "        assert total([-2]) == -2\n"
+    )
     assert rule_ids(moved_class(tmp_path, body)) == []
 
 
@@ -622,7 +626,14 @@ def test_moved_test_that_lost_its_check_is_weakened_not_removed(tmp_path: Path) 
 
 
 def test_js_describe_title_edit_pairs_by_test_title(tmp_path: Path) -> None:
-    base = "describe('throws an message', () => {\n  it('rejects', () => {\n    expect(f()).toBe(1);\n    expect(f()).toEqual(1);\n  });\n});\n"
+    base = (
+        "describe('throws an message', () => {\n"
+        "  it('rejects', () => {\n"
+        "    expect(f()).toBe(1);\n"
+        "    expect(f()).toEqual(1);\n"
+        "  });\n"
+        "});\n"
+    )
     repo = init_repo(tmp_path / "ok")
     repo.write("a.test.js", base)
     repo.commit("base")
@@ -636,3 +647,100 @@ def test_js_describe_title_edit_pairs_by_test_title(tmp_path: Path) -> None:
         base.replace("an message", "a message").replace("    expect(f()).toEqual(1);\n", ""),
     )
     assert rule_ids(static_findings(repo)) == ["tests.weakened"]
+
+
+# ---- tests with no counted check, and deleted files with no units (5.7) --------------------
+
+SMOKE = """\
+from app import total
+
+
+def test_total():
+    assert total([1]) == 1
+
+
+def test_smoke():
+    total([1])
+"""
+NO_SMOKE = "\n\ndef test_smoke():\n    total([1])\n"
+
+
+def test_zero_check_test_removed_with_a_new_test_warns(tmp_path: Path) -> None:
+    other = "def test_other():\n    assert total([2]) == 2"
+    new = SMOKE.replace("def test_smoke():\n    total([1])", other)
+    found = change(tmp_path, new, SMOKE)
+    assert rule_ids(found) == ["tests.replaced"] and found[0].severity == "warn"
+    assert "no counted check" in found[0].message and "test_smoke" in found[0].message
+
+
+def test_zero_check_test_removed_with_an_absorbing_test_warns(tmp_path: Path) -> None:
+    new = SMOKE.replace(NO_SMOKE, "").replace(
+        "assert total([1]) == 1", "assert total([1]) == 1\n    assert total([2]) == 2"
+    )
+    found = change(tmp_path, new, SMOKE)
+    assert rule_ids(found) == ["tests.replaced"] and found[0].severity == "warn"
+
+
+def test_zero_check_test_removed_with_no_new_test_still_blocks(tmp_path: Path) -> None:
+    found = change(tmp_path, SMOKE.replace(NO_SMOKE, ""), SMOKE)
+    assert rule_ids(found) == ["tests.removed"] and found[0].severity == "block"
+
+
+def test_removed_test_with_checks_still_blocks_when_the_file_gains_a_test(tmp_path: Path) -> None:
+    new = SMOKE.replace(
+        "def test_total():\n    assert total([1]) == 1",
+        "def test_fresh():\n    assert parse('5') == 5",
+    ).replace("import total", "import parse, total")
+    found = change(tmp_path, new, SMOKE)
+    assert rule_ids(found) == ["tests.replaced"] and found[0].severity == "block"
+    assert "test_total" in found[0].message
+
+
+JS_SMOKE = (
+    "describe('f', () => {\n  it('is one', () => {\n    expect(f()).toBe(1);\n  });\n\n"
+    "  it('does not throw', () => {\n    f();\n  });\n});\n"
+)
+
+
+def test_js_zero_check_test_removed_with_a_new_test_warns(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "w")
+    repo.write("a.test.js", JS_SMOKE)
+    repo.commit("base")
+    gained = JS_SMOKE.replace(
+        "  it('does not throw', () => {\n    f();\n  });\n",
+        "  it('is two', () => {\n    expect(f()).toBe(2);\n  });\n",
+    )
+    repo.write("a.test.js", gained)
+    found = static_findings(repo)
+    assert rule_ids(found) == ["tests.replaced"] and found[0].severity == "warn"
+
+
+def test_js_zero_check_test_removed_alone_still_blocks(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "b")
+    repo.write("a.test.js", JS_SMOKE)
+    repo.commit("base")
+    repo.write(
+        "a.test.js", JS_SMOKE.replace("\n  it('does not throw', () => {\n    f();\n  });\n", "")
+    )
+    assert rule_ids(static_findings(repo)) == ["tests.removed"]
+
+
+def test_deleted_test_file_without_units_is_not_tests_deleted(tmp_path: Path) -> None:
+    helpers = (
+        'package calc\n\nimport "testing"\n\nfunc mustAdd(t *testing.T) int {\n\treturn 1\n}\n'
+    )
+    repo = init_repo(tmp_path / "go")
+    repo.write("calc_test.go", helpers)
+    repo.commit("base")
+    repo.remove("calc_test.go")
+    assert static_findings(repo) == []
+    repo = init_repo(tmp_path / "py")
+    repo.write("test_helpers.py", "def make():\n    return 1\n")
+    repo.commit("base")
+    repo.remove("test_helpers.py")
+    assert static_findings(repo) == []
+    repo = init_repo(tmp_path / "units")
+    repo.write("test_x.py", "def test_a():\n    assert 1 == 1\n")
+    repo.commit("base")
+    repo.remove("test_x.py")
+    assert rule_ids(static_findings(repo)) == ["tests.deleted"]
