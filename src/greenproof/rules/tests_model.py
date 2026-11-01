@@ -38,10 +38,13 @@ class Unit:
     unreachable: int = 0
     unreachable_line: int = 0
     # Python only (SPEC 5.4): shape -> source of each subject of an exact check, and of each
-    # target of a loose check; every literal in the assertions and parametrize cases.
+    # target of a loose check; exact checks pinned to a literal (SPEC 5.7); operand shapes of
+    # comparisons and of bare truthiness checks.
     exact_subjects: dict[str, str] = field(default_factory=dict)
     loose_targets: dict[str, str] = field(default_factory=dict)
-    constants: set[str] = field(default_factory=set)
+    pinned: int = 0
+    strong_operands: set[str] = field(default_factory=set)
+    weak_operands: set[str] = field(default_factory=set)
     # Collection facts: enclosing classes, whether one is a TestCase, `__test__ = False`.
     classes: tuple[str, ...] = ()
     testcase: bool = False

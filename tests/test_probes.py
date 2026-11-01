@@ -920,3 +920,53 @@ def test_rewrite_keeping_its_literals_and_exact_subjects_warns(tmp_path: Path, r
     )
     got, found = check(repo, run, tmp_path / "out.json")
     assert (got, found) == (0, {("tests.replaced", "warn")})
+
+
+def test_rewrite_to_literal_parametrize_cases_with_new_values_warns(tmp_path: Path, run) -> None:
+    repo = init_repo(tmp_path / "pin")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write("src/shop.py", SHOP_SRC)
+    repo.write(
+        "tests/test_shop.py",
+        "from shop import refund\n\n\ndef test_refund():\n    out = str(refund(4))\n"
+        '    assert out == "3\\n"\n',
+    )
+    repo.commit("base")
+    repo.write(
+        "tests/test_shop.py",
+        "import pytest\n\nfrom shop import refund\n\n\n"
+        '@pytest.mark.parametrize(("x", "expected"), [(4, "three"), (6, "five")])\n'
+        "def test_refund_cases(x, expected):\n    out = str(refund(x))\n"
+        "    assert out == expected\n",
+    )
+    got, found = check(repo, run, tmp_path / "out.json")
+    assert (got, found) == (0, {("tests.replaced", "warn")})
+
+
+def test_rewrite_computing_its_expected_value_does_not_pin_it(tmp_path: Path, run) -> None:
+    repo = init_repo(tmp_path / "pin2")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write("src/shop.py", SHOP_SRC)
+    repo.write(
+        "tests/test_shop.py",
+        'from shop import refund\n\n\ndef test_refund():\n    assert str(refund(4)) == "3"\n',
+    )
+    repo.commit("base")
+    repo.write(
+        "tests/test_shop.py",
+        "import pytest\n\nfrom shop import refund\n\n\n"
+        '@pytest.mark.parametrize(("x", "expected"), [(4, 3), (6, 5)])\n'
+        "def test_refund_cases(x, expected):\n    assert str(refund(x)) == repr(expected)\n",
+    )
+    got, found = check(repo, run, tmp_path / "out.json")
+    assert (got, found) == (1, BLOCK_REPLACED)
+
+
+def test_comparison_cut_to_truthiness_of_its_operand_blocks(tmp_path: Path, run) -> None:
+    repo = init_repo(tmp_path / "cut")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write("tests/test_t.py", "def test_t():\n    x = f()\n    assert x < 5\n")
+    repo.commit("base")
+    repo.write("tests/test_t.py", "def test_t():\n    x = f()\n    assert x\n")
+    got, found = check(repo, run, tmp_path / "out.json")
+    assert (got, found) == (1, BLOCK_WEAKENED)

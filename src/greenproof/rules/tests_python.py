@@ -419,6 +419,67 @@ def _is_literal(node: ast.AST) -> bool:
     return False
 
 
+def _is_pinned(node: ast.AST) -> bool:
+    """A literal an exact check can pin a value to: a constant, a negated number, a display of
+    literals, or `approx(<literal>)`."""
+    if isinstance(node, ast.Constant):
+        return node.value is not Ellipsis
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return _number(node) is not None or _is_pinned(node.operand)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_is_pinned(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(k is not None and _is_pinned(k) for k in node.keys) and all(
+            _is_pinned(v) for v in node.values
+        )
+    if isinstance(node, ast.Call) and dotted(node.func).endswith("approx") and node.args:
+        return _is_pinned(node.args[0])
+    return False
+
+
+def _literal_params(fn: _FuncDef) -> set[str]:
+    """Parametrize arguments whose cases are all literals."""
+    names: dict[str, bool] = {}
+    for dec in fn.decorator_list:
+        if not (isinstance(dec, ast.Call) and dotted(dec.func).endswith("mark.parametrize")):
+            continue
+        argnames = dec.args[0] if dec.args else None
+        values: ast.AST | None = dec.args[1] if len(dec.args) > 1 else None
+        for kw in dec.keywords:
+            if kw.arg == "argnames":
+                argnames = kw.value
+            elif kw.arg == "argvalues":
+                values = kw.value
+        listed: list[str] = []
+        if isinstance(argnames, ast.Constant) and isinstance(argnames.value, str):
+            listed = [n.strip() for n in argnames.value.split(",") if n.strip()]
+        elif isinstance(argnames, (ast.List, ast.Tuple)):
+            listed = [
+                e.value
+                for e in argnames.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)
+            ]
+        cases = values.elts if isinstance(values, (ast.List, ast.Tuple)) else None
+        for i, name in enumerate(listed):
+            ok = cases is not None and all(_case_literal(c, i, len(listed)) for c in cases)
+            names[name] = names.get(name, True) and ok
+    return {n for n, ok in names.items() if ok}
+
+
+def _case_literal(case: ast.expr, index: int, width: int) -> bool:
+    if isinstance(case, ast.Call) and dotted(case.func).rsplit(".", 1)[-1] == "param":
+        case = (
+            ast.Tuple(elts=list(case.args), ctx=ast.Load())
+            if width > 1
+            else (case.args[0] if case.args else case)
+        )
+    if width == 1:
+        return _is_pinned(case)
+    if isinstance(case, (ast.Tuple, ast.List)) and len(case.elts) == width:
+        return _is_pinned(case.elts[index])
+    return False
+
+
 def _expected_of(node: ast.AST) -> ast.AST | None:
     """The literal on the expected side of `x == LIT`, `x == approx(LIT)` or None."""
     if _is_literal(node):
@@ -457,13 +518,28 @@ class _Stats(ast.NodeVisitor):
         self.vacuous_line = 0
         self.exact: dict[str, str] = {}  # shape -> source of each exact-check subject
         self.loose: dict[str, str] = {}  # shape -> source of the loose check on it
-        self.constants: set[str] = set()
+        self.pinned = 0  # exact checks against a literal or an all-literal parametrize argument
+        self.literal_params: set[str] = set()
+        self.strong_operands: set[str] = set()  # operands of comparisons
+        self.weak_operands: set[str] = (
+            set()
+        )  # targets of a bare truthiness (or `is not None`) check
         self.first_line = 0
 
     def _opshape(self, node: ast.AST) -> str:
         return digest(ast.dump(_Locals(self.consts.stores).visit(self.consts.inline(node))))
 
     # -- exact and loose checks (SPEC 5.4) ---------------------------------------------
+    def _pinned_side(self, node: ast.expr) -> bool:
+        if isinstance(node, ast.Name) and node.id in self.literal_params:
+            return True
+        return _is_pinned(self.consts.inline(node))
+
+    def _pinned_check(self, sides: Sequence[ast.expr]) -> None:
+        """Count an exact check one of whose sides is pinned to a literal."""
+        if any(self._pinned_side(s) for s in sides):
+            self.pinned += 1
+
     def _exact(self, node: ast.expr, src: str) -> None:
         """`node` is a subject of an exact check; a `type(X)`, `len(X)`, `bool(X)` wrapper also
         makes X the target of a loose one."""
@@ -515,6 +591,8 @@ class _Stats(ast.NodeVisitor):
             exact = False
         else:  # `in`: neither an exact nor a loose check
             return
+        if exact:
+            self._pinned_check((left, right))
         for side in (left, right):
             if exact:
                 self._exact(side, src)
@@ -538,7 +616,6 @@ class _Stats(ast.NodeVisitor):
             self.first_line = self.first_line or node.lineno
             return
         self._counted(node.test)
-        self._constants_of(node.test)
         self._test_checks(test, ast.unparse(test))
         if isinstance(test, ast.Compare):
             weak = (
@@ -549,8 +626,12 @@ class _Stats(ast.NodeVisitor):
             )
             if weak:
                 self.weak += 1
+                self.weak_operands.add(self._opshape(test.left))
             else:
                 self.strong += 1
+                self.strong_operands.update(
+                    self._opshape(o) for o in (test.left, *test.comparators)
+                )
             if len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq):
                 for side in (test.left, test.comparators[0]):
                     lit = _expected_of(side)
@@ -558,19 +639,15 @@ class _Stats(ast.NodeVisitor):
                         self.expected.append((ast.dump(lit), node.lineno))
         elif isinstance(test, (ast.Name, ast.Attribute, ast.Subscript)):
             self.weak += 1
+            self.weak_operands.add(self._opshape(test))
         elif isinstance(test, ast.Call):
             # A bare truthiness check on a call is weak; type checks pin a concrete fact.
             if dotted(test.func) in {"isinstance", "issubclass"}:
                 self.strong += 1
             else:
                 self.weak += 1
+                self.weak_operands.add(self._opshape(test))
         self.generic_visit(node)
-
-    def _constants_of(self, node: ast.AST) -> None:
-        """Literals the assertion compares against, after local inlining."""
-        for n in ast.walk(self.consts.inline(node)):
-            if _is_literal(n):
-                self.constants.add(ast.dump(n))
 
     def _raises(self, call: ast.Call) -> None:
         self._counted(call)
@@ -606,12 +683,14 @@ class _Stats(ast.NodeVisitor):
                 self.first_line = self.first_line or node.lineno
                 return
             self._counted(node)
-            self._constants_of(node)
             self._method_checks(tail, node)
             if tail in _WEAK_METHODS:
                 self.weak += 1
+                if node.args:
+                    self.weak_operands.add(self._opshape(node.args[0]))
             else:
                 self.strong += 1
+                self.strong_operands.update(self._opshape(a) for a in node.args[:2])
             if tail in _EQUAL_METHODS:
                 for arg in node.args[:2]:
                     lit = _expected_of(arg)
@@ -637,6 +716,10 @@ class _Stats(ast.NodeVisitor):
         src = ast.unparse(node)
         args = node.args
         if tail in _EXACT_METHODS:
+            if tail == "assertIsNone":
+                self.pinned += 1  # `is None`: pinned to the constant None
+            else:
+                self._pinned_check(args[:2])
             for arg in args[: 1 if tail == "assertIsNone" else 2]:
                 self._exact(arg, src)
         elif tail in _LOOSE_PAIR_METHODS:
@@ -722,18 +805,6 @@ class _Stats(ast.NodeVisitor):
             ):
                 self._count_inside(node.body, node.lineno)
         self.generic_visit(node)
-
-
-def _param_constants(fn: _FuncDef) -> set[str]:
-    """Literals among the cases of the test's parametrize decorators."""
-    out: set[str] = set()
-    for dec in fn.decorator_list:
-        if not (isinstance(dec, ast.Call) and dotted(dec.func).endswith("mark.parametrize")):
-            continue
-        values = [dec.args[1]] if len(dec.args) > 1 else []
-        values += [kw.value for kw in dec.keywords if kw.arg == "argvalues"]
-        out.update(ast.dump(n) for v in values for n in ast.walk(v) if _is_literal(n))
-    return out
 
 
 def _parametrize(fn: _FuncDef) -> tuple[int | None, bool, list[str]]:
@@ -843,6 +914,7 @@ def _unit(
     live = copy.deepcopy(fn)
     dropped = _prune(live)
     stats = _Stats(helpers, consts=_Consts(live))
+    stats.literal_params = _literal_params(fn)
     for stmt in live.body:
         stats.visit(stmt)
     cases, literal, case_forms = _parametrize(fn)
@@ -877,7 +949,9 @@ def _unit(
         unreachable_line=lost.first_line,
         exact_subjects=stats.exact,
         loose_targets=stats.loose,
-        constants=stats.constants | _param_constants(fn),
+        pinned=stats.pinned,
+        strong_operands=stats.strong_operands,
+        weak_operands=stats.weak_operands,
         classes=classes,
         testcase=testcase,
         disabled=disabled,

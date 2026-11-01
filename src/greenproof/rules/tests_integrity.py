@@ -172,13 +172,15 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
     loosened = _loosened(b, c) if b.engine == "python" else []
     out.extend((f"exact check on `{x}` loosened to `{src}`", c.line, BLOCK) for x, src in loosened)
     if c.strong < b.strong and c.weak > b.weak and not loosened:
-        # An exact check loosened is reported above; replacing a check by a different
-        # expression is often a legitimate refactor, so on Python it only warns.
+        # Cutting a comparison to a truthiness check on its own operand is a plain weakening
+        # (an exact check loosened is reported above); a different expression is often a
+        # legitimate refactor, so on Python it only warns.
+        own = bool(c.weak_operands & b.strong_operands) or b.engine != "python"
         out.append(
             (
                 "a strong assertion was replaced by a weaker one",
                 c.line,
-                WARN if b.engine == "python" else BLOCK,
+                BLOCK if own else WARN,
             )
         )
     if c.broad_raises > b.broad_raises and c.specific_raises < b.specific_raises:
@@ -341,9 +343,13 @@ def _group_checks(units: list[Unit], literal: bool) -> int:
     return sum(u.asserts * ((u.param_cases or 1) if literal else 1) for u in units)
 
 
+def _group_pinned(units: list[Unit], literal: bool) -> int:
+    return sum(u.pinned * ((u.param_cases or 1) if literal else 1) for u in units)
+
+
 def _is_rewrite(removed: list[Unit], added: list[Unit]) -> bool:
     """SPEC 5.7: the new tests keep every subject, at least as many checks, loosen no exact check
-    and keep every literal the removed tests pinned."""
+    and pin at least as many expected values as the removed tests."""
     if any(u.engine != "python" for u in (*removed, *added)):
         return False
     subjects = set().union(*(u.subjects for u in removed))
@@ -357,8 +363,7 @@ def _is_rewrite(removed: list[Unit], added: list[Unit]) -> bool:
     for u in removed:
         if any(s in checked_after and s not in exact_after for s in u.exact_subjects):
             return False
-    pinned = {lit for u in removed for lit, _ in u.expected}
-    return pinned <= set().union(*(u.constants for u in added))
+    return _group_pinned(added, literal) >= _group_pinned(removed, literal)
 
 
 def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]:
