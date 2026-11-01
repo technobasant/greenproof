@@ -542,3 +542,46 @@ def test_make_icon_needs_an_output_path(capsys: pytest.CaptureFixture[str]) -> N
     icon = load_script("make_icon")
     assert icon.main([]) == 2
     assert "usage" in capsys.readouterr().err
+
+
+# --- the OpenCode plugin (SPEC 6.8) ----------------------------------------------------------
+
+OPENCODE = ROOT / "integrations" / "opencode"
+PACKAGED_PLUGIN = ROOT / "src" / "greenproof" / "init" / "hooks" / "opencode_plugin.js"
+
+
+def test_the_two_opencode_plugin_copies_differ_only_in_the_command_line() -> None:
+    packaged = PACKAGED_PLUGIN.read_text(encoding="utf-8").split("\n")
+    npm = (OPENCODE / "index.js").read_text(encoding="utf-8").split("\n")
+    assert len(packaged) == len(npm)
+    differing = [(a, b) for a, b in zip(packaged, npm, strict=True) if a != b]
+    assert differing == [
+        ('const COMMAND = ["greenproof"]', f'const COMMAND = ["uvx", "greenproof@{__version__}"]')
+    ]
+
+
+def test_opencode_package_versions_equal_the_release_version() -> None:
+    package = read_json(OPENCODE / "package.json")
+    assert package["version"] == __version__
+    assert package["name"] == "opencode-greenproof"
+    assert package["files"] == ["index.js", "README.md", "LICENSE"]
+    assert package["exports"] == {".": "./index.js", "./server": "./index.js"}
+    assert not {"dependencies", "devDependencies", "peerDependencies"} & set(package)
+    assert (OPENCODE / "LICENSE").read_bytes() == (ROOT / "LICENSE").read_bytes()
+    pins = set(re.findall(r"greenproof@(\d[\w.]*)", (OPENCODE / "README.md").read_text("utf-8")))
+    assert pins <= {__version__}
+
+
+def test_the_packaged_opencode_plugin_is_a_data_file_of_the_wheel() -> None:
+    text = PACKAGED_PLUGIN.read_text(encoding="utf-8")
+    assert text.startswith("// greenproof plugin for OpenCode. Written by greenproof init;")
+    assert text.endswith('export default { id: "greenproof", setup }\n')
+    assert not re.search(r"^import .* from \"(?!node:)", text, re.MULTILINE)
+
+
+def test_bump_covers_the_opencode_package(tree: Path) -> None:
+    bump = load_script("bump_version")
+    bump.bump(tree, "9.8.7")
+    assert read_json(tree / "integrations/opencode/package.json")["version"] == "9.8.7"
+    index = (tree / "integrations/opencode/index.js").read_text(encoding="utf-8")
+    assert 'const COMMAND = ["uvx", "greenproof@9.8.7"]' in index
