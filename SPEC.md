@@ -320,6 +320,17 @@ call line with whitespace removed. `t.Helper()` is not required.
 Matching is on added lines only, ignoring lines whose content already
 existed elsewhere in the same file at base (moved code is not new suppression).
 
+Each pattern applies only to files where it has an effect (M5). The comment and type
+patterns keep their languages (Python, JavaScript/TypeScript, Go, Rust). `|| true`,
+`; true$`, `set +e` and the git `--no-verify` pattern apply only to **shell-capable
+files**: suffixes `.sh`, `.bash`, `.zsh`, `.ksh`, `.mk`, `.yml`, `.yaml`, `.dockerfile`;
+basenames `Makefile`, `GNUmakefile`, `makefile`, `justfile`, `Justfile`, `.justfile`,
+`package.json`, `pyproject.toml`, `tox.ini`, `setup.cfg`; basenames starting with
+`Dockerfile` or `Containerfile`; any file under a `.husky/` or `.githooks/` directory.
+`--passWithNoTests` applies to shell-capable files and JavaScript/TypeScript files (jest
+and vitest configs). Data and fixture files (`.toml` other than `pyproject.toml`, `.json`
+other than `package.json`, `.txt`, `.csv`) and prose never match.
+
 ### 5.6 Runner tampering (`runner.tampered`)
 
 Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
@@ -498,6 +509,9 @@ cannot be verified ships as `experimental`: `init` installs it only when it is n
 - Codex CLI: https://developers.openai.com/codex/hooks, schemas in
   `openai/codex` under `codex-rs/hooks/schema/generated`
 - Gemini CLI: https://geminicli.com/docs/hooks/reference/
+- OpenCode (M5): https://opencode.ai/docs/plugins/ and the `@opencode-ai/plugin` package
+  (V1, CLI `opencode-ai`); `@opencode/plugin` (V2, CLI `@opencode/cli`). OpenCode has no
+  command hooks: the plugin in 6.8 runs `check --hook opencode` and maps its output.
 
 ### 6.1 Hook protocol (`check --hook AGENT`)
 
@@ -511,6 +525,15 @@ or unparseable stdin counts as `{}` and the gate still runs. From the payload it
 | cursor | `conversation_id` | `workspace_roots[0]` | `status`, `loop_count` |
 | codex | `session_id` | `cwd` | `stop_hook_active` (unused) |
 | gemini | `session_id` | `cwd` | `stop_hook_active` (unused) |
+| opencode | `session_id` | `cwd` | none |
+
+The **payload fingerprint** is the sha256 of the payload object serialized with sorted
+keys and compact separators. An empty payload (`{}`, which is also what a TTY or
+unparseable stdin counts as) has no fingerprint. Two hooks run for the same stop receive
+the same payload; a later stop differs in at least one field (Claude Code's
+`stop_hook_active` and `last_assistant_message`, Codex's `turn_id`, Cursor's
+`loop_count`, the OpenCode plugin's `message_id`). It is used only by 6.2's duplicate
+rule.
 
 The start directory, when it exists, replaces the process cwd for repo discovery. In hook
 mode stdout carries only the protocol output below, never the text report; `--json` and
@@ -521,6 +544,10 @@ mode stdout carries only the protocol output below, never the text report; `--js
 | pass | exit 0, no output | exit 0, `{}` | exit 0, no output | exit 0, no output |
 | block | exit 2, agent message on stderr | exit 0, `{"followup_message": msg}` | exit 0, `{"decision": "block", "reason": msg}` | exit 0, `{"decision": "deny", "reason": msg}` |
 | release | exit 0, `{"continue": false, "stopReason": note}` | exit 0, `{}` | exit 0, `{"continue": false, "stopReason": note}` | exit 0, `{"continue": false, "stopReason": note}` |
+
+opencode speaks codex's protocol exactly (pass: no output; block: `{"decision": "block",
+"reason": msg}`; release: `{"continue": false, "stopReason": note}`; always exit 0). The
+plugin (6.8) turns these into a follow-up prompt or a toast.
 
 A Cursor payload whose `status` is not `completed` (the user aborted, or the turn errored)
 → exit 0, `{}`, nothing runs. An error inside the check (what would be exit 4 or 5) is a
@@ -565,6 +592,33 @@ state counts as empty. In order:
 Outside a git repository there is nowhere to keep state, so a hook releases with the
 "could not run" note instead of blocking.
 
+**Duplicate hooks for one stop (M5).** The gate can be installed twice: a plugin (6.7)
+and the project hooks `init` writes, or user and project settings. The agent then runs
+both for one stop, in parallel; Claude Code does not deduplicate plugin hooks against
+settings hooks. Without coordination the second run would find the first one's block,
+apply rule 2 and release, and because Claude Code and Codex let one hook's
+`continue: false` override every other hook's block, every block would become a release.
+So:
+
+- Everything after repository discovery (rules 1–3 and the state write) runs under an
+  exclusive lock on `<git-dir>/greenproof/hook.lock`: `fcntl.flock` on POSIX,
+  `msvcrt.locking` on Windows (retried until it succeeds). A second run waits for the
+  lock. When the lock file cannot be opened, the hook runs without the lock.
+- The state also records the fingerprint of the payload that decided it (6.1), the
+  decision (`pass`, `block` or `release`), the agent message of a block, and a replay
+  count. A pass now writes state (decision `pass`, zero blocks) instead of clearing it.
+  Rule 1 (nothing to verify) still clears it.
+- After taking the lock and before rule 1: when the payload has a fingerprint, the state
+  has the same session and the same fingerprint, and its replay count is below 3, the hook
+  outputs the recorded decision again in its own agent's protocol (pass; block with the
+  recorded message; release with the recorded note), adds one to the replay count and
+  changes nothing else. The report notes "replayed the decision of another greenproof
+  hook for this stop". From the fourth replay on, the normal rules apply.
+- Rule 2 applies only when the recorded decision is `block` or `release`. A recorded pass
+  counts as zero previous blocks in rule 3.
+- A state file without these fields (written by 0.1.0) counts as decision `block` with no
+  fingerprint and zero replays.
+
 Local acceptances apply in hook mode (6.6). Cursor's own `loop_limit` (default 5) and
 Claude Code's cap of 8 consecutive stop-hook continuations still apply on top. All of this
 is advisory: the agent shares the user's shell and can edit the state file or the session
@@ -581,8 +635,10 @@ Writes the session marker and gives the agent its instructions:
   the policy at HEAD, when there is one); that it inspects the diff for deleted, skipped or
   weakened tests and edits to test, runner or CI configuration; "Fix the code, not the
   check. Never run `greenproof accept`; accepting a finding is the user's call."
-- Output: claude, codex and gemini `{"hookSpecificOutput": {"hookEventName":
+- Output: claude, codex, gemini and opencode `{"hookSpecificOutput": {"hookEventName":
   "SessionStart", "additionalContext": text}}`; cursor `{"additional_context": text}`.
+  The OpenCode plugin adds the context to the session only where OpenCode offers a
+  supported way to (6.8); the marker is what matters.
 - Never blocks: with `--hook`, any error → exit 0, nothing on stdout, one line on stderr.
   Without `--hook`, errors use the normal exit codes.
 
@@ -605,25 +661,32 @@ written with two-space indent and a trailing newline.
   ```json
   {"hooks": {
     "Stop": [{"hooks": [{"type": "command", "command": "greenproof check --hook claude", "timeout": 960}]}],
-    "SessionStart": [{"matcher": "startup|resume|clear|compact",
+    "SessionStart": [{"matcher": "startup|resume|clear|compact|fork",
                       "hooks": [{"type": "command", "command": "greenproof session-start --hook claude"}]}]}}
   ```
 
   No `SubagentStop`: a subagent stopping midway through the parent's task would be blocked
-  for the parent's unfinished work. The parent's `Stop` is the gate.
+  for the parent's unfinished work. The parent's `Stop` is the gate. `fork` (M5) is the
+  source of a session forked from another; 6.3 keeps its marker.
 - **Cursor**: `.cursor/hooks.json`:
   `{"version": 1, "hooks": {"stop": [{"command": "greenproof check --hook cursor", "timeout": 960}], "sessionStart": [{"command": "greenproof session-start --hook cursor"}]}}`.
   No `subagentStop`, for the same reason.
 - **Codex CLI**: `.codex/hooks.json`, verified against `codex-rs/config/src/hook_config.rs`
   (`HooksFile`) and `codex-rs/protocol/src/hooks.rs`: top-level keys `description` and
   `hooks` only (unknown keys are rejected), events nested like Claude's (`Stop`;
-  `SessionStart` with matcher `startup|resume|clear|compact`), handler
+  `SessionStart` with matcher `startup|resume|clear|compact`, plus `fork` when Codex's
+  SessionStart source enum has it (M5: verify in `openai/codex` and cite the file), handler
   `{"type": "command", "command": ..., "timeout": seconds}`. `init` prints: "Codex: review
   and trust the new hooks once with /hooks; Codex skips untrusted project hooks."
 - **Gemini CLI**: experimental. Gemini CLI was superseded by Antigravity CLI on 2026-06-18,
   and the open issue google-gemini/gemini-cli#27712 reports `AfterAgent` hooks not firing.
   `.gemini/settings.json`: `AfterAgent` (matcher `*`, `"name": "greenproof"`, timeout in
   **milliseconds**) and `SessionStart` (matcher `startup|resume|clear`).
+- **OpenCode** (M5): `.opencode/plugins/greenproof.js`, the plugin of 6.8 with the hook
+  command baked in. The file is wholly greenproof's: its first line is
+  `// greenproof plugin for OpenCode. Written by greenproof init; re-running init replaces it.`
+  Re-running `init` rewrites it; an existing file without that first line → exit 4,
+  nothing written. OpenCode loads `.js` files from `.opencode/plugins/` in V1 and V2.
 
 Every agent treats a hook that cannot start as a non-blocking error, so hooks fail open
 when the greenproof executable is missing. The README says so; CI is the backstop.
@@ -681,6 +744,139 @@ through that an agent cannot forge.
 - An accepted finding keeps its severity, is marked accepted and does not affect the exit
   code. It shows as `ACCEPTED` in text, in its own Markdown table and as a `::notice`
   annotation.
+
+### 6.7 Plugins for Claude Code, Codex and Cursor (M5)
+
+A plugin gives the user the hooks without running `init` in each repository. One plugin
+directory serves the three agents; each reads its own manifest.
+
+```
+.claude-plugin/marketplace.json     Claude Code marketplace
+.agents/plugins/marketplace.json    Codex marketplace (format from openai/codex)
+.cursor-plugin/marketplace.json     Cursor marketplace (format from cursor/plugin-template)
+plugins/greenproof/
+  .claude-plugin/plugin.json
+  .claude-plugin/icon.png           square PNG, 512 x 512, under 256 KiB
+  .codex-plugin/plugin.json
+  .cursor-plugin/plugin.json
+  hooks/claude.json  hooks/codex.json  hooks/cursor.json
+  skills/greenproof/SKILL.md
+  assets/logo.png                   the same image, for Cursor's `logo` and Codex's interface
+  README.md
+  LICENSE                           a copy of the repository's Apache-2.0 LICENSE
+```
+
+- **No `hooks/hooks.json`.** Each manifest names its own hooks file, so no agent loads
+  another agent's protocol through a default path. Verify, for each agent, which files it
+  loads from a plugin directory that carries other vendors' manifests (Codex probes
+  `.codex-plugin`, then `.claude-plugin`, then `.cursor-plugin`), and that none of them
+  picks up a hooks file meant for another.
+- **Hook command**: `uvx greenproof@<version>`, `<version>` equal to `__version__` (uv's
+  `@` form is an exact pin). The hooks are 6.4's: Stop/stop and SessionStart/sessionStart,
+  no subagent stop, Claude's matcher `startup|resume|clear|compact|fork`, Codex's matcher
+  per 6.4. The Stop timeout is 3600 seconds, because a plugin cannot read the policy.
+  Plugins need uv on PATH; without it the hook cannot start and fails open (README).
+- **Manifests**: `name` `greenproof`; `version` equal to `__version__`; description
+  "Done gate for coding agents: when the agent stops, greenproof runs your checks and
+  blocks deleted, skipped or weakened tests."; author Basant Bhattarai; homepage and
+  repository https://github.com/technobasant/greenproof; license `Apache-2.0`; keywords.
+  Vendor fields follow each vendor's documentation or source, and the test that checks the
+  manifests names the source it was written against:
+  - Claude Code: `"hooks": "./hooks/claude.json"`; skills from the default `skills/`.
+    `claude plugin validate --strict` passes for the plugin and the marketplace.
+  - Codex: `.codex-plugin/plugin.json` with the hooks and skills paths and the `interface`
+    block (display name, short description, developer, category, logo, and the rest Codex
+    defines), field names checked against the Rust structs in `openai/codex` and, where
+    published, the agent-plugins JSON schema.
+  - Cursor: `.cursor-plugin/plugin.json` with the hooks path and `logo`; cursor's
+    `plugin-template` validator passes.
+- **Skill** `skills/greenproof/SKILL.md` (frontmatter `name: greenproof` and a
+  `description` saying when to use it: a "greenproof: not done" message, or the user asks
+  to run the done gate, explain a finding or set greenproof up). At most 60 lines: what
+  the gate does; how to answer a block (fix the code; never delete, skip or weaken tests
+  or edit test, runner or CI configuration; if the requirement changed, stop and tell the
+  user which test and why); `uvx greenproof@<version> check` to run it on demand;
+  `greenproof explain RULE_ID`; `uvx greenproof@<version> init --agents none` to add a
+  policy in a repository where the plugin already provides the hooks; never run
+  `greenproof accept` and never edit `.greenproof.toml`, hook files or greenproof's state
+  under the git directory to get past a block.
+- **Plugin README** (at least 40 words): exactly what runs and when. On stop:
+  `uvx greenproof@<version> check --hook AGENT` in the project, which runs the static
+  checks and the commands in the project's `.greenproof.toml` (the project's own tests).
+  On session start: writes the session marker under the git directory. uv downloads
+  greenproof from PyPI on first use; greenproof itself makes no network calls in hook
+  mode and has no telemetry. Install per agent, how to turn it off for one project, and
+  that running `init --agents ...` in a repository that has the plugin is unnecessary
+  (`init --agents none` adds only the policy and AGENTS.md); if both are installed, 6.2
+  makes one decision per stop.
+- **Marketplaces**: name `greenproof`, owner Basant Bhattarai, one plugin `greenproof`
+  with source `./plugins/greenproof`. Claude Code: `claude plugin marketplace add
+  technobasant/greenproof`, then `claude plugin install greenproof@greenproof`. Codex:
+  `codex plugin marketplace add technobasant/greenproof` (the public Codex directory does
+  not accept plugins with lifecycle hooks). Cursor: what its documentation offers for a
+  GitHub-hosted plugin, and the marketplace submission.
+- **Directory limits** (Anthropic): fewer than 512 files in the plugin directory, each
+  under 256 KiB; a LICENSE; a kebab-case name.
+- **Versions in step**: `scripts/bump_version.py X.Y.Z` rewrites `_version.py`, the
+  manifests, the marketplace entries that carry a version, every pinned command in the
+  plugin (hook files, skill, README) and the OpenCode package (6.8). A test fails when any
+  of them differs from `__version__`.
+
+Publishing (directory submissions, marketplace listings) is the maintainer's step, not
+part of the implementation.
+
+### 6.8 OpenCode plugin (M5)
+
+OpenCode has no command hooks, so greenproof ships a plugin that runs the command and maps
+its output.
+
+- **One ES module**, plain JavaScript, only `node:` built-ins, no build step. Canonical
+  source `src/greenproof/init/hooks/opencode_plugin.js` (package data; `init` writes it,
+  6.4), mirrored in `integrations/opencode/index.js` (npm package `opencode-greenproof`).
+  The two are identical except the `COMMAND` line; a test checks that.
+- `const COMMAND = [...]` near the top is the argv prefix. `init` renders it from the hook
+  command with `shlex.split`, as a JSON array; the npm copy has
+  `["uvx", "greenproof@<version>"]`.
+- **Loaders**: V1 (`opencode-ai`, contract of `@opencode-ai/plugin`) and V2
+  (`@opencode/cli`, contract of `@opencode/plugin`), each verified by loading the plugin
+  in the real CLI at a pinned version (run through npx or bunx in a temporary directory,
+  never installed globally). If one file cannot satisfy both loaders, stop and report
+  with the evidence; that choice is the maintainer's.
+- **New top-level session** (V1 `session.created`; sessions with a `parentID` are
+  subagents and are skipped): run `COMMAND session-start --hook opencode` with stdin
+  `{"session_id", "cwd", "hook_event_name": "session.created", "source": "startup"}`.
+  Add its context to the session only through a documented, non-experimental API;
+  otherwise ignore stdout.
+- **Idle of a top-level session** (V1 `session.idle`; V2 its idle hook): run
+  `COMMAND check --hook opencode` with stdin `{"session_id", "cwd", "hook_event_name":
+  "session.idle", "message_id"}`, where `message_id` is the id of the session's last
+  assistant message. No timestamps or random values (the fingerprint in 6.1 must match
+  across duplicate plugins and differ across stops). Map stdout:
+  - empty → nothing;
+  - `{"decision": "block", "reason"}` → send `reason` to that session as a new user
+    prompt (V1 `client.session.promptAsync`), only if the session is still idle and has
+    no newer user message;
+  - `{"continue": false, "stopReason"}` → a warning toast with the note
+    (V1 `client.tui.showToast`) and an app log entry;
+  - a spawn error, a non-zero exit, invalid JSON or a timeout → one warning toast
+    "greenproof could not run: ..." and nothing else (fail open).
+- At most one check per session at a time; an idle event during a running check for the
+  same session is ignored. The child runs without a shell, in the project directory,
+  stdin the JSON, killed after 3600 seconds.
+- Each injected prompt makes a new turn and a new idle event; 6.2 bounds the loop.
+- **npm package** `integrations/opencode/`: `package.json` (`name` `opencode-greenproof`,
+  `version` equal to `__version__`, `type: module`, `main` and `exports` `./index.js`,
+  `files` index.js, README.md, LICENSE; keywords `opencode`, `opencode-plugin`,
+  `greenproof`; license Apache-2.0; repository with `directory`), README (what runs, the
+  uv requirement, the `opencode.json` entry for V1 and V2), LICENSE copy. `npm pack
+  --dry-run` lists only those files. Publishing is the maintainer's step.
+- **Tests**: `node --test` with a fake client and a fake greenproof executable (pass,
+  block, release, error, timeout, child session, concurrent idle, non-idle session at
+  inject time), run in CI. An end-to-end script runs the real V1 CLI (and V2 when
+  supported) against a local fake OpenAI-compatible model server (Python stdlib), so no
+  API key is needed, and shows: a tampered tree is blocked and the model receives the
+  greenproof message as a new user turn; the next idle with the same tree is released
+  without another prompt; an honest change gets no prompt.
 
 ## 7. `init`
 
@@ -745,7 +941,8 @@ through that an agent cannot forge.
    line, add one inside its own marker pair at the end (so Claude Code, which
    reads CLAUDE.md, sees the section too). Never create CLAUDE.md.
 6. **Hooks** (6.4). `--agents auto` (the default) installs claude when `.claude/` or
-   `CLAUDE.md` exists, cursor when `.cursor/` exists, codex when `.codex/` exists; never
+   `CLAUDE.md` exists, cursor when `.cursor/` exists, codex when `.codex/` exists, opencode
+   when `.opencode/`, `opencode.json` or `opencode.jsonc` exists (M5); never
    gemini. `none` installs nothing. A list installs
    exactly those, experimental ones with a warning.
 7. **CI** (`--ci github`; default `none`, and then the summary suggests `--ci github` when
@@ -863,10 +1060,14 @@ src/greenproof/
   hooks.py          hook payloads, per-agent output protocol, hook state and release rules
   accept.py, github.py   local acceptances, PR comment acceptances
   pins.py           SHA pins for third-party actions
-  init/             detect.py, write_policy.py, agents_md.py, hooks/{claude,cursor,codex,gemini}.py, ci_github.py
+  init/             detect.py, write_policy.py, agents_md.py, ci_github.py,
+                    hooks/{claude,cursor,codex,gemini,opencode}.py, hooks/opencode_plugin.js
   schema/report-v1.json
 tests/              pytest; fixture repos are built in tmp dirs by helpers (real git)
 bench/              testwashing benchmark (milestone 4)
+plugins/greenproof/ Claude Code, Codex and Cursor plugin (6.7)
+integrations/opencode/  npm package opencode-greenproof (6.8)
+scripts/bump_version.py
 ```
 
 - Python ≥ 3.11, zero runtime dependencies. Dev: pytest, pytest-cov, ruff, mypy (strict).
@@ -1039,3 +1240,38 @@ MEASUREMENTS.md.
   MEASUREMENTS.md. No claims that are not measured in MEASUREMENTS.md. No comparison
   table with named competitors.
 - **CHANGELOG** `0.1.0` entry; version stays `0.1.0`; nothing is published.
+
+## 14. M5: OpenCode, plugins and gaps (0.2.0)
+
+Three workstreams, each on its own branch off `m5-spec`, merged by the maintainer:
+
+- **M5a, runtime and init** (`m5a-runtime`): `--hook opencode` (6.1, 6.3); the payload
+  fingerprint (6.1); the lock, the recorded decision and replays (6.2); `fork` in the
+  SessionStart matchers (6.4; check Claude Code's documentation and Codex's source, and
+  stop and report if either lacks it); suppression scoping (5.5); README "Agents" (a row
+  for OpenCode pointing at 6.8, duplicates, the uv requirement of `uvx` hook commands);
+  CHANGELOG `Unreleased`. Tests: a real concurrent run (two `check --hook claude`
+  processes on one payload against a failing tree) gives two blocks with the same message
+  and one block in the state; a later payload with the same tree releases; a 0.1.0 state
+  file still releases; fingerprints of `{}` never replay; replays stop after 3; the lock
+  is skipped when the git directory is read-only; suppression patterns do and do not
+  fire per file kind (a `.toml` case file with `|| true` does not; `Makefile` does).
+- **M5b, plugins** (`m5b-plugins`): everything in 6.7, including the icon,
+  `scripts/bump_version.py`, `tests/test_plugins.py`, README "Plugins", CHANGELOG. Run
+  `claude plugin validate --strict` on the plugin and the marketplace, cursor's
+  validator, and the Codex checks; record the commands and their output in the final
+  report. Add them to CI only if they run there without credentials, with pinned
+  versions.
+- **M5c, OpenCode** (`m5c-opencode`, after M5a is merged): everything in 6.8, `init
+  --agents opencode` (6.4, section 7), the `node --test` job in CI with setup-node pinned
+  to a full SHA, the end-to-end script under `scripts/e2e/`, README "OpenCode",
+  CHANGELOG, and the OpenCode entries in `scripts/bump_version.py`.
+
+Out of scope for M5: a Gemini or Antigravity extension; publishing anything.
+
+Acceptance for the milestone: AGENTS.md's five checks pass; the plugin validators pass;
+the OpenCode end-to-end script passes against the real V1 CLI; a Claude Code end-to-end run
+with the plugin loaded through `--plugin-dir` blocks a requested test skip and releases
+the next stop; with the plugin and `init` hooks both installed, one stop gives one
+decision. Then the maintainer bumps to 0.2.0 with `scripts/bump_version.py`, tags, and
+publishes.
