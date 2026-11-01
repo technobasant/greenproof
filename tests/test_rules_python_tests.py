@@ -557,3 +557,24 @@ def test_loose_drop_that_loses_the_exact_subject_still_blocks(tmp_path: Path) ->
     )
     found = weakened(tmp_path, STREAM, new)
     assert any(f.severity == "block" for f in found)
+
+
+def test_dropping_the_only_check_on_a_subject_still_blocks(tmp_path: Path) -> None:
+    base = (
+        "def test_closing():\n"
+        "    response = make()\n"
+        "    assert response.name == 'a'\n"
+        "    assert not response.is_closed\n"
+    )
+    new = base.replace("    assert not response.is_closed\n", "    pass\n")
+    found = weakened(tmp_path, base, new)
+    assert rule_ids(found) == ["tests.weakened"] and found[0].severity == "block"
+    # the same drop while the subject stays pinned by an exact check only warns
+    kept = (
+        "def test_name():\n"
+        "    response = make()\n"
+        "    assert response.name == 'a'\n"
+        "    assert response.name != 'b'\n"
+    )
+    found = weakened(tmp_path / "kept", kept, kept.replace("    assert response.name != 'b'\n", ""))
+    assert rule_ids(found) == ["tests.weakened"] and found[0].severity == "warn"

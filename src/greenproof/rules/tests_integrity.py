@@ -170,13 +170,16 @@ def _loosened(b: Unit, c: Unit) -> list[tuple[str, str]]:
 
 def _only_loose_dropped(b: Unit, c: Unit, added: _Added) -> bool:
     """SPEC 5.4: every base assertion that is gone is a loose check, and every subject of an
-    exact check at the base is still the subject of one in the candidate."""
+    exact check at the base is still the subject of one in the candidate. Beyond the spec text
+    (replay: httpx ff9813e84, 5ee613525): everything checked loosely at the base is still
+    checked, exactly or loosely, so a lone `assert not x.closed` dropped to nothing still blocks."""
     gone = Counter(b.assertion_forms) - Counter(c.assertion_forms)
     gone_forms = [f for f in gone if f not in added.forms]
     return (
         bool(gone_forms)
         and all(f in b.loose_forms for f in gone_forms)
         and set(b.exact_subjects) <= set(c.exact_subjects)
+        and set(b.loose_targets) <= set(c.exact_subjects) | set(c.loose_targets)
     )
 
 
