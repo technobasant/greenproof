@@ -25,11 +25,11 @@ line.
 
 ## Commands
 
-- Run the gate on demand: `uvx greenproof@0.1.0 check`
-- Explain a finding: `uvx greenproof@0.1.0 explain RULE_ID`, for example
-  `uvx greenproof@0.1.0 explain tests.skipped`
+- Run the gate on demand: `uvx greenproof@0.2.0 check`
+- Explain a finding: `uvx greenproof@0.2.0 explain RULE_ID`, for example
+  `uvx greenproof@0.2.0 explain tests.skipped`
 - Add a policy in a repository where this plugin already provides the hooks:
-  `uvx greenproof@0.1.0 init --agents none`. It writes `.greenproof.toml` and an AGENTS.md
+  `uvx greenproof@0.2.0 init --agents none`. It writes `.greenproof.toml` and an AGENTS.md
   section, and no hooks, because the plugin has them.
 
 ## What it needs

@@ -5,6 +5,8 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-02
+
 ### Added
 
 - A plugin for Claude Code, Codex and Cursor (`plugins/greenproof`) that installs the Stop

@@ -8,7 +8,7 @@
 // prompt this process sees for a top-level session.
 import { spawn } from "node:child_process"
 
-const COMMAND = ["uvx", "greenproof@0.1.0"]
+const COMMAND = ["uvx", "greenproof@0.2.0"]
 
 const TIMEOUT_MS = 3600 * 1000
 const SESSION_START_TIMEOUT_MS = 120 * 1000
