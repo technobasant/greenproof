@@ -398,7 +398,7 @@ def test_ignores_added_to_an_existing_ruff_table_still_block(tmp_path: Path) -> 
     found = pyproject(tmp_path / "a", base, base + 'ignore = ["B904"]\n')
     assert rule_ids(found) == ["runner.tampered"] and found[0].severity == "block"
     # An existing mypy table does not make a new ruff table an old one, and vice versa.
-    mixed = BARE + '\n[tool.mypy]\nstrict = true\n'
+    mixed = BARE + "\n[tool.mypy]\nstrict = true\n"
     new = mixed + '\n[tool.ruff]\nignore = ["E501"]\n'
     assert {f.severity for f in pyproject(tmp_path / "b", mixed, new)} == {"warn"}
     loosened = mixed.replace("true", "false") + '\n[tool.ruff]\nignore = ["E501"]\n'

@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from greenproof.registry import RULES
+from greenproof.rules.tests_integrity import pair_units
+from greenproof.rules.tests_model import Unit
 from tests.helpers import init_repo, rule_ids, static_findings
 
 TESTS = "tests/test_x.py"
@@ -548,3 +550,89 @@ def test_folding_asserts_into_cases_is_not_a_drop(tmp_path: Path) -> None:
         "def test_a(n):\n    assert make(n) == n\n"
     )
     assert rule_ids(change(tmp_path, new, base)) == []
+
+
+# ---- leaf-name pairing (5.7 pass 2) ---------------------------------------------------------
+
+
+def unit(path: str, key: str, body: str, engine: str = "python") -> Unit:
+    return Unit(path=path, key=key, line=1, body_hash=body, engine=engine)
+
+
+def pairs_of(base: list[Unit], cand: list[Unit]) -> list[tuple[str, str]]:
+    return [(b.key, c.key) for b, c in pair_units(base, cand).pairs]
+
+
+def test_leaf_name_pairs_a_test_moved_between_classes() -> None:
+    base = [unit("t.py", "TestA::test_x", "h1")]
+    cand = [unit("t.py", "TestB::test_x", "h2")]
+    assert pairs_of(base, cand) == [("TestA::test_x", "TestB::test_x")]
+
+
+def test_leaf_name_pairs_a_js_test_whose_describe_title_changed() -> None:
+    base = [unit("a.test.js", "throws an message > rejects", "h1", "js")]
+    cand = [unit("a.test.js", "throws a message > rejects", "h2", "js")]
+    assert len(pairs_of(base, cand)) == 1
+
+
+def test_duplicate_leaf_names_do_not_pair_by_leaf() -> None:
+    base = [unit("t.py", "TestA::test_x", "h1"), unit("t.py", "TestB::test_x", "h2")]
+    cand = [unit("t.py", "TestC::test_x", "h3")]
+    assert pairs_of(base, cand) == []
+    base = [unit("t.py", "TestA::test_x", "h1")]
+    cand = [unit("t.py", "TestC::test_x", "h3"), unit("t.py", "TestD::test_x", "h4")]
+    assert pairs_of(base, cand) == []
+
+
+def test_leaf_name_pairing_needs_the_same_file() -> None:
+    base = [unit("a.py", "TestA::test_x", "h1")]
+    cand = [unit("b.py", "TestA::test_x", "h2")]
+    # the later key pass still pairs this move; the leaf pass must not have changed the file
+    assert pairs_of(base, cand) == [("TestA::test_x", "TestA::test_x")]
+    cand = [unit("b.py", "TestB::test_x", "h2")]
+    assert pairs_of(base, cand) == []
+
+
+def test_exact_path_and_key_pair_first_so_duplicates_survive() -> None:
+    base = [unit("t.py", "TestA::test_x", "h1"), unit("t.py", "TestB::test_x", "h2")]
+    cand = [unit("t.py", "TestA::test_x", "h1"), unit("t.py", "TestB::test_x", "h2")]
+    assert len(pairs_of(base, cand)) == 2
+
+
+def moved_class(tmp_path: Path, body: str):
+    base = BASE
+    new = BASE.replace(
+        "class TestMore:\n    def test_neg(self):\n        assert total([-1]) == -1\n",
+        "class TestOther:\n" + body,
+    )
+    return change(tmp_path, new, base)
+
+
+def test_moved_test_with_the_same_leaf_pairs_and_is_clean_when_not_weakened(
+    tmp_path: Path,
+) -> None:
+    body = "    def test_neg(self):\n        assert total([-1]) == -1\n        assert total([-2]) == -2\n"
+    assert rule_ids(moved_class(tmp_path, body)) == []
+
+
+def test_moved_test_that_lost_its_check_is_weakened_not_removed(tmp_path: Path) -> None:
+    body = "    def test_neg(self):\n        assert total([-1])\n"
+    found = moved_class(tmp_path, body)
+    assert rule_ids(found) == ["tests.weakened"] and found[0].severity == "block"
+
+
+def test_js_describe_title_edit_pairs_by_test_title(tmp_path: Path) -> None:
+    base = "describe('throws an message', () => {\n  it('rejects', () => {\n    expect(f()).toBe(1);\n    expect(f()).toEqual(1);\n  });\n});\n"
+    repo = init_repo(tmp_path / "ok")
+    repo.write("a.test.js", base)
+    repo.commit("base")
+    repo.write("a.test.js", base.replace("an message", "a message"))
+    assert static_findings(repo) == []
+    repo = init_repo(tmp_path / "weak")
+    repo.write("a.test.js", base)
+    repo.commit("base")
+    repo.write(
+        "a.test.js",
+        base.replace("an message", "a message").replace("    expect(f()).toEqual(1);\n", ""),
+    )
+    assert rule_ids(static_findings(repo)) == ["tests.weakened"]

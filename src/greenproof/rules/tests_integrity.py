@@ -57,6 +57,15 @@ class _Pairing:
     left_cand: list[Unit] = field(default_factory=list)
 
 
+def _leaf(u: Unit) -> str:
+    """The last segment of a test's qualified name: the function, or the JS/TS test title."""
+    if u.engine.startswith("python"):
+        return u.key.rsplit("::", 1)[-1]
+    if u.engine == "js":
+        return u.key.rsplit(" > ", 1)[-1]
+    return u.key
+
+
 def pair_units(base: list[Unit], cand: list[Unit]) -> _Pairing:
     result = _Pairing()
     free = list(range(len(cand)))
@@ -66,14 +75,27 @@ def pair_units(base: list[Unit], cand: list[Unit]) -> _Pairing:
         free.remove(predicate_index)
         return cand[predicate_index]
 
-    for b in base:  # same path and key
+    for b in base:  # 1. same path and key
         hit = next((i for i in free if cand[i].path == b.path and cand[i].key == b.key), None)
         if hit is None:
             unmatched.append(b)
         else:
             result.pairs.append((b, take(hit)))
+    # 2. same path and leaf name, unique among the still-unpaired tests of the file on both
+    # sides: a test moved between classes or describe blocks, or a describe title edited.
+    base_leaves = Counter((b.path, _leaf(b)) for b in unmatched)
+    cand_leaves = Counter((cand[i].path, _leaf(cand[i])) for i in free)
+    unpaired: list[Unit] = []
+    for b in unmatched:
+        ident = (b.path, _leaf(b))
+        if base_leaves[ident] == 1 and cand_leaves[ident] == 1:
+            result.pairs.append(
+                (b, take(next(i for i in free if (cand[i].path, _leaf(cand[i])) == ident)))
+            )
+        else:
+            unpaired.append(b)
     remaining: list[Unit] = []
-    for b in unmatched:  # same key, another path: a move
+    for b in unpaired:  # 3. same key, another path: a move
         hits = [i for i in free if cand[i].key == b.key]
         hits.sort(key=lambda i: cand[i].body_hash != b.body_hash)
         if hits:
@@ -81,13 +103,13 @@ def pair_units(base: list[Unit], cand: list[Unit]) -> _Pairing:
         else:
             remaining.append(b)
     leftover: list[Unit] = []
-    for b in remaining:  # same body, another name: a rename
+    for b in remaining:  # 4. same body, another name: a rename
         hit = next((i for i in free if cand[i].body_hash == b.body_hash), None)
         if hit is None:
             leftover.append(b)
         else:
             result.pairs.append((b, take(hit)))
-    # Same structure (identifiers alpha-renamed), only when the match is one-to-one.
+    # 5. Same structure (identifiers alpha-renamed), only when the match is one-to-one.
     base_counts = Counter(b.struct_hash for b in leftover if b.struct_hash)
     cand_counts = Counter(cand[i].struct_hash for i in free if cand[i].struct_hash)
     for b in leftover:
