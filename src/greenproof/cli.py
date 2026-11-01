@@ -134,7 +134,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
     )
     if args.hook:
         return _run_hook(args, opts)
-    report = pipeline.run_check(opts)
+    with gitops.temp_object_store_scope():
+        report = pipeline.run_check(opts)
     _emit(report, args)
     return report.exit_code
 

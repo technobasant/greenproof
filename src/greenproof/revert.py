@@ -36,6 +36,7 @@ _COLLECTION_ERROR = re.compile(
 )
 _ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SHOWN_TESTS = 5
+READONLY_SKIP = "the git directory is read-only here; the stop hook runs this check"
 
 
 @dataclass(frozen=True)
@@ -245,6 +246,8 @@ def run_revert(
     )
     if isinstance(plan, RevertOutcome):
         return plan
+    if gitops.readonly_git():  # the check needs a worktree, which needs a writable git dir
+        return _skip(READONLY_SKIP)
     try:
         overlaid = overlay_tree(repo, base_sha, tree, plan.overlay)
     except UsageError as exc:
