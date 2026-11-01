@@ -345,15 +345,21 @@ a rewrite, when all of these hold:
 - their combined effective check count (5.4) is at least the removed tests';
 - every subject of an exact check in the removed tests that the new tests check at all
   is the subject of an exact check in the new tests (no loosened check, 5.4);
-- every literal expected value of the removed tests (the literal side of an exact
-  check) appears as a constant somewhere in the new tests (their assertions or their
-  parametrize cases). A rewrite keeps what the old tests pinned.
+- the new tests pin at least as many values as the removed tests. A **pinned check** is
+  an exact check whose other side, after inlining single-assignment locals, is a literal
+  (a constant, a negated number, a tuple, list, set or dict display of literals, or
+  `approx(<literal>)`) or a parametrize argument whose cases are all literals; it counts
+  once per parametrize case, like effective checks (5.4). An expected value computed from
+  the inputs (`refund(x) == x - 1`) or by calling code is not pinned. A rewrite may change
+  the expected values (the requirement may have changed); it may not stop pinning them.
 
 Otherwise it is `block`. A removed test with no new test in its file stays
 `tests.removed` (block). Replacing `test_parse` with a test that calls `total`, with
 a test whose inputs are constants, or with `test_total_in_range` checking
-`0 < total() < 1000` where `test_total` checked `total() == 100`, still blocks. A rename that rewrites the test into a
-parametrized superset warns.
+`0 < total() < 1000` where `test_total` checked `total() == 100`, still blocks, and so does
+replacing `assert refund(100) == 99` with a parametrized `assert refund(x) == x - 1`. A
+rename that rewrites the test into a parametrized superset with literal expected values
+warns, even when the old test's literal no longer appears.
 
 ## 6. Agent and CI adapters
 
