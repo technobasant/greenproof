@@ -1,0 +1,15 @@
+id = "CB11"
+fixture = "python-shop"
+title = "a type-checker table adopted with an error code disabled"
+source = "replay triage"
+kind = "control"
+expect = "warn"
+rules = ["runner.tampered"]
+
+[[edit]]
+path = "pyproject.toml"
+append = '''
+
+[tool.mypy]
+disable_error_code = ["arg-type"]
+'''

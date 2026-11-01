@@ -369,3 +369,47 @@ def test_justfile_target_emptied_fires(tmp_path: Path) -> None:
     assert rule_ids(edit(tmp_path, "justfile", just, new, {"test": "just test"})) == [
         "runner.tampered"
     ]
+
+
+# ---- linter adoption (SPEC 5.6) -------------------------------------------------------------
+
+BARE = '[project]\nname = "x"\n'
+
+
+def test_new_ruff_table_with_ignores_only_warns(tmp_path: Path) -> None:
+    adopted = BARE + '\n[tool.ruff]\nselect = ["E"]\nignore = ["B904", "B028"]\n'
+    found = pyproject(tmp_path / "a", BARE, adopted)
+    assert rule_ids(found) == ["runner.tampered"] and found[0].severity == "warn"
+    assert "B904" in found[0].message
+    per_file = BARE + '\n[tool.ruff.lint.per-file-ignores]\n"tests/*" = ["S101"]\n'
+    found = pyproject(tmp_path / "b", BARE, per_file)
+    assert rule_ids(found) == ["runner.tampered"] and found[0].severity == "warn"
+
+
+def test_new_mypy_table_loosening_only_warns(tmp_path: Path) -> None:
+    adopted = BARE + '\n[tool.mypy]\nstrict = false\ndisable_error_code = ["arg-type"]\n'
+    found = pyproject(tmp_path, BARE, adopted)
+    assert rule_ids(found) == ["runner.tampered", "runner.tampered"]
+    assert {f.severity for f in found} == {"warn"}
+
+
+def test_ignores_added_to_an_existing_ruff_table_still_block(tmp_path: Path) -> None:
+    base = BARE + '\n[tool.ruff]\nselect = ["E"]\n'
+    found = pyproject(tmp_path / "a", base, base + 'ignore = ["B904"]\n')
+    assert rule_ids(found) == ["runner.tampered"] and found[0].severity == "block"
+    # An existing mypy table does not make a new ruff table an old one, and vice versa.
+    mixed = BARE + "\n[tool.mypy]\nstrict = true\n"
+    new = mixed + '\n[tool.ruff]\nignore = ["E501"]\n'
+    assert {f.severity for f in pyproject(tmp_path / "b", mixed, new)} == {"warn"}
+    loosened = mixed.replace("true", "false") + '\n[tool.ruff]\nignore = ["E501"]\n'
+    severities = sorted(f.severity for f in pyproject(tmp_path / "c", mixed, loosened))
+    assert severities == ["block", "warn"]
+
+
+def test_ini_flake8_section_added_to_an_existing_file_is_adoption(tmp_path: Path) -> None:
+    base = "[tool:pytest]\naddopts = -q\n"
+    found = edit(tmp_path / "a", "setup.cfg", base, base + "\n[flake8]\nignore = W503\n")
+    assert rule_ids(found) == ["runner.tampered"] and found[0].severity == "warn"
+    old = base + "\n[flake8]\nignore = W503\n"
+    found = edit(tmp_path / "b", "setup.cfg", old, old.replace("W503", "W503, E203"))
+    assert rule_ids(found) == ["runner.tampered"] and found[0].severity == "block"

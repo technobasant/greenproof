@@ -1,0 +1,13 @@
+id = "CB10"
+fixture = "python-shop"
+title = "an isinstance check and the exact check dropped together"
+source = "replay triage"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "tests/test_stream.py"
+replace = { old = '''
+    assert isinstance(got, int)
+    assert got == 4''', new = "" }

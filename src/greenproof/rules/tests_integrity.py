@@ -8,7 +8,6 @@ by body hash (a rename); only what is left over counts as removed, replaced or d
 
 from __future__ import annotations
 
-import posixpath
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -23,7 +22,6 @@ from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
 from greenproof.rules.tests_python import analyse_python, marker_display
 
 _RUST_TEST_ATTR = re.compile(r"#\[\s*(?:\w+::)*test\b")
-_TEST_MODULE_NAME = re.compile(r"(?:^test_.*\.py|.*_test\.(?:py|go)|.*\.(?:test|spec)\.\w+)$")
 
 
 def analyse(path: str, text: str) -> FileAnalysis | None:
@@ -57,6 +55,15 @@ class _Pairing:
     left_cand: list[Unit] = field(default_factory=list)
 
 
+def _leaf(u: Unit) -> str:
+    """The last segment of a test's qualified name: the function, or the JS/TS test title."""
+    if u.engine.startswith("python"):
+        return u.key.rsplit("::", 1)[-1]
+    if u.engine == "js":
+        return u.key.rsplit(" > ", 1)[-1]
+    return u.key
+
+
 def pair_units(base: list[Unit], cand: list[Unit]) -> _Pairing:
     result = _Pairing()
     free = list(range(len(cand)))
@@ -66,14 +73,27 @@ def pair_units(base: list[Unit], cand: list[Unit]) -> _Pairing:
         free.remove(predicate_index)
         return cand[predicate_index]
 
-    for b in base:  # same path and key
+    for b in base:  # 1. same path and key
         hit = next((i for i in free if cand[i].path == b.path and cand[i].key == b.key), None)
         if hit is None:
             unmatched.append(b)
         else:
             result.pairs.append((b, take(hit)))
+    # 2. same path and leaf name, unique among the still-unpaired tests of the file on both
+    # sides: a test moved between classes or describe blocks, or a describe title edited.
+    base_leaves = Counter((b.path, _leaf(b)) for b in unmatched)
+    cand_leaves = Counter((cand[i].path, _leaf(cand[i])) for i in free)
+    unpaired: list[Unit] = []
+    for b in unmatched:
+        ident = (b.path, _leaf(b))
+        if base_leaves[ident] == 1 and cand_leaves[ident] == 1:
+            result.pairs.append(
+                (b, take(next(i for i in free if (cand[i].path, _leaf(cand[i])) == ident)))
+            )
+        else:
+            unpaired.append(b)
     remaining: list[Unit] = []
-    for b in unmatched:  # same key, another path: a move
+    for b in unpaired:  # 3. same key, another path: a move
         hits = [i for i in free if cand[i].key == b.key]
         hits.sort(key=lambda i: cand[i].body_hash != b.body_hash)
         if hits:
@@ -81,13 +101,13 @@ def pair_units(base: list[Unit], cand: list[Unit]) -> _Pairing:
         else:
             remaining.append(b)
     leftover: list[Unit] = []
-    for b in remaining:  # same body, another name: a rename
+    for b in remaining:  # 4. same body, another name: a rename
         hit = next((i for i in free if cand[i].body_hash == b.body_hash), None)
         if hit is None:
             leftover.append(b)
         else:
             result.pairs.append((b, take(hit)))
-    # Same structure (identifiers alpha-renamed), only when the match is one-to-one.
+    # 5. Same structure (identifiers alpha-renamed), only when the match is one-to-one.
     base_counts = Counter(b.struct_hash for b in leftover if b.struct_hash)
     cand_counts = Counter(cand[i].struct_hash for i in free if cand[i].struct_hash)
     for b in leftover:
@@ -148,6 +168,21 @@ def _loosened(b: Unit, c: Unit) -> list[tuple[str, str]]:
     ]
 
 
+def _only_loose_dropped(b: Unit, c: Unit, added: _Added) -> bool:
+    """SPEC 5.4: every base assertion that is gone is a loose check, and every subject of an
+    exact check at the base is still the subject of one in the candidate. Beyond the spec text
+    (replay: httpx ff9813e84, 5ee613525): everything checked loosely at the base is still
+    checked, exactly or loosely, so a lone `assert not x.closed` dropped to nothing still blocks."""
+    gone = Counter(b.assertion_forms) - Counter(c.assertion_forms)
+    gone_forms = [f for f in gone if f not in added.forms]
+    return (
+        bool(gone_forms)
+        and all(f in b.loose_forms for f in gone_forms)
+        and set(b.exact_subjects) <= set(c.exact_subjects)
+        and set(b.loose_targets) <= set(c.exact_subjects) | set(c.loose_targets)
+    )
+
+
 def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> list[_Reason]:
     if b.engine != c.engine:
         return []
@@ -155,7 +190,15 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
     if b.engine == "python":
         before, after = _effective(b, c)
         if after < before and not set(b.assertion_forms) <= set(c.assertion_forms) | added.forms:
-            out.append((f"checks dropped from {before} to {after}", c.line, BLOCK))
+            only_loose = _only_loose_dropped(b, c, added)
+            note = " (only loose checks dropped)" if only_loose else ""
+            out.append(
+                (
+                    f"checks dropped from {before} to {after}{note}",
+                    c.line,
+                    WARN if only_loose else BLOCK,
+                )
+            )
     elif count_drop_allowed and c.asserts < b.asserts:
         out.append((f"assertions dropped from {b.asserts} to {c.asserts}", c.line, BLOCK))
     if c.vacuous > b.vacuous:
@@ -400,11 +443,8 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
         names = [u for u in s.base.units if id(u) in lost]
         # Deleted, or renamed to a path that is not a test file or that the runner skips.
         if s.cand is None or (not s.cand.collected and s.file.status == "R"):
-            if names or (
-                not s.base.units
-                and _TEST_MODULE_NAME.match(posixpath.basename(s.file.old_path or path))
-            ):
-                listed = ", ".join(u.name for u in names[:5]) or "no test functions"
+            if names:  # a file with no test units (helpers, fixtures) loses nothing (SPEC 5.7)
+                listed = ", ".join(u.name for u in names[:5])
                 more = f" and {len(names) - 5} more" if len(names) > 5 else ""
                 what = "deleted" if s.file.status == "D" else "renamed to a non-test path"
                 out.append(
@@ -419,6 +459,23 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
             continue
         added = added_by_path.get(path, [])
         absorbing = _absorbing(pairing, path) if names else []
+        if added or absorbing:
+            # No counted check at the base (type-only test, "does not throw" smoke test):
+            # nothing to lose, so a file that gained tests only warns (SPEC 5.7).
+            at = added[0].line if added else absorbing[0][1].line
+            for removed in (u for u in names if u.asserts == 0):
+                out.append(
+                    sev_finding(
+                        "tests.replaced",
+                        WARN,
+                        path,
+                        at,
+                        f"test {removed.name} was removed; it had no counted check "
+                        "and the file gained tests",
+                        "Keep the original test; add new tests alongside it, not in its place.",
+                    )
+                )
+            names = [u for u in names if u.asserts > 0]
         if absorbing:
             rewrite = _is_rewrite(
                 [*names, *(b for b, _ in absorbing)], [*added, *(c for _, c in absorbing)]

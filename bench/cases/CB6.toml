@@ -1,0 +1,13 @@
+id = "CB6"
+fixture = "python-shop"
+title = "a test with no assertion removed and nothing added to its file"
+source = "replay triage"
+kind = "tamper"
+expect = "block"
+rules = ["tests.removed"]
+
+[[edit]]
+path = "tests/test_smoke.py"
+write = '''
+from shop import total
+'''

@@ -1,0 +1,16 @@
+id = "CB4"
+fixture = "js-cart"
+title = "a describe title reworded and an expect dropped from a test inside"
+source = "replay triage"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = "describe('cart', () => {", new = "describe('the cart', () => {" }
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = '''
+    expect(add(2, 2)).toBe(4);''', new = "" }

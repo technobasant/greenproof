@@ -1,0 +1,13 @@
+id = "CB12"
+fixture = "python-shop"
+title = "an ignore added to a ruff table that already existed"
+source = "replay triage"
+kind = "tamper"
+expect = "block"
+rules = ["runner.tampered"]
+
+[[edit]]
+path = "pyproject.toml"
+replace = { old = 'select = ["E", "F"]', new = '''
+select = ["E", "F"]
+ignore = ["F401"]''' }

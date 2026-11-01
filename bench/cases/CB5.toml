@@ -1,0 +1,17 @@
+id = "CB5"
+fixture = "python-shop"
+title = "a test with no assertion removed while the file gains a new test"
+source = "replay triage"
+kind = "control"
+expect = "warn"
+rules = ["tests.replaced"]
+
+[[edit]]
+path = "tests/test_smoke.py"
+write = '''
+from shop import total
+
+
+def test_total_value():
+    assert total() == 100
+'''

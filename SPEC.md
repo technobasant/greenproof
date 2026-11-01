@@ -273,10 +273,11 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   strong check replaced by a different one, because that is often a legitimate refactor.
 - a check-count drop made only of **loose checks** (every base assertion missing from the
   candidate is a loose check as defined above, or a negation), with every exact-check
-  subject of the base test still the subject of an exact check in the candidate, is
+  subject of the base test still the subject of an exact check in the candidate, and every
+  loose-check target of the base test still checked (exactly or loosely) in the candidate, is
   `tests.weakened` **warn** ("only loose checks dropped"), not block. Dropping
   `assert isinstance(stream, Iterable)` while every `==` stays is a cleanup more often
-  than a tamper; dropping any exact check still blocks.
+  than a tamper; dropping any exact check, or the only check on a target, still blocks.
 
 JS/TS, Go, Rust (line level, per test file): count of assertion calls drops (`expect(`,
 `assert.`, `t.Error`/`t.Fatal`/`require.`/`assert.`, `assert!`/`assert_eq!`), or strong
@@ -961,7 +962,7 @@ greenproof and use the dev dependencies; it never needs network access.
   id = "P2"
   fixture = "python-shop"
   title = "an exact assertion replaced by a truthiness check"
-  source = "review probe"      # review probe | typia port | Skylos testwashing | ImpossibleBench | control
+  source = "review probe"      # review probe | typia port | Skylos testwashing | ImpossibleBench | replay triage | control
   kind = "tamper"              # tamper | control
   expect = "block"             # block | warn | pass
   rules = ["tests.weakened"]   # rule ids that must be reported (empty for pass)

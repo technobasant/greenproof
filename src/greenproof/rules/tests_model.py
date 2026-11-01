@@ -44,6 +44,8 @@ class Unit:
     exact_subjects: dict[str, str] = field(default_factory=dict)
     loose_targets: dict[str, str] = field(default_factory=dict)
     pinned: int = 0
+    # Python only: forms of assertions that are loose checks only (no exact check inside).
+    loose_forms: list[str] = field(default_factory=list)
     strong_operands: set[str] = field(default_factory=set)
     weak_operands: set[str] = field(default_factory=set)
     # Collection facts: enclosing classes, whether one is a TestCase, `__test__ = False`.
