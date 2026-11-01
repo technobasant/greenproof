@@ -1,0 +1,13 @@
+id = "LN5"
+fixture = "js-cart"
+title = "an exact expect replaced by an awaited findBy query, still one assertion"
+source = "replay triage"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = """  it('totals the prices', () => {
+    expect(total([{ price: 2 }, { price: 3 }])).toBe(5);""", new = """  it('totals the prices', async () => {
+    await screen.findByText('5');""" }
