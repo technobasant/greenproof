@@ -46,6 +46,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.12", "3.13", "3.14"]
+    # uv's own Python builds, not the runner's: on the macOS runner, servers started with
+    # the preinstalled python.org framework Python never accept loopback connections, so
+    # the smoke tests time out.
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
