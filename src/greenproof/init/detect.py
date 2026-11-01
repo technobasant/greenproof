@@ -46,6 +46,8 @@ class Detection:
                 parts.append(f"node ({self.node_pm})")
             else:
                 parts.append(stack)
+        if self.targets:
+            parts.append(f"task targets ({', '.join(sorted(self.targets))})")
         return ", ".join(parts)
 
 

@@ -140,7 +140,7 @@ def _summary(
     ci_hint: bool,
 ) -> str:
     lines = [f"greenproof init: {root}", ""]
-    if det.stacks:
+    if det.stacks or det.targets:
         lines.append(f"detected: {det.describe()}")
     else:
         lines.append("detected: nothing; the policy has no commands, the static checks still work")

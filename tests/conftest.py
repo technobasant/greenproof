@@ -39,3 +39,25 @@ def run(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
         return Result(code, captured.out, captured.err)
 
     return _run
+
+
+@pytest.fixture
+def controlled_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """PATH holds only git, sh, make and a few coreutils, so `shutil.which("greenproof")`
+    is under the test's control. Returns a function that puts a `greenproof` on that PATH."""
+    import shutil
+
+    bin_dir = tmp_path / "pathbin"
+    bin_dir.mkdir()
+    for tool in ("git", "sh", "make", "sleep", "true", "false", "touch"):
+        found = shutil.which(tool)
+        if found:
+            (bin_dir / tool).symlink_to(found)
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    def install_greenproof() -> None:
+        script = bin_dir / "greenproof"
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+
+    return install_greenproof
