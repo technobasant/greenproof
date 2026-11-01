@@ -52,7 +52,6 @@ _MARKERS: dict[str, list[_MarkerPattern]] = {
 _ASSERTS: dict[str, re.Pattern[str]] = {
     "js": re.compile(
         r"\bexpect\s*\(|\bassert(?:\.\w+)?\s*\(|\b(?:expectTypeOf|assertType)\s*(?:<[^>\n]*>)?\s*\("
-        r"|\bawait\s+(?:screen\.)?find(?:All)?By\w+\s*\("
     ),
     "go": re.compile(
         r"\bt\.(?:Error|Errorf|Fatal|Fatalf|Fail|FailNow)\b|\b(?:require|assert)\.\w+\s*\("
@@ -60,6 +59,13 @@ _ASSERTS: dict[str, re.Pattern[str]] = {
     "rust": re.compile(r"\b(?:debug_)?assert(?:_eq|_ne)?!"),
     "python-lines": re.compile(r"^\s*assert\b|\.assert\w*\(", re.MULTILINE),
 }
+# A testing-library query that throws when the element is missing (SPEC 5.4): `getBy`/`getAllBy`
+# bare or on `screen.`, and awaited `findBy`/`findAllBy`. It counts once per line, and only on a
+# line with no other assertion call. `queryBy...` returns null instead of throwing: not counted.
+_JS_QUERY = re.compile(
+    r"\bawait\s+(?:screen\.)?find(?:All)?By\w+\s*\(|\bscreen\.get(?:All)?By\w+\s*\("
+    r"|(?<![\w.])get(?:All)?By\w+\s*\("
+)
 # `expect(<literal>)` checks nothing about the code (SPEC 5.4): it is not counted.
 _JS_CONST_EXPECT = re.compile(
     r"\bexpect\s*\(\s*(?:-?\d[\w.]*|'[^'\n]*'|\"[^\"\n]*\"|`[^`$\n]*`|true|false|null|undefined)\s*\)"
@@ -325,7 +331,7 @@ _VOCAB: dict[str, frozenset[str]] = {
         "is_empty"
     ),
 }
-_JS_MATCHER = re.compile(r"to[A-Z]\w*|find(?:All)?By\w+")
+_JS_MATCHER = re.compile(r"to[A-Z]\w*|(?:find|get)(?:All)?By\w+")
 _TOKEN = {
     "js": re.compile(
         r"""(?P<lit>"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`[^`]*`)|(?P<num>\d[\w.]*)"""
@@ -420,6 +426,14 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
             if lang == "js"
             else [0] * (span.end - span.start + 1)
         )
+        query_hits = [
+            int(
+                lang == "js"
+                and _ASSERTS[lang].search(masked[k]) is None
+                and _JS_QUERY.search(masked[k]) is not None
+            )
+            for k in range(span.start, span.end + 1)
+        ]
         unit = Unit(
             path=path,
             key=span.key,
@@ -429,12 +443,14 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
             end_line=span.end + 1,
             asserts=len(_ASSERTS[lang].findall(body_masked))
             + (len(helper_call.findall(body_masked)) if helper_call else 0)
+            + sum(query_hits)
             - sum(const_hits),
             vacuous=sum(const_hits),
             vacuous_line=next((span.start + i + 1 for i, h in enumerate(const_hits) if h), 0),
         )
         for k in range(span.start, span.end + 1):
             hits = len(_ASSERTS[lang].findall(masked[k])) - const_hits[k - span.start]
+            hits += query_hits[k - span.start]
             if helper_call:
                 hits += len(helper_call.findall(masked[k]))
             if hits > 0:

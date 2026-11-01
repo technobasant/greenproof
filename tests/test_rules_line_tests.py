@@ -337,12 +337,37 @@ def test_js_type_and_awaited_query_assertions_count() -> None:
         "  assertType<string>('a');\n});\n"
         "it('queries', async () => {\n  await findByText('a');\n"
         "  await screen.findAllByRole('button');\n  const el = await screen.findByText('b');\n"
-        "  screen.getByText('c');\n});\n"
+        "  screen.queryByText('c');\n});\n"
     )
     types, queries = analyse_lines("a.test.tsx", js, "js").units
     assert types.asserts == 2
     assert queries.asserts == 3
     assert len(queries.assertion_forms) == 3
+
+
+def _js_asserts(body: str) -> int:
+    (unit,) = analyse_lines("a.test.tsx", f"it('x', () => {{\n{body}\n}});\n", "js").units
+    return unit.asserts
+
+
+def test_js_get_by_queries_count_once_per_line_and_only_alone() -> None:
+    assert _js_asserts("  getByText('a');") == 1
+    assert _js_asserts("  screen.getAllByRole('button');") == 1
+    assert _js_asserts("  expect(getByText('a')).toBeVisible();") == 1
+    assert _js_asserts("  getByText('a'); getByText('b');") == 1
+    assert _js_asserts("  getByText('a');\n  getByText('b');") == 2
+    assert _js_asserts("  within(el).getByText('a');") == 0
+
+
+def test_js_query_by_is_not_counted_and_unawaited_find_by_is_not() -> None:
+    assert _js_asserts("  queryByText('a');\n  screen.queryAllByRole('x');") == 0
+    assert _js_asserts("  const p = findByText('a');") == 0
+
+
+def test_js_find_by_to_get_by_migration_is_no_drop() -> None:
+    before = "  await findByText('a');\n  await screen.findByRole('button');"
+    after = "  getByText('a');\n  screen.getByRole('button');"
+    assert _js_asserts(before) == _js_asserts(after) == 2
 
 
 GO_HELPER = """\
