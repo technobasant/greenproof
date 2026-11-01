@@ -50,7 +50,10 @@ _MARKERS: dict[str, list[_MarkerPattern]] = {
 }
 
 _ASSERTS: dict[str, re.Pattern[str]] = {
-    "js": re.compile(r"\bexpect\s*\(|\bassert(?:\.\w+)?\s*\("),
+    "js": re.compile(
+        r"\bexpect\s*\(|\bassert(?:\.\w+)?\s*\(|\b(?:expectTypeOf|assertType)\s*(?:<[^>\n]*>)?\s*\("
+        r"|\bawait\s+(?:screen\.)?find(?:All)?By\w+\s*\("
+    ),
     "go": re.compile(
         r"\bt\.(?:Error|Errorf|Fatal|Fatalf|Fail|FailNow)\b|\b(?:require|assert)\.\w+\s*\("
     ),
@@ -91,7 +94,7 @@ _EXPECTED: dict[str, re.Pattern[str]] = {
 
 _JS_UNIT = re.compile(r"^\s*(?:it|test|xit|fit|xtest)(?:\.\w+)*\s*\(\s*(['\"`])(.*?)\1")
 _JS_DESCRIBE = re.compile(r"^\s*(?:describe|xdescribe|fdescribe)(?:\.\w+)*\s*\(\s*(['\"`])(.*?)\1")
-_GO_UNIT = re.compile(r"^func\s+(Test\w*|Benchmark\w*|Fuzz\w*)\s*\(")
+_GO_UNIT = re.compile(r"^func\s+(Test\w*|Fuzz\w*)\s*\(")
 _RUST_ATTR = re.compile(r"^\s*#\[\s*(?:\w+::)*test\b")
 _RUST_FN = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)")
 _PY_DEF = re.compile(r"^(\s*)(?:async\s+)?def\s+(test\w*)\s*\(")
@@ -219,15 +222,19 @@ class _Span:
     end: int
     key: str
     name_line: int
+    # Column range of the test's own name on `name_line` (Go/Rust function name, JS/TS title).
+    name_cols: tuple[int, int] | None = None
 
 
-def _find_spans(lang: str, raw: list[str], masked: list[str]) -> list[_Span]:
+def _find_spans(lang: str, raw: list[str], masked: list[str], code: list[str]) -> list[_Span]:
+    """Test spans. Declarations are matched on `code` (comments removed), so a test inside a
+    block comment does not exist; `raw` only measures indentation for Python."""
     spans: list[_Span] = []
     describes: list[tuple[int, int, str]] = []
     class_stack: list[tuple[int, str]] = []
     i = 0
     while i < len(raw):
-        line = raw[i]
+        line = code[i]
         if lang == "js":
             dm = _JS_DESCRIBE.match(line)
             if dm:
@@ -236,20 +243,22 @@ def _find_spans(lang: str, raw: list[str], masked: list[str]) -> list[_Span]:
             if um:
                 end = _brace_end(masked, i)
                 titles = [t for s, e, t in describes if s < i <= e] + [um.group(2)]
-                spans.append(_Span(i, end, " > ".join(titles), i))
+                spans.append(_Span(i, end, " > ".join(titles), i, (um.start(2), um.end(2))))
         elif lang == "go":
             gm = _GO_UNIT.match(line)
             if gm:
-                spans.append(_Span(i, _brace_end(masked, i), gm.group(1), i))
+                end = _brace_end(masked, i)
+                spans.append(_Span(i, end, gm.group(1), i, (gm.start(1), gm.end(1))))
         elif lang == "rust":
             if _RUST_ATTR.match(line):
                 j = i + 1
-                while j < len(raw) and j < i + 8 and not _RUST_FN.match(raw[j]):
+                while j < len(raw) and j < i + 8 and not _RUST_FN.match(code[j]):
                     j += 1
                 if j < len(raw) and j < i + 8:
-                    fm = _RUST_FN.match(raw[j])
+                    fm = _RUST_FN.match(code[j])
                     assert fm is not None
-                    spans.append(_Span(i, _brace_end(masked, j), fm.group(1), j))
+                    end = _brace_end(masked, j)
+                    spans.append(_Span(i, end, fm.group(1), j, (fm.start(1), fm.end(1))))
                     i = max(i + 1, spans[-1].end + 1)
                     continue
         else:
@@ -272,6 +281,124 @@ def _find_spans(lang: str, raw: list[str], masked: list[str]) -> list[_Span]:
     return spans
 
 
+def _words(text: str) -> frozenset[str]:
+    return frozenset(text.split())
+
+
+# Name placeholder: not a character source code contains, and no token pattern matches it.
+_NAME = "\x00"
+
+_KEYWORDS: dict[str, frozenset[str]] = {
+    "js": _words(
+        "async await break case catch class const continue debugger default delete do else enum "
+        "export extends false finally for from function if import in instanceof interface let new "
+        "null of return static super switch this throw true try type typeof undefined var void "
+        "while with yield as"
+    ),
+    "go": _words(
+        "break case chan const continue default defer else fallthrough for func go goto if import "
+        "interface map package range return select struct switch type var nil true false iota "
+        "any bool byte error float32 float64 int int8 int16 int32 int64 rune string uint uint8 "
+        "uint16 uint32 uint64 uintptr append cap close copy delete len make new panic print "
+        "println recover testing"
+    ),
+    "rust": _words(
+        "as async await break const continue crate dyn else enum extern false fn for if impl in "
+        "let loop match mod move mut pub ref return self Self static struct super trait true type "
+        "unsafe use where while Some None Ok Err Option Result Vec String bool char str i8 i16 "
+        "i32 i64 i128 isize u8 u16 u32 u64 u128 usize f32 f64"
+    ),
+}
+# 5.4 assertion vocabulary: what the line engines count, plus the matcher names around it.
+_VOCAB: dict[str, frozenset[str]] = {
+    "js": _words(
+        "expect expectTypeOf assertType assert it test describe screen not resolves rejects any "
+        "require"
+    ),
+    "go": _words(
+        "t assert require Error Errorf Fatal Fatalf Fail FailNow Equal EqualValues Exactly "
+        "InDelta Contains NotNil Nil True False NotEmpty Empty Greater GreaterOrEqual Less "
+        "LessOrEqual IsType NotEqual Len NoError Error ErrorIs Skip Skipf SkipNow Helper"
+    ),
+    "rust": _words(
+        "assert assert_eq assert_ne debug_assert debug_assert_eq debug_assert_ne is_some is_ok "
+        "is_empty"
+    ),
+}
+_JS_MATCHER = re.compile(r"to[A-Z]\w*|find(?:All)?By\w+")
+_TOKEN = {
+    "js": re.compile(
+        r"""(?P<lit>"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`[^`]*`)|(?P<num>\d[\w.]*)"""
+        r"""|(?P<id>[A-Za-z_$][\w$]*)""",
+        re.DOTALL,
+    ),
+}
+_TOKEN["go"] = _TOKEN["js"]
+_TOKEN["rust"] = re.compile(
+    r"""(?P<lit>"(?:\\.|[^"\\])*")|(?P<num>\d[\w.]*)|(?P<id>[A-Za-z_][\w]*)""", re.DOTALL
+)
+
+
+def _struct_text(text: str, lang: str) -> str:
+    """Alpha-rename every identifier that is not a keyword or assertion vocabulary (`_1`, `_2`,
+    by first occurrence), keeping literals, operators and matcher names."""
+    keep = _KEYWORDS[lang] | _VOCAB[lang]
+    names: dict[str, str] = {}
+
+    def sub(m: re.Match[str]) -> str:
+        word = m.group("id")
+        if word is None:
+            return m.group(0)
+        if word in keep or (lang == "js" and _JS_MATCHER.fullmatch(word)):
+            return word
+        return names.setdefault(word, f"_{len(names) + 1}")
+
+    return _TOKEN[lang].sub(sub, text)
+
+
+def _hash_text(code: list[str], span: _Span) -> str:
+    """The span's code with the test's own name replaced by a placeholder, so that a pure
+    rename keeps the same hash. The declaration line is kept (one-line JS tests differ)."""
+    lines = code[span.start : span.end + 1]
+    if span.name_cols is not None:
+        k = span.name_line - span.start
+        a, b = span.name_cols
+        lines[k] = lines[k][:a] + _NAME + lines[k][b:]
+    return "\n".join(lines)
+
+
+_GO_FUNC = re.compile(r"^func\s+(\w+)\s*(?:\[[^\]]*\])?\s*\(([^)]*)\)")
+_GO_TESTING_PARAM = re.compile(r"\*\s*testing\.(?:T|B|F)\b|\btesting\.TB\b")
+
+
+def _go_helper_calls(masked: list[str], code: list[str]) -> re.Pattern[str] | None:
+    """Call pattern for the assertion helpers declared in this file (SPEC 5.4): functions taking
+    a testing handle that assert directly or through another helper."""
+    cands: dict[str, str] = {}
+    for i, line in enumerate(code):
+        fm = _GO_FUNC.match(line)
+        if fm is None or _GO_UNIT.match(line) or not _GO_TESTING_PARAM.search(fm.group(2)):
+            continue
+        end = _brace_end(masked, i)
+        cands[fm.group(1)] = "\n".join([masked[i][fm.end() :], *masked[i + 1 : end + 1]])
+    helpers: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, body in cands.items():
+            if name in helpers:
+                continue
+            if _ASSERTS["go"].search(body) or (helpers and _go_call(helpers).search(body)):
+                helpers.add(name)
+                changed = True
+    return _go_call(helpers) if helpers else None
+
+
+def _go_call(names: set[str]) -> re.Pattern[str]:
+    alt = "|".join(re.escape(n) for n in sorted(names))
+    return re.compile(rf"(?<![\w.])(?:{alt})\s*\(")
+
+
 def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
     """`lang` is js, go, rust or python-lines."""
     raw = split_lines(text)
@@ -279,7 +406,8 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
     while len(masked) < len(raw):
         masked.append("")
         code.append("")
-    spans = _find_spans(lang, raw, masked)
+    spans = _find_spans(lang, raw, masked, code)
+    helper_call = _go_helper_calls(masked, code) if lang == "go" else None
     analysis = FileAnalysis(path, lang)
     owner: dict[int, _Span] = {}
     for span in spans:
@@ -296,15 +424,19 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
             path=path,
             key=span.key,
             line=span.name_line + 1,
-            body_hash=digest("".join(code[span.start : span.end + 1])),
+            body_hash=digest(_hash_text(code, span)),
             engine=lang,
             end_line=span.end + 1,
-            asserts=len(_ASSERTS[lang].findall(body_masked)) - sum(const_hits),
+            asserts=len(_ASSERTS[lang].findall(body_masked))
+            + (len(helper_call.findall(body_masked)) if helper_call else 0)
+            - sum(const_hits),
             vacuous=sum(const_hits),
             vacuous_line=next((span.start + i + 1 for i, h in enumerate(const_hits) if h), 0),
         )
         for k in range(span.start, span.end + 1):
             hits = len(_ASSERTS[lang].findall(masked[k])) - const_hits[k - span.start]
+            if helper_call:
+                hits += len(helper_call.findall(masked[k]))
             if hits > 0:
                 unit.assertion_forms.extend([digest("".join(code[k].split()))] * hits)
         if lang == "js":
@@ -318,6 +450,8 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
             unit.weak = len(_RUST_WEAK.findall(body_masked)) + sum(
                 1 for k in range(span.start, span.end + 1) if _RUST_COMPARED.search(masked[k])
             )
+        if lang in _KEYWORDS:
+            unit.struct_hash = digest(_struct_text(_hash_text(code, span), lang))
         if lang in _EXPECTED:
             for k in range(span.start, span.end + 1):
                 for em in _EXPECTED[lang].finditer(code[k]):
