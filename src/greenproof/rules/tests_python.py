@@ -227,6 +227,7 @@ class _Stats(ast.NodeVisitor):
         self.swallow_line = 0
         self.expected: list[tuple[str, int]] = []
         self.shapes: list[str] = []
+        self.forms: list[str] = []
         self.vacuous = 0
         self.vacuous_line = 0
         self.strong_operands: set[str] = set()
@@ -238,6 +239,7 @@ class _Stats(ast.NodeVisitor):
         self.asserts += 1
         self.first_line = self.first_line or getattr(node, "lineno", 0)
         self.shapes.append(_shape(node))
+        self.forms.append(digest(ast.dump(node)))
 
     def visit_Assert(self, node: ast.Assert) -> None:
         test = node.test
@@ -358,6 +360,7 @@ class _Stats(ast.NodeVisitor):
         self.broad += sub.broad
         self.specific += sub.specific
         self.shapes.extend(sub.shapes)
+        self.forms.extend(sub.forms)
         self.vacuous += sub.vacuous
 
     # -- swallowing ---------------------------------------------------------------------
@@ -484,6 +487,7 @@ def _unit(
         expected=stats.expected,
         struct_hash=_struct_hash(fn),
         shapes=stats.shapes,
+        assertion_forms=stats.forms,
         vacuous=stats.vacuous,
         vacuous_line=stats.vacuous_line,
         unreachable=lost.asserts,

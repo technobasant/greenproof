@@ -99,9 +99,17 @@ def pair_units(base: list[Unit], cand: list[Unit]) -> _Pairing:
     return result
 
 
+def _added_forms(pairing: _Pairing) -> set[str]:
+    """Exact assertion forms the change adds: new tests, and what each paired test gained."""
+    universe = {form for u in pairing.left_cand for form in u.assertion_forms}
+    for b, c in pairing.pairs:
+        universe.update((Counter(c.assertion_forms) - Counter(b.assertion_forms)).keys())
+    return universe
+
+
 def _covered(unit: Unit, universe: set[str]) -> bool:
-    """Every assertion of `unit` (in structural form) appears in some collected candidate test."""
-    return bool(unit.shapes) and all(shape in universe for shape in unit.shapes)
+    """Every assertion of `unit` reappears, in exact form, among the assertions the change adds."""
+    return bool(unit.assertion_forms) and all(f in universe for f in unit.assertion_forms)
 
 
 _Reason = tuple[str, int, str]  # text, line, severity
@@ -260,7 +268,7 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
     base_units = _collected(sides, cfg, base=True)
     cand_units = _collected(sides, cfg, base=False)
     pairing = pair_units(base_units, cand_units)
-    universe = {shape for u in cand_units for shape in u.shapes}
+    universe = _added_forms(pairing)
     pairing.left_base = [u for u in pairing.left_base if not _covered(u, universe)]
     out: list[Finding] = []
     out.extend(_deleted_and_removed(sides, pairing))

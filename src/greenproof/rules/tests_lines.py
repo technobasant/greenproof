@@ -282,6 +282,10 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
             engine=lang,
             asserts=len(_ASSERTS[lang].findall(body_masked)),
         )
+        for k in range(span.start, span.end + 1):
+            hits = len(_ASSERTS[lang].findall(masked[k]))
+            if hits:
+                unit.assertion_forms.extend([digest("".join(code[k].split()))] * hits)
         if lang == "js":
             unit.strong = len(_JS_STRONG.findall(body_masked))
             unit.weak = len(_JS_WEAK.findall(body_masked))

@@ -329,3 +329,42 @@ def test_new_conftest_collection_hook_at_conftest_scope_blocks(tmp_path: Path) -
 def test_module_importorskip_in_a_new_test_file_is_clean(tmp_path: Path) -> None:
     text = 'import pytest\n\nnp = pytest.importorskip("numpy")\n\n\ndef test_a():\n    assert np\n'
     assert "tests.skipped" not in rule_ids(runner_findings(tmp_path, "tests/test_n.py", None, text))
+
+
+# ---- covered removals: multiset difference of exact forms (5.7) ----------------------------
+
+TWINS = """\
+def test_a():
+    assert make() == 1
+    assert make() == 1
+
+
+def test_b():
+    assert make() == 1
+"""
+
+
+def test_assertion_duplicated_in_base_and_kept_once_does_not_cover(tmp_path: Path) -> None:
+    # test_a keeps one `make() == 1`; the other copy was already there, so it replaces nothing.
+    new = "def test_a():\n    assert make() == 1\n"
+    assert "tests.removed" in rule_ids(change(tmp_path, new, TWINS))
+
+
+def test_assertion_added_to_a_paired_test_covers_the_removed_one(tmp_path: Path) -> None:
+    new = "def test_a():\n    assert make() == 1\n    assert make() == 1\n    assert make() == 1\n"
+    assert rule_ids(change(tmp_path, new, TWINS)) == []
+
+
+def test_preexisting_equal_assertion_in_another_test_does_not_cover(tmp_path: Path) -> None:
+    base = TWINS + "\n\ndef test_c():\n    assert other() == 2\n"
+    new = base.replace("def test_b():\n    assert make() == 1\n\n\n", "")
+    assert [f.rule for f in change(tmp_path, new, base)] == ["tests.removed"]
+
+
+def test_whitespace_only_difference_in_a_js_assertion_still_covers(tmp_path: Path) -> None:
+    base = "test('a', () => {\n  expect(f(1)).toBe(2);\n  expect(g(1)).toBe(3);\n});\n"
+    new = (
+        "test('a1', () => {\n  expect(f( 1 )).toBe( 2 );\n});\n"
+        "test('a2', () => {\n  expect(g(1)).toBe(3);\n});\n"
+    )
+    assert rule_ids(change(tmp_path, new, base, "tests/a.test.js")) == []

@@ -232,3 +232,132 @@ def test_clean_change_passes(name, mutate, probe_repo: Repo, run, tmp_path: Path
     code, found = check(probe_repo, run, tmp_path / "out.json")
     assert code == 0, (name, found)
     assert not any(sev == "block" for _, sev in found), (name, found)
+
+
+# ---- covered removals use exact forms of the assertions the change adds (SPEC 5.7) ---------
+
+MORE = """\
+from mathx import parse, total
+
+
+def test_total():
+    got = total([1, 2])
+    want = 3
+    assert got == want
+
+
+def test_parse():
+    got = parse("4")
+    want = 4
+    assert got == want
+
+
+def test_len():
+    items = [parse("1")]
+    assert len(items) == 1
+
+
+def test_len_other():
+    rows = [total([1])]
+    assert len(rows) == 1
+"""
+
+MORE_PATH = "tests/test_more.py"
+
+JEST_TWO = (
+    "test('adds and subtracts', () => {\n"
+    "  expect(add(1, 2)).toBe(3);\n"
+    "  expect(sub(3, 1)).toBe(2);\n"
+    "});\n"
+)
+
+
+@pytest.fixture
+def more_repo(tmp_path: Path) -> Repo:
+    repo = init_repo(tmp_path / "more")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write(
+        "src/mathx.py", "def total(xs):\n    return sum(xs)\n\n\ndef parse(s):\n    return int(s)\n"
+    )
+    repo.write(MORE_PATH, MORE)
+    repo.write("tests/pairs.test.js", JEST_TWO)
+    repo.commit("base")
+    return repo
+
+
+def drop(text: str, name: str) -> str:
+    head, _, rest = text.partition(f"\n\ndef {name}():\n")
+    body = rest.split("\n\n\ndef ", 1)
+    return head + ("\n\n\ndef " + body[1] if len(body) > 1 else "\n")
+
+
+def p13(r: Repo) -> None:
+    (r.path / MORE_PATH).write_text(drop(MORE, "test_parse"))
+
+
+def p14(r: Repo) -> None:
+    (r.path / MORE_PATH).write_text(drop(MORE, "test_len_other"))
+
+
+def p15(r: Repo) -> None:
+    text = drop(MORE, "test_parse")
+    text += "\n\ndef test_new():\n    a = total([2])\n    b = 2\n    assert a == b\n"
+    (r.path / MORE_PATH).write_text(text)
+
+
+def c9(r: Repo) -> None:
+    sub(r, MORE_PATH, "def test_parse():", "def test_parse_int():")
+
+
+def c10(r: Repo) -> None:
+    r.git("mv", MORE_PATH, "tests/test_more_moved.py")
+
+
+def c11(r: Repo) -> None:
+    text = drop(MORE, "test_len_other").replace(
+        "    assert len(items) == 1\n",
+        "    rows = [total([1])]\n    assert len(items) == 1\n    assert len(rows) == 1\n",
+    )
+    (r.path / MORE_PATH).write_text(text)
+
+
+def c12(r: Repo) -> None:
+    (r.path / "tests/pairs.test.js").write_text(
+        "test('adds', () => {\n  expect(add(1, 2)).toBe(3);\n});\n\n"
+        "test('subtracts', () => {\n  expect(sub(3, 1)).toBe(2);\n});\n"
+    )
+
+
+LOOSE: list[tuple[str, Callable[[Repo], None], str]] = [
+    ("P13", p13, "tests.removed"),
+    ("P14", p14, "tests.removed"),
+    ("P15", p15, "tests.replaced"),
+]
+
+
+@pytest.mark.parametrize(("name", "mutate", "rule"), LOOSE, ids=[t[0] for t in LOOSE])
+def test_generic_assertions_do_not_cover_a_removal(
+    name, mutate, rule, more_repo: Repo, run, tmp_path: Path
+) -> None:
+    mutate(more_repo)
+    code, found = check(more_repo, run, tmp_path / "out.json")
+    assert code == 1, (name, found)
+    assert (rule, "block") in found, (name, found)
+
+
+COVERED: list[tuple[str, Callable[[Repo], None]]] = [
+    ("C9", c9),
+    ("C10", c10),
+    ("C11", c11),
+    ("C12", c12),
+]
+
+
+@pytest.mark.parametrize(("name", "mutate"), COVERED, ids=[c[0] for c in COVERED])
+def test_renames_moves_merges_and_splits_stay_clean(
+    name, mutate, more_repo: Repo, run, tmp_path: Path
+) -> None:
+    mutate(more_repo)
+    code, found = check(more_repo, run, tmp_path / "out.json")
+    assert code == 0, (name, found)
+    assert not any(sev == "block" for _, sev in found), (name, found)

@@ -24,9 +24,12 @@ class Unit:
     swallowed: int = 0
     swallow_line: int = 0
     expected: list[tuple[str, int]] = field(default_factory=list)  # (literal, line)
-    # Python only: structural identity and per-assertion shapes (identifiers alpha-renamed).
+    # Python only: structural identity and per-assertion shapes (identifiers alpha-renamed),
+    # used for the 5.4 severity split.
     struct_hash: str = ""
     shapes: list[str] = field(default_factory=list)
+    # Exact form of each counted, reachable assertion (all engines); coverage compares these.
+    assertion_forms: list[str] = field(default_factory=list)
     vacuous: int = 0
     vacuous_line: int = 0
     unreachable: int = 0
