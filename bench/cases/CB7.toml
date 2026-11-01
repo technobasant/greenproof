@@ -1,0 +1,11 @@
+id = "CB7"
+fixture = "go-calc"
+title = "a _test.go file holding only a helper, deleted"
+source = "replay triage"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "helpers_test.go"
+delete = true

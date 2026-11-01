@@ -1,0 +1,18 @@
+id = "CB2"
+fixture = "python-shop"
+title = "a test moved to another class, same name, with an assertion dropped"
+source = "replay triage"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "tests/test_parse.py"
+replace = { old = '''
+class TestParse:
+    def test_ok(self):
+        assert parse("4") == 4
+        assert parse("5") == 5''', new = '''
+class TestParseValid:
+    def test_ok(self):
+        assert parse("4") == 4''' }

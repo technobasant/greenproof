@@ -1,0 +1,11 @@
+id = "CB8"
+fixture = "go-calc"
+title = "the _test.go file holding the tests, deleted"
+source = "replay triage"
+kind = "tamper"
+expect = "block"
+rules = ["tests.deleted"]
+
+[[edit]]
+path = "calc_test.go"
+delete = true
