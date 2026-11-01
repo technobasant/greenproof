@@ -186,7 +186,7 @@ def test_init_writes_the_expected_policy_and_it_loads(case: str, tmp_path: Path,
     assert text == expected
     policy = parse_policy(text)
     assert policy.timeout == 900
-    assert policy.mode_checks["ci"] == ("static", "commands")
+    assert policy.mode_checks["ci"] == ("static", "commands", "revert")
     assert "created  .greenproof.toml" in result.out
 
 

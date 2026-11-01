@@ -342,16 +342,19 @@ def test_hook_mode_output_tail_is_forty_lines(tmp_path: Path, run) -> None:
     assert len(load_json(tmp_path / "l.json")["commands"][0]["output_tail"].splitlines()) == 100
 
 
-def test_ci_mode_marks_unimplemented_checks_skipped(repo: Repo, run, tmp_path: Path) -> None:
+def test_ci_mode_skipped_checks_say_why(repo: Repo, run, tmp_path: Path) -> None:
     result = run(repo.path, "check", "--mode", "ci", "--json", str(tmp_path / "r.json"))
     assert result.code == 0
-    statuses = {c["id"]: c["status"] for c in schema_ok(tmp_path / "r.json")["checks"]}
+    data = schema_ok(tmp_path / "r.json")
+    statuses = {c["id"]: c["status"] for c in data["checks"]}
     assert statuses == {
         "static": "pass",
         "commands": "pass",
         "revert": "skipped",
         "smoke": "skipped",
     }
+    assert any(n.startswith("revert: skipped, ") for n in data["notes"])
+    assert any(n.startswith("smoke: skipped, ") for n in data["notes"])
 
 
 def test_checks_flag_selects_static_only(tmp_path: Path, run) -> None:
@@ -361,17 +364,11 @@ def test_checks_flag_selects_static_only(tmp_path: Path, run) -> None:
     assert "FAIL" not in result.out
 
 
-@pytest.mark.parametrize("value", ["revert", "smoke", "static,bogus", ","])
+@pytest.mark.parametrize("value", ["static,bogus", ","])
 def test_checks_flag_rejects_unavailable_or_unknown(repo: Repo, run, value: str) -> None:
     result = run(repo.path, "check", "--checks", value)
     assert result.code == 4
     assert "--checks" in result.err
-
-
-def test_isolate_is_not_implemented_yet(repo: Repo, run) -> None:
-    result = run(repo.path, "check", "--isolate")
-    assert result.code == 4
-    assert "not implemented" in result.err
 
 
 def test_markdown_and_annotations_outputs(repo: Repo, run, tmp_path: Path) -> None:
