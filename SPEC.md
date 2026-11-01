@@ -244,21 +244,27 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   `assertSetEqual`, `assertSequenceEqual`, `assertMultiLineEqual`, `assertCountEqual` or
   `assertAlmostEqual`. Its **subjects** are its operands that are not constant (a literal,
   or an operator, container or pure builtin over literals, as in the constant rule above),
-  compared as shapes after single-assignment locals are inlined. A **loose check** on `X`
+  compared as shapes after single-assignment locals are inlined (names bound inside the
+  test, its locals and parameters, are alpha-renamed; globals, attributes and builtins keep
+  their spelling, so `resp.status` and `resp.ok` differ). A **loose check** on `X`
   is any other assertion in which `X` is: the whole test (`assert X`, `assertTrue(X)`); an
   operand of `is not`, `!=`, `<`, `<=`, `>`, `>=`, `not in` (`assert X > 0`,
   `assert 0 < X < 10`, `assertNotEqual`, `assertGreater`, `assertGreaterEqual`,
   `assertLess`, `assertLessEqual`, `assertIsNotNone`); the first argument of `isinstance`,
   `issubclass` or `assertIsInstance`; or wrapped as `type(X)`, `len(X)` or `bool(X)` in
-  any comparison (`assert type(X) is int`, `assert len(X) == 3`). A subject of an exact
+  any comparison (`assert type(X) is int`, `assert len(X) == 3`). Negations count as
+  loose checks on what they negate (`assert not X`, `assertFalse(X)`, `assert not X == 1`,
+  `assertNotIn`, `assertNotAlmostEqual`); `and`/`or` operands and each link of a chained
+  comparison are classified separately. A subject of an exact
   check in the base test that is the subject of no exact check in the candidate test, and
   is the target of a loose check there, is loosened: `tests.weakened` (block), "exact
   check on `<X>` loosened to `<the new assertion's source>`". This includes
   `assert total() == 100` → `assert total()`, → `assert total() > 0`, →
   `assert isinstance(total(), int)` and `assert rows == [a, b]` → `assert len(rows) == 2`.
-  When the new assertion is a different expression (`assert f(x) == 1` →
-  `assert is_one(x)`) it is a `warn` for a strong check replaced by a different one,
-  because that is often a legitimate refactor.
+  Any other comparison on `X` replaced by a truthiness check on `X` alone
+  (`assert x < 5` → `assert x`) is also `tests.weakened` (block). When the new assertion
+  is a different expression (`assert f(x) == 1` → `assert is_one(x)`) it is a `warn` for a
+  strong check replaced by a different one, because that is often a legitimate refactor.
 
 JS/TS, Go, Rust (line level, per test file): count of assertion calls drops (`expect(`,
 `assert.`, `t.Error`/`t.Fatal`/`require.`/`assert.`, `assert!`/`assert_eq!`), or strong
