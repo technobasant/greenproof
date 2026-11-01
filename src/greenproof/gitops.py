@@ -282,7 +282,7 @@ class _Interrupted(SystemExit):
 
 
 @contextmanager
-def _cleanup_on_signals() -> Iterator[None]:
+def cleanup_on_signals() -> Iterator[None]:
     def handler(signum: int, _frame: FrameType | None) -> None:
         raise _Interrupted(128 + signum)
 
@@ -318,7 +318,7 @@ def worktree_for_tree(repo: Path, tree: str) -> Iterator[Path]:
     container = Path(tempfile.mkdtemp(prefix="greenproof-wt-"))
     path = container / "wt"
     added = False
-    with _cleanup_on_signals():
+    with cleanup_on_signals():
         try:
             git(repo, "worktree", "add", "--detach", str(path), commit)
             added = True
