@@ -185,3 +185,38 @@ def test_greenproof_action_ref_bump_still_warns(tmp_path: Path) -> None:
     found = adopted(tmp_path, base, base.replace("greenproof@v1", "greenproof@v2"))
     assert rule_ids(found) == ["ci.tampered"]
     assert found[0].severity == "warn"
+
+
+# ---- only the check invocation or the action is "the greenproof step" -------------------
+
+PACKAGE = (
+    "  package:\n    runs-on: ubuntu-latest\n    steps:\n"
+    "      - run: /tmp/wheel-check/bin/greenproof --version\n"
+    "      - run: /tmp/wheel-check/bin/greenproof explain policy.changed\n"
+)
+
+
+def test_a_version_mention_gaining_a_check_job_is_adoption(tmp_path: Path) -> None:
+    base = NO_GP + PACKAGE
+    assert adopted(tmp_path, base, base + GP_JOB) == []
+
+
+def test_changing_a_version_line_alone_is_not_a_greenproof_change(tmp_path: Path) -> None:
+    base = NO_GP + PACKAGE
+    new = base.replace("greenproof --version", "greenproof --version --verbose")
+    assert adopted(tmp_path, base, new) == []
+    renamed = (NO_GP + GP_JOB).replace("  greenproof:\n", "  gate:\n")
+    assert adopted(tmp_path / "n", NO_GP + GP_JOB, renamed) == []
+
+
+def test_check_invocation_with_a_path_or_version_counts(tmp_path: Path) -> None:
+    for i, run_line in enumerate(
+        (
+            "uvx greenproof@0.4.0 check --mode ci",
+            "/opt/bin/greenproof check",
+            "uv run greenproof check",
+        )
+    ):
+        base = NO_GP + f"      - run: {run_line}\n"
+        found = adopted(tmp_path / str(i), base, base.replace(run_line, run_line + " --x"))
+        assert rule_ids(found) == ["ci.tampered"], run_line

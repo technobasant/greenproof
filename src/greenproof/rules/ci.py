@@ -54,10 +54,18 @@ def _kinds(text: str | None) -> Counter[str]:
     return out
 
 
+# The greenproof step: a line that runs `greenproof check` (any prefix, any `@version`) or
+# `uses:` the greenproof action. Other mentions (`greenproof --version`) are not the step.
+_GP_STEP = re.compile(
+    r"greenproof(?:@\S+)?\s+check\b|^(?:-\s*)?uses\s*:\s*['\"]?[^\s'\"]*greenproof",
+    re.IGNORECASE,
+)
+
+
 def _greenproof_lines(text: str | None) -> Counter[str]:
-    """The non-comment lines that mention greenproof, stripped, counted."""
+    """The non-comment lines that are the greenproof step, stripped, counted."""
     stripped = (ln.strip() for ln in split_lines(text or ""))
-    return Counter(ln for ln in stripped if "greenproof" in ln.lower() and not ln.startswith("#"))
+    return Counter(ln for ln in stripped if not ln.startswith("#") and _GP_STEP.search(ln))
 
 
 _ACTION_REF = re.compile(
