@@ -31,6 +31,10 @@ from greenproof.runner import HOOK_TAIL_LINES, TAIL_LINES, CommandResult, run_co
 
 MODES = ("local", "hook", "ci")
 IMPLEMENTED_CHECKS = ("static", "commands", "revert", "smoke")
+READONLY_NOTE = (
+    "the git directory is read-only here (an agent sandbox?), "
+    "so greenproof used a temporary object store"
+)
 
 
 @dataclass(frozen=True)
@@ -90,7 +94,10 @@ def locate(opts: CheckOptions, repo: Path | None = None) -> Candidate:
     """Steps 1-3 of SPEC 3.1: find the repository, snapshot the candidate, resolve the base."""
     repo = repo if repo is not None else gitops.find_repo(opts.cwd)
     gitops.require_commits(repo)
-    tree = gitops.snapshot_tree(repo)
+    if opts.mode == "local":
+        tree, _ = gitops.snapshot_tree_local(repo)
+    else:  # hook and ci fail closed on a git failure
+        tree = gitops.snapshot_tree(repo)
     base = gitops.resolve_base(repo, opts.base, opts.env)
     return Candidate(repo, tree, base)
 
@@ -131,6 +138,12 @@ def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
 
     candidate = candidate if candidate is not None else locate(opts)
     repo, tree, base = candidate.repo, candidate.tree, candidate.base
+    readonly = opts.mode == "local" and gitops.readonly_git()
+    if readonly and opts.isolate:
+        raise UsageError(
+            "--isolate needs a writable git directory (it creates a worktree), "
+            "and the git directory is read-only here"
+        )
 
     loaded = load_policy(
         gitops.read_blob(repo, base.sha, POLICY_FILE), gitops.read_blob(repo, tree, POLICY_FILE)
@@ -147,6 +160,8 @@ def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
         policy_source=loaded.source,
         policy_sha256=loaded.sha256,
     )
+    if readonly:
+        report.notes.append(READONLY_NOTE)
 
     available = _load_acceptances(opts, repo, report)
     flags = ["allow-policy-change"] if opts.allow_policy_change else []
@@ -212,7 +227,7 @@ def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
                 report.checks.append(CheckStatus(check, "fail" if failed else "pass", elapsed))
 
     report.finish()
-    if report.exit_code == 0 and use_cache:
+    if report.exit_code == 0 and use_cache and not readonly:  # nothing is written under .git
         cache.record_pass(key, [asdict(c) for c in report.checks])
     return report
 

@@ -69,6 +69,20 @@ greenproof --version
    object with `git commit-tree <tree> -p HEAD` (no ref is updated) and
    `git worktree add --detach <tmpdir> <commit>`; always remove the worktree afterwards,
    including on error and on SIGINT/SIGTERM.
+
+   **Read-only git directory (local mode).** Agent sandboxes (Codex's workspace-write, for
+   one) let the agent write the working tree but not the git directory, so `git add -A`
+   cannot store the snapshot's objects. In local mode only, when the snapshot fails and a
+   probe file cannot be created in the object directory (`git rev-parse --git-path
+   objects`), greenproof retries with a temporary object directory for the rest of the run:
+   `GIT_OBJECT_DIRECTORY` set to it and `GIT_ALTERNATE_OBJECT_DIRECTORIES` set to the
+   repository's object directory, for every git command greenproof runs. The directory is
+   deleted on exit, and nothing is written under the git directory (no cache, no state).
+   Checks that need a worktree cannot run: the revert check is skipped with the note "the
+   git directory is read-only here; the stop hook runs this check", and `--isolate` exits 4
+   saying it needs a writable git directory. The report carries the note "the git directory
+   is read-only here (an agent sandbox?), so greenproof used a temporary object store". Hook
+   and CI mode are unchanged: a git failure there fails closed.
 3. **Resolve the base**, first match wins:
    1. `--base REF`;
    2. in GitHub Actions on a PR: `GITHUB_BASE_REF` → `git merge-base HEAD origin/<ref>` (the

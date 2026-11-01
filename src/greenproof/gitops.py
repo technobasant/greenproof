@@ -42,6 +42,14 @@ class DiffEntry:
     old_path: str | None = None
 
 
+# While a temporary object store stands in for a read-only git directory: the two variables
+# every git call then gets, and the directory to delete. Process-wide, because greenproof
+# runs one check per process.
+_override: dict[str, str] = {}
+_store_root: Path | None = None
+_scope_open = False
+
+
 def git(
     repo: Path | str,
     *args: str,
@@ -50,8 +58,8 @@ def git(
 ) -> subprocess.CompletedProcess[bytes]:
     """Run git in `repo` and return the completed process (stdout and stderr as bytes)."""
     full_env = None
-    if env is not None:
-        full_env = {**os.environ, **env}
+    if env is not None or _override:
+        full_env = {**os.environ, **(env or {}), **_override}
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -102,6 +110,75 @@ def git_dir(repo: Path) -> Path:
 def session_marker_path(repo: Path) -> Path:
     """Per worktree, so parallel sessions in separate worktrees keep their own base."""
     return git_dir(repo) / "greenproof" / SESSION_MARKER
+
+
+def objects_dir(repo: Path) -> Path:
+    return Path(_out(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects")))
+
+
+def object_dir_writable(repo: Path) -> bool:
+    """Whether a file can be created in the object directory. A real creation: `os.access`
+    does not reflect an agent sandbox that denies writes under the git directory."""
+    try:
+        fd, name = tempfile.mkstemp(dir=objects_dir(repo), prefix="tmp_greenproof_probe_")
+    except (OSError, UsageError):
+        return False
+    os.close(fd)
+    Path(name).unlink(missing_ok=True)
+    return True
+
+
+def readonly_git() -> bool:
+    """True while a temporary object store stands in for a read-only git directory."""
+    return bool(_override)
+
+
+@contextmanager
+def temp_object_store_scope() -> Iterator[None]:
+    """Owns the temporary object store that `snapshot_tree_local` may create: it is deleted
+    and the override cleared on exit, on error and on SIGINT/SIGTERM."""
+    global _scope_open, _store_root
+    _scope_open = True
+    try:
+        with cleanup_on_signals():
+            yield
+    finally:
+        _scope_open = False
+        _override.clear()
+        if _store_root is not None:
+            shutil.rmtree(_store_root, ignore_errors=True)
+            _store_root = None
+
+
+def _use_temp_object_store(repo: Path) -> None:
+    """Send every later git call's object writes to a temporary directory; reads still see the
+    repository's objects through an alternate (git follows that directory's own
+    `info/alternates` too, so `git clone --shared` repositories keep working)."""
+    global _store_root
+    _store_root = Path(tempfile.mkdtemp(prefix="greenproof-objects-"))
+    store = _store_root / "objects"
+    store.mkdir()
+    alternates = [str(objects_dir(repo))]
+    inherited = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+    if inherited:
+        alternates.append(inherited)
+    _override["GIT_OBJECT_DIRECTORY"] = str(store)
+    _override["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join(alternates)
+
+
+def snapshot_tree_local(repo: Path) -> tuple[str, bool]:
+    """`snapshot_tree`, retried with a temporary object store when the git directory is
+    read-only (SPEC 3.1). Returns the tree and whether the store was needed. A failure is
+    re-raised unchanged unless the probe shows the object directory cannot be written; the
+    store needs an enclosing `temp_object_store_scope` to be deleted, so without one there is
+    no retry."""
+    try:
+        return snapshot_tree(repo), False
+    except UsageError:
+        if readonly_git() or not _scope_open or object_dir_writable(repo):
+            raise
+    _use_temp_object_store(repo)
+    return snapshot_tree(repo), True
 
 
 def has_commits(repo: Path) -> bool:

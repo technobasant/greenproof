@@ -231,6 +231,10 @@ example `"tests.expected_changed" = "off"`.
 tries to stop, and `greenproof session-start --hook AGENT` when a session begins. The agent
 is told what failed and is asked to fix the code, not the check.
 
+When the agent runs `greenproof check` itself in a sandbox that cannot write to `.git` (Codex's
+workspace-write, for one), it still works: greenproof keeps its snapshot in a temporary
+object store, skips the revert check (the stop hook runs it) and says so in the report.
+
 | agent | hook file | status |
 |---|---|---|
 | Claude Code | `.claude/settings.json` | supported |
