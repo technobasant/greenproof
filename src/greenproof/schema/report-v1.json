@@ -5,7 +5,7 @@
   "type": "object",
   "required": [
     "schema", "version", "mode", "base", "candidate", "policy", "checks", "findings",
-    "commands", "verdict", "exit_code", "cached"
+    "commands", "notes", "verdict", "exit_code", "cached"
   ],
   "additionalProperties": false,
   "properties": {
@@ -50,7 +50,9 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["rule", "severity", "file", "line", "message", "hint"],
+        "required": [
+          "rule", "severity", "file", "line", "message", "hint", "fingerprint", "accepted"
+        ],
         "additionalProperties": false,
         "properties": {
           "rule": { "type": "string" },
@@ -58,7 +60,19 @@
           "file": { "type": ["string", "null"] },
           "line": { "type": ["integer", "null"] },
           "message": { "type": "string" },
-          "hint": { "type": "string" }
+          "hint": { "type": "string" },
+          "fingerprint": { "type": "string" },
+          "accepted": {
+            "type": ["object", "null"],
+            "required": ["by", "at", "source", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "by": { "type": "string" },
+              "at": { "type": "string" },
+              "source": { "enum": ["local", "github"] },
+              "reason": { "type": ["string", "null"] }
+            }
+          }
         }
       }
     },
@@ -78,6 +92,7 @@
         }
       }
     },
+    "notes": { "type": "array", "items": { "type": "string" } },
     "verdict": { "enum": ["pass", "fail", "error"] },
     "exit_code": { "type": "integer", "minimum": 0, "maximum": 5 },
     "cached": { "type": "boolean" },
