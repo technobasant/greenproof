@@ -31,6 +31,18 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `fork` in the SessionStart matchers of the Claude Code and Codex CLI hooks `init` writes.
   Both agents document it as a source; the session marker is kept, as for `resume`.
 
+### Fixed
+
+- `greenproof check` in local mode no longer exits 4 when the git directory is read-only, as
+  in an agent sandbox that lets the agent write the working tree but not `.git` (Codex's
+  workspace-write): `git add -A` could not store the snapshot's objects. When the snapshot
+  fails and a probe file cannot be created in the object directory, greenproof retries with
+  a temporary object directory (`GIT_OBJECT_DIRECTORY`, with the repository's objects as
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES`) for every git command of the run, deletes it on exit
+  and writes nothing under the git directory, so no pass is cached. The revert check is
+  skipped with a note, `--isolate` exits 4, and the report carries a note. Hook and CI mode
+  still fail closed on a git failure.
+
 ### Changed
 
 - A pass is now recorded in the hook state instead of clearing it, so a duplicate hook for
