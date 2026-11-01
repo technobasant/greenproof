@@ -1,0 +1,18 @@
+# `uvx pre-commit install` once; the hooks then run on every commit. Ruff is pinned to the
+# version in uv.lock, so the hook and CI cannot disagree.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-merge-conflict
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.0
+    hooks:
+      - id: ruff-format
+      - id: ruff-check

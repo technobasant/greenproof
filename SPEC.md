@@ -56,24 +56,34 @@ greenproof --version
 ### 3.1 `check` pipeline
 
 1. **Locate the repo** (`git rev-parse --show-toplevel`). Not a git repo → exit 4.
-2. **Snapshot the candidate** without touching the user's index or working tree:
-   `GIT_INDEX_FILE=<tmp> git read-tree HEAD && GIT_INDEX_FILE=<tmp> git add -A && git write-tree`.
-   This includes staged, unstaged and untracked (non-ignored) files, because agents often
+2. **Snapshot the candidate** without touching the user's index or working tree: seed a
+   temporary index with a copy of the user's index (its stat cache means unchanged files are
+   not re-hashed and clean filters such as Git LFS do not re-run), falling back to
+   `GIT_INDEX_FILE=<tmp> git read-tree HEAD` when there is no index or the copy cannot be
+   used; then `GIT_INDEX_FILE=<tmp> git add -A && GIT_INDEX_FILE=<tmp> git write-tree`.
+   Both seeds must give the same tree. This includes staged, unstaged and untracked (non-ignored) files, because agents often
    do not commit. When `--isolate` or the revert check needs a checkout, create a commit
    object with `git commit-tree <tree> -p HEAD` (no ref is updated) and
    `git worktree add --detach <tmpdir> <commit>`; always remove the worktree afterwards,
    including on error and on SIGINT/SIGTERM.
 3. **Resolve the base**, first match wins:
    1. `--base REF`;
-   2. in GitHub Actions on a PR: `GITHUB_BASE_REF` → `origin/<ref>` (the action fetches it);
+   2. in GitHub Actions on a PR: `GITHUB_BASE_REF` → `git merge-base HEAD origin/<ref>` (the
+      action fetches it; on the PR merge-commit checkout this stays correct after the base
+      branch has advanced);
    3. the session marker written by `session-start` at
-      `<git-common-dir>/greenproof/session-base`, if that commit is an ancestor of HEAD;
+      `<git-dir>/greenproof/session-base`, if that commit is an ancestor of HEAD. The marker
+      is per worktree (`git rev-parse --git-dir`), so parallel agent sessions in separate
+      worktrees do not overwrite each other's base;
    4. `git merge-base HEAD <default branch>` where the default branch is
       `origin/HEAD`'s target, else `main`, else `master`; if HEAD *is* the default branch,
       use `HEAD` (only uncommitted changes are compared).
    Base not resolvable (e.g. shallow clone) → exit 4 with the fix (`fetch-depth: 0`).
 4. **Load policy from the base**: `git show <base>:.greenproof.toml`. If the base has no
    policy file (first adoption), use the candidate's and record `policy.source = "candidate"`.
+   No policy at the base or in the working tree → exit 4, telling the user to run
+   `greenproof init`. Policies are compared on parsed TOML (comment and formatting edits are
+   not a change); a deleted or unparseable candidate policy is a change, not a config error.
    If the candidate's policy differs from the base's, emit `policy.changed` (block) unless
    `--allow-policy-change`. The commands, test globs and severities used for this run all
    come from the base policy.
@@ -84,10 +94,15 @@ greenproof --version
    except in `hook` mode where a blocking static finding skips the remaining checks to keep
    the agent loop fast.
 7. **Cache**: key = sha256(candidate tree, base sha, policy hash, greenproof version, mode,
-   checks). Stored in `<git-common-dir>/greenproof/cache.json` (keep the last 50 entries).
+   checks, verdict-changing flags such as `--allow-policy-change`). Stored in
+   `<git-common-dir>/greenproof/cache.json` (keep the last 50 entries) together with the
+   check statuses of the original run, which a hit replays (a skipped check stays skipped).
    A previous *pass* for the same key returns pass immediately with
    "unchanged since the last verified pass". Failures are never cached. `--no-cache`
-   disables it.
+   disables it. **`ci` mode never reads or writes the cache**: the file is writable by
+   anything running as the user, an agent included, so a cached pass is a speed-up for the
+   local loop and never evidence. The key uses the snapshot taken before the commands run,
+   so commands that leave untracked, non-ignored artifacts cause a miss next time.
 8. **Report** (text to stdout, plus optional JSON/Markdown/annotations) and **exit**.
 
 ### 3.2 Exit codes
@@ -305,8 +320,10 @@ Output tails are capped at 40 lines in hook mode and 200 lines in reports.
   "sha"}, "candidate": {"tree", "dirty"}, "policy": {"source", "sha256"}, "checks":
   [{"id", "status", "duration_ms"}], "findings": [{"rule", "severity", "file", "line",
   "message", "hint"}], "commands": [{"name", "cmd", "exit_code", "duration_ms",
-  "timed_out", "output_tail"}], "verdict": "pass|fail|error", "exit_code"}`. Ship a JSON
-  Schema file and test the output against it.
+  "timed_out", "output_tail"}], "verdict": "pass|fail|error", "exit_code", "cached",
+  "error"?}`. Check status is `pass|fail|skipped`. In an `error` report (exit 4 or 5,
+  still written when `--json` is given) `base`, `candidate` and `policy` may be null and
+  `error` carries the message. Ship a JSON Schema file and test the output against it.
 - Markdown (`--markdown`): table of findings and commands for the job summary.
 - GitHub annotations (`--github-annotations`): `::error file=…,line=…,title=<rule>::msg`
   for block, `::warning` for warn.

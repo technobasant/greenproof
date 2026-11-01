@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use greenproof in research or a published evaluation, please cite it."
+title: "greenproof: a definition-of-done gate for LLM coding agents"
+type: software
+authors:
+  - family-names: Bhattarai
+    given-names: Basant
+    website: "https://basantbhattarai.com.np"
+version: 0.1.0.dev0
+license: Apache-2.0
+repository-code: "https://github.com/technobasant/greenproof"

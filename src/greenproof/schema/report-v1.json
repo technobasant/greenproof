@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/technobasant/greenproof/blob/main/src/greenproof/schema/report-v1.json",
+  "title": "greenproof report, version 1",
+  "type": "object",
+  "required": [
+    "schema", "version", "mode", "base", "candidate", "policy", "checks", "findings",
+    "commands", "verdict", "exit_code", "cached"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "greenproof/report@1" },
+    "version": { "type": "string" },
+    "mode": { "enum": ["local", "hook", "ci"] },
+    "base": {
+      "type": ["object", "null"],
+      "required": ["ref", "sha"],
+      "additionalProperties": false,
+      "properties": { "ref": { "type": "string" }, "sha": { "type": "string" } }
+    },
+    "candidate": {
+      "type": ["object", "null"],
+      "required": ["tree", "dirty"],
+      "additionalProperties": false,
+      "properties": { "tree": { "type": "string" }, "dirty": { "type": "boolean" } }
+    },
+    "policy": {
+      "type": ["object", "null"],
+      "required": ["source", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "enum": ["base", "candidate"] },
+        "sha256": { "type": "string" }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "status", "duration_ms"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "enum": ["static", "commands", "revert", "smoke"] },
+          "status": { "enum": ["pass", "fail", "skipped"] },
+          "duration_ms": { "type": "integer" }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["rule", "severity", "file", "line", "message", "hint"],
+        "additionalProperties": false,
+        "properties": {
+          "rule": { "type": "string" },
+          "severity": { "enum": ["block", "warn"] },
+          "file": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"] },
+          "message": { "type": "string" },
+          "hint": { "type": "string" }
+        }
+      }
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "cmd", "exit_code", "duration_ms", "timed_out", "output_tail"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "cmd": { "type": "string" },
+          "exit_code": { "type": "integer" },
+          "duration_ms": { "type": "integer" },
+          "timed_out": { "type": "boolean" },
+          "output_tail": { "type": "string" }
+        }
+      }
+    },
+    "verdict": { "enum": ["pass", "fail", "error"] },
+    "exit_code": { "type": "integer", "minimum": 0, "maximum": 5 },
+    "cached": { "type": "boolean" },
+    "error": { "type": "string" }
+  }
+}
