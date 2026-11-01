@@ -279,14 +279,17 @@ class _JsFile:
         return bool(assigned and re.search(rf"\b{re.escape(assigned.group(1))}{_JS_MOCKED}", code))
 
     def asserted(self, patch: _JsPatch, unit: Unit) -> str | None:
+        """The imported name an `expect(...)` argument calls (`add(1, 2)`, `math.add(1, 2)`).
+        Naming the mock without calling it (`expect(sendMail).toHaveBeenCalled()`) is fine."""
         for body in _expect_bodies(self.masked, unit.line, unit.end_line):
             if patch.qualified:
-                found = re.search(rf"(?<![\w$.]){re.escape(patch.qualified)}\b", body)
+                found = re.search(rf"(?<![\w$.]){re.escape(patch.qualified)}\s*\(", body)
                 if found:
                     return patch.qualified
             for name in sorted(patch.names):
-                if re.search(rf"(?<![\w$]){re.escape(name)}(?![\w$])", body):
-                    return name
+                for m in re.finditer(rf"(?<![\w$.]){re.escape(name)}((?:\.[\w$]+)*)\s*\(", body):
+                    if ".mock" not in m.group(1):
+                        return name
         return None
 
 

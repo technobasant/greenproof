@@ -309,6 +309,13 @@ JS_QUIET = {
         "jest.mock('./api');\n\n"
         "test('adds', () => {\n  fetchRate.mockReturnValue(1);\n  expect(add(1, 2)).toBe(3);\n});\n"
     ),
+    "the mock of a collaborator is asserted as a mock": (
+        "import { sendMail } from './mailer';\nimport { signUp } from './signup';\n\n"
+        "jest.mock('./mailer');\n\n"
+        "test('mails', () => {\n  signUp('a@b.c');\n"
+        "  expect(sendMail).toHaveBeenCalled();\n"
+        "  expect(sendMail.mock.calls.length).toBe(1);\n});\n"
+    ),
     "a spy that is not given a return value": (
         "import * as math from './math';\n\n"
         "test('adds', () => {\n"
@@ -333,6 +340,14 @@ JS_QUIET = {
 @pytest.mark.parametrize("case", JS_QUIET)
 def test_legitimate_js_mocking_does_not_fire(tmp_path: Path, case: str) -> None:
     assert js_fired(tmp_path, JS_QUIET[case]) == [], case
+
+
+def test_js_needs_the_imported_name_called_not_just_named(tmp_path: Path) -> None:
+    base = (
+        "import { add } from './math';\n\ntest('adds', () => {\n  expect(add(1, 2)).toBe(3);\n});\n"
+    )
+    named = base.replace("expect(add(1, 2)).toBe(3)", "expect(add).toHaveBeenCalled()")
+    assert js_fired(tmp_path, "jest.mock('./math');\n" + named, base=named) == []
 
 
 def test_a_js_mock_already_at_base_does_not_fire(tmp_path: Path) -> None:
