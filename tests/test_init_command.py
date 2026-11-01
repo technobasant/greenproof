@@ -598,3 +598,20 @@ def test_opencode_auto_detection(tmp_path: Path, run) -> None:
     bare = fixture_repo(tmp_path, UV_PROJECT, name="bare")
     run(bare.path, "init", "--no-verify")
     assert not (bare.path / ".opencode").exists()
+
+
+def test_opencode_render_rejects_an_empty_command_and_a_damaged_template(monkeypatch) -> None:
+    from greenproof.errors import UsageError
+    from greenproof.init.hooks import opencode
+
+    with pytest.raises(UsageError, match="expected a command"):
+        opencode.render(None, "   ", 60)
+    text = opencode.template()
+    monkeypatch.setattr(
+        opencode, "template", lambda: text.replace("const COMMAND = ", "const C = ")
+    )
+    with pytest.raises(RuntimeError, match="COMMAND or owner line"):
+        opencode.render(None, "greenproof", 60)
+    monkeypatch.setattr(opencode, "template", lambda: "// something else\n" + text)
+    with pytest.raises(RuntimeError, match="COMMAND or owner line"):
+        opencode.render(None, "greenproof", 60)
