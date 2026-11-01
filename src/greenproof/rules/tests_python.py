@@ -1009,6 +1009,7 @@ def _unit(
         classes=classes,
         testcase=testcase,
         disabled=disabled,
+        node=fn,
     )
 
 
@@ -1172,7 +1173,7 @@ def analyse_python(path: str, text: str) -> FileAnalysis | None:
                     "test"
                 ):
                     helpers.setdefault(n.name, n)
-    analysis = FileAnalysis(path, "python")
+    analysis = FileAnalysis(path, "python", tree=tree)
     _collect_units(
         path, tree.body, "", helpers, analysis.units, disabled=_test_disabled(tree.body) is not None
     )

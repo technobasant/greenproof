@@ -11,7 +11,7 @@ PYTEST_TOML = "[tool.pytest.ini_options]\ntestpaths = ['tests']\n"
 MODES = (
     '\n[modes.hook]\nchecks = ["static", "commands"]\n'
     '\n[modes.local]\nchecks = ["static", "commands"]\n'
-    '\n[modes.ci]\nchecks = ["static", "commands"]\n'
+    '\n[modes.ci]\nchecks = ["static", "commands", "revert"]\n'
 )
 
 

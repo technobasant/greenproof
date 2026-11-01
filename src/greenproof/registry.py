@@ -119,6 +119,15 @@ _RULES = [
         "structural ones, so fix the file.",
     ),
     RuleInfo(
+        "tests.self_mocked",
+        WARN,
+        "An added or changed test patches (monkeypatch.setattr, mock.patch, patch.object, "
+        "jest.mock, vi.mock, a mocked spyOn) the same callable its assertions call, so the "
+        "assertion checks the mock instead of the code. Patching a collaborator is fine; "
+        "patching the subject of the test is not. A patch that was already in the same test "
+        "at the base does not fire.",
+    ),
+    RuleInfo(
         "code.hardcoded",
         WARN,
         "Non-test code gained a literal lookup table or an equality branch on a literal that "

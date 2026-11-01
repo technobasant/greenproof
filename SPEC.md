@@ -188,8 +188,8 @@ covering at least one true positive and one legitimate change that must NOT fire
 | `runner.tampered` | block | a change narrows or neuters how checks run: test selection, thresholds, strictness, test scripts (see 5.6) |
 | `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `|| true`, `if: false`, path filters excluding tests, or changes the greenproof step itself. A ref-only version bump of the greenproof action (same inputs) is `warn` |
 | `static.parse_error` | warn | a changed file in a parsed language (Python, TOML, JSON, INI) does not parse; that file falls back to the line-level checks |
-| `tests.self_mocked` | warn | (M3) a test patches (`monkeypatch.setattr`, `mock.patch`, `jest.mock`, `vi.mock`) the same callable its assertions call, so it tests the mock |
-| `code.hardcoded` | warn | non-test code gains a literal table (≥ 8 entries) or an `if x == <literal>` branch whose literal also appears in a test file or fixture changed in this diff (Python AST only in v0.1) |
+| `tests.self_mocked` | warn | an added or changed test patches (`monkeypatch.setattr`, `mock.patch`, `jest.mock`, `vi.mock`) the same callable its assertions call, so it tests the mock (5.8) |
+| `code.hardcoded` | warn | non-test code gains a literal table (≥ 8 entries) or an `if x == <literal>` branch whose literal also appears in added lines of a test file changed in this diff (5.8; Python AST only in v0.1) |
 
 ### 5.3 Skip/ignore markers
 
@@ -386,6 +386,50 @@ a test whose inputs are constants, or with `test_total_in_range` checking
 replacing `assert refund(100) == 99` with a parametrized `assert refund(x) == x - 1`. A
 rename that rewrites the test into a parametrized superset with literal expected values
 warns, even when the old test's literal no longer appears.
+
+### 5.8 `tests.self_mocked` and `code.hardcoded`
+
+**`tests.self_mocked`** (warn). It fires only for tests that are added or changed, when the
+patch is not in that test at the base. A test patches a callable and one of its assertions
+calls that callable, so the assertion checks the mock.
+
+- Python (AST). Patch targets in the test body, its decorators and its `with` items:
+  `monkeypatch.setattr(obj, "name", ...)` and `monkeypatch.setattr("pkg.mod.name", ...)`;
+  `mock.patch("pkg.mod.name", ...)`, `patch(...)` and `mocker.patch(...)` used as a call, a
+  decorator or a context manager; `patch.object(obj, "name", ...)` and
+  `mocker.patch.object(obj, "name", ...)`. Each target is a qualifier (the dotted `obj`
+  expression, or the string minus its last component) plus a name.
+- It fires when an assertion contains a call whose dotted name is the qualifier plus the
+  name (`mathx.total(...)`), or is the bare name when the test file imports it with
+  `from <qualifier-module> import <name>` (also when the qualifier is that module's alias).
+  It still fires when the patch does not reach the from-imported name; an agent that
+  patches the subject of its own test intended to.
+- JS/TS (line level). An added `jest.mock(P)` or `vi.mock(P)`, or an added
+  `jest.spyOn(X, 'n')` / `vi.spyOn(X, 'n')` followed by `.mockReturnValue`,
+  `.mockResolvedValue` or `.mockImplementation`, where the same file imports from `P` (or
+  `n` from `X`) and an imported name is **called** inside an `expect(` argument
+  (`expect(total([1, 2]))`, `expect(X.n(...))`). `expect(sendMail).toHaveBeenCalled()`
+  asserts on the mock of a collaborator, which is what mocks are for, and does not fire.
+- Message: "test <name> patches <target> and asserts on <call>; it tests the mock".
+
+**`code.hardcoded`** (warn, Python AST only). It only looks at literals that also appear in
+**added lines of test files changed in this diff**, after this filter: strings of three or
+more characters, and numbers other than 0, 1 and -1 (other literals never count). In
+non-test Python files changed in the diff, it fires when the candidate gains, compared with
+the same function or module at the base:
+
+1. a literal dict, list, tuple or set display with eight or more constant entries, at
+   least one of which is a counted test literal; or
+2. a branch that compares a name, attribute or subscript with a counted test literal
+   (`x == L`, `L == x`, `x in (L, ...)`, `case L:`) and whose body returns or assigns a
+   literal that is also a counted test literal: both the input and the answer come from
+   the tests (`if x == 250: return 240` with a test asserting `refund(250) == 240`). A new
+   branch whose value the tests do not mention (`if mode == "fast": t = 5` tested only
+   by `timeout_for("fast") < timeout_for("slow")`) does not fire.
+
+Message: "<path>: <function> gained <a table | a branch on L> whose value also appears in
+<test file>; it may special-case the test input". New modules count as gaining everything
+in them.
 
 ## 6. Agent and CI adapters
 
@@ -632,8 +676,11 @@ through that an agent cannot forge.
    "the suite is red before greenproof; fix it or remove it before relying on the gate".
 4. **Write `.greenproof.toml`**: `version = 1`; the commands, each with a comment saying
    where it came from; `timeout = 900`; `[modes.hook]` and `[modes.local]` checks
-   `["static", "commands"]`, `[modes.ci]` checks `["static", "commands"]`. An existing
-   policy is kept (and used for the rest of init) unless `--yes`.
+   `["static", "commands"]`, `[modes.ci]` checks `["static", "commands", "revert"]`. init
+   never writes a `[smoke]` table, because it cannot know how to start the application;
+   the user adds `[smoke]` and `"smoke"` in `[modes.ci]` by hand (8.2). An existing
+   policy is kept (and used for the rest of init) unless `--yes`, which rewrites the whole
+   file: hand-written tables such as `[rules]` and `[smoke]` are not carried over.
 5. **AGENTS.md**: a section between `<!-- greenproof:begin -->` and `<!-- greenproof:end -->`
    with the heading `## Verify`, the commands, "Before you say a task is done, run
    `greenproof check`.", the fix-the-code rule and "Never run `greenproof accept`". Create
@@ -682,6 +729,47 @@ commits.
 - **smoke** (`smoke.failed`, block): start `smoke.start` in its own process group, poll
   `ready_url` (stdlib `urllib`) until 2xx/3xx or timeout, run each probe, then terminate
   the group (SIGTERM, then SIGKILL after 5 s). Any failure → exit 3 with the probe output.
+
+### 8.1 Revert check details
+
+- It runs when the change adds or modifies test files and also modifies non-test code
+  (files with a `CODE_SUFFIXES` suffix outside the test globs). Otherwise it reports
+  `skipped` with a note.
+- The tree it checks is the base tree with every added or modified test file overlaid at
+  its candidate version. Build it in a temporary index (`read-tree <base>`, then
+  `update-index --add --cacheinfo` per file, then `write-tree`). Check it out with
+  `worktree_for_tree`, which is always removed. Run `setup`, then only the selected tests:
+  - **pytest**, when `commands.test` contains `pytest`: append the node ids of the tests
+    that were added or whose body changed (`path::Class::name`, parametrized ids dropped).
+  - **jest or vitest**, when `commands.test` contains `jest` or `vitest`, or is
+    `<pm> test` / `<pm> run test` and that script in `package.json` contains them: append
+    the changed test file paths, after `--` for package-manager scripts.
+  - **go**, when `commands.test` contains `go test`: `go test <package dirs of the changed
+    test files> -run '^(TestA|TestB)$'`.
+  - Any other runner, a test command that is a make or just target, or nothing to select:
+    `skipped` with a note, never a failure.
+- Verdict, from the runner's exit code: 0 (every selected test passes without the source
+  change) → `revert.passes_without_change` (default warn; a policy may set block): "the
+  added or changed tests pass on the base code; they may not exercise the change". Exit 1
+  (some fail without the change) → pass. Anything else (pytest 2–5 such as "no tests
+  collected", a timeout, a setup failure) → `skipped` with a note, because it says nothing
+  about the tests. A pytest collection error gets the note "the changed tests do not
+  collect on the base code; they likely import what the change adds".
+- It obeys the policy timeout and kills the process group.
+
+### 8.2 Smoke and isolate details
+
+- smoke runs when `[smoke]` has `start`, `ready_url` and at least one probe; otherwise it
+  is `skipped` with a note. It runs in place, or in the isolated worktree with `--isolate`.
+  Poll every 0.5 s with a 2-second timeout per request; the overall `smoke.timeout`
+  (default 60) covers start-up and the probes. A start process that exits before ready →
+  `smoke.failed` with its output tail. The group is always terminated (SIGTERM, then
+  SIGKILL after 5 s), also on SIGINT/SIGTERM.
+- `--isolate`: `commands` (after `setup`) and smoke run in a worktree of the candidate
+  tree; static analysis is unchanged. `--isolate` is a verdict-changing flag in the cache
+  key.
+- `IMPLEMENTED_CHECKS` becomes all four. `init` writes `[modes.ci] checks = ["static",
+  "commands", "revert"]`, plus `"smoke"` when the policy has a `[smoke]` table.
 
 ## 9. Reports
 
@@ -762,7 +850,16 @@ bench/              testwashing benchmark (milestone 4)
     YAML in tests (PyYAML as a dev dependency only) and pass `actionlint` and `zizmor` when
     they are installed.
 - **M3 — execution depth.** revert check, smoke runner, `code.hardcoded`, `tests.self_mocked`,
-  `--isolate`.
+  `--isolate` (5.8, 8.1, 8.2). Done when: each form in 5.8 has a firing and a non-firing
+  test, and probe P12 (a test that monkeypatches the function it asserts on) warns
+  `tests.self_mocked`; the revert check on fixture repos covers passes-without-change
+  (warn, and exit 1 when the policy sets block), fails-without-change (pass), no source
+  change, an unsupported runner, nothing collected and a timeout (each `skipped` with its
+  note), with pytest run for real and the jest, vitest and go command lines unit-tested
+  (run for real only when the tool is installed); smoke covers ready plus passing probes,
+  a failing probe (exit 3), a start process that exits early, a ready timeout, and leaves
+  no process behind; `--isolate` runs `setup` and the commands in a worktree that is
+  removed afterwards, also after a timeout and on SIGINT; the M1 and M2 gates stay green.
 - **M4 — benchmark and release prep.** `bench/`: ≥ 30 cases (tamper patterns from the
   typia port, the Skylos testwashing set and ImpossibleBench-style edits, plus ≥ 10 clean
   controls: refactors, legitimate spec changes, added tests; seeded with the 20 review

@@ -2,7 +2,7 @@
 
 Each case builds a small repository, commits a base, edits the working tree and runs the CLI the
 way an agent's gate would (`check --checks static`). P12 (a test that patches the code under
-test) is not covered: it belongs to `tests.self_mocked` in M3.
+test) is a warning from `tests.self_mocked`, so it does not change the exit code.
 """
 
 from __future__ import annotations
@@ -126,6 +126,18 @@ def p11(r: Repo) -> None:
     r.write("tests/conftest.py", HOOK)
 
 
+def p12(r: Repo) -> None:
+    sub(
+        r,
+        MATH_FILE,
+        "def test_total():\n    assert total([1, 2]) == 3",
+        "def test_total(monkeypatch):\n"
+        '    monkeypatch.setattr(mathx, "total", lambda xs: 3)\n'
+        "    assert total([1, 2]) == 3",
+    )
+    sub(r, MATH_FILE, "import pytest\n", "import mathx\nimport pytest\n")
+
+
 def c1(r: Repo) -> None:
     (r.path / MATH_FILE).write_text(
         MATH + "\n\ndef test_total_empty():\n    assert total([]) == 0\n"
@@ -214,6 +226,14 @@ def test_p2_unreachable_assertion_is_weakened(probe_repo: Repo, run, tmp_path: P
     assert ("tests.weakened", "block") in found
 
 
+def test_p12_patching_the_code_under_test_warns(probe_repo: Repo, run, tmp_path: Path) -> None:
+    p12(probe_repo)
+    code, found = check(probe_repo, run, tmp_path / "out.json")
+    assert code == 0, found
+    assert ("tests.self_mocked", "warn") in found
+    assert not any(sev == "block" for _, sev in found), found
+
+
 CLEAN: list[tuple[str, Callable[[Repo], None]]] = [
     ("C1", c1),
     ("C2", c2),
@@ -232,6 +252,7 @@ def test_clean_change_passes(name, mutate, probe_repo: Repo, run, tmp_path: Path
     code, found = check(probe_repo, run, tmp_path / "out.json")
     assert code == 0, (name, found)
     assert not any(sev == "block" for _, sev in found), (name, found)
+    assert not {"tests.self_mocked", "code.hardcoded"} & {rule for rule, _ in found}, (name, found)
 
 
 # ---- covered removals use exact forms of the assertions the change adds (SPEC 5.7) ---------

@@ -5,16 +5,17 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from greenproof import __version__, accept, github, gitops
+from greenproof import __version__, accept, github, gitops, revert, smoke
 from greenproof.accept import Acceptance
 from greenproof.cache import PassCache, cache_key
 from greenproof.changeset import ChangeSet, build_changeset
 from greenproof.errors import UsageError
-from greenproof.findings import OFF, Finding
+from greenproof.findings import BLOCK, OFF, Finding
 from greenproof.policy import (
     CHECK_IDS,
     POLICY_FILE,
@@ -25,11 +26,11 @@ from greenproof.policy import (
 )
 from greenproof.report import CheckStatus, Report
 from greenproof.rules import run_static_rules
+from greenproof.rules._common import finding
 from greenproof.runner import HOOK_TAIL_LINES, TAIL_LINES, CommandResult, run_command
 
 MODES = ("local", "hook", "ci")
-# Checks this build can run. revert and smoke arrive in a later milestone.
-IMPLEMENTED_CHECKS = ("static", "commands")
+IMPLEMENTED_CHECKS = ("static", "commands", "revert", "smoke")
 
 
 @dataclass(frozen=True)
@@ -127,8 +128,6 @@ def _load_acceptances(opts: CheckOptions, repo: Path, report: Report) -> dict[st
 def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
     if opts.mode not in MODES:
         raise UsageError(f"--mode: unknown mode {opts.mode!r} (allowed: {', '.join(MODES)})")
-    if opts.isolate:
-        raise UsageError("--isolate is not implemented yet")
 
     candidate = candidate if candidate is not None else locate(opts)
     repo, tree, base = candidate.repo, candidate.tree, candidate.base
@@ -151,6 +150,8 @@ def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
 
     available = _load_acceptances(opts, repo, report)
     flags = ["allow-policy-change"] if opts.allow_policy_change else []
+    if opts.isolate:
+        flags.append("isolate")  # verdict-changing: commands and smoke run in a fresh worktree
     if opts.mode != "ci":
         # A cached pass may have leaned on an acceptance; revoking it must miss the cache.
         flags.extend(f"accepted:{fp}" for fp in available)
@@ -167,32 +168,62 @@ def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
 
     tail_lines = HOOK_TAIL_LINES if opts.mode == "hook" else TAIL_LINES
     skip_rest = False
-    for check in checks:
-        started = time.monotonic()
-        if check not in IMPLEMENTED_CHECKS or skip_rest:
-            report.checks.append(CheckStatus(check, "skipped"))
-            continue
-        if check == "static":
-            changes = build_changeset(repo, base.sha, tree, policy.test_paths)
-            found = apply_severities(_static_findings(loaded, opts, changes), policy.rules)
-            report.findings.extend(found)
-            report.accepted = {
-                f.fingerprint: available[f.fingerprint] for f in found if f.fingerprint in available
-            }
-            failed = any(f.severity == "block" and f.fingerprint not in available for f in found)
-            # In hook mode a blocking static finding skips the rest to keep the loop fast.
-            skip_rest = failed and opts.mode == "hook"
-        else:
-            results = _run_commands(policy, repo, tail_lines, opts.mode)
-            report.commands.extend(results)
-            failed = any(r.failed for r in results)
-        elapsed = int((time.monotonic() - started) * 1000)
-        report.checks.append(CheckStatus(check, "fail" if failed else "pass", elapsed))
+    changes: ChangeSet | None = None
+    with ExitStack() as stack:
+        work = _Workdir(repo, tree, opts.isolate, opts.mode == "ci" or opts.isolate, stack)
+        for check in checks:
+            started = time.monotonic()
+            if check not in IMPLEMENTED_CHECKS:
+                report.checks.append(CheckStatus(check, "skipped"))
+                report.notes.append(f"{check}: skipped, not implemented in this version")
+                continue
+            if skip_rest:
+                report.checks.append(CheckStatus(check, "skipped"))
+                report.notes.append(f"{check}: skipped, a blocking static finding stopped this run")
+                continue
+            skipped_note: str | None = None
+            failed = False
+            if check == "static":
+                changes = changes or build_changeset(repo, base.sha, tree, policy.test_paths)
+                found = apply_severities(_static_findings(loaded, opts, changes), policy.rules)
+                failed = _record(report, found, available)
+                # In hook mode a blocking static finding skips the rest to keep the loop fast.
+                skip_rest = failed and opts.mode == "hook"
+            elif check == "commands":
+                results = _run_commands(policy, work, tail_lines)
+                report.commands.extend(results)
+                failed = any(r.failed for r in results)
+            elif check == "revert":
+                changes = changes or build_changeset(repo, base.sha, tree, policy.test_paths)
+                outcome = _run_revert(repo, base.sha, tree, changes, policy, tail_lines)
+                skipped_note = outcome.note if outcome.skipped else None
+                found = apply_severities([outcome.finding] if outcome.finding else [], policy.rules)
+                failed = _record(report, found, available)
+            else:
+                skipped_note, smoke_found, setup_results = _run_smoke(policy, work, tail_lines)
+                report.commands.extend(setup_results)
+                found = apply_severities(smoke_found, policy.rules)
+                failed = _record(report, found, available)
+            elapsed = int((time.monotonic() - started) * 1000)
+            if skipped_note is not None:
+                report.notes.append(f"{check}: skipped, {skipped_note}")
+                report.checks.append(CheckStatus(check, "skipped", elapsed))
+            else:
+                report.checks.append(CheckStatus(check, "fail" if failed else "pass", elapsed))
 
     report.finish()
     if report.exit_code == 0 and use_cache:
         cache.record_pass(key, [asdict(c) for c in report.checks])
     return report
+
+
+def _record(report: Report, found: list[Finding], available: Mapping[str, Acceptance]) -> bool:
+    """Add a check's findings and their acceptances; True when one blocks and is not accepted."""
+    report.findings.extend(found)
+    report.accepted.update(
+        {f.fingerprint: available[f.fingerprint] for f in found if f.fingerprint in available}
+    )
+    return any(f.severity == BLOCK and f.fingerprint not in available for f in found)
 
 
 def _replayable(stored: list[dict[str, Any]] | None) -> list[CheckStatus] | None:
@@ -213,15 +244,70 @@ def _replayable(stored: list[dict[str, Any]] | None) -> list[CheckStatus] | None
     return out
 
 
-def _run_commands(policy: Policy, repo: Path, tail_lines: int, mode: str) -> list[CommandResult]:
-    """`setup` first in ci mode only (a fresh checkout); when it fails nothing else runs."""
-    results: list[CommandResult] = []
-    setup = policy.commands.get("setup", "").strip()
-    if mode == "ci" and setup:
-        result = run_command("setup", setup, repo, policy.timeout, tail_lines)
-        results.append(result)
-        if result.failed:
-            return results
+class _Workdir:
+    """Where `commands` and `smoke` run: the repository, or with `--isolate` a worktree of the
+    candidate tree (created on first use, removed when the stack closes). `setup` runs once,
+    in ci mode and in isolated worktrees, never in local or hook mode (SPEC 8)."""
+
+    def __init__(
+        self, repo: Path, tree: str, isolate: bool, run_setup: bool, stack: ExitStack
+    ) -> None:
+        self._repo, self._tree, self._isolate = repo, tree, isolate
+        self._run_setup, self._stack = run_setup, stack
+        self._path: Path | None = None
+        self._setup: CommandResult | None = None
+
+    @property
+    def path(self) -> Path:
+        if not self._isolate:
+            return self._repo
+        if self._path is None:
+            self._path = self._stack.enter_context(gitops.worktree_for_tree(self._repo, self._tree))
+        return self._path
+
+    def setup(self, policy: Policy, tail_lines: int) -> tuple[list[CommandResult], bool]:
+        """The setup result when it runs now, and whether setup has failed."""
+        command = policy.commands.get("setup", "").strip()
+        if not self._run_setup or not command:
+            return [], False
+        if self._setup is not None:
+            return [], self._setup.failed
+        self._setup = run_command("setup", command, self.path, policy.timeout, tail_lines)
+        return [self._setup], self._setup.failed
+
+
+def _run_commands(policy: Policy, work: _Workdir, tail_lines: int) -> list[CommandResult]:
+    """`setup` first where it applies; when it fails nothing else runs."""
+    results, setup_failed = work.setup(policy, tail_lines)
+    if setup_failed:
+        return results
     for name, cmd in policy.runnable_commands():
-        results.append(run_command(name, cmd, repo, policy.timeout, tail_lines))
+        results.append(run_command(name, cmd, work.path, policy.timeout, tail_lines))
     return results
+
+
+def _run_revert(
+    repo: Path, base_sha: str, tree: str, changes: ChangeSet, policy: Policy, tail_lines: int
+) -> revert.RevertOutcome:
+    if policy.rules.get(revert.RULE) == OFF:
+        return revert.RevertOutcome(True, f"the rule {revert.RULE} is off in the policy")
+    return revert.run_revert(repo, base_sha, tree, changes, policy, tail_lines)
+
+
+def _run_smoke(
+    policy: Policy, work: _Workdir, tail_lines: int
+) -> tuple[str | None, list[Finding], list[CommandResult]]:
+    """(skip note, findings, setup results that ran for the smoke check)."""
+    reason = smoke.skip_reason(policy.smoke)
+    if reason is not None or policy.smoke is None:
+        return reason, [], []
+    setup_results, setup_failed = work.setup(policy, tail_lines)
+    if setup_failed:
+        return "setup failed", [], setup_results
+    result = smoke.run_smoke(policy.smoke, work.path, tail_lines)
+    if result.ok:
+        return None, [], setup_results
+    hint = "Start the artifact the way smoke.start does and request smoke.ready_url yourself."
+    if result.output_tail:
+        hint += "\nlast lines:\n" + result.output_tail
+    return None, [finding(smoke.RULE, None, None, result.message, hint)], setup_results
