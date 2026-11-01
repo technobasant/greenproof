@@ -271,6 +271,12 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   (`assert x < 5` → `assert x`) is also `tests.weakened` (block). When the new assertion
   is a different expression (`assert f(x) == 1` → `assert is_one(x)`) it is a `warn` for a
   strong check replaced by a different one, because that is often a legitimate refactor.
+- a check-count drop made only of **loose checks** (every base assertion missing from the
+  candidate is a loose check as defined above, or a negation), with every exact-check
+  subject of the base test still the subject of an exact check in the candidate, is
+  `tests.weakened` **warn** ("only loose checks dropped"), not block. Dropping
+  `assert isinstance(stream, Iterable)` while every `==` stays is a cleanup more often
+  than a tamper; dropping any exact check still blocks.
 
 JS/TS, Go, Rust (line level, per test file): count of assertion calls drops (`expect(`,
 `assert.`, `t.Error`/`t.Fatal`/`require.`/`assert.`, `assert!`/`assert_eq!`), or strong
@@ -285,6 +291,15 @@ matchers are removed while weak ones are added: JS/TS strong `toEqual`, `toBe(`,
 `.is_some())`, `.is_ok())`, `.is_empty())`, and `assert!(` lines containing `>`, `<`
 or `!=`. An `expect(<literal>)` (number, string, `true`/`false`/`null`/`undefined`) is
 vacuous and not counted, so `expect(add(1, 2)).toBe(3)` → `expect(3).toBe(3)` drops the count.
+
+Line-engine assertion vocabulary also includes: JS/TS `expectTypeOf(`, `assertType(` and
+an awaited testing-library query (`await findBy…(`, `await findAllBy…(`, and the same on
+`screen.`), which fails when the element never appears. Go **assertion helpers**: a
+function declared in a `_test.go` file of the same directory (package) that takes a
+`*testing.T`, `*testing.B`, `*testing.F` or `testing.TB` parameter and contains an
+assertion call, directly or by calling another assertion helper, is an assertion helper.
+Each call to one inside a test counts as one assertion, and its exact form (5.7) is the
+call line with whitespace removed. `t.Helper()` is not required.
 
 ### 5.5 Suppressions (`suppress.added`, warn by default; each pattern its own sub-id in the message)
 
@@ -317,12 +332,33 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `os._exit(` or `sys.exit(0)` added to a test or conftest file.
 When structural parsing fails, fall back to a file-level `warn` naming the file.
 
+A linter or type-checker configuration that does not exist at the base (a new
+`[tool.ruff]`/`[tool.ruff.lint]` or `[tool.mypy]` table, a new `ruff.toml`, `.ruff.toml`,
+`mypy.ini` or `.flake8`) is adoption or a migration: its ignores, per-file ignores and
+disabled error codes are `runner.tampered` **warn**, not block, because there was no
+stricter configuration to loosen. Ignores added to a table that existed at the base
+still block.
+
 ### 5.7 Test identity and covered removals
 
 Base tests are paired with candidate tests in passes, each pairing a test at most once:
-1. same path and qualified name; 2. same qualified name in another file; 3. same
-normalised body hash; 4. same *structural* hash (identifiers alpha-renamed; constants,
-operators and assertion shapes kept) when the match is one-to-one within the change set.
+1. same path and qualified name; 2. same path and same **leaf name** (the last segment of
+the qualified name: the test function, or the JS/TS test title) when that leaf name is
+unique among the still-unpaired tests of that file on both sides (a test moved between
+classes or describe blocks, or a describe title edited); 3. same qualified name in
+another file; 4. same normalised body hash; 5. same *structural* hash (identifiers
+alpha-renamed; constants, operators and assertion shapes kept) when the match is
+one-to-one within the change set.
+
+Line engines hash a test with its own name (the Go or Rust function name, the JS/TS
+title literal) replaced by a placeholder, so a pure rename pairs in pass 4. Their
+structural hash also replaces every identifier token that is not a language keyword or
+5.4 assertion vocabulary (`expect`, matcher names, `t.Errorf`, `assert.Equal`, ...) by a
+placeholder numbered by first occurrence, keeping string and number literals and
+operators. Go `Benchmark*` functions are not tests (`go test` runs them only with
+`-bench`) and are never units, so they are neither removed tests nor replacements. Line
+engines find test declarations on comment-masked lines: a test inside `/* */` does not
+exist.
 Only candidate tests the runner will **collect** can be paired: the file matches the
 runner's collection patterns (pytest `python_files`/`python_classes`/`python_functions`
 read from the base revision's pytest config, else `test_*.py`/`*_test.py`, `Test*`,
@@ -341,7 +377,7 @@ line with whitespace removed). Unreachable assertions (5.4) are not counted.
 Both limits matter. Generic assertions such as `assert got == want` or
 `assert len(rows) == 1` would, in structural form, match almost any other test. An
 assertion that already existed sat alongside the removed test before the change, so it
-replaces nothing. Renames that also rename identifiers are handled by pass 4, not by
+replaces nothing. Renames that also rename identifiers are handled by pass 5, not by
 coverage. This keeps renames, splits, merges (including into an existing test) and moves
 clean, while a deleted test, or one replaced by a weaker test, still fires. Paired tests
 are then compared by the 5.4 heuristics.
@@ -368,6 +404,14 @@ a rewrite, when all of these hold:
   the expected values (the requirement may have changed); it may not stop pinning them.
 
 Otherwise it is `block`.
+
+**Tests with no counted check** (all engines). A removed uncovered test whose effective
+check count at the base is zero (a type-only test checked by the compiler, a "does not
+throw" smoke test) in a file that gains new tests or has absorbing tests is
+`tests.replaced` **warn**: it had no counted check to lose. With no new or absorbing test
+in its file it stays `tests.removed` (block). A deleted test file that contained no test
+units (helpers, fixtures) is not `tests.deleted`; `runner.tampered` still covers conftest
+hooks.
 
 **Absorbing tests.** A paired test in the same file whose effective check count (5.4)
 grew is an absorbing test: removed tests were often folded into it (two tests merged into
