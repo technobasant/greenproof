@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from greenproof import cli
 from tests.helpers import Repo, make_repo
 
 
@@ -22,3 +23,19 @@ def isolated_git_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterato
 @pytest.fixture
 def repo(tmp_path: Path) -> Repo:
     return make_repo(tmp_path / "repo")
+
+
+class Result:
+    def __init__(self, code: int, out: str, err: str) -> None:
+        self.code, self.out, self.err = code, out, err
+
+
+@pytest.fixture
+def run(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    def _run(where: Path, *argv: str) -> Result:
+        monkeypatch.chdir(where)
+        code = cli.main(list(argv))
+        captured = capsys.readouterr()
+        return Result(code, captured.out, captured.err)
+
+    return _run
