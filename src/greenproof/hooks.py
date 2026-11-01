@@ -3,7 +3,8 @@
 Each agent's stop hook calls `greenproof check --hook AGENT`. The gate cannot force an agent
 to keep working, so blocking is bounded (6.2): an unchanged tree after a block, or the eighth
 consecutive block, releases the agent with a note for the user. All of it is advisory; CI is
-the authoritative gate.
+the authoritative gate. Where a plugin and `init`'s hooks both run for one stop, a lock and the
+recorded decision give one decision per stop (6.2).
 
 Vendor documents the output formats were verified against (fetched 2026-11-01):
 - Claude Code: https://code.claude.com/docs/en/hooks.md

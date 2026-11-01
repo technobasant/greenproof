@@ -1,6 +1,7 @@
 """Claude Code hook installer. Verified against https://code.claude.com/docs/en/hooks.md
-(fetched 2026-11-01). No SubagentStop: a subagent stopping midway would be blocked for the
-parent's unfinished work; the parent's Stop is the gate."""
+(fetched 2026-11-01); `fork` is a documented SessionStart source there ("a new session forked
+from an existing one"), so the matcher lists it. No SubagentStop: a subagent stopping midway
+would be blocked for the parent's unfinished work; the parent's Stop is the gate."""
 
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ def render(existing: str | None, hook_command: str, timeout: int) -> str:
         ]
     }
     start = {
-        "matcher": "startup|resume|clear|compact",
+        "matcher": "startup|resume|clear|compact|fork",
         "hooks": [{"type": "command", "command": f"{hook_command} session-start --hook claude"}],
     }
     set_grouped_event(table, "Stop", stop, PATH)
