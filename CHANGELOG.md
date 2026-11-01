@@ -51,6 +51,8 @@ First release. Nothing has been published yet.
   workflow. It never prompts and never commits. It writes `revert` into `[modes.ci]` and
   never writes a `[smoke]` table.
 - A composite GitHub Action (`action.yml`) and a pre-commit hook (`.pre-commit-hooks.yaml`).
+- A release workflow: a `v*` tag builds the package, checks that the tag matches its version
+  and publishes it to PyPI with trusted publishing, so no token is stored.
 - Dogfooding: this repository has its own `.greenproof.toml`, AGENTS.md section and Claude
   Code hooks, and a `greenproof` job in CI that runs `greenproof check --mode ci` on pull
   requests.
