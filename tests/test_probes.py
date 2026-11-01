@@ -970,3 +970,64 @@ def test_comparison_cut_to_truthiness_of_its_operand_blocks(tmp_path: Path, run)
     repo.write("tests/test_t.py", "def test_t():\n    x = f()\n    assert x\n")
     got, found = check(repo, run, tmp_path / "out.json")
     assert (got, found) == (1, BLOCK_WEAKENED)
+
+
+ABSORB_BASE = (
+    "from shop import refund\n\n\ndef test_refund():\n    assert refund(100) == 99\n\n\n"
+    "def test_refund_small():\n    assert refund(2) == 1\n"
+)
+ABSORB_HEAD = "import pytest\n\nfrom shop import refund\n\n\n"
+
+
+def _absorb(tmp_path: Path, run, name: str, new: str) -> tuple[int, set[tuple[str, str]]]:
+    repo = init_repo(tmp_path / name)
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write("src/shop.py", SHOP_SRC)
+    repo.write("tests/test_shop.py", ABSORB_BASE)
+    repo.commit("base")
+    repo.write("tests/test_shop.py", new)
+    return check(repo, run, tmp_path / "out.json")
+
+
+def test_tests_folded_into_a_parametrized_test_warn(tmp_path: Path, run) -> None:
+    new = (
+        ABSORB_HEAD + '@pytest.mark.parametrize("a,e", [(100, 99), (2, 1)])\n'
+        "def test_refund(a, e):\n    assert refund(a) == e\n"
+    )
+    assert _absorb(tmp_path, run, "a1", new) == (0, {("tests.replaced", "warn")})
+
+
+def test_tests_folded_into_one_case_still_block(tmp_path: Path, run) -> None:
+    new = (
+        ABSORB_HEAD + '@pytest.mark.parametrize("a,e", [(100, 99)])\n'
+        "def test_refund(a, e):\n    assert refund(a) == e\n"
+    )
+    assert _absorb(tmp_path, run, "a6", new) == (1, {("tests.removed", "block")})
+
+
+def test_tests_folded_with_expected_values_computed_by_code_block(tmp_path: Path, run) -> None:
+    new = (
+        ABSORB_HEAD + '@pytest.mark.parametrize("a,e", [(100, refund(100)), (2, refund(2))])\n'
+        "def test_refund(a, e):\n    assert refund(a) == e\n"
+    )
+    assert _absorb(tmp_path, run, "a2", new) == (1, {("tests.removed", "block")})
+
+
+def test_comparison_with_a_local_assigned_from_the_same_call_is_vacuous(
+    tmp_path: Path, run
+) -> None:
+    new = (
+        "from shop import refund\n\n\ndef test_refund():\n    expected = refund(100)\n"
+        "    assert refund(100) == expected\n\n\ndef test_refund_small():\n"
+        "    assert refund(2) == 1\n"
+    )
+    assert _absorb(tmp_path, run, "a4", new) == (1, BLOCK_WEAKENED)
+
+
+def test_two_locals_each_assigned_from_a_call_are_not_assumed_equal(tmp_path: Path, run) -> None:
+    new = (
+        "from shop import refund\n\n\ndef test_refund():\n    a = refund(100)\n"
+        "    b = refund(100)\n    assert a == b\n    assert a == 99\n\n\n"
+        "def test_refund_small():\n    assert refund(2) == 1\n"
+    )
+    assert _absorb(tmp_path, run, "a9", new) == (0, set())

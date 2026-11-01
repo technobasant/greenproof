@@ -7,7 +7,7 @@ import builtins
 import copy
 import posixpath
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from greenproof.rules._common import digest
 from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
@@ -126,29 +126,34 @@ def _has_call(node: ast.AST) -> bool:
     return any(isinstance(n, ast.Call) for n in ast.walk(node))
 
 
-def _always_false(node: ast.AST) -> bool:
+_Same = Callable[[ast.AST, ast.AST], bool]
+
+
+def _always_false(node: ast.AST, same: _Same | None = None) -> bool:
     if isinstance(node, ast.Constant):
         return not node.value
     return (
         isinstance(node, ast.UnaryOp)
         and isinstance(node.op, ast.Not)
-        and _always_true(node.operand)
+        and _always_true(node.operand, same)
     )
 
 
-def _always_true(node: ast.AST) -> bool:
-    """A condition that cannot fail: a truthy constant, `x or True`, `x == x`, a non-empty tuple."""
+def _always_true(node: ast.AST, same: _Same | None = None) -> bool:
+    """A condition that cannot fail: a truthy constant, `x or True`, `x == x`, a non-empty tuple.
+    `same` decides whether two sides are the same expression (default: `_same`)."""
+    same = same or _same
     if isinstance(node, ast.Constant):
         return bool(node.value) and node.value is not Ellipsis
     if isinstance(node, ast.Tuple):
         return bool(node.elts)
     if isinstance(node, ast.BoolOp):
-        parts = [_always_true(v) for v in node.values]
+        parts = [_always_true(v, same) for v in node.values]
         return any(parts) if isinstance(node.op, ast.Or) else all(parts)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-        return _always_false(node.operand)
+        return _always_false(node.operand, same)
     if isinstance(node, ast.Compare) and len(node.ops) == 1:
-        return isinstance(node.ops[0], (ast.Eq, ast.LtE, ast.GtE, ast.Is)) and _same(
+        return isinstance(node.ops[0], (ast.Eq, ast.LtE, ast.GtE, ast.Is)) and same(
             node.left, node.comparators[0]
         )
     return False
@@ -159,11 +164,11 @@ def _same(a: ast.AST, b: ast.AST) -> bool:
     return not _has_call(a) and ast.dump(a) == ast.dump(b)
 
 
-def _vacuous_call(tail: str, node: ast.Call) -> bool:
+def _vacuous_call(tail: str, node: ast.Call, same: _Same | None = None) -> bool:
     if tail == "assertTrue":
-        return bool(node.args) and _always_true(node.args[0])
+        return bool(node.args) and _always_true(node.args[0], same)
     if tail in _EQUAL_METHODS and len(node.args) >= 2:
-        return _same(node.args[0], node.args[1])
+        return (same or _same)(node.args[0], node.args[1])
     return False
 
 
@@ -206,6 +211,8 @@ class _Consts:
         self.names: set[str] = set()
         self.stores: set[str] = set()
         self.assigned: dict[str, ast.expr] = {}
+        self.assigned_line: dict[str, int] = {}
+        self.other_reads: dict[str, list[int]] = {}  # reads outside any assertion, by line
         if fn is not None:
             self._analyse(fn)
 
@@ -254,6 +261,22 @@ class _Consts:
                 if counts.get(name) == 1 and name not in bad:
                     candidates[name] = stmt
                     self.assigned[name] = stmt.value
+                    self.assigned_line[name] = stmt.lineno
+        in_assert: set[int] = set()
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assert) or (
+                isinstance(node, ast.Call)
+                and _ASSERT_METHOD.fullmatch(dotted(node.func).rsplit(".", 1)[-1])
+            ):
+                in_assert.update(id(n) for n in ast.walk(node))
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in self.assigned
+                and id(node) not in in_assert
+            ):
+                self.other_reads.setdefault(node.id, []).append(node.lineno)
         for node in ast.walk(fn):
             if (
                 isinstance(node, ast.Name)
@@ -272,15 +295,29 @@ class _Consts:
             ):
                 self.names.add(stmt.targets[0].id)
 
-    def inline(self, node: ast.AST, depth: int = 0) -> ast.AST:
+    def _usable(self, name: str, before: int | None) -> bool:
+        """With `before` set, only a local assigned earlier than that line and not read before it
+        outside an assertion (SPEC 5.4, vacuous comparisons)."""
+        if before is None:
+            return True
+        return self.assigned_line[name] < before and not any(
+            line < before for line in self.other_reads.get(name, ())
+        )
+
+    def inline(self, node: ast.AST, depth: int = 0, before: int | None = None) -> ast.AST:
         """A copy of `node` with single-assignment locals replaced by what they were assigned,
         so `got = parse("4"); assert got == 4` and `assert parse("4") == 4` share operands."""
         outer = self
 
         class _Inline(ast.NodeTransformer):
             def visit_Name(self, n: ast.Name) -> ast.AST:
-                if isinstance(n.ctx, ast.Load) and n.id in outer.assigned and depth < 3:
-                    return outer.inline(outer.assigned[n.id], depth + 1)
+                if (
+                    isinstance(n.ctx, ast.Load)
+                    and n.id in outer.assigned
+                    and depth < 3
+                    and outer._usable(n.id, before)
+                ):
+                    return outer.inline(outer.assigned[n.id], depth + 1, before)
                 return n
 
         result: ast.AST = _Inline().visit(copy.deepcopy(node))
@@ -526,6 +563,23 @@ class _Stats(ast.NodeVisitor):
         )  # targets of a bare truthiness (or `is not None`) check
         self.first_line = 0
 
+    def _same_at(self, line: int) -> _Same:
+        """`_same`, also after inlining the locals assigned once before `line`. An expression with
+        calls is the same only when one side is the other's call written out again (a local
+        assigned from `f(x)` against `f(x)`), not two locals each assigned from a call."""
+
+        def same(a: ast.AST, b: ast.AST) -> bool:
+            if _same(a, b):
+                return True
+            ia, ib = self.consts.inline(a, 0, line), self.consts.inline(b, 0, line)
+            if ast.dump(ia) != ast.dump(ib):
+                return False
+            if not (_has_call(ia)):
+                return True
+            return (ast.dump(ia) == ast.dump(a)) != (ast.dump(ib) == ast.dump(b))
+
+        return same
+
     def _opshape(self, node: ast.AST) -> str:
         return digest(ast.dump(_Locals(self.consts.stores).visit(self.consts.inline(node))))
 
@@ -608,7 +662,7 @@ class _Stats(ast.NodeVisitor):
 
     def visit_Assert(self, node: ast.Assert) -> None:
         test = node.test
-        if _always_true(test) or self.consts.is_const(
+        if _always_true(test, self._same_at(node.lineno)) or self.consts.is_const(
             test
         ):  # vacuous: it can never fail, so it checks nothing
             self.vacuous += 1
@@ -677,7 +731,7 @@ class _Stats(ast.NodeVisitor):
         if tail in {"raises", "warns"} or tail in _RAISES_METHODS:
             self._raises(node)
         elif re.fullmatch(r"assert[A-Z]\w*", tail):
-            if _vacuous_call(tail, node) or self._const_call(node):
+            if _vacuous_call(tail, node, self._same_at(node.lineno)) or self._const_call(node):
                 self.vacuous += 1
                 self.vacuous_line = self.vacuous_line or node.lineno
                 self.first_line = self.first_line or node.lineno

@@ -366,6 +366,18 @@ def _is_rewrite(removed: list[Unit], added: list[Unit]) -> bool:
     return _group_pinned(added, literal) >= _group_pinned(removed, literal)
 
 
+def _absorbing(pairing: _Pairing, path: str) -> list[tuple[Unit, Unit]]:
+    """Paired Python tests of `path` whose effective check count grew (SPEC 5.7): removed tests
+    were often folded into them."""
+    found = []
+    for b, c in pairing.pairs:
+        if c.path == path and b.engine == c.engine == "python":
+            before, after = _effective(b, c)
+            if after > before:
+                found.append((b, c))
+    return found
+
+
 def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]:
     out: list[Finding] = []
     lost = {id(u) for u in pairing.left_base}
@@ -397,18 +409,36 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
                 )
             continue
         added = added_by_path.get(path, [])
-        rewrite = bool(names and added) and _is_rewrite(names, added)
+        absorbing = _absorbing(pairing, path) if names else []
+        if absorbing:
+            rewrite = _is_rewrite(
+                [*names, *(b for b, _ in absorbing)], [*added, *(c for _, c in absorbing)]
+            )
+            folded = ", ".join(c.name for _, c in absorbing)
+        else:
+            rewrite = bool(names and added) and _is_rewrite(names, added)
+            folded = ""
         for i, removed in enumerate(names):
-            if i >= len(added) and not rewrite:
+            if rewrite and folded:
+                line = added[min(i, len(added) - 1)].line if added else absorbing[0][1].line
+                what = f"test {removed.name} was removed and folded into {folded}"
+            elif i < len(added):
+                line = added[i].line
+                what = f"test {removed.name} was removed and a different test {added[i].name} added"
+            elif rewrite:
+                line = added[-1].line
+                what = (
+                    f"test {removed.name} was removed and a different test {added[-1].name} added"
+                )
+            else:
                 break
-            new = added[min(i, len(added) - 1)]
             out.append(
                 sev_finding(
                     "tests.replaced",
                     WARN if rewrite else BLOCK,
                     path,
-                    new.line,
-                    f"test {removed.name} was removed and a different test {new.name} added"
+                    line,
+                    what
                     + (" (a rewrite: same subjects, at least as many checks)" if rewrite else ""),
                     "Keep the original test; add new tests alongside it, not in its place.",
                 )
