@@ -509,9 +509,10 @@ cannot be verified ships as `experimental`: `init` installs it only when it is n
 - Codex CLI: https://developers.openai.com/codex/hooks, schemas in
   `openai/codex` under `codex-rs/hooks/schema/generated`
 - Gemini CLI: https://geminicli.com/docs/hooks/reference/
-- OpenCode (M5): https://opencode.ai/docs/plugins/ and the `@opencode-ai/plugin` package
-  (V1, CLI `opencode-ai`); `@opencode/plugin` (V2, CLI `@opencode/cli`). OpenCode has no
-  command hooks: the plugin in 6.8 runs `check --hook opencode` and maps its output.
+- OpenCode 2.x (M5): the README of the `@opencode/plugin` package (CLI `@opencode/cli`)
+  and the `anomalyco/opencode` source. OpenCode 1.x (`opencode-ai`, documented at
+  https://opencode.ai/docs/plugins/) is not supported. OpenCode has no command hooks: the
+  plugin in 6.8 runs `check --hook opencode` and maps its output.
 
 ### 6.1 Hook protocol (`check --hook AGENT`)
 
@@ -694,7 +695,8 @@ written with two-space indent and a trailing newline.
   command baked in. The file is wholly greenproof's: its first line is
   `// greenproof plugin for OpenCode. Written by greenproof init; re-running init replaces it.`
   Re-running `init` rewrites it; an existing file without that first line → exit 4,
-  nothing written. OpenCode loads `.js` files from `.opencode/plugins/` in V1 and V2.
+  nothing written. OpenCode 2.x loads it from `.opencode/plugins/` without a config
+  entry (6.8).
 
 Every agent treats a hook that cannot start as a non-blocking error, so hooks fail open
 when the greenproof executable is missing. The README says so; CI is the backstop.
@@ -845,46 +847,92 @@ its output.
 - `const COMMAND = [...]` near the top is the argv prefix. `init` renders it from the hook
   command with `shlex.split`, as a JSON array; the npm copy has
   `["uvx", "greenproof@<version>"]`.
-- **Loaders**: V1 (`opencode-ai`, contract of `@opencode-ai/plugin`) and V2
-  (`@opencode/cli`, contract of `@opencode/plugin`), each verified by loading the plugin
-  in the real CLI at a pinned version (run through npx or bunx in a temporary directory,
-  never installed globally). If one file cannot satisfy both loaders, stop and report
-  with the evidence; that choice is the maintainer's.
-- **New top-level session** (V1 `session.created`; sessions with a `parentID` are
-  subagents and are skipped): run `COMMAND session-start --hook opencode` with stdin
-  `{"session_id", "cwd", "hook_event_name": "session.created", "source": "startup"}`.
-  Add its context to the session only through a documented, non-experimental API;
-  otherwise ignore stdout.
-- **Idle of a top-level session** (V1 `session.idle`; V2 its idle hook): run
-  `COMMAND check --hook opencode` with stdin `{"session_id", "cwd", "hook_event_name":
-  "session.idle", "message_id"}`, where `message_id` is the id of the session's last
-  assistant message. No timestamps or random values (the fingerprint in 6.1 must match
-  across duplicate plugins and differ across stops). Map stdout:
+- **OpenCode 2.x only**: `@opencode/cli`, plugin contract of `@opencode/plugin`
+  (documented in that package's README), source `anomalyco/opencode`, read at v2.2.5 on
+  2026-11-01. OpenCode 1.x (`opencode-ai`, the API on opencode.ai/docs/plugins) is not
+  supported: its loader rejects the module ("must default export an object with
+  server()"), logs that and runs without the plugin; the README says so. Items marked
+  *verify* were read in the source, not run; confirm each in the real CLI and stop and
+  report when one does not hold. Every check uses a pinned CLI: the newest 2.x the local
+  npm age policy allows (2.2.1 on 2026-11-01), run through npx in a temporary directory,
+  never installed globally.
+- **Export**: exactly one, `export default { id: "greenproof", setup }`, and no other
+  export. The loader (`packages/core/src/plugin/module.ts`) decodes a default `{id,
+  setup}`; `setup(ctx)` registers what follows.
+- **Discovery and config**: the CLI loads plugin files from `.opencode/plugins/`
+  (`core/src/plugin/source-directory.ts`; *verify* the directories and extensions), so
+  `init`'s `.opencode/plugins/greenproof.js` needs no config entry. The npm package goes
+  under `plugins` in `opencode.json` (a string or `{package, options}`).
+- **Two copies in one process** (the npm package and `init`'s file, or a user-level and a
+  project-level copy): each copy acts on its own, so two blocks would continue the run
+  twice. Before running anything for an event, a copy claims the key `<event>:<session
+  id>:<message id or "">` in a `Set` kept on `globalThis[Symbol.for("greenproof.opencode")]`
+  and does nothing when the key is already claimed. The lock and replays of 6.2 still
+  cover copies in different processes.
+- **Top-level sessions only.** A session whose `ctx.session.get({sessionID})` has a
+  `parentID` is a subagent and is skipped; the idle event carries no parent.
+- **New top-level session**: the session-created event of `ctx.event` (*verify* that the
+  contract has one, and its payload). Run `COMMAND session-start --hook opencode` with
+  stdin `{"session_id", "cwd", "hook_event_name": "session.created", "source":
+  "startup"}` and ignore stdout; the AGENTS.md section from `init` tells the agent about
+  the gate. Without such an event there is no session start, the base falls back to the
+  default branch, and the README says so.
+- **Idle of a top-level session**: `ctx.session.hook("experimental.idle", fn)`, event
+  `{sessionID, ...}`. The runner awaits it after the model's work and before the session
+  goes idle, and continues the same run when the hook leaves input
+  (`core/src/session/runner/llm.ts`); it does not fire after an interrupt or a failure.
+  The name marks it experimental: when `ctx.session.hook` is missing or registering
+  throws, log once and do nothing (fail open). Run `COMMAND check --hook opencode` with
+  stdin `{"session_id", "cwd", "hook_event_name": "session.idle", "message_id"}`. `cwd`
+  is the directory the plugin was loaded for (from `ctx.location`, *verify*);
+  `message_id` is the id of the session's last assistant message, from
+  `ctx.session.context({sessionID})` (*verify* the field names). No timestamps or random
+  values: the fingerprint of 6.1 must match across copies and differ across stops. When
+  the message id cannot be read, do not run the check (a payload without it would replay
+  an earlier stop's decision) and log why. Map stdout:
   - empty → nothing;
-  - `{"decision": "block", "reason"}` → send `reason` to that session as a new user
-    prompt (V1 `client.session.promptAsync`), only if the session is still idle and has
-    no newer user message;
-  - `{"continue": false, "stopReason"}` → a warning toast with the note
-    (V1 `client.tui.showToast`) and an app log entry;
-  - a spawn error, a non-zero exit, invalid JSON or a timeout → one warning toast
-    "greenproof could not run: ..." and nothing else (fail open).
+  - `{"decision": "block", "reason"}` → `ctx.session.synthetic({sessionID, text:
+    reason})` inside the hook, which continues the same run (the documented path; the
+    built-in goal plugin uses it);
+  - `{"continue": false, "stopReason"}` → `console.warn` the note (2.x gives plugins no
+    toast or log API); also record it in the session with `ctx.session.synthetic({...,
+    resume: false})` only if a real run shows that this adds a visible note without
+    starting a turn;
+  - a spawn error, a non-zero exit, invalid JSON or a timeout → fail open:
+    `console.warn("greenproof could not run: ...")` and nothing else.
 - At most one check per session at a time; an idle event during a running check for the
-  same session is ignored. The child runs without a shell, in the project directory,
-  stdin the JSON, killed after 3600 seconds.
-- Each injected prompt makes a new turn and a new idle event; 6.2 bounds the loop.
+  same session is ignored. The child runs with `node:child_process` `spawn` (*verify* it
+  works in the plugin runtime), without a shell, in the project directory, stdin the
+  JSON, killed after 3600 seconds.
+- Each block continues the run and fires the idle hook again; 6.2 bounds the loop.
 - **npm package** `integrations/opencode/`: `package.json` (`name` `opencode-greenproof`,
-  `version` equal to `__version__`, `type: module`, `main` and `exports` `./index.js`,
-  `files` index.js, README.md, LICENSE; keywords `opencode`, `opencode-plugin`,
-  `greenproof`; license Apache-2.0; repository with `directory`), README (what runs, the
-  uv requirement, the `opencode.json` entry for V1 and V2), LICENSE copy. `npm pack
-  --dry-run` lists only those files. Publishing is the maintainer's step.
-- **Tests**: `node --test` with a fake client and a fake greenproof executable (pass,
-  block, release, error, timeout, child session, concurrent idle, non-idle session at
-  inject time), run in CI. An end-to-end script runs the real V1 CLI (and V2 when
-  supported) against a local fake OpenAI-compatible model server (Python stdlib), so no
-  API key is needed, and shows: a tampered tree is blocked and the model receives the
-  greenproof message as a new user turn; the next idle with the same tree is released
-  without another prompt; an honest change gets no prompt.
+  `version` equal to `__version__`, `type: module`, `main` `./index.js`, `exports`
+  `{".": "./index.js", "./server": "./index.js"}` because the CLI resolves
+  `exports["./server"]` first (`plugin/src/host.ts`), `files` index.js, README.md,
+  LICENSE; keywords `opencode`, `opencode-plugin`, `greenproof`; license Apache-2.0;
+  repository with `directory`), README (what runs, the uv requirement, OpenCode 2.x only,
+  the `plugins` entry), LICENSE copy. `npm pack --dry-run` lists only those files.
+  Publishing is the maintainer's step.
+- **Tests**: `node --test` with a fake 2.x context and a fake greenproof executable
+  (pass, block, release, error, timeout, child session, concurrent idle, two copies in one
+  process, a missing message id, a context without `session.hook`), run in CI.
+- **End-to-end** `scripts/e2e/opencode.py` (Python stdlib): a fake OpenAI-compatible
+  model server (`POST /v1/chat/completions`, streamed SSE ending in `data: [DONE]` and
+  plain JSON; it also answers title requests sent to `small_model`, and logs the last
+  user message of every request) and the pinned CLI in a temporary git repository, with
+  `HOME` and the `XDG_*` directories pointed at a temporary directory. Drive a headless
+  session with what 2.x offers (`opencode run`, or `opencode serve` and its HTTP API);
+  *verify* that the driver waits for a run the idle hook continued. The harness edits the
+  files itself; the fake model makes no tool calls. Provider config (*verify* against the
+  2.x config schema): `"provider": {"fake": {"npm": "@ai-sdk/openai-compatible",
+  "options": {"baseURL": "http://127.0.0.1:PORT/v1", "apiKey": "x"}, "models":
+  {"fake-model": {"tool_call": false, ...}}}}`, `"model"` and `"small_model"`
+  `"fake/fake-model"`. It shows: a tampered tree is blocked and the fake model receives
+  the greenproof message as the next input; the next idle with the same tree is released
+  without another continuation; an honest change is not continued; with the npm copy and
+  `init`'s file both loaded, one stop continues once. It needs the network for npx (and
+  maybe for the provider package), so it is not part of pytest; it runs on the
+  maintainer's machine and in a CI job with pinned versions.
 
 ## 7. `init`
 
@@ -1270,15 +1318,15 @@ Three workstreams, each on its own branch off `m5-spec`, merged by the maintaine
   validator, and the Codex checks; record the commands and their output in the final
   report. Add them to CI only if they run there without credentials, with pinned
   versions.
-- **M5c, OpenCode** (`m5c-opencode`, after M5a is merged): everything in 6.8, `init
-  --agents opencode` (6.4, section 7), the `node --test` job in CI with setup-node pinned
-  to a full SHA, the end-to-end script under `scripts/e2e/`, README "OpenCode",
-  CHANGELOG, and the OpenCode entries in `scripts/bump_version.py`.
+- **M5c, OpenCode 2.x** (`m5c-opencode`, off `main` after M5a and M5b are merged):
+  everything in 6.8, `init --agents opencode` (6.4, section 7), the `node --test` job in
+  CI with setup-node pinned to a full SHA, the end-to-end script under `scripts/e2e/`,
+  README "OpenCode", CHANGELOG, and the OpenCode entries in `scripts/bump_version.py`.
 
 Out of scope for M5: a Gemini or Antigravity extension; publishing anything.
 
 Acceptance for the milestone: AGENTS.md's five checks pass; the plugin validators pass;
-the OpenCode end-to-end script passes against the real V1 CLI; a Claude Code end-to-end run
+the OpenCode end-to-end script passes against the pinned `@opencode/cli` 2.x; a Claude Code end-to-end run
 with the plugin loaded through `--plugin-dir` blocks a requested test skip and releases
 the next stop; with the plugin and `init` hooks both installed, one stop gives one
 decision. Then the maintainer bumps to 0.2.0 with `scripts/bump_version.py`, tags, and
