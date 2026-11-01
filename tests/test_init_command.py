@@ -161,7 +161,7 @@ def test_claude_hooks_use_greenproof_on_path_and_the_exact_shape(
             ],
             "SessionStart": [
                 {
-                    "matcher": "startup|resume|clear|compact",
+                    "matcher": "startup|resume|clear|compact|fork",
                     "hooks": [
                         {"type": "command", "command": "greenproof session-start --hook claude"}
                     ],
@@ -237,7 +237,7 @@ def test_cursor_codex_and_gemini_files(tmp_path: Path, run, controlled_path) -> 
             ]
         }
     ]
-    assert codex["hooks"]["SessionStart"][0]["matcher"] == "startup|resume|clear|compact"
+    assert codex["hooks"]["SessionStart"][0]["matcher"] == "startup|resume|clear|compact|fork"
     gemini = json.loads((repo.path / ".gemini/settings.json").read_text())
     assert gemini["hooks"]["AfterAgent"] == [
         {
