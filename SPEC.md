@@ -860,16 +860,14 @@ bench/              testwashing benchmark (milestone 4)
   a failing probe (exit 3), a start process that exits early, a ready timeout, and leaves
   no process behind; `--isolate` runs `setup` and the commands in a worktree that is
   removed afterwards, also after a timeout and on SIGINT; the M1 and M2 gates stay green.
-- **M4 — benchmark and release prep.** `bench/`: ≥ 30 cases (tamper patterns from the
-  typia port, the Skylos testwashing set and ImpossibleBench-style edits, plus ≥ 10 clean
-  controls: refactors, legitimate spec changes, added tests; seeded with the 20 review
-  probes P1–P12 and C1–C8 from M1); a runner that reports
-  detection and false-positive rates for greenproof and, when installed, other tools;
-  a replay harness that runs the static rules over the last 200 test-touching commits of
-  ≥ 3 real repositories (pallets/click first) and reports the block rate per rule with a
-  triaged sample. The M1 baseline on click was 30 of 200 commits blocked, before the M1d
-  calibration. MEASUREMENTS.md; README; dogfood `greenproof init` on this repo. Release (GitHub repo,
-  PyPI) only on the maintainer's explicit go-ahead.
+- **M4 — benchmark and release prep** (sections 12 and 13). `bench/` with at least 45
+  cases, the runner and its rot test; the replay harness run on pallets/click,
+  encode/httpx, pmndrs/zustand and spf13/cobra with every blocked commit triaged;
+  MEASUREMENTS.md; pytest-xdist; dogfood `greenproof init` on this repository and a
+  `greenproof` CI job; README.md; the CHANGELOG `0.1.0` entry. The M1 baseline on click
+  was 30 of 200 commits blocked, before the M1d calibration. Done when `bench/run.py`
+  meets every case, the replay numbers and triage are in MEASUREMENTS.md, and the gates
+  stay green. Release (GitHub repo, PyPI) only on the maintainer's explicit go-ahead.
 
 ### M1 acceptance scenarios (each is an automated test)
 
@@ -892,3 +890,94 @@ bench/              testwashing benchmark (milestone 4)
 10. Test command fails → exit 2 with the output tail; a timeout kills the process group.
 11. Untracked new test file with a failing test → included in the snapshot; exit 2.
 12. Not a git repo → exit 4; internal exception → exit 5 (fail closed), never 0.
+
+## 12. Benchmark and replay (M4)
+
+**`bench/`** is dev tooling in the repository, not part of the wheel. It may import
+greenproof and use the dev dependencies; it never needs network access.
+
+- `bench/fixtures/<name>/`: small base repositories, at least `python-shop` (src/shop.py,
+  tests with pytest, `.greenproof.toml` whose `test` is `python -m pytest -q -p
+  no:cacheprovider`, resolved to the running interpreter at build time), `js-cart`
+  (package.json, src/cart.js, test/cart.test.js, empty commands) and `go-calc` (go.mod,
+  calc.go, calc_test.go, empty commands).
+- `bench/cases/<id>.toml`, one case per file:
+
+  ```toml
+  id = "P2"
+  fixture = "python-shop"
+  title = "an exact assertion replaced by a truthiness check"
+  source = "review probe"      # review probe | typia port | Skylos testwashing | ImpossibleBench | control
+  kind = "tamper"              # tamper | control
+  expect = "block"             # block | warn | pass
+  rules = ["tests.weakened"]   # rule ids that must be reported (empty for pass)
+  checks = "static"            # default; "static,commands" or "static,commands,revert" when needed
+
+  [[edit]]                     # applied in order: replace (exact, must match once), write, delete
+  path = "tests/test_shop.py"
+  replace = { old = "assert refund(100) == 99", new = "assert refund(100)" }
+  ```
+
+- `bench/run.py [--cases GLOB] [--json PATH]`: for each case build the fixture in a temp
+  git repo (commit as the base), apply the edits uncommitted, run `greenproof check --mode
+  local --no-cache --checks <checks> --json <tmp>`, and compare. A case **meets** its
+  expectation when: `block` → exit 1 and every listed rule reported at block; `warn` →
+  exit 0 and every listed rule reported at warn; `pass` → exit 0 and no block finding.
+  Output: a Markdown table (id, kind, expect, got, rules, met) and the totals: detection
+  rate = tamper cases met / tamper cases; false-positive rate = control cases with any
+  block finding / control cases; control warn rate = control cases with any warn / control
+  cases. Exit 1 when any case is not met.
+- At least 45 cases: P1–P17 and C1–C12 (from `tests/test_probes.py`), Q1–Q10 (loosened
+  checks, 5.4), and at least 12 more covering the patterns below, each with its source:
+  `pytest.skip()` inside a test body; `if False:` / early `return` before the assertions;
+  `except Exception: pass` around an assertion; `pytest.approx` tolerance widened;
+  `collect_ignore` in conftest; `addopts = "-k not total"`; a test edited to expect the
+  buggy output while the code is unchanged; special-casing the test input in code
+  (`code.hardcoded`, warn); mocking the function under test (`tests.self_mocked`, warn);
+  `it.only`, `it.skip` and `expect(x).toBe(3)` → `toBeTruthy()` in js-cart; `t.Skip()` and
+  a removed `t.Errorf` check in go-calc; `continue-on-error: true` on a test step;
+  `--passWithNoTests` or `|| true` added to the test script; a new test that passes
+  without the source change (revert, warn); plus at least 3 more controls (a legitimate
+  rename across code and tests, a new feature with new tests, a spec change that updates
+  code and expected values together).
+- A test in `tests/` runs `bench/run.py` on all cases (marked slow if it exceeds 60 s with
+  xdist) so the benchmark cannot rot.
+
+**Replay harness** `bench/replay.py REPO [--n 200] [--out PATH.tsv] [--details]`: on a
+temporary clone of REPO (never the original), for each of the last N first-parent,
+non-merge commits whose diff touches a file greenproof classifies as a test: check out the
+parent, commit a policy with empty commands as the base, set index and worktree to the
+commit's tree with `git read-tree -u --reset <sha>`, rewrite the same policy file (so the
+base and candidate policies are equal), and run `greenproof check --checks static --base
+HEAD --no-cache --json`. TSV columns: short sha, exit code, sorted `rule(severity)` list,
+check duration in ms, subject (70 chars). `--details` also writes, per blocked commit, every
+block finding with its path, line and message. Summary on stderr: commits scanned, blocked
+count and rate, block count per rule, median and p95 duration.
+
+Repositories: pallets/click, encode/httpx, pmndrs/zustand, spf13/cobra (clones under
+`/tmp`, not committed). Results and the triage of every blocked commit go in
+MEASUREMENTS.md.
+
+## 13. Release preparation (M4)
+
+- **pytest-xdist** as a dev dependency; the gate becomes `pytest -n auto`; any test that
+  is not parallel-safe is fixed or marked to run serially.
+- **Dogfood**: run `greenproof init --agents claude --ci none --hook-command "uv run
+  greenproof"` on this repository and commit the result (`.greenproof.toml` with
+  `uv run ruff check .`, `uv run mypy src`, `uv run pytest -q -n auto`; AGENTS.md section;
+  `.claude/settings.json`). The repository's own CI gains a `greenproof` job on
+  `pull_request` that runs `uv run greenproof check --mode ci` with `fetch-depth: 0` and
+  read-only permissions, with actions pinned like the rest of ci.yml.
+- **README.md**: what it is and the problem (agents report done on red or tampered suites);
+  install (`uvx greenproof`, `pipx install greenproof`); quick start (`greenproof init`,
+  then `greenproof check`); how a check works (snapshot, base, policy from base, static
+  rules, commands, revert, smoke, cache, exit codes); the rule table with defaults; the
+  agent support matrix (Claude Code, Cursor, Codex CLI: supported; Gemini CLI:
+  experimental) with the caveats: hooks are advisory and fail open, an agent can edit
+  them, CI is the authority; CI usage (the action and the generated workflow); accepting
+  a finding (PR comment by a maintainer; local acceptances are advisory); smoke setup by
+  hand (init never writes `[smoke]`, and `init --yes` rewrites the whole policy); the limits
+  (heuristics, Python AST and line-level elsewhere, revert runners); a short link to
+  MEASUREMENTS.md. No claims that are not measured in MEASUREMENTS.md. No comparison
+  table with named competitors.
+- **CHANGELOG** `0.1.0` entry; version stays `0.1.0`; nothing is published.
