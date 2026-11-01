@@ -68,6 +68,41 @@ def test_fixed_code_green_suite_passes_and_second_run_is_cached(
     assert cache_file.exists()
 
 
+def test_ci_mode_never_reads_or_writes_the_cache(repo: Repo, run, tmp_path: Path) -> None:
+    cache_file = repo.path / ".git" / "greenproof" / "cache.json"
+    first = run(repo.path, "check", "--mode", "ci")
+    second = run(repo.path, "check", "--mode", "ci")
+    assert (first.code, second.code) == (0, 0)
+    assert "unchanged since" not in second.out
+    assert "PASS  test" in second.out
+    assert not cache_file.exists()
+    # A pass cached by a local run is not replayed in ci either.
+    assert run(repo.path, "check", "--mode", "local").code == 0
+    assert cache_file.exists()
+    third = run(repo.path, "check", "--mode", "ci", "--json", str(tmp_path / "r.json"))
+    assert "unchanged since" not in third.out
+    assert schema_ok(tmp_path / "r.json")["cached"] is False
+
+
+def test_cache_hit_replays_the_original_check_statuses(tmp_path: Path, run) -> None:
+    repo = make_repo(
+        tmp_path / "r",
+        policy_text("true", '\n[modes.local]\nchecks = ["static", "commands", "smoke"]\n'),
+    )
+    first = run(repo.path, "check", "--json", str(tmp_path / "a.json"))
+    second = run(repo.path, "check", "--json", str(tmp_path / "b.json"))
+    assert (first.code, second.code) == (0, 0)
+    original = schema_ok(tmp_path / "a.json")
+    replay = schema_ok(tmp_path / "b.json")
+    assert replay["cached"] is True
+    assert [(c["id"], c["status"]) for c in replay["checks"]] == [
+        ("static", "pass"),
+        ("commands", "pass"),
+        ("smoke", "skipped"),
+    ]
+    assert replay["checks"] == original["checks"]
+
+
 def test_failures_are_never_cached(repo: Repo, run) -> None:
     repo.write("app.py", "def total():\n    return 1\n")
     first = run(repo.path, "check")
@@ -239,6 +274,7 @@ def test_missing_policy_everywhere_exits_4(tmp_path: Path, run) -> None:
     result = run(repo.path, "check")
     assert result.code == 4
     assert ".greenproof.toml" in result.err
+    assert "greenproof init" in result.err
 
 
 @pytest.mark.parametrize(

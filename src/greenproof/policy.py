@@ -227,7 +227,7 @@ def load_policy(base_blob: bytes | None, candidate_blob: bytes | None) -> Loaded
         if candidate_blob is None:
             raise PolicyError(
                 f"{POLICY_FILE}: not found at the base revision or in the working tree. "
-                "Add one (see SPEC section 4)."
+                "Run `greenproof init`."
             )
         text = _decode(candidate_blob, f"{POLICY_FILE} (working tree)")
         policy = parse_policy(text, f"{POLICY_FILE} (working tree)")
