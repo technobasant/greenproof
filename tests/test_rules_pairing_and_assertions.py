@@ -150,14 +150,14 @@ def test_assertions_after_raises_block_are_still_reachable(tmp_path: Path) -> No
 
 
 def test_replacement_by_a_different_expression_warns(tmp_path: Path) -> None:
-    found = replaced(tmp_path, "assert total([1, 2]) == 3", "assert len([1, 2])")
+    found = replaced(tmp_path, "assert total([1, 2]) == 3", 'assert parse("4")')
     assert [f.rule for f in found] == ["tests.weakened"]
     assert found[0].severity == "warn"
 
 
 def test_replacement_with_the_old_operand_blocks(tmp_path: Path) -> None:
-    base = "def test_a():\n    assert len([1]) == 1\n"
-    found = change(tmp_path, "def test_a():\n    assert len([1])\n", base)
+    base = "def test_a():\n    assert make(1) == 1\n"
+    found = change(tmp_path, "def test_a():\n    assert make(1)\n", base)
     assert [(f.rule, f.severity) for f in found] == [("tests.weakened", "block")]
 
 
@@ -368,3 +368,90 @@ def test_whitespace_only_difference_in_a_js_assertion_still_covers(tmp_path: Pat
         "test('a2', () => {\n  expect(g(1)).toBe(3);\n});\n"
     )
     assert rule_ids(change(tmp_path, new, base, "tests/a.test.js")) == []
+
+
+# ---- constant-only assertions: the analysis and its edges (5.4) ----------------------------
+
+LIVE = "def test_a():\n    got = make()\n    assert got == 4\n"
+
+
+def constant_verdict(tmp_path: Path, new: str, base: str = LIVE) -> list[tuple[str, str]]:
+    return [(f.rule, f.severity) for f in change(tmp_path, new, base)]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "    got = 4\n    assert got == 4\n",
+        "    got = len([1, 2])\n    assert got == 2\n",
+        "    a = 2\n    got = a * 2\n    assert got == 4\n",
+        '    got = f"{4}"\n    assert got == "4"\n',
+        "    assert 0.3 == pytest.approx(0.1 + 0.2)\n",
+        "    got = sorted([3, 1])\n    assert got == [1, 3]\n",
+    ],
+)
+def test_constant_only_assertion_in_a_paired_test_blocks(tmp_path: Path, body: str) -> None:
+    new = f"import pytest\n\n\ndef test_a():\n{body}"
+    assert ("tests.weakened", "block") in constant_verdict(tmp_path, new)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # reassigned: the name is no longer a single-assignment constant
+        "    got = 4\n    got = make()\n    assert got == 4\n",
+        # passed to a call before the assertion
+        "    got = 4\n    consume(got)\n    assert got == 4\n",
+        # attribute access (a mutating method) on it
+        "    got = [4]\n    got.append(make())\n    assert got == [4]\n",
+        # subscript assignment
+        "    got = [4]\n    got[0] = make()\n    assert got == [4]\n",
+        # augmented assignment
+        "    got = 1\n    got += make()\n    assert got == 4\n",
+        # a loop target
+        "    for got in make():\n        assert got == 4\n",
+        # a with target
+        "    with make() as got:\n        assert got == 4\n",
+        # a non-pure call and a non-constant argument
+        "    got = max(make(), 4)\n    assert got == 4\n",
+        # a global, not a local
+        "    assert MODULE_VALUE == 4\n    assert make() == 4\n",
+    ],
+)
+def test_constant_analysis_stays_conservative(tmp_path: Path, body: str) -> None:
+    new = f"def test_a():\n{body}"
+    assert "tests.weakened" not in [r for r, _ in constant_verdict(tmp_path, new)]
+
+
+def test_parametrize_and_fixture_arguments_are_not_constants(tmp_path: Path) -> None:
+    param = (
+        "import pytest\n\n\n@pytest.mark.parametrize('got', [4])\n"
+        "def test_a(got):\n    assert got == 4\n"
+    )
+    assert rule_ids(change(tmp_path / "p", param, LIVE)) == []
+    fixture = "def test_a(got):\n    assert got == 4\n"
+    assert rule_ids(change(tmp_path / "f", fixture, LIVE)) == []
+
+
+def test_unittest_assert_with_only_constants_blocks(tmp_path: Path) -> None:
+    base = (
+        "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_a(self):\n"
+        "        self.assertEqual(make(), 4)\n"
+    )
+    new = base.replace("make()", "4")
+    assert ("tests.weakened", "block") in constant_verdict(tmp_path, new, base)
+
+
+def test_constant_assertion_in_a_new_test_weakens_nothing(tmp_path: Path) -> None:
+    new = LIVE + "\n\ndef test_b():\n    assert 2 + 2 == 4\n"
+    assert rule_ids(change(tmp_path, new, LIVE)) == []
+
+
+def test_js_expect_of_a_literal_is_not_counted(tmp_path: Path) -> None:
+    base = "test('a', () => {\n  expect(f(1)).toBe(2);\n});\n"
+    for literal in ("3", "'x'", "true", "null", "undefined", "-1"):
+        new = base.replace("f(1)", literal)
+        found = change(tmp_path / literal.strip("'-"), new, base, "tests/a.test.js")
+        assert ("tests.weakened", "block") in [(f.rule, f.severity) for f in found], literal
+    live = base.replace("f(1)", "f(x)")
+    assert rule_ids(change(tmp_path / "live", live, base, "tests/a.test.js")) == []

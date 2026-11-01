@@ -138,6 +138,179 @@ def _vacuous_call(tail: str, node: ast.Call) -> bool:
     return False
 
 
+_PURE_BUILTINS = frozenset(
+    {
+        "len",
+        "abs",
+        "min",
+        "max",
+        "sum",
+        "sorted",
+        "reversed",
+        "list",
+        "tuple",
+        "set",
+        "frozenset",
+        "dict",
+        "str",
+        "int",
+        "float",
+        "bool",
+        "round",
+        "repr",
+    }
+)
+_ASSERT_METHOD = re.compile(r"assert[A-Z]\w*")
+
+
+class _Consts:
+    """Which locals of one test body are constants, and whether an expression is constant.
+
+    Deliberately conservative (SPEC 5.4): a local counts only when it is assigned exactly once,
+    by a plain `name = <constant expression>` at the top level of the body, is not a parameter,
+    loop/with/except/import/match target or nested definition, and is only ever read as an
+    operand of an operator, comparison, container, f-string, pure builtin, assertion or
+    `approx`. Calls, attribute access and subscripts on it make it non-constant.
+    """
+
+    def __init__(self, fn: _FuncDef | None = None) -> None:
+        self.names: set[str] = set()
+        self.stores: set[str] = set()
+        if fn is not None:
+            self._analyse(fn)
+
+    def _analyse(self, fn: _FuncDef) -> None:
+        counts: dict[str, int] = {}
+        bad: set[str] = set()
+        parents: dict[int, ast.AST] = {}
+
+        def store(name: str | None) -> None:
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+
+        for node in ast.walk(fn):
+            for child in ast.iter_child_nodes(node):
+                parents[id(child)] = node
+            if isinstance(node, ast.arg):
+                store(node.arg)
+            elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+                store(node.id)
+                if isinstance(node.ctx, ast.Del):
+                    bad.add(node.id)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node is not fn:
+                    store(node.name)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    store(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ExceptHandler):
+                store(node.name)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                bad.update(node.names)
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+                store(node.name)
+            elif isinstance(node, ast.MatchMapping):
+                store(node.rest)
+        self.stores = set(counts)
+
+        candidates: dict[str, ast.Assign] = {}
+        for stmt in fn.body:
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+            ):
+                name = stmt.targets[0].id
+                if counts.get(name) == 1 and name not in bad:
+                    candidates[name] = stmt
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in candidates
+                and not self._benign_read(node, parents)
+            ):
+                del candidates[node.id]
+        # Source order: a constant may only be built from constants defined before it.
+        for stmt in fn.body:
+            if (
+                isinstance(stmt, ast.Assign)
+                and isinstance(stmt.targets[0], ast.Name)
+                and candidates.get(stmt.targets[0].id) is stmt
+                and self.is_const(stmt.value)
+            ):
+                self.names.add(stmt.targets[0].id)
+
+    def _benign_read(self, node: ast.Name, parents: dict[int, ast.AST]) -> bool:
+        parent = parents.get(id(node))
+        if isinstance(parent, ast.keyword):
+            parent = parents.get(id(parent))
+            return isinstance(parent, ast.Call) and self._neutral_call(parent)
+        if isinstance(parent, ast.Call):
+            return node is not parent.func and self._neutral_call(parent)
+        return isinstance(
+            parent,
+            (
+                ast.BinOp,
+                ast.UnaryOp,
+                ast.BoolOp,
+                ast.Compare,
+                ast.Tuple,
+                ast.List,
+                ast.Set,
+                ast.Dict,
+                ast.IfExp,
+                ast.JoinedStr,
+                ast.FormattedValue,
+                ast.Assert,
+            ),
+        ) or (isinstance(parent, ast.Assign) and node is parent.value)
+
+    def _pure_call(self, call: ast.Call) -> bool:
+        return (
+            isinstance(call.func, ast.Name)
+            and call.func.id in _PURE_BUILTINS
+            and call.func.id not in self.stores
+        )
+
+    def _neutral_call(self, call: ast.Call) -> bool:
+        """A call that only reads its arguments: a pure builtin, an assertion, or approx."""
+        tail = dotted(call.func).rsplit(".", 1)[-1]
+        return self._pure_call(call) or tail == "approx" or bool(_ASSERT_METHOD.fullmatch(tail))
+
+    def is_const(self, node: ast.AST | None) -> bool:
+        if node is None or isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.Name):
+            return node.id in self.names
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return all(self.is_const(e) for e in node.elts)
+        if isinstance(node, ast.Dict):
+            return all(k is not None and self.is_const(k) for k in node.keys) and all(
+                self.is_const(v) for v in node.values
+            )
+        if isinstance(node, ast.BinOp):
+            return self.is_const(node.left) and self.is_const(node.right)
+        if isinstance(node, ast.UnaryOp):
+            return self.is_const(node.operand)
+        if isinstance(node, (ast.BoolOp, ast.JoinedStr)):
+            return all(self.is_const(v) for v in node.values)
+        if isinstance(node, ast.FormattedValue):
+            return self.is_const(node.value) and self.is_const(node.format_spec)
+        if isinstance(node, ast.Compare):
+            return self.is_const(node.left) and all(self.is_const(c) for c in node.comparators)
+        if isinstance(node, ast.IfExp):
+            return all(self.is_const(n) for n in (node.test, node.body, node.orelse))
+        if isinstance(node, ast.Call):
+            tail = dotted(node.func).rsplit(".", 1)[-1]
+            if not (self._pure_call(node) or tail == "approx"):
+                return False
+            return all(self.is_const(a) for a in node.args) and all(
+                self.is_const(k.value) for k in node.keywords
+            )
+        return False
+
+
 def _is_raises_with(node: ast.With | ast.AsyncWith) -> bool:
     return any(
         isinstance(i.context_expr, ast.Call)
@@ -213,8 +386,15 @@ def _expected_of(node: ast.AST) -> ast.AST | None:
 class _Stats(ast.NodeVisitor):
     """Assertion statistics for one test body, crediting same-module helper functions."""
 
-    def __init__(self, helpers: dict[str, _FuncDef], depth: int = 0, stack: tuple[str, ...] = ()):
+    def __init__(
+        self,
+        helpers: dict[str, _FuncDef],
+        depth: int = 0,
+        stack: tuple[str, ...] = (),
+        consts: _Consts | None = None,
+    ):
         self.helpers = helpers
+        self.consts = consts or _Consts()
         self.depth = depth
         self.stack = stack
         self.asserts = 0
@@ -243,7 +423,9 @@ class _Stats(ast.NodeVisitor):
 
     def visit_Assert(self, node: ast.Assert) -> None:
         test = node.test
-        if _always_true(test):  # vacuous: it can never fail, so it checks nothing
+        if _always_true(test) or self.consts.is_const(
+            test
+        ):  # vacuous: it can never fail, so it checks nothing
             self.vacuous += 1
             self.vacuous_line = self.vacuous_line or node.lineno
             self.first_line = self.first_line or node.lineno
@@ -306,7 +488,7 @@ class _Stats(ast.NodeVisitor):
         if tail in {"raises", "warns"} or tail in _RAISES_METHODS:
             self._raises(node)
         elif re.fullmatch(r"assert[A-Z]\w*", tail):
-            if _vacuous_call(tail, node):
+            if _vacuous_call(tail, node) or self._const_call(node):
                 self.vacuous += 1
                 self.vacuous_line = self.vacuous_line or node.lineno
                 self.first_line = self.first_line or node.lineno
@@ -340,6 +522,14 @@ class _Stats(ast.NodeVisitor):
             self._credit_helper(node)
         self.generic_visit(node)
 
+    def _const_call(self, node: ast.Call) -> bool:
+        """`self.assertEqual(4, 4)`: every argument is a constant, so nothing is checked."""
+        return (
+            bool(node.args)
+            and all(self.consts.is_const(a) for a in node.args)
+            and all(self.consts.is_const(k.value) for k in node.keywords)
+        )
+
     def _credit_helper(self, node: ast.Call) -> None:
         func = node.func
         target: str | None = None
@@ -351,7 +541,9 @@ class _Stats(ast.NodeVisitor):
             return
         if target in self.stack:
             return
-        sub = _Stats(self.helpers, self.depth + 1, (*self.stack, target))
+        sub = _Stats(
+            self.helpers, self.depth + 1, (*self.stack, target), _Consts(self.helpers[target])
+        )
         for stmt in self.helpers[target].body:
             sub.visit(stmt)
         self.asserts += sub.asserts
@@ -463,7 +655,7 @@ def _unit(
 ) -> Unit:
     live = copy.deepcopy(fn)
     dropped = _prune(live)
-    stats = _Stats(helpers)
+    stats = _Stats(helpers, consts=_Consts(live))
     for stmt in live.body:
         stats.visit(stmt)
     lost = _Stats(helpers)

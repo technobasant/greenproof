@@ -214,6 +214,17 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
 - an assertion made vacuous or tautological: `assert <truthy constant>` (`assert True`,
   `assert 1`), `self.assertTrue(True)`, an `or` with a truthy constant operand
   (`assert x == 3 or True`), or a comparison of an expression with itself;
+- an assertion whose inputs are all constants, so it checks nothing about the code:
+  every operand is a literal, a pure builtin (`len`, `abs`, `min`, `max`, `sum`, `sorted`,
+  `reversed`, `list`, `tuple`, `set`, `frozenset`, `dict`, `str`, `int`, `float`, `bool`,
+  `round`, `repr`) applied to constant arguments, an operator over constants, or a local
+  name assigned exactly once in the test body, before the assertion, from a constant
+  expression and not used before it in any other way (passed to a call, its attribute or
+  method accessed, subscript-, attribute- or augmented-assigned). Names bound by
+  parameters, fixtures, `parametrize`, loops, comprehensions, `with ... as`, imports or
+  module scope are never constant. Example: `got = parse("4")` → `got = 4` with
+  `assert got == want` unchanged. Such an assertion is vacuous, like `assert True`;
+  vacuous assertions do not count toward assertion totals or 5.7 coverage;
 - an assertion made unreachable: an unconditional `return`/`raise` (outside a
   `pytest.raises`/`assertRaises` block) placed before it in the test body, or the
   assertion moved under `if False:`/`if 0:`. Unreachable assertions do not count;
@@ -227,7 +238,8 @@ JS/TS, Go, Rust (line level, per test file): count of assertion calls drops (`ex
 `assert.`, `t.Error`/`t.Fatal`/`require.`/`assert.`, `assert!`/`assert_eq!`), or strong
 matchers (`toEqual`, `toBe(`, `toStrictEqual`, `toMatchObject`, `toThrow(<arg>)`) are
 removed while weak ones (`toBeDefined`, `toBeTruthy`, `not.toThrow`, `toBeGreaterThanOrEqual(0)`)
-are added.
+are added. An `expect(<literal>)` (number, string, `true`/`false`/`null`/`undefined`) is
+vacuous and not counted, so `expect(add(1, 2)).toBe(3)` → `expect(3).toBe(3)` drops the count.
 
 ### 5.5 Suppressions (`suppress.added`, warn by default; each pattern its own sub-id in the message)
 
