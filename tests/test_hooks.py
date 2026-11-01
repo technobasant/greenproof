@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import io
+import itertools
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,7 +18,7 @@ from greenproof.errors import GreenproofError, UsageError
 from tests.helpers import Repo, load_json, make_repo, policy_text
 from tests.schema_check import load_schema, validate
 
-AGENTS = ("claude", "cursor", "codex", "gemini")
+AGENTS = ("claude", "cursor", "codex", "gemini", "opencode")
 FAILING = "echo FAILED boom; exit 1"
 
 
@@ -27,7 +30,13 @@ def stdin(monkeypatch: pytest.MonkeyPatch):
     return _set
 
 
+_STOPS = itertools.count(1)
+
+
 def payload(agent: str, repo: Repo, session: str = "s1", **extra: Any) -> dict[str, Any]:
+    """The payload of a new stop. Every call differs in `stop`, the way real stops differ
+    (Claude's `last_assistant_message`, Codex's `turn_id`); reuse one dict to model the same
+    stop reaching two hooks, which 6.2 replays."""
     if agent == "cursor":
         base: dict[str, Any] = {
             "conversation_id": session,
@@ -37,7 +46,7 @@ def payload(agent: str, repo: Repo, session: str = "s1", **extra: Any) -> dict[s
         }
     else:
         base = {"session_id": session, "cwd": str(repo.path), "stop_hook_active": False}
-    return {**base, **extra}
+    return {**base, "stop": next(_STOPS), **extra}
 
 
 @pytest.fixture
@@ -76,7 +85,7 @@ def expect_block(agent: str, result) -> str:
         assert set(data) == {"followup_message"}
         return data["followup_message"]
     assert set(data) == {"decision", "reason"}
-    assert data["decision"] == ("block" if agent == "codex" else "deny")
+    assert data["decision"] == ("deny" if agent == "gemini" else "block")
     return data["reason"]
 
 
@@ -193,7 +202,8 @@ def test_same_session_and_tree_as_the_last_block_releases_without_rerunning(
     # Remove it so the tree is the one that was blocked.
     (repo.path / "runs.log").unlink()
 
-    second = fire(agent, body, "--json", str(tmp_path / "r.json"))
+    # The next stop of the same session (a different payload) on the same tree.
+    second = fire(agent, payload(agent, repo), "--json", str(tmp_path / "r.json"))
     note = expect_release(agent, second)
     assert not (repo.path / "runs.log").exists()  # nothing ran
     if agent != "cursor":
@@ -207,7 +217,7 @@ def test_same_session_and_tree_as_the_last_block_releases_without_rerunning(
     assert any("released without re-running" in n for n in data["notes"])
 
     # And again: the release keeps its state, so it stays released.
-    expect_release(agent, fire(agent, body))
+    expect_release(agent, fire(agent, payload(agent, repo)))
 
 
 def test_a_different_session_runs_again_and_a_changed_tree_runs_again(tmp_path: Path, fire) -> None:
@@ -251,14 +261,20 @@ def test_the_eighth_consecutive_block_releases(agent: str, tmp_path: Path, fire)
     assert state.blocks == 1
 
 
-def test_a_pass_clears_the_state(tmp_path: Path, fire) -> None:
+def test_a_pass_is_recorded_with_zero_blocks(tmp_path: Path, fire) -> None:
     repo = gate(tmp_path, "test -f ok")
     repo.write("app.py", "x = 1\n")
     expect_block("claude", fire("claude", payload("claude", repo)))
-    assert hooks.state_path(repo.path).exists()
+    state = hooks.load_state(repo.path)
+    assert state is not None
+    assert (state.decision, state.blocks) == ("block", 1)
     repo.write("ok", "")
-    expect_pass("claude", fire("claude", payload("claude", repo)))
-    assert not hooks.state_path(repo.path).exists()
+    body = payload("claude", repo)
+    expect_pass("claude", fire("claude", body))
+    state = hooks.load_state(repo.path)
+    assert state is not None
+    assert (state.decision, state.blocks, state.replays) == ("pass", 0, 0)
+    assert state.fingerprint == hooks.payload_fingerprint(body)
 
 
 def test_malformed_state_counts_as_empty(tmp_path: Path, fire) -> None:
@@ -370,8 +386,9 @@ def test_a_configuration_error_blocks_with_could_not_run_then_releases(
 ) -> None:
     repo = make_repo(tmp_path / "bad", "version = 1\n[commands]\nbogus = 1\n")
     repo.write("app.py", "x = 1\n")
-    body = payload(agent, repo)
-    message = expect_block(agent, fire(agent, body, "--json", str(tmp_path / "e.json")))
+    message = expect_block(
+        agent, fire(agent, payload(agent, repo), "--json", str(tmp_path / "e.json"))
+    )
     assert message.startswith("greenproof could not run: ")
     assert "bogus" in message
     assert message.strip().endswith("do not edit greenproof's configuration to get past it.")
@@ -380,7 +397,9 @@ def test_a_configuration_error_blocks_with_could_not_run_then_releases(
     assert (data["verdict"], data["exit_code"]) == ("error", 4)
     assert data["base"] is not None  # the candidate was located before the error
 
-    note = expect_release(agent, fire(agent, body, "--json", str(tmp_path / "e2.json")))
+    note = expect_release(
+        agent, fire(agent, payload(agent, repo), "--json", str(tmp_path / "e2.json"))
+    )
     if agent != "cursor":
         assert "greenproof could not run" in note
     data = load_json(tmp_path / "e2.json")
@@ -411,12 +430,13 @@ def test_an_unresolvable_base_blocks_once_then_releases_the_same_session(
     tmp_path: Path, fire
 ) -> None:
     repo = gate(tmp_path)
-    body = payload("gemini", repo)
-    message = expect_block("gemini", fire("gemini", body, "--base", "no-such-ref"))
+    message = expect_block(
+        "gemini", fire("gemini", payload("gemini", repo), "--base", "no-such-ref")
+    )
     assert "no-such-ref" in message
     # The tree was never known, so trees cannot match; the same session erroring again is
     # released instead of blocked.
-    expect_release("gemini", fire("gemini", body, "--base", "no-such-ref"))
+    expect_release("gemini", fire("gemini", payload("gemini", repo), "--base", "no-such-ref"))
 
 
 @pytest.mark.parametrize("agent", AGENTS)
@@ -490,13 +510,16 @@ def test_hook_with_mode_hook_is_fine(tmp_path: Path, run, stdin) -> None:
 def test_a_locally_accepted_finding_does_not_block_in_hook_mode(tmp_path: Path, fire, run) -> None:
     repo = gate(tmp_path)
     repo.remove("tests/test_app.py")
-    body = payload("claude", repo)
-    expect_block("claude", fire("claude", body, "--json", str(tmp_path / "r.json")))
+    expect_block(
+        "claude", fire("claude", payload("claude", repo), "--json", str(tmp_path / "r.json"))
+    )
     fp = load_json(tmp_path / "r.json")["findings"][0]["fingerprint"]
     assert run(repo.path, "accept", fp).code == 0
     # The agent made a change, so the gate runs again (an untouched tree would be released).
     repo.write("app.py", "x = 1\n")
-    expect_pass("claude", fire("claude", body, "--json", str(tmp_path / "r2.json")))
+    expect_pass(
+        "claude", fire("claude", payload("claude", repo), "--json", str(tmp_path / "r2.json"))
+    )
     data = load_json(tmp_path / "r2.json")
     assert data["findings"][0]["accepted"]["source"] == "local"
 
@@ -568,3 +591,276 @@ def test_greenproof_errors_carry_their_exit_code() -> None:
     assert hooks._error_exit_code(UsageError("x")) == 4
     assert hooks._error_exit_code(GreenproofError("x")) == 5
     assert hooks._error_exit_code(ValueError("x")) == 5
+
+
+# ---- opencode ----------------------------------------------------------------------------
+
+
+def test_opencode_speaks_codexs_protocol_and_reads_session_id_and_cwd(tmp_path: Path, fire) -> None:
+    repo = gate(tmp_path, FAILING)
+    repo.write("app.py", "x = 1\n")
+    body = {"session_id": "oc", "cwd": str(repo.path), "message_id": "m1"}
+    parsed = hooks.parse_payload("opencode", body)
+    assert (parsed.session_id, parsed.start_dir) == ("oc", repo.path)
+    assert parsed.status is None  # `status` is Cursor's alone
+    result = fire("opencode", body)
+    assert result.code == 0 and result.err == ""
+    state = hooks.load_state(repo.path)
+    assert state is not None
+    assert json.loads(result.out) == {"decision": "block", "reason": state.message}
+    assert state.session == "oc"
+
+
+# ---- payload fingerprint (6.1) -----------------------------------------------------------
+
+
+def test_the_fingerprint_is_the_sha256_of_the_sorted_compact_payload() -> None:
+    import hashlib
+
+    raw = {"b": [1, 2], "a": {"y": "é", "x": None}}
+    text = json.dumps(raw, sort_keys=True, separators=(",", ":"))
+    assert text == '{"a":{"x":null,"y":"\\u00e9"},"b":[1,2]}'
+    assert hooks.payload_fingerprint(raw) == hashlib.sha256(text.encode()).hexdigest()
+    assert hooks.payload_fingerprint({"a": 1, "b": 2}) == hooks.payload_fingerprint(
+        {"b": 2, "a": 1}
+    )
+    assert hooks.payload_fingerprint({"a": 1}) != hooks.payload_fingerprint({"a": 2})
+    assert hooks.payload_fingerprint({}) is None
+    assert hooks.parse_payload("claude", {}).fingerprint is None
+    assert hooks.parse_payload("cursor", {"conversation_id": "c"}).fingerprint is not None
+
+
+# ---- duplicate hooks: replay (6.2) -------------------------------------------------------
+
+
+def _stop_state(repo: Repo) -> hooks.HookState:
+    state = hooks.load_state(repo.path)
+    assert state is not None
+    return state
+
+
+@pytest.mark.parametrize("agent", AGENTS)
+def test_the_same_payload_replays_the_recorded_block_without_running(
+    agent: str, tmp_path: Path, fire
+) -> None:
+    ran = tmp_path / "ran.log"
+    repo = gate(tmp_path, f"echo run >> {ran}; {FAILING}")
+    repo.write("app.py", "x = 1\n")
+    body = payload(agent, repo)
+    first = expect_block(agent, fire(agent, body))
+    second = expect_block(agent, fire(agent, body, "--json", str(tmp_path / "r.json")))
+    assert second == first
+    assert ran.read_text() == "run\n"  # once
+    state = _stop_state(repo)
+    assert (state.decision, state.blocks, state.replays) == ("block", 1, 1)
+    data = load_json(tmp_path / "r.json")
+    assert validate(data, load_schema()) == []
+    assert data["verdict"] == "fail"
+    assert "replayed the decision of another greenproof hook for this stop" in data["notes"]
+
+
+def test_a_replay_uses_its_own_agents_protocol(tmp_path: Path, fire) -> None:
+    repo = gate(tmp_path, FAILING)
+    repo.write("app.py", "x = 1\n")
+    # One payload that every agent can read: Cursor's field names beside Claude's.
+    body = payload(
+        "claude", repo, conversation_id="s1", workspace_roots=[str(repo.path)], status="completed"
+    )
+    message = expect_block("claude", fire("claude", body)).rstrip("\n")  # stderr adds one
+    assert expect_block("codex", fire("codex", body)) == message
+    assert expect_block("gemini", fire("gemini", body)) == message
+    assert expect_block("cursor", fire("cursor", body)) == message
+
+
+def test_the_same_payload_replays_a_pass_and_a_release(tmp_path: Path, fire) -> None:
+    repo = gate(tmp_path, "test -f ok")
+    repo.write("app.py", "x = 1\n")
+    expect_block("codex", fire("codex", payload("codex", repo)))
+    repo.write("ok", "")
+    body = payload("codex", repo)
+    expect_pass("codex", fire("codex", body))
+    repo.remove("ok")  # the tree would now fail, but the stop was already decided: pass
+    expect_pass("codex", fire("codex", body, "--json", str(tmp_path / "p.json")))
+    assert "replayed the decision" in " ".join(load_json(tmp_path / "p.json")["notes"])
+    assert _stop_state(repo).replays == 1
+
+    # A release replays with the recorded note.
+    repo2 = make_repo(tmp_path / "second", policy_text(FAILING))
+    for i in range(1, 8):
+        repo2.write("app.py", f"x = {i}\n")
+        expect_block("claude", fire("claude", payload("claude", repo2)))
+    repo2.write("app.py", "x = 8\n")
+    body2 = payload("claude", repo2)
+    note = expect_release("claude", fire("claude", body2))
+    repo2.write("app.py", "x = 9\n")  # a changed tree does not matter to a replay
+    assert expect_release("claude", fire("claude", body2)) == note
+    assert _stop_state(repo2).replays == 1
+
+
+def test_an_empty_payload_has_no_fingerprint_and_never_replays(tmp_path: Path, run, stdin) -> None:
+    repo = gate(tmp_path, FAILING)
+    repo.write("app.py", "x = 1\n")
+    stdin("{}")
+    expect_block("claude", run(repo.path, "check", "--hook", "claude"))
+    assert _stop_state(repo).fingerprint is None
+    stdin("{}")
+    # No replay: rule 2 releases (same empty session, same tree) instead of blocking again.
+    expect_release("claude", run(repo.path, "check", "--hook", "claude"))
+    assert _stop_state(repo).replays == 0
+
+
+def test_replays_stop_after_three(tmp_path: Path, fire) -> None:
+    repo = gate(tmp_path, FAILING)
+    repo.write("app.py", "x = 1\n")
+    body = payload("claude", repo)
+    expect_block("claude", fire("claude", body))
+    for replay in (1, 2, 3):
+        expect_block("claude", fire("claude", body))
+        assert _stop_state(repo).replays == replay
+    # From the fourth on the normal rules apply: same session, same tree as the block.
+    expect_release("claude", fire("claude", body))
+    assert _stop_state(repo).replays == 3  # rule 2 changes nothing in the state
+
+
+def test_a_later_payload_on_the_same_tree_releases(tmp_path: Path, fire) -> None:
+    repo = gate(tmp_path, FAILING)
+    repo.write("app.py", "x = 1\n")
+    expect_block("claude", fire("claude", payload("claude", repo)))
+    expect_release("claude", fire("claude", payload("claude", repo)))
+    assert _stop_state(repo).decision == "block"  # rule 2 records nothing new
+    body = payload("claude", repo)
+    expect_release("claude", fire("claude", body))
+    expect_release("claude", fire("claude", body))
+
+
+def test_a_recorded_pass_is_not_a_block_for_rule_2(tmp_path: Path, fire) -> None:
+    repo = gate(tmp_path, "test -f ok")
+    repo.write("app.py", "x = 1\n")
+    repo.write("ok", "")
+    expect_pass("claude", fire("claude", payload("claude", repo)))
+    # The same session and tree as the recorded pass: rule 2 does not apply to a pass, so the
+    # check runs again and passes again (a release here would be a wrong release).
+    expect_pass("claude", fire("claude", payload("claude", repo)))
+    repo.remove("ok")
+    expect_block("claude", fire("claude", payload("claude", repo)))
+    assert _stop_state(repo).blocks == 1  # a pass counts as zero previous blocks
+
+
+def test_a_010_state_file_releases_with_no_fingerprint_and_zero_replays(
+    tmp_path: Path, fire
+) -> None:
+    repo = gate(tmp_path, FAILING)
+    repo.write("app.py", "x = 1\n")
+    body = payload("claude", repo)
+    expect_block("claude", fire("claude", body))
+    old = _stop_state(repo)
+    # What 0.1.0 wrote: no fingerprint, decision, message or replays.
+    hooks.state_path(repo.path).write_text(
+        json.dumps(
+            {
+                "session": old.session,
+                "tree": old.tree,
+                "blocks": old.blocks,
+                "note": old.note,
+                "exit_code": old.exit_code,
+            }
+        )
+    )
+    loaded = _stop_state(repo)
+    assert (loaded.decision, loaded.fingerprint, loaded.replays, loaded.message) == (
+        "block",
+        None,
+        0,
+        "",
+    )
+    # Even the very same payload is not replayed (no fingerprint): rule 2 releases.
+    expect_release("claude", fire("claude", body))
+
+
+@pytest.mark.parametrize(
+    "field", [("fingerprint", 3), ("decision", "maybe"), ("message", 1), ("replays", True)]
+)
+def test_new_state_fields_of_the_wrong_type_make_the_state_malformed(
+    field: tuple[str, object], tmp_path: Path
+) -> None:
+    repo = gate(tmp_path)
+    good = {"session": "s", "tree": "t", "blocks": 1, "note": "n"}
+    path = hooks.state_path(repo.path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({**good, field[0]: field[1]}))
+    assert hooks.load_state(repo.path) is None
+
+
+# ---- duplicate hooks: the lock (6.2) -----------------------------------------------------
+
+
+def test_the_lock_file_lives_beside_the_state(tmp_path: Path, fire) -> None:
+    repo = gate(tmp_path, FAILING)
+    repo.write("app.py", "x = 1\n")
+    expect_block("claude", fire("claude", payload("claude", repo)))
+    assert hooks.lock_path(repo.path) == repo.path / ".git" / "greenproof" / "hook.lock"
+    assert hooks.lock_path(repo.path).exists()
+
+
+def test_the_lock_is_skipped_when_the_lock_file_cannot_be_opened(tmp_path: Path, fire) -> None:
+    repo = gate(tmp_path, FAILING)
+    repo.write("app.py", "x = 1\n")
+    # A file where the directory should be: the git directory cannot hold greenproof's files,
+    # the way a read-only one cannot. The hook runs without the lock, and still blocks.
+    (repo.path / ".git" / "greenproof").write_text("a file")
+    with hooks.hook_lock(repo.path):
+        pass  # no error
+    expect_block("claude", fire("claude", payload("claude", repo)))
+    assert not hooks.lock_path(repo.path).exists()
+
+
+def test_the_lock_is_skipped_when_it_cannot_be_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = gate(tmp_path)
+
+    def refuse(_handle: Any) -> None:
+        raise OSError("locking is not supported here")
+
+    monkeypatch.setattr(hooks, "_acquire", refuse)
+    ran = []
+    with hooks.hook_lock(repo.path):
+        ran.append(True)
+    assert ran == [True]
+
+
+def _hook_process(repo: Repo, body: dict[str, Any], agent: str = "claude") -> subprocess.Popen[str]:
+    code = "import sys; from greenproof.cli import main; sys.exit(main(sys.argv[1:]))"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, "check", "--hook", agent],
+        cwd=repo.path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+    )
+    assert proc.stdin is not None
+    proc.stdin.write(json.dumps(body))
+    proc.stdin.close()
+    return proc
+
+
+def test_two_concurrent_hooks_for_one_stop_give_one_decision(tmp_path: Path, fire) -> None:
+    ran = tmp_path / "ran.log"
+    repo = gate(tmp_path, f"echo run >> {ran}; sleep 1; {FAILING}")
+    repo.write("app.py", "x = 1\n")
+    body = payload("claude", repo)
+    procs = [_hook_process(repo, body), _hook_process(repo, body)]
+    outputs = [(*p.communicate(), p.returncode) for p in procs]
+    for out, err, code in outputs:
+        assert code == 2
+        assert out == ""
+        assert err.startswith("greenproof: not done.\n")
+        assert "FAILED boom" in err
+    assert outputs[0][1] == outputs[1][1]  # the same message
+    assert ran.read_text() == "run\n"  # the check ran once
+    state = _stop_state(repo)
+    assert (state.decision, state.blocks, state.replays) == ("block", 1, 1)
+    # The next stop (a different payload) on the same tree releases instead of blocking.
+    expect_release("claude", fire("claude", payload("claude", repo)))

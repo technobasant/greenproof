@@ -13,7 +13,7 @@ import pytest
 from greenproof import gitops, hooks
 from tests.helpers import Repo, init_repo, make_repo, policy_text
 
-AGENTS = ("claude", "cursor", "codex", "gemini")
+AGENTS = ("claude", "cursor", "codex", "gemini", "opencode")
 
 
 @pytest.fixture

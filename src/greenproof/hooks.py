@@ -16,9 +16,12 @@ Vendor documents the output formats were verified against (fetched 2026-11-01):
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
+import sys
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Any
@@ -28,10 +31,14 @@ from greenproof.errors import GreenproofError
 from greenproof.policy import POLICY_FILE, parse_policy
 from greenproof.report import Report, error_report
 
-HOOK_AGENTS = ("claude", "cursor", "codex", "gemini")
+HOOK_AGENTS = ("claude", "cursor", "codex", "gemini", "opencode")
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_CONSECUTIVE_BLOCKS = 8
 STATE_FILE = "hook-state.json"
+LOCK_FILE = "hook.lock"
+MAX_REPLAYS = 3
+DECISIONS = ("pass", "block", "release")
+REPLAY_NOTE = "replayed the decision of another greenproof hook for this stop"
 RELEASE_FIRST_LINE = "greenproof: the agent stopped with the gate failing"
 RELEASE_LAST_LINE = "run `greenproof check` for the full report"
 RELEASE_ITEMS = 5
@@ -53,6 +60,7 @@ class Payload:
     start_dir: Path | None = None
     status: str | None = None  # cursor only
     source: str | None = None  # session start only
+    fingerprint: str | None = None  # None for an empty payload (SPEC 6.1)
 
 
 @dataclass
@@ -88,8 +96,16 @@ def _text(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def payload_fingerprint(raw: dict[str, Any]) -> str | None:
+    """sha256 of the payload with sorted keys and compact separators; none when it is empty."""
+    if not raw:
+        return None
+    text = json.dumps(raw, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def parse_payload(agent: str, raw: dict[str, Any]) -> Payload:
-    """Session id and start directory per agent (SPEC 6.1 table)."""
+    """Session id, start directory and fingerprint per agent (SPEC 6.1 table)."""
     if agent == "cursor":
         roots = raw.get("workspace_roots")
         first = roots[0] if isinstance(roots, list) and roots else None
@@ -103,6 +119,7 @@ def parse_payload(agent: str, raw: dict[str, Any]) -> Payload:
         start_dir=Path(start) if start else None,
         status=_text(raw.get("status")) if agent == "cursor" else None,
         source=_text(raw.get("source")),
+        fingerprint=payload_fingerprint(raw),
     )
 
 
@@ -122,7 +139,7 @@ def protocol_block(agent: str, message: str) -> HookResult:
         return HookResult(exit_code=2, stderr=message + "\n")
     if agent == "cursor":
         return HookResult(stdout=_json_line({"followup_message": message}))
-    decision = "block" if agent == "codex" else "deny"
+    decision = "deny" if agent == "gemini" else "block"
     return HookResult(stdout=_json_line({"decision": decision, "reason": message}))
 
 
@@ -202,10 +219,20 @@ class HookState:
     blocks: int
     note: str
     exit_code: int = 1  # the exit code of the failing run, for the report of a release
+    # State written by 0.1.0 has none of the fields below: decision block, no fingerprint,
+    # no message, zero replays.
+    fingerprint: str | None = None  # of the payload that decided it
+    decision: str = "block"  # pass, block or release
+    message: str = ""  # the agent message of a block
+    replays: int = 0
 
 
 def state_path(repo: Path) -> Path:
     return gitops.git_dir(repo) / "greenproof" / STATE_FILE
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def load_state(repo: Path) -> HookState | None:
@@ -215,19 +242,27 @@ def load_state(repo: Path) -> HookState | None:
         session, tree, blocks = data["session"], data["tree"], data["blocks"]
         note = data["note"]
         exit_code = data.get("exit_code", 1)
+        fingerprint = data.get("fingerprint")
+        decision = data.get("decision", "block")
+        message = data.get("message", "")
+        replays = data.get("replays", 0)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
     if (
         not isinstance(session, str)
         or not isinstance(tree, str)
         or not isinstance(note, str)
-        or isinstance(blocks, bool)
-        or not isinstance(blocks, int)
-        or isinstance(exit_code, bool)
-        or not isinstance(exit_code, int)
+        or not _is_int(blocks)
+        or not _is_int(exit_code)
+        or not (fingerprint is None or isinstance(fingerprint, str))
+        or decision not in DECISIONS
+        or not isinstance(message, str)
+        or not _is_int(replays)
     ):
         return None
-    return HookState(session, tree, blocks, note, exit_code)
+    return HookState(
+        session, tree, blocks, note, exit_code, fingerprint, decision, message, replays
+    )
 
 
 def save_state(repo: Path, state: HookState) -> None:
@@ -246,6 +281,10 @@ def save_state(repo: Path, state: HookState) -> None:
                     "blocks": state.blocks,
                     "note": state.note,
                     "exit_code": state.exit_code,
+                    "fingerprint": state.fingerprint,
+                    "decision": state.decision,
+                    "message": state.message,
+                    "replays": state.replays,
                 },
                 handle,
             )
@@ -257,6 +296,49 @@ def save_state(repo: Path, state: HookState) -> None:
 def clear_state(repo: Path) -> None:
     with contextlib.suppress(OSError):
         state_path(repo).unlink(missing_ok=True)
+
+
+# --- lock (SPEC 6.2, duplicate hooks) --------------------------------------------------
+
+
+def lock_path(repo: Path) -> Path:
+    return gitops.git_dir(repo) / "greenproof" / LOCK_FILE
+
+
+def _acquire(handle: IO[str]) -> None:
+    """Block until the exclusive lock on `handle` is held. Raises OSError when it cannot be."""
+    if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
+        import msvcrt
+
+        while True:  # LK_LOCK gives up after about ten seconds: retry until it succeeds
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError:
+                continue
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+@contextlib.contextmanager
+def hook_lock(repo: Path) -> Iterator[None]:
+    """Exclusive lock on `<git-dir>/greenproof/hook.lock`. When the lock file cannot be opened
+    (or locked), the hook runs without it: advisory, never a reason to fail."""
+    path = lock_path(repo)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a")
+    except OSError:
+        yield
+        return
+    try:
+        with contextlib.suppress(OSError):
+            _acquire(handle)
+        yield
+    finally:
+        handle.close()  # closing releases the lock
 
 
 # --- check --hook ----------------------------------------------------------------------
@@ -274,24 +356,40 @@ def _failed_report(exc: Exception, candidate: pipeline.Candidate | None) -> Repo
     return report
 
 
+def _recorded_report(
+    state: HookState, note: str, candidate: pipeline.Candidate | None = None
+) -> Report:
+    """The report of a decision taken from the recorded state without running the check."""
+    if state.exit_code >= 4:
+        report = error_report(__version__, "hook", state.note, state.exit_code)
+    else:
+        report = Report(version=__version__, mode="hook", verdict="fail", exit_code=state.exit_code)
+    report.notes.append(note)
+    if candidate is not None:
+        report.base, report.tree = candidate.base, candidate.tree
+    return report
+
+
 def _released_report(state: HookState, candidate: pipeline.Candidate) -> Report:
     """The report of a release without a rerun: the agent was told and stopped unchanged."""
     note = "released without re-running: same session and same tree as the last block"
-    if state.exit_code >= 4:
-        report = error_report(__version__, "hook", state.note, state.exit_code)
-        report.notes.append(note)
-        report.base, report.tree = candidate.base, candidate.tree
-        return report
-    report = Report(
-        version=__version__,
-        mode="hook",
-        base=candidate.base,
-        tree=candidate.tree,
-        notes=[note],
-        verdict="fail",
-        exit_code=state.exit_code,
-    )
-    return report
+    return _recorded_report(state, note, candidate)
+
+
+def _replay(agent: str, repo: Path, state: HookState) -> HookResult:
+    """Output the recorded decision again for a duplicate hook of the same stop (SPEC 6.2)."""
+    save_state(repo, replace(state, replays=state.replays + 1))
+    if state.decision == "pass":
+        report = Report(version=__version__, mode="hook", notes=[REPLAY_NOTE])
+        result = protocol_pass(agent)
+    else:
+        report = _recorded_report(state, REPLAY_NOTE)
+        if state.decision == "block":
+            result = protocol_block(agent, state.message)
+        else:
+            result = protocol_release(agent, state.note)
+    result.report = report
+    return result
 
 
 def run_hook(agent: str, payload: Payload, opts: pipeline.CheckOptions) -> HookResult:
@@ -313,6 +411,23 @@ def run_hook(agent: str, payload: Payload, opts: pipeline.CheckOptions) -> HookR
         result.report = report
         return result
 
+    # Duplicate hooks for one stop (a plugin and `init`'s hooks) run in parallel: everything
+    # from here to the state write is one decision, taken by one hook at a time.
+    with hook_lock(repo):
+        return _decide(agent, repo, payload, opts)
+
+
+def _decide(agent: str, repo: Path, payload: Payload, opts: pipeline.CheckOptions) -> HookResult:
+    state = load_state(repo)
+    if (
+        state is not None
+        and payload.fingerprint is not None
+        and state.session == payload.session_id
+        and state.fingerprint == payload.fingerprint
+        and state.replays < MAX_REPLAYS
+    ):
+        return _replay(agent, repo, state)
+
     candidate: pipeline.Candidate | None = None
     try:
         candidate = pipeline.locate(opts, repo)
@@ -321,8 +436,12 @@ def run_hook(agent: str, payload: Payload, opts: pipeline.CheckOptions) -> HookR
             result = protocol_pass(agent)
             result.report = pipeline.nothing_to_verify_report(opts, candidate)
             return result
-        state = load_state(repo)
-        if state and state.session == payload.session_id and state.tree == candidate.tree:
+        if (
+            state
+            and state.decision in ("block", "release")
+            and state.session == payload.session_id
+            and state.tree == candidate.tree
+        ):
             result = protocol_release(agent, state.note)
             result.report = _released_report(state, candidate)
             return result
@@ -330,8 +449,20 @@ def run_hook(agent: str, payload: Payload, opts: pipeline.CheckOptions) -> HookR
     except Exception as exc:  # fail closed: an error is a failure, never a pass
         report = _failed_report(exc, candidate)
 
-    if report.exit_code == 0:
-        clear_state(repo)
+    if report.exit_code == 0 and candidate is not None:
+        # A pass is recorded, not cleared: a duplicate hook for this stop replays it.
+        save_state(
+            repo,
+            HookState(
+                payload.session_id,
+                candidate.tree,
+                0,
+                "",
+                0,
+                payload.fingerprint,
+                "pass",
+            ),
+        )
         result = protocol_pass(agent)
         result.report = report
         return result
@@ -356,19 +487,33 @@ def _fail(
     repeated_error = (
         candidate is None
         and state is not None
+        and state.decision in ("block", "release")
         and state.session == payload.session_id
         and state.tree == ""
     )
     release = blocks >= MAX_CONSECUTIVE_BLOCKS or repeated_error
+    message = "" if release else agent_message(report)
     # A release starts the count again but keeps the tree: the same tree stays released
     # without a rerun, and a later change in the session is gated again.
     kept = 0 if release else blocks
-    save_state(repo, HookState(payload.session_id, tree, kept, note, report.exit_code))
+    save_state(
+        repo,
+        HookState(
+            payload.session_id,
+            tree,
+            kept,
+            note,
+            report.exit_code,
+            payload.fingerprint,
+            "release" if release else "block",
+            message,
+        ),
+    )
     if release:
         report.notes.append(f"released after {blocks} consecutive failures in this session")
         result = protocol_release(agent, note)
     else:
-        result = protocol_block(agent, agent_message(report))
+        result = protocol_block(agent, message)
     result.report = report
     return result
 
