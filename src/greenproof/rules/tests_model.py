@@ -24,6 +24,19 @@ class Unit:
     swallowed: int = 0
     swallow_line: int = 0
     expected: list[tuple[str, int]] = field(default_factory=list)  # (literal, line)
+    # Python only: structural identity and per-assertion shapes (identifiers alpha-renamed).
+    struct_hash: str = ""
+    shapes: list[str] = field(default_factory=list)
+    vacuous: int = 0
+    vacuous_line: int = 0
+    unreachable: int = 0
+    unreachable_line: int = 0
+    strong_operands: set[str] = field(default_factory=set)
+    weak_operands: set[str] = field(default_factory=set)
+    # Collection facts: enclosing classes, whether one is a TestCase, `__test__ = False`.
+    classes: tuple[str, ...] = ()
+    testcase: bool = False
+    disabled: bool = False
 
     @property
     def name(self) -> str:
@@ -39,6 +52,7 @@ class Marker:
     text: str
     line: int
     rule: str  # tests.skipped or tests.focused
+    conditional: bool = False  # skipif(<condition>), importorskip: depends on the environment
 
 
 @dataclass
@@ -47,3 +61,4 @@ class FileAnalysis:
     engine: str
     units: list[Unit] = field(default_factory=list)
     markers: list[Marker] = field(default_factory=list)
+    collected: bool = True  # whether the runner's file patterns pick this file up

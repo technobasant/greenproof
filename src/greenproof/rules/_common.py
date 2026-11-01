@@ -22,6 +22,13 @@ def warn_finding(rule: str, file: str | None, line: int | None, message: str, hi
     return Finding(rule, WARN, file, line, message, hint)
 
 
+def sev_finding(
+    rule: str, severity: str, file: str | None, line: int | None, message: str, hint: str
+) -> Finding:
+    """A finding at an explicit severity (policy overrides still apply later)."""
+    return Finding(rule, severity, file, line, message, hint)
+
+
 def language_of(path: str) -> str | None:
     if path.endswith(".py"):
         return "python"

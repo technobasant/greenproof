@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import builtins
+import copy
 import posixpath
 import re
 from collections.abc import Sequence
@@ -39,6 +41,10 @@ _EQUAL_METHODS = {
     "assertAlmostEquals",
 }
 _FuncDef = ast.FunctionDef | ast.AsyncFunctionDef
+_CONDITIONAL = {"mark.skipif", "pytest.importorskip", "unittest.skipIf", "unittest.skipUnless"}
+_KEEP_NAMES = set(dir(builtins)) | {"self", "cls", "pytest", "mock", "unittest"}
+_KEEP_ATTRS = {"raises", "warns", "approx", "mark", "parametrize", "skip", "skipif", "xfail"}
+_KEEP_ATTRS |= {"fail", "importorskip", "TestCase"}
 
 
 def dotted(node: ast.AST) -> str:
@@ -51,7 +57,120 @@ def dotted(node: ast.AST) -> str:
 
 
 def _is_test_name(name: str, in_class: bool) -> bool:
-    return name.startswith("test") if in_class else name.startswith("test_")
+    # Superset of what the runner collects; `collect.Collection` applies the configured prefixes.
+    return name.startswith("test")
+
+
+class _Renamer(ast.NodeTransformer):
+    """Alpha-renames identifiers to `_0`, `_1`, ... by first occurrence; keeps builtins, the
+    pytest vocabulary, `assert*` method names, constants, operators and keyword names."""
+
+    def __init__(self) -> None:
+        self.names: dict[str, str] = {}
+
+    def _new(self, ident: str) -> str:
+        return self.names.setdefault(ident, f"_{len(self.names)}")
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id not in _KEEP_NAMES:
+            node.id = self._new(node.id)
+        return node
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        self.generic_visit(node)
+        if node.attr not in _KEEP_ATTRS and not node.attr.startswith("assert"):
+            node.attr = self._new(node.attr)
+        return node
+
+    def visit_arg(self, node: ast.arg) -> ast.AST:
+        node.arg = self._new(node.arg)
+        node.annotation = None
+        return node
+
+
+def _shape(node: ast.AST) -> str:
+    """Structural form of an expression or statement: identifiers renamed, rest kept."""
+    return digest(ast.dump(_Renamer().visit(copy.deepcopy(node))))
+
+
+def _has_call(node: ast.AST) -> bool:
+    return any(isinstance(n, ast.Call) for n in ast.walk(node))
+
+
+def _always_false(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return not node.value
+    return (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.Not)
+        and _always_true(node.operand)
+    )
+
+
+def _always_true(node: ast.AST) -> bool:
+    """A condition that cannot fail: a truthy constant, `x or True`, `x == x`, a non-empty tuple."""
+    if isinstance(node, ast.Constant):
+        return bool(node.value) and node.value is not Ellipsis
+    if isinstance(node, ast.Tuple):
+        return bool(node.elts)
+    if isinstance(node, ast.BoolOp):
+        parts = [_always_true(v) for v in node.values]
+        return any(parts) if isinstance(node.op, ast.Or) else all(parts)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _always_false(node.operand)
+    if isinstance(node, ast.Compare) and len(node.ops) == 1:
+        return isinstance(node.ops[0], (ast.Eq, ast.LtE, ast.GtE, ast.Is)) and _same(
+            node.left, node.comparators[0]
+        )
+    return False
+
+
+def _same(a: ast.AST, b: ast.AST) -> bool:
+    """The same side-effect-free expression on both sides (calls are not assumed pure)."""
+    return not _has_call(a) and ast.dump(a) == ast.dump(b)
+
+
+def _vacuous_call(tail: str, node: ast.Call) -> bool:
+    if tail == "assertTrue":
+        return bool(node.args) and _always_true(node.args[0])
+    if tail in _EQUAL_METHODS and len(node.args) >= 2:
+        return _same(node.args[0], node.args[1])
+    return False
+
+
+def _is_raises_with(node: ast.With | ast.AsyncWith) -> bool:
+    return any(
+        isinstance(i.context_expr, ast.Call)
+        and (t := dotted(i.context_expr.func).rsplit(".", 1)[-1])
+        and (t in {"raises", "warns"} or t in _RAISES_METHODS)
+        for i in node.items
+    )
+
+
+def _prune(fn: _FuncDef) -> list[ast.stmt]:
+    """Remove statements that can never run (after an unconditional return/raise outside a
+    raises-block, or under `if False:`) from `fn` in place; return what was removed."""
+    dropped: list[ast.stmt] = []
+
+    def walk(stmts: list[ast.stmt], in_raises: bool) -> None:
+        for i, stmt in enumerate(stmts):
+            if isinstance(stmt, ast.If) and _always_false(stmt.test):
+                dropped.extend(stmt.body)
+                stmt.body = [ast.copy_location(ast.Pass(), stmt)]
+            for name in ("body", "orelse", "finalbody"):
+                inner = getattr(stmt, name, None)
+                if isinstance(inner, list) and inner and isinstance(inner[0], ast.stmt):
+                    raises = isinstance(stmt, (ast.With, ast.AsyncWith)) and _is_raises_with(stmt)
+                    walk(inner, in_raises or (raises and name == "body"))
+            for handler in getattr(stmt, "handlers", []):
+                walk(handler.body, in_raises)
+            if isinstance(stmt, (ast.Return, ast.Raise)) and not in_raises:
+                dropped.extend(stmts[i + 1 :])
+                del stmts[i + 1 :]
+                return
+
+    walk(fn.body, False)
+    return dropped
 
 
 def _number(node: ast.AST) -> float | None:
@@ -107,11 +226,27 @@ class _Stats(ast.NodeVisitor):
         self.swallowed = 0
         self.swallow_line = 0
         self.expected: list[tuple[str, int]] = []
+        self.shapes: list[str] = []
+        self.vacuous = 0
+        self.vacuous_line = 0
+        self.strong_operands: set[str] = set()
+        self.weak_operands: set[str] = set()
+        self.first_line = 0
 
     # -- assertions ---------------------------------------------------------------------
-    def visit_Assert(self, node: ast.Assert) -> None:
+    def _counted(self, node: ast.AST) -> None:
         self.asserts += 1
+        self.first_line = self.first_line or getattr(node, "lineno", 0)
+        self.shapes.append(_shape(node))
+
+    def visit_Assert(self, node: ast.Assert) -> None:
         test = node.test
+        if _always_true(test):  # vacuous: it can never fail, so it checks nothing
+            self.vacuous += 1
+            self.vacuous_line = self.vacuous_line or node.lineno
+            self.first_line = self.first_line or node.lineno
+            return
+        self._counted(node.test)
         if isinstance(test, ast.Compare):
             if (
                 len(test.ops) == 1
@@ -120,8 +255,10 @@ class _Stats(ast.NodeVisitor):
                 and test.comparators[0].value is None
             ):
                 self.weak += 1
+                self.weak_operands.add(_shape(test.left))
             else:
                 self.strong += 1
+                self.strong_operands.update(_shape(o) for o in (test.left, *test.comparators))
             if len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq):
                 for side in (test.left, test.comparators[0]):
                     lit = _expected_of(side)
@@ -129,16 +266,18 @@ class _Stats(ast.NodeVisitor):
                         self.expected.append((ast.dump(lit), node.lineno))
         elif isinstance(test, (ast.Name, ast.Attribute, ast.Subscript)):
             self.weak += 1
+            self.weak_operands.add(_shape(test))
         elif isinstance(test, ast.Call):
             # A bare truthiness check on a call is weak; type checks pin a concrete fact.
             if dotted(test.func) in {"isinstance", "issubclass"}:
                 self.strong += 1
             else:
                 self.weak += 1
+                self.weak_operands.add(_shape(test))
         self.generic_visit(node)
 
     def _raises(self, call: ast.Call) -> None:
-        self.asserts += 1
+        self._counted(call)
         arg = call.args[0] if call.args else None
         names = (
             [dotted(e) for e in arg.elts]
@@ -165,11 +304,19 @@ class _Stats(ast.NodeVisitor):
         if tail in {"raises", "warns"} or tail in _RAISES_METHODS:
             self._raises(node)
         elif re.fullmatch(r"assert[A-Z]\w*", tail):
-            self.asserts += 1
+            if _vacuous_call(tail, node):
+                self.vacuous += 1
+                self.vacuous_line = self.vacuous_line or node.lineno
+                self.first_line = self.first_line or node.lineno
+                return
+            self._counted(node)
             if tail in _WEAK_METHODS:
                 self.weak += 1
+                if node.args:
+                    self.weak_operands.add(_shape(node.args[0]))
             else:
                 self.strong += 1
+                self.strong_operands.update(_shape(a) for a in node.args[:2])
             if tail in _EQUAL_METHODS:
                 for arg in node.args[:2]:
                     lit = _expected_of(arg)
@@ -182,7 +329,7 @@ class _Stats(ast.NodeVisitor):
                 if len(node.args) >= 3:
                     self._tolerance("places", _number(node.args[2]))
         elif tail.startswith("assert_"):
-            self.asserts += 1
+            self._counted(node)
         elif tail == "approx":
             for kw in node.keywords:
                 if kw.arg in {"rel", "abs"}:
@@ -210,6 +357,8 @@ class _Stats(ast.NodeVisitor):
         self.weak += sub.weak
         self.broad += sub.broad
         self.specific += sub.specific
+        self.shapes.extend(sub.shapes)
+        self.vacuous += sub.vacuous
 
     # -- swallowing ---------------------------------------------------------------------
     def _swallows(self, handler: ast.ExceptHandler) -> bool:
@@ -285,10 +434,38 @@ def _body_hash(fn: _FuncDef) -> str:
     return digest(ast.dump(fn.args) + "".join(ast.dump(s) for s in body))
 
 
-def _unit(path: str, key: str, fn: _FuncDef, helpers: dict[str, _FuncDef]) -> Unit:
+def _struct_hash(fn: _FuncDef) -> str:
+    clone = copy.deepcopy(fn)
+    body = list(clone.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    renamer = _Renamer()
+    args = renamer.visit(clone.args)
+    return digest(ast.dump(args) + "".join(ast.dump(renamer.visit(s)) for s in body))
+
+
+def _unit(
+    path: str,
+    key: str,
+    fn: _FuncDef,
+    helpers: dict[str, _FuncDef],
+    classes: tuple[str, ...],
+    testcase: bool,
+    disabled: bool,
+) -> Unit:
+    live = copy.deepcopy(fn)
+    dropped = _prune(live)
     stats = _Stats(helpers)
-    for stmt in fn.body:
+    for stmt in live.body:
         stats.visit(stmt)
+    lost = _Stats(helpers)
+    for stmt in dropped:
+        lost.visit(stmt)
     return Unit(
         path=path,
         key=key,
@@ -305,19 +482,65 @@ def _unit(path: str, key: str, fn: _FuncDef, helpers: dict[str, _FuncDef]) -> Un
         swallowed=stats.swallowed,
         swallow_line=stats.swallow_line,
         expected=stats.expected,
+        struct_hash=_struct_hash(fn),
+        shapes=stats.shapes,
+        vacuous=stats.vacuous,
+        vacuous_line=stats.vacuous_line,
+        unreachable=lost.asserts,
+        unreachable_line=lost.first_line,
+        strong_operands=stats.strong_operands,
+        weak_operands=stats.weak_operands,
+        classes=classes,
+        testcase=testcase,
+        disabled=disabled,
     )
 
 
+def _test_disabled(body: Sequence[ast.stmt]) -> ast.stmt | None:
+    """The `__test__ = False` assignment in a module or class body, if any."""
+    for node in body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = node.value
+            if (
+                any(isinstance(t, ast.Name) and t.id == "__test__" for t in targets)
+                and isinstance(value, ast.Constant)
+                and value.value is False
+            ):
+                return node
+    return None
+
+
 def _collect_units(
-    path: str, body: Sequence[ast.stmt], prefix: str, helpers: dict[str, _FuncDef], out: list[Unit]
+    path: str,
+    body: Sequence[ast.stmt],
+    prefix: str,
+    helpers: dict[str, _FuncDef],
+    out: list[Unit],
+    classes: tuple[str, ...] = (),
+    testcase: bool = False,
+    disabled: bool = False,
 ) -> None:
     in_class = bool(prefix)
     for node in body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _is_test_name(node.name, in_class):
-                out.append(_unit(path, f"{prefix}{node.name}", node, helpers))
+                unit = _unit(
+                    path, f"{prefix}{node.name}", node, helpers, classes, testcase, disabled
+                )
+                out.append(unit)
         elif isinstance(node, ast.ClassDef):
-            _collect_units(path, node.body, f"{prefix}{node.name}::", helpers, out)
+            case = any(dotted(b).rsplit(".", 1)[-1].endswith("TestCase") for b in node.bases)
+            _collect_units(
+                path,
+                node.body,
+                f"{prefix}{node.name}::",
+                helpers,
+                out,
+                (*classes, node.name),
+                testcase or case,
+                disabled or _test_disabled(node.body) is not None,
+            )
 
 
 class _Markers(ast.NodeVisitor):
@@ -331,8 +554,22 @@ class _Markers(ast.NodeVisitor):
 
     def _add(self, kind: str, node: ast.AST) -> None:
         self.found.append(
-            Marker(self.scope, kind, kind, getattr(node, "lineno", 0), "tests.skipped")
+            Marker(
+                self.scope,
+                kind,
+                kind,
+                getattr(node, "lineno", 0),
+                "tests.skipped",
+                kind in _CONDITIONAL,
+            )
         )
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if not self.in_unit and _test_disabled([node]) is not None:
+            self.found.append(
+                Marker(self.scope, "__test__", "__test__ = False", node.lineno, "tests.skipped")
+            )
+        self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         name = dotted(node)
@@ -420,7 +657,9 @@ def analyse_python(path: str, text: str) -> FileAnalysis | None:
                 ):
                     helpers.setdefault(n.name, n)
     analysis = FileAnalysis(path, "python")
-    _collect_units(path, tree.body, "", helpers, analysis.units)
+    _collect_units(
+        path, tree.body, "", helpers, analysis.units, disabled=_test_disabled(tree.body) is not None
+    )
     visitor = _Markers(path)
     visitor.visit(tree)
     analysis.markers = visitor.found

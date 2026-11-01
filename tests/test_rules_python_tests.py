@@ -216,7 +216,8 @@ def test_skip_calls_in_the_body_fire(tmp_path: Path) -> None:
         new = "import unittest\n" + BASE_TESTS.replace(
             "    total = helper(100)", f"    {call}\n    total = helper(100)"
         )
-        assert rule_ids(skipped(sub, new)) == ["tests.skipped"], call
+        # a raise before the assertions also leaves them unreachable, so weakened may join it
+        assert "tests.skipped" in rule_ids(skipped(sub, new)), call
 
 
 def test_importorskip_only_counts_on_an_existing_test(tmp_path: Path) -> None:

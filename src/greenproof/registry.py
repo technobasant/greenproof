@@ -30,26 +30,37 @@ _RULES = [
     RuleInfo(
         "tests.deleted",
         BLOCK,
-        "A test file was deleted, or renamed to a path that is not a test file. Deleting the "
-        "test is the simplest way to make a failing gate pass.",
+        "A test file was deleted, or renamed to a path that is not a test file or that the "
+        "test runner does not collect (for pytest: python_files from the base revision's "
+        "configuration, else test_*.py and *_test.py). Deleting or hiding the test is the "
+        "simplest way to make a failing gate pass.",
     ),
     RuleInfo(
         "tests.removed",
         BLOCK,
-        "A test function or case that exists at the base revision is gone and nothing "
-        "replaced it, so the behaviour it checked is no longer checked.",
+        "A test function or case that exists at the base revision is gone and is not covered: "
+        "some of its assertions appear in no collected test of the candidate, so the behaviour "
+        "it checked is no longer checked. A test moved to a file or name the runner does not "
+        "collect counts as gone. Renamed, moved, split or merged tests whose assertions all "
+        "survive are covered and do not fire.",
     ),
     RuleInfo(
         "tests.replaced",
         BLOCK,
-        "In one file a test was removed and a different test was added (delete-and-replace). "
-        "Both names are reported. Rename a test in its own change if that is what you mean.",
+        "In one file a test was removed and a different test was added (delete-and-replace), "
+        "and the removed test is not covered: its assertions do not all survive in a collected "
+        "test. Both names are reported. A rename with an identical or structurally identical "
+        "body is clean, and so is splitting or merging tests that keep every assertion.",
     ),
     RuleInfo(
         "tests.skipped",
         BLOCK,
-        "A skip, xfail, ignore or todo marker was added to a test, or to collection "
-        "configuration such as conftest.py. The test no longer runs, so it can no longer fail.",
+        "A skip, xfail, ignore or todo marker (or `__test__ = False`, or a skip in `pytestmark`) "
+        "was added to a test that exists at the base revision, or at module, class or "
+        "conftest scope. The test no longer runs, so it can no longer fail. On a brand-new "
+        "test an unconditional skip or xfail is only a warning, and a conditional one "
+        "(skipif with a condition, importorskip) does not fire: neither hides existing "
+        "verification.",
     ),
     RuleInfo(
         "tests.focused",
@@ -61,8 +72,12 @@ _RULES = [
         "tests.weakened",
         BLOCK,
         "A test present on both sides checks less than before: fewer assertions, a strong "
-        "assertion replaced by a weaker one, a wider tolerance, fewer parametrize cases, or an "
-        "assertion wrapped in a try/except that swallows the failure.",
+        "assertion replaced by a weaker one, a wider tolerance, fewer parametrize cases, an "
+        "assertion made vacuous (`assert True`, `... or True`, `x == x`) or unreachable (after "
+        "an unconditional return or raise, or under `if False`), or an assertion wrapped in a "
+        "try/except that swallows the failure. Replacing a comparison with its own operand "
+        "(`assert f() == 1` to `assert f()`) blocks; replacing it with a different expression "
+        "is a warning, because that is often a legitimate refactor.",
     ),
     RuleInfo(
         "tests.expected_changed",
@@ -81,15 +96,24 @@ _RULES = [
     RuleInfo(
         "runner.tampered",
         BLOCK,
-        "A change narrows or neuters how checks run: test selection, coverage thresholds, "
-        "type-checker or linter strictness, or the scripts that run the tests.",
+        "A change narrows or neuters how checks run: test selection or collection patterns, "
+        "coverage thresholds (lowered or removed), type-checker or linter strictness, the "
+        "scripts that run the tests, a conftest or plugin hook that can rewrite outcomes or "
+        "collection, or os._exit / sys.exit(0) added to a test file.",
     ),
     RuleInfo(
         "ci.tampered",
         BLOCK,
         "A CI workflow change removes or neuters a test or lint step, adds continue-on-error, "
         "|| true or if: false, adds path filters that exclude tests, or changes the greenproof "
-        "step itself.",
+        "step itself. A ref-only version bump of the greenproof action is a warning.",
+    ),
+    RuleInfo(
+        "static.parse_error",
+        WARN,
+        "A changed file in a parsed language (Python, TOML, JSON, INI) does not parse. "
+        "greenproof falls back to line-level checks for that file, which see less than the "
+        "structural ones, so fix the file.",
     ),
     RuleInfo(
         "code.hardcoded",
