@@ -224,9 +224,53 @@ def test_base_github_base_ref(tmp_path: Path) -> None:
     assert (base.ref, base.sha) == ("origin/main", pr_base)
 
 
+def test_base_github_base_ref_is_the_fork_point_after_the_base_advances(tmp_path: Path) -> None:
+    upstream = make_repo(tmp_path / "upstream")
+    fork_point = upstream.head()
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(upstream.path), str(clone)], check=True)
+    work = Repo(clone)
+    work.git("config", "user.name", "Test")
+    work.git("config", "user.email", "t@example.com")
+    work.git("checkout", "-q", "-b", "pr")
+    work.write("a.py", "a = 1\n")
+    work.commit("pr change")
+    upstream.write("b.py", "b = 1\n")
+    advanced = upstream.commit("base advanced after the PR branched")
+    work.git("fetch", "-q", "origin")
+    assert work.git("rev-parse", "origin/main") == advanced
+    base = gitops.resolve_base(clone, None, {"GITHUB_BASE_REF": "main"})
+    assert (base.ref, base.sha) == ("origin/main", fork_point)
+
+
 def test_base_github_base_ref_missing_suggests_fetch_depth(repo: Repo) -> None:
     with pytest.raises(UsageError, match="fetch-depth: 0"):
         gitops.resolve_base(repo.path, None, {"GITHUB_BASE_REF": "main"})
+
+
+def test_session_marker_is_per_worktree(repo: Repo, tmp_path: Path) -> None:
+    repo.git("checkout", "-q", "-b", "feature")
+    repo.write("a.py", "a = 1\n")
+    first = repo.commit("first session started here")
+    other = tmp_path / "other"
+    repo.git("worktree", "add", "-q", "-b", "feature-2", str(other))
+    second_repo = Repo(other)
+    second_repo.write("b.py", "b = 1\n")
+    second = second_repo.commit("second session started here")
+
+    gitops.write_session_marker(repo.path)
+    gitops.write_session_marker(other)
+    repo.write("c.py", "c = 1\n")
+    repo.commit("work in the first")
+    second_repo.write("d.py", "d = 1\n")
+    second_repo.commit("work in the second")
+
+    assert gitops.resolve_base(repo.path, None, {}).sha == first
+    assert gitops.resolve_base(other, None, {}).sha == second
+    assert gitops.session_marker_path(repo.path) != gitops.session_marker_path(other)
+    assert gitops.session_marker_path(other).parent.parent.parent.name == "worktrees"
+    # The cache stays shared in the common dir.
+    assert gitops.greenproof_dir(other) == gitops.greenproof_dir(repo.path)
 
 
 def test_session_marker_requires_commits(tmp_path: Path) -> None:
@@ -296,3 +340,31 @@ def test_worktree_removed_on_sigterm(repo: Repo) -> None:
         time.sleep(0.05)
     assert not wt.exists()
     assert _worktree_count(repo) == 1
+
+
+def test_both_snapshot_seeds_give_the_same_tree(repo: Repo) -> None:
+    repo.write("keep.py", "k = 1\n")
+    repo.write("gone_staged.py", "g = 1\n")
+    repo.write("gone_unstaged.py", "g = 2\n")
+    repo.commit("more files")
+    repo.write("staged_new.py", "s = 1\n")
+    repo.git("add", "staged_new.py")
+    repo.write("keep.py", "k = 2\n")  # unstaged modification
+    repo.write("untracked.py", "u = 1\n")
+    repo.git("rm", "-q", "gone_staged.py")  # staged deletion
+    repo.remove("gone_unstaged.py")  # unstaged deletion
+
+    from_index = gitops.snapshot_tree(repo.path, seed_from_index=True)
+    from_head = gitops.snapshot_tree(repo.path, seed_from_index=False)
+    assert from_index == from_head
+    files = set(repo.git("ls-tree", "-r", "--name-only", from_index).splitlines())
+    assert {"staged_new.py", "untracked.py", "keep.py"} <= files
+    assert not files & {"gone_staged.py", "gone_unstaged.py"}
+
+
+def test_snapshot_falls_back_to_head_when_there_is_no_index(repo: Repo) -> None:
+    repo.write("untracked.py", "u = 1\n")
+    expected = gitops.snapshot_tree(repo.path, seed_from_index=False)
+    (repo.path / ".git" / "index").unlink()
+    assert gitops.snapshot_tree(repo.path) == expected
+    assert not (repo.path / ".git" / "index").exists()  # the fallback did not create one

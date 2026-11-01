@@ -94,6 +94,16 @@ def greenproof_dir(repo: Path) -> Path:
     return git_common_dir(repo) / "greenproof"
 
 
+def git_dir(repo: Path) -> Path:
+    """The git directory of this worktree (the common dir only in the main worktree)."""
+    return Path(_out(git(repo, "rev-parse", "--path-format=absolute", "--git-dir")))
+
+
+def session_marker_path(repo: Path) -> Path:
+    """Per worktree, so parallel sessions in separate worktrees keep their own base."""
+    return git_dir(repo) / "greenproof" / SESSION_MARKER
+
+
 def has_commits(repo: Path) -> bool:
     return git(repo, "rev-parse", "--verify", "-q", "HEAD^{commit}", check=False).returncode == 0
 
@@ -118,15 +128,32 @@ def head_sha(repo: Path) -> str:
     return _out(git(repo, "rev-parse", "HEAD"))
 
 
-def snapshot_tree(repo: Path) -> str:
+def _seed_from_user_index(repo: Path, index: Path) -> bool:
+    """Copy the user's index to `index`; its stat cache saves re-hashing unchanged files and
+    re-running clean filters (Git LFS). False when there is no index or it cannot be copied."""
+    try:
+        source = Path(_out(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index")))
+        # copy2 keeps the mtime: git decides whether an entry is "racily clean" by comparing
+        # it with the index file's mtime, so a fresher copy would hide same-size edits.
+        shutil.copy2(source, index)
+    except (OSError, UsageError):
+        index.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def snapshot_tree(repo: Path, seed_from_index: bool = True) -> str:
     """The tree of HEAD plus every staged, unstaged and untracked (non-ignored) change.
 
-    Built in a temporary index file, so the user's index and working tree are untouched.
+    Built in a temporary index file (a copy of the user's index, else `read-tree HEAD`), so
+    the user's index and working tree are untouched. Both seeds give the same tree.
     """
     require_commits(repo)
     with tempfile.TemporaryDirectory(prefix="greenproof-index-") as tmp:
-        env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
-        git(repo, "read-tree", "HEAD", env=env)
+        index = Path(tmp) / "index"
+        env = {"GIT_INDEX_FILE": str(index)}
+        if not (seed_from_index and _seed_from_user_index(repo, index)):
+            git(repo, "read-tree", "HEAD", env=env)
         git(repo, "add", "-A", env=env)
         return _out(git(repo, "write-tree", env=env))
 
@@ -137,15 +164,14 @@ def head_tree(repo: Path) -> str:
 
 def write_session_marker(repo: Path) -> Path:
     sha = head_sha(repo)
-    directory = greenproof_dir(repo)
-    directory.mkdir(parents=True, exist_ok=True)
-    marker = directory / SESSION_MARKER
+    marker = session_marker_path(repo)
+    marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(sha + "\n")
     return marker
 
 
 def _read_session_marker(repo: Path) -> str | None:
-    marker = greenproof_dir(repo) / SESSION_MARKER
+    marker = session_marker_path(repo)
     try:
         sha = marker.read_text().strip()
     except OSError:
@@ -190,12 +216,16 @@ def resolve_base(repo: Path, explicit: str | None, env: Mapping[str, str]) -> Ba
     pr_base = env.get("GITHUB_BASE_REF", "").strip()
     if pr_base:
         ref = f"origin/{pr_base}"
-        sha = rev_parse_commit(repo, ref)
-        if sha is None:
+        if rev_parse_commit(repo, ref) is None:
             raise UsageError(
                 f"GITHUB_BASE_REF is {pr_base!r} but {ref} is not available locally. {_FETCH_HINT}"
             )
-        return Base(ref, sha)
+        # The fork point, not the branch tip: on the PR merge-commit checkout the base branch
+        # may have advanced since, and diffing against its tip would show those commits reversed.
+        proc = git(repo, "merge-base", "HEAD", ref, check=False)
+        if proc.returncode != 0 or not _out(proc):
+            raise UsageError(f"no merge base between HEAD and {ref}. {_FETCH_HINT}")
+        return Base(ref, _out(proc))
 
     marker = _read_session_marker(repo)
     if marker is not None:
