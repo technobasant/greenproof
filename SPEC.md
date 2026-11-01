@@ -272,9 +272,20 @@ module or class is not disabled by `__test__ = False`. A test file renamed to a 
 the runner does not collect is `tests.deleted` even when its content is unchanged.
 
 A base test left unpaired is **covered**, and produces no finding, when every one of its
-assertions (in structural form) appears in some collected candidate test. This keeps
-renames, splits, merges and moves clean while a deleted or replaced test whose checks
-disappear still fires. Paired tests are then compared by the 5.4 heuristics.
+assertions appears among the assertions the change **adds**: all assertions of collected
+candidate tests left unpaired (new tests), plus, for each paired test, the candidate's
+assertions minus its base test's (a multiset difference). Assertions are compared in
+**exact form**: the parsed assertion with identifiers and constants kept and only
+formatting normalised (Python: the AST dump without positions; line engines: the assertion
+line with whitespace removed). Unreachable assertions (5.4) are not counted.
+
+Both limits matter. Generic assertions such as `assert got == want` or
+`assert len(rows) == 1` would, in structural form, match almost any other test. An
+assertion that already existed sat alongside the removed test before the change, so it
+replaces nothing. Renames that also rename identifiers are handled by pass 4, not by
+coverage. This keeps renames, splits, merges (including into an existing test) and moves
+clean, while a deleted test, or one replaced by a weaker test, still fires. Paired tests
+are then compared by the 5.4 heuristics.
 
 ## 6. Agent and CI adapters
 
