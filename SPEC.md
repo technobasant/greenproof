@@ -175,15 +175,17 @@ covering at least one true positive and one legitimate change that must NOT fire
 |---|---|---|
 | `policy.changed` | block | the candidate's `.greenproof.toml` differs from the base's |
 | `tests.deleted` | block | a test file is deleted, or renamed to a non-test path |
-| `tests.removed` | block | a test function/case present at base is gone and nothing replaced it |
-| `tests.replaced` | block | in the same file, a test is removed and a different test is added (delete-and-replace); report both names |
-| `tests.skipped` | block | a skip/xfail/ignore/todo marker is added (see 5.3) |
+| `tests.removed` | block | a test function/case present at base is gone and is not covered (5.7), including a test moved to a file or name the runner does not collect |
+| `tests.replaced` | block | in the same file, a test is removed and a different test is added (delete-and-replace) and the removed test is not covered (5.7); report both names |
+| `tests.skipped` | block | a skip/xfail/ignore/todo marker is added to a test that exists at base, or at module/class/conftest scope (see 5.3). On a brand-new test an unconditional skip/xfail is `warn` and a conditional one (`skipif(<condition>)`, `importorskip`) does not fire: neither hides existing verification |
 | `tests.focused` | block | a focus marker is added (`it.only`, `fit`, `describe.only`, `test.only`), which silently skips the rest |
-| `tests.weakened` | block | for a test present on both sides: fewer assertions, a strong assertion replaced by a weaker one, tolerance widened, parametrize cases reduced, or an assertion wrapped in a swallowing `try/except` (see 5.4) |
+| `tests.weakened` | block | for a test present on both sides: fewer assertions, a strong assertion replaced by a weaker one, tolerance widened, parametrize cases reduced, an assertion made vacuous, tautological or unreachable, or an assertion wrapped in a swallowing `try/except` (see 5.4) |
 | `tests.expected_changed` | warn | a literal in an assertion's expected side changed while non-test code also changed (legitimate when the spec changed, so warn) |
 | `suppress.added` | warn | an added line introduces a type/lint/coverage suppression (see 5.5) |
 | `runner.tampered` | block | a change narrows or neuters how checks run: test selection, thresholds, strictness, test scripts (see 5.6) |
-| `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `|| true`, `if: false`, path filters excluding tests, or changes the greenproof step itself |
+| `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `|| true`, `if: false`, path filters excluding tests, or changes the greenproof step itself. A ref-only version bump of the greenproof action (same inputs) is `warn` |
+| `static.parse_error` | warn | a changed file in a parsed language (Python, TOML, JSON, INI) does not parse; that file falls back to the line-level checks |
+| `tests.self_mocked` | warn | (M3) a test patches (`monkeypatch.setattr`, `mock.patch`, `jest.mock`, `vi.mock`) the same callable its assertions call, so it tests the mock |
 | `code.hardcoded` | warn | non-test code gains a literal table (≥ 8 entries) or an `if x == <literal>` branch whose literal also appears in a test file or fixture changed in this diff (Python AST only in v0.1) |
 
 ### 5.3 Skip/ignore markers
@@ -191,7 +193,8 @@ covering at least one true positive and one legitimate change that must NOT fire
 - Python: `@pytest.mark.skip`, `@pytest.mark.skipif`, `@pytest.mark.xfail`,
   `pytest.skip(`, `pytest.xfail(`, `pytest.importorskip(` added to an existing test,
   `@unittest.skip*`, `raise unittest.SkipTest`, `collect_ignore` / `collect_ignore_glob`
-  and `pytest_collection_modifyitems` added to `conftest.py`.
+  and `pytest_collection_modifyitems` added to `conftest.py`, `__test__ = False` added at
+  module or class scope, `pytestmark` gaining a skip/xfail.
 - JS/TS: `.skip(`, `xit(`, `xdescribe(`, `xtest(`, `.todo(`, `test.fails(` added.
 - Go: `t.Skip(`, `t.SkipNow(`, `t.Skipf(`. Rust: `#[ignore]`.
 
@@ -207,7 +210,18 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   increased;
 - `@pytest.mark.parametrize` case count reduced;
 - an assertion moved inside `try:` whose handler catches `AssertionError`/`Exception`
-  without re-raising.
+  without re-raising;
+- an assertion made vacuous or tautological: `assert <truthy constant>` (`assert True`,
+  `assert 1`), `self.assertTrue(True)`, an `or` with a truthy constant operand
+  (`assert x == 3 or True`), or a comparison of an expression with itself;
+- an assertion made unreachable: an unconditional `return`/`raise` (outside a
+  `pytest.raises`/`assertRaises` block) placed before it in the test body, or the
+  assertion moved under `if False:`/`if 0:`. Unreachable assertions do not count;
+- severity split for replaced assertions: when the new assertion is the old comparison's
+  own operand (`assert total() == 100` → `assert total()`, `assert a == b` →
+  `assert a is not None`) the finding is `block`; when it is a different expression
+  (`assert f(x) == 1` → `assert is_one(x)`) it is `warn`, because that is often a
+  legitimate refactor.
 
 JS/TS, Go, Rust (line level, per test file): count of assertion calls drops (`expect(`,
 `assert.`, `t.Error`/`t.Fatal`/`require.`/`assert.`, `assert!`/`assert_eq!`), or strong
@@ -228,15 +242,50 @@ existed elsewhere in the same file at base (moved code is not new suppression).
 Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
 - `pyproject.toml` `[tool.pytest.ini_options]` (`testpaths`, `addopts` adding `-k`,
   `--ignore`, `--deselect`, `-p no:`), `[tool.coverage.report] fail_under` lowered,
-  `[tool.mypy]` (`strict` off, `ignore_errors`, `disable_error_code` added),
+  `[tool.mypy]` (`strict` off, `ignore_errors`, `disable_error_code` added), `fail_under`
+  removed (counts as lowered), `python_files`/`python_functions`/`python_classes` narrowed,
   `[tool.ruff.lint]` (`ignore`/`extend-ignore`/`per-file-ignores` added);
 - `pytest.ini`, `setup.cfg`, `tox.ini`, `noxfile.py` equivalents;
 - `package.json` `scripts` whose names appear in the base policy's commands, plus
   `test`, `lint`, `typecheck`; `jest.config.*`/`vitest.config.*` (`testPathIgnorePatterns`,
   `exclude`, `coverageThreshold` lowered, `passWithNoTests`); `tsconfig*.json` (`strict`
   or `noImplicitAny` set false, `skipLibCheck` is ignored);
-- `Makefile`/`justfile` targets referenced by the base policy's commands.
+- `Makefile`/`justfile` targets referenced by the base policy's commands;
+- `conftest.py` or a local pytest plugin gaining a hook that can rewrite outcomes or
+  collection (`pytest_runtest_makereport`, `pytest_runtest_call`, `pytest_runtest_protocol`,
+  `pytest_pyfunc_call`, `pytest_report_teststatus`, `pytest_ignore_collect`,
+  `pytest_collect_file`, or `pytest_sessionfinish` assigning `exitstatus`), and
+  `os._exit(` or `sys.exit(0)` added to a test or conftest file.
 When structural parsing fails, fall back to a file-level `warn` naming the file.
+
+### 5.7 Test identity and covered removals
+
+Base tests are paired with candidate tests in passes, each pairing a test at most once:
+1. same path and qualified name; 2. same qualified name in another file; 3. same
+normalised body hash; 4. same *structural* hash (identifiers alpha-renamed; constants,
+operators and assertion shapes kept) when the match is one-to-one within the change set.
+Only candidate tests the runner will **collect** can be paired: the file matches the
+runner's collection patterns (pytest `python_files`/`python_classes`/`python_functions`
+read from the base revision's pytest config, else `test_*.py`/`*_test.py`, `Test*`,
+`test*`; Jest/Vitest `*.test.*`, `*.spec.*`, `__tests__/`; Go `*_test.go`), and the
+module or class is not disabled by `__test__ = False`. A test file renamed to a path
+the runner does not collect is `tests.deleted` even when its content is unchanged.
+
+A base test left unpaired is **covered**, and produces no finding, when every one of its
+assertions appears among the assertions the change **adds**: all assertions of collected
+candidate tests left unpaired (new tests), plus, for each paired test, the candidate's
+assertions minus its base test's (a multiset difference). Assertions are compared in
+**exact form**: the parsed assertion with identifiers and constants kept and only
+formatting normalised (Python: the AST dump without positions; line engines: the assertion
+line with whitespace removed). Unreachable assertions (5.4) are not counted.
+
+Both limits matter. Generic assertions such as `assert got == want` or
+`assert len(rows) == 1` would, in structural form, match almost any other test. An
+assertion that already existed sat alongside the removed test before the change, so it
+replaces nothing. Renames that also rename identifiers are handled by pass 4, not by
+coverage. This keeps renames, splits, merges (including into an existing test) and moves
+clean, while a deleted test, or one replaced by a weaker test, still fires. Paired tests
+are then compared by the 5.4 heuristics.
 
 ## 6. Agent and CI adapters
 
@@ -374,10 +423,12 @@ bench/              testwashing benchmark (milestone 4)
   `action.yml`, `.pre-commit-hooks.yaml`. Done when: `init` on fixture repos for each stack
   produces working config, and a scripted Claude Code Stop-hook payload is blocked/passed
   correctly.
-- **M3 — execution depth.** revert check, smoke runner, `code.hardcoded`, `--isolate`.
+- **M3 — execution depth.** revert check, smoke runner, `code.hardcoded`, `tests.self_mocked`,
+  `--isolate`.
 - **M4 — benchmark and release prep.** `bench/`: ≥ 30 cases (tamper patterns from the
   typia port, the Skylos testwashing set and ImpossibleBench-style edits, plus ≥ 10 clean
-  controls: refactors, legitimate spec changes, added tests); a runner that reports
+  controls: refactors, legitimate spec changes, added tests; seeded with the 20 review
+  probes P1–P12 and C1–C8 from M1); a runner that reports
   detection and false-positive rates for greenproof and, when installed, other tools;
   MEASUREMENTS.md; README; dogfood `greenproof init` on this repo. Release (GitHub repo,
   PyPI) only on the maintainer's explicit go-ahead.

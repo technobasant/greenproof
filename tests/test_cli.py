@@ -6,26 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from greenproof import __version__, cli, gitops
+from greenproof import __version__, gitops
 from greenproof.errors import EXIT_INTERNAL
 from tests.helpers import PYTEST_CMD, Repo, init_repo, load_json, make_repo, policy_text
 from tests.schema_check import load_schema, validate
-
-
-class Result:
-    def __init__(self, code: int, out: str, err: str) -> None:
-        self.code, self.out, self.err = code, out, err
-
-
-@pytest.fixture
-def run(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    def _run(where: Path, *argv: str) -> Result:
-        monkeypatch.chdir(where)
-        code = cli.main(list(argv))
-        captured = capsys.readouterr()
-        return Result(code, captured.out, captured.err)
-
-    return _run
 
 
 def schema_ok(path: Path) -> dict:

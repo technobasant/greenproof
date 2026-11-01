@@ -1,0 +1,67 @@
+"""What the test analysers produce: units (tests) and markers (skip/focus) per file."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Unit:
+    """One test. `key` is its qualified name without the path, so a move keeps its identity."""
+
+    path: str
+    key: str
+    line: int
+    body_hash: str
+    engine: str  # "python" (AST), "python-lines", "js", "go", "rust"
+    asserts: int = 0
+    strong: int = 0
+    weak: int = 0
+    broad_raises: int = 0
+    specific_raises: int = 0
+    tolerances: dict[str, float] = field(default_factory=dict)  # rel/abs/delta max, places min
+    param_cases: int | None = None
+    swallowed: int = 0
+    swallow_line: int = 0
+    expected: list[tuple[str, int]] = field(default_factory=list)  # (literal, line)
+    # Python only: structural identity and per-assertion shapes (identifiers alpha-renamed),
+    # used for the 5.4 severity split.
+    struct_hash: str = ""
+    shapes: list[str] = field(default_factory=list)
+    # Exact form of each counted, reachable assertion (all engines); coverage compares these.
+    assertion_forms: list[str] = field(default_factory=list)
+    vacuous: int = 0
+    vacuous_line: int = 0
+    unreachable: int = 0
+    unreachable_line: int = 0
+    strong_operands: set[str] = field(default_factory=set)
+    weak_operands: set[str] = field(default_factory=set)
+    # Collection facts: enclosing classes, whether one is a TestCase, `__test__ = False`.
+    classes: tuple[str, ...] = ()
+    testcase: bool = False
+    disabled: bool = False
+
+    @property
+    def name(self) -> str:
+        return self.key.rsplit("::", 1)[-1] if self.engine.startswith("python") else self.key
+
+
+@dataclass(frozen=True)
+class Marker:
+    """A skip or focus marker. `scope` is the unit key it sits in, else `<path>::<module>`."""
+
+    scope: str
+    kind: str
+    text: str
+    line: int
+    rule: str  # tests.skipped or tests.focused
+    conditional: bool = False  # skipif(<condition>), importorskip: depends on the environment
+
+
+@dataclass
+class FileAnalysis:
+    path: str
+    engine: str
+    units: list[Unit] = field(default_factory=list)
+    markers: list[Marker] = field(default_factory=list)
+    collected: bool = True  # whether the runner's file patterns pick this file up

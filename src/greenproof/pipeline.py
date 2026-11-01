@@ -11,7 +11,7 @@ from typing import Any
 
 from greenproof import __version__, gitops
 from greenproof.cache import PassCache, cache_key
-from greenproof.changeset import build_changeset
+from greenproof.changeset import ChangeSet, build_changeset
 from greenproof.errors import UsageError
 from greenproof.findings import OFF, Finding
 from greenproof.policy import (
@@ -22,8 +22,8 @@ from greenproof.policy import (
     load_policy,
     policy_changed_finding,
 )
-from greenproof.registry import RULES
 from greenproof.report import CheckStatus, Report
+from greenproof.rules import run_static_rules
 from greenproof.runner import HOOK_TAIL_LINES, TAIL_LINES, CommandResult, run_command
 
 MODES = ("local", "hook", "ci")
@@ -58,17 +58,18 @@ def apply_severities(findings: list[Finding], overrides: Mapping[str, str]) -> l
     """Apply the base policy's `[rules]` overrides; `off` drops the finding."""
     out: list[Finding] = []
     for f in findings:
-        severity = overrides.get(f.rule, RULES[f.rule].default_severity)
+        severity = overrides.get(f.rule, f.severity)
         if severity != OFF:
             out.append(replace(f, severity=severity))
     return out
 
 
-def _static_findings(loaded: LoadedPolicy, opts: CheckOptions) -> list[Finding]:
-    # M1a: the only static check is policy.changed; the rule families land next.
+def _static_findings(loaded: LoadedPolicy, opts: CheckOptions, changes: ChangeSet) -> list[Finding]:
+    found: list[Finding] = []
     if loaded.changed and not opts.allow_policy_change:
-        return [policy_changed_finding(loaded)]
-    return []
+        found.append(policy_changed_finding(loaded))
+    found.extend(run_static_rules(changes, loaded.policy.commands))
+    return found
 
 
 def run_check(opts: CheckOptions) -> Report:
@@ -118,9 +119,8 @@ def run_check(opts: CheckOptions) -> Report:
             report.checks.append(CheckStatus(check, "skipped"))
             continue
         if check == "static":
-            # Building the change set is part of the static check's input.
-            build_changeset(repo, base.sha, tree, policy.test_paths)
-            found = apply_severities(_static_findings(loaded, opts), policy.rules)
+            changes = build_changeset(repo, base.sha, tree, policy.test_paths)
+            found = apply_severities(_static_findings(loaded, opts, changes), policy.rules)
             report.findings.extend(found)
             failed = any(f.severity == "block" for f in found)
             # In hook mode a blocking static finding skips the rest to keep the loop fast.

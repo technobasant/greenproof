@@ -1,0 +1,304 @@
+"""Line-level test analysis for JS/TS, Go and Rust, and the fallback for unparsable Python.
+
+These are heuristics (SPEC section 2, "Honest about coverage"): source is masked (comments
+removed, string contents blanked), tests are found by declaration patterns and braces or
+indentation, and assertions are counted with regular expressions.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from greenproof.rules._common import digest, split_lines
+from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
+
+_NUM = r"-?\d+(?:\.\d+)?"
+
+
+@dataclass(frozen=True)
+class _MarkerPattern:
+    regex: re.Pattern[str]
+    kind: str
+    text: str
+    rule: str = "tests.skipped"
+
+
+def _marker(pattern: str, kind: str, text: str, rule: str = "tests.skipped") -> _MarkerPattern:
+    return _MarkerPattern(re.compile(pattern), kind, text, rule)
+
+
+_MARKERS: dict[str, list[_MarkerPattern]] = {
+    "js": [
+        _marker(r"\.skip\s*\(", ".skip(", ".skip("),
+        _marker(r"\bx(?:it|describe|test)\s*\(", "x-prefix", "xit/xdescribe/xtest("),
+        _marker(r"\.todo\s*\(", ".todo(", ".todo("),
+        _marker(r"\.fails\s*\(", ".fails(", "test.fails("),
+        _marker(r"\.only\s*\(", ".only(", ".only(", "tests.focused"),
+        _marker(r"\bf(?:it|describe)\s*\(", "f-prefix", "fit/fdescribe(", "tests.focused"),
+    ],
+    "go": [_marker(r"\b(?:t|b|tb|f)\.Skip(?:Now|f)?\s*\(", "t.Skip", "t.Skip(")],
+    "rust": [_marker(r"#\[\s*ignore\b", "#[ignore]", "#[ignore]")],
+    "python-lines": [
+        _marker(r"\bmark\.skipif\b", "mark.skipif", "@pytest.mark.skipif"),
+        _marker(r"\bmark\.skip\b", "mark.skip", "@pytest.mark.skip"),
+        _marker(r"\bmark\.xfail\b", "mark.xfail", "@pytest.mark.xfail"),
+        _marker(r"\bpytest\.(?:skip|xfail|importorskip)\s*\(", "pytest.call", "pytest.skip("),
+        _marker(r"\bunittest\.(?:skip\w*|expectedFailure)\b", "unittest.skip", "unittest.skip"),
+        _marker(r"\bSkipTest\b", "unittest.SkipTest", "unittest.SkipTest"),
+    ],
+}
+
+_ASSERTS: dict[str, re.Pattern[str]] = {
+    "js": re.compile(r"\bexpect\s*\(|\bassert(?:\.\w+)?\s*\("),
+    "go": re.compile(
+        r"\bt\.(?:Error|Errorf|Fatal|Fatalf|Fail|FailNow)\b|\b(?:require|assert)\.\w+\s*\("
+    ),
+    "rust": re.compile(r"\b(?:debug_)?assert(?:_eq|_ne)?!"),
+    "python-lines": re.compile(r"^\s*assert\b|\.assert\w*\(", re.MULTILINE),
+}
+_JS_STRONG = re.compile(
+    r"\.(?:toEqual|toStrictEqual|toMatchObject)\b|\.toBe\s*\(|\.toThrow\s*\(\s*[^)\s]"
+)
+_JS_WEAK = re.compile(
+    r"\.(?:toBeDefined|toBeTruthy)\s*\(|\.not\.(?:toThrow|toBeUndefined|toBeNull)\s*\("
+    r"|\.toBeGreaterThanOrEqual\s*\(\s*0\s*\)"
+)
+_EXPECTED: dict[str, re.Pattern[str]] = {
+    "js": re.compile(
+        r"\.(?:toBe|toEqual|toStrictEqual|toBeCloseTo|toContain|toMatch|toHaveLength)\s*\(\s*"
+        rf"({_NUM}|\"[^\"]*\"|'[^']*'|`[^`]*`)"
+    ),
+    "go": re.compile(
+        rf"\b(?:assert|require)\.(?:Equal|EqualValues|Exactly|InDelta|Contains)\s*\(\s*\w+\s*,\s*"
+        rf"({_NUM}|\"[^\"]*\")"
+    ),
+    "rust": re.compile(rf"\bassert_(?:eq|ne)!\s*\([^;]*?,\s*({_NUM}|\"[^\"]*\")\s*\)"),
+}
+
+_JS_UNIT = re.compile(r"^\s*(?:it|test|xit|fit|xtest)(?:\.\w+)*\s*\(\s*(['\"`])(.*?)\1")
+_JS_DESCRIBE = re.compile(r"^\s*(?:describe|xdescribe|fdescribe)(?:\.\w+)*\s*\(\s*(['\"`])(.*?)\1")
+_GO_UNIT = re.compile(r"^func\s+(Test\w*|Benchmark\w*|Fuzz\w*)\s*\(")
+_RUST_ATTR = re.compile(r"^\s*#\[\s*(?:\w+::)*test\b")
+_RUST_FN = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)")
+_PY_DEF = re.compile(r"^(\s*)(?:async\s+)?def\s+(test\w*)\s*\(")
+_PY_CLASS = re.compile(r"^(\s*)class\s+(\w+)")
+
+
+def mask_source(text: str, lang: str) -> tuple[list[str], list[str]]:
+    """(masked, code) per line: comments removed in both, string contents blanked in `masked`.
+
+    One pass with a small state machine. It is a heuristic, not a lexer: Rust lifetimes and
+    raw strings and JS regex literals can confuse it, which only ever costs precision.
+    """
+    py = lang == "python-lines"
+    line_comment = "#" if py else "//"
+    block = not py
+    quotes = "\"'" if lang != "rust" else '"'
+    multi = "`" if lang in ("js", "go") else ""
+    masked: list[str] = []
+    code: list[str] = []
+    m: list[str] = []
+    c: list[str] = []
+    i, n = 0, len(text)
+    state = ""  # "", "block", "str", "multi", "triple"
+    quote = ""
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            masked.append("".join(m))
+            code.append("".join(c))
+            m, c = [], []
+            i += 1
+            continue
+        if state == "block":
+            if text.startswith("*/", i):
+                state = ""
+                i += 2
+            else:
+                i += 1
+            continue
+        if state in ("str", "multi", "triple"):
+            if ch == "\\" and state != "triple" and i + 1 < n and text[i + 1] != "\n":
+                c.append(text[i : i + 2])
+                i += 2
+                continue
+            end = quote * 3 if state == "triple" else quote
+            if text.startswith(end, i):
+                m.append(quote)
+                c.append(end)
+                state = ""
+                i += len(end)
+                continue
+            if state == "str" and ch == "\n":
+                state = ""
+                continue
+            c.append(ch)
+            i += 1
+            continue
+        if text.startswith(line_comment, i):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if block and text.startswith("/*", i):
+            state = "block"
+            i += 2
+            continue
+        if py and ch in "\"'" and text.startswith(ch * 3, i):
+            state, quote = "triple", ch
+            m.append(ch)
+            c.append(ch * 3)
+            i += 3
+            continue
+        if ch in quotes:
+            state, quote = "str", ch
+            m.append(ch)
+            c.append(ch)
+            i += 1
+            continue
+        if multi and ch in multi:
+            state, quote = "multi", ch
+            m.append(ch)
+            c.append(ch)
+            i += 1
+            continue
+        m.append(ch)
+        c.append(ch)
+        i += 1
+    masked.append("".join(m))
+    code.append("".join(c))
+    return masked, code
+
+
+def _brace_end(masked: list[str], start: int) -> int:
+    """Index of the line where the first `{` opened at or after `start` closes."""
+    depth = 0
+    opened = False
+    for i in range(start, len(masked)):
+        for ch in masked[i]:
+            if ch == "{":
+                depth += 1
+                opened = True
+            elif ch == "}":
+                depth -= 1
+        if opened and depth <= 0:
+            return i
+        if not opened and masked[i].rstrip().endswith((";", ")")) and i >= start:
+            return i
+    return len(masked) - 1
+
+
+def _indent_end(raw: list[str], start: int, indent: int) -> int:
+    end = start
+    for i in range(start + 1, len(raw)):
+        line = raw[i]
+        if not line.strip():
+            continue
+        if len(line) - len(line.lstrip()) <= indent:
+            break
+        end = i
+    return end
+
+
+@dataclass
+class _Span:
+    start: int
+    end: int
+    key: str
+    name_line: int
+
+
+def _find_spans(lang: str, raw: list[str], masked: list[str]) -> list[_Span]:
+    spans: list[_Span] = []
+    describes: list[tuple[int, int, str]] = []
+    class_stack: list[tuple[int, str]] = []
+    i = 0
+    while i < len(raw):
+        line = raw[i]
+        if lang == "js":
+            dm = _JS_DESCRIBE.match(line)
+            if dm:
+                describes.append((i, _brace_end(masked, i), dm.group(2)))
+            um = _JS_UNIT.match(line)
+            if um:
+                end = _brace_end(masked, i)
+                titles = [t for s, e, t in describes if s < i <= e] + [um.group(2)]
+                spans.append(_Span(i, end, " > ".join(titles), i))
+        elif lang == "go":
+            gm = _GO_UNIT.match(line)
+            if gm:
+                spans.append(_Span(i, _brace_end(masked, i), gm.group(1), i))
+        elif lang == "rust":
+            if _RUST_ATTR.match(line):
+                j = i + 1
+                while j < len(raw) and j < i + 8 and not _RUST_FN.match(raw[j]):
+                    j += 1
+                if j < len(raw) and j < i + 8:
+                    fm = _RUST_FN.match(raw[j])
+                    assert fm is not None
+                    spans.append(_Span(i, _brace_end(masked, j), fm.group(1), j))
+                    i = max(i + 1, spans[-1].end + 1)
+                    continue
+        else:
+            cm = _PY_CLASS.match(line)
+            if cm:
+                indent = len(cm.group(1))
+                while class_stack and class_stack[-1][0] >= indent:
+                    class_stack.pop()
+                class_stack.append((indent, cm.group(2)))
+            pm = _PY_DEF.match(line)
+            if pm:
+                indent = len(pm.group(1))
+                while class_stack and class_stack[-1][0] >= indent:
+                    class_stack.pop()
+                prefix = "".join(f"{name}::" for _, name in class_stack)
+                spans.append(_Span(i, _indent_end(raw, i, indent), f"{prefix}{pm.group(2)}", i))
+                i = spans[-1].end + 1
+                continue
+        i += 1
+    return spans
+
+
+def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
+    """`lang` is js, go, rust or python-lines."""
+    raw = split_lines(text)
+    masked, code = mask_source(text, lang)
+    while len(masked) < len(raw):
+        masked.append("")
+        code.append("")
+    spans = _find_spans(lang, raw, masked)
+    analysis = FileAnalysis(path, lang)
+    owner: dict[int, _Span] = {}
+    for span in spans:
+        for ln in range(span.start, span.end + 1):
+            owner.setdefault(ln, span)
+    for span in spans:
+        body_masked = "\n".join(masked[span.start : span.end + 1])
+        unit = Unit(
+            path=path,
+            key=span.key,
+            line=span.name_line + 1,
+            body_hash=digest("".join(code[span.start : span.end + 1])),
+            engine=lang,
+            asserts=len(_ASSERTS[lang].findall(body_masked)),
+        )
+        for k in range(span.start, span.end + 1):
+            hits = len(_ASSERTS[lang].findall(masked[k]))
+            if hits:
+                unit.assertion_forms.extend([digest("".join(code[k].split()))] * hits)
+        if lang == "js":
+            unit.strong = len(_JS_STRONG.findall(body_masked))
+            unit.weak = len(_JS_WEAK.findall(body_masked))
+        if lang in _EXPECTED:
+            for k in range(span.start, span.end + 1):
+                for em in _EXPECTED[lang].finditer(code[k]):
+                    unit.expected.append((em.group(1), k + 1))
+        analysis.units.append(unit)
+    module_scope = f"{path}::<module>"
+    for k, line in enumerate(masked):
+        for pat in _MARKERS[lang]:
+            if pat.regex.search(line):
+                owning = owner.get(k)
+                scope = owning.key if owning is not None else module_scope
+                analysis.markers.append(Marker(scope, pat.kind, pat.text, k + 1, pat.rule))
+    return analysis

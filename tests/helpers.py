@@ -79,3 +79,18 @@ def load_json(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text())
     assert isinstance(data, dict)
     return data
+
+
+def static_findings(repo: Repo, base: str | None = None, commands: dict[str, str] | None = None):
+    """Run every static rule over the working tree against `base` (default: HEAD)."""
+    from greenproof import gitops
+    from greenproof.changeset import build_changeset
+    from greenproof.rules import run_static_rules
+
+    base_sha = base or repo.head()
+    tree = gitops.snapshot_tree(repo.path)
+    return run_static_rules(build_changeset(repo.path, base_sha, tree), commands or {})
+
+
+def rule_ids(findings) -> list[str]:
+    return [f.rule for f in findings]

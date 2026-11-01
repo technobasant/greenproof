@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,6 +37,18 @@ class ChangedFile:
 class ChangeSet:
     files: list[ChangedFile] = field(default_factory=list)
     skipped_binary: list[str] = field(default_factory=list)
+    # Reads any file as it was at the base revision (None when absent), changed or not.
+    read_base: Callable[[str], bytes | None] | None = None
+
+    def base_text(self, path: str) -> str | None:
+        """The file's text at the base revision, or None when it did not exist there."""
+        if self.read_base is not None:
+            blob = self.read_base(path)
+            return None if blob is None else blob.decode(errors="replace")
+        for f in self.files:
+            if (f.old_path or f.path) == path:
+                return f.old_text
+        return None
 
     def tests(self) -> list[ChangedFile]:
         return [f for f in self.files if f.is_test or f.was_test]
@@ -123,4 +135,4 @@ def build_changeset(
                 was_test=entry.status != "A" and is_test_path(old_path, test_patterns),
             )
         )
-    return ChangeSet(files, skipped)
+    return ChangeSet(files, skipped, lambda p: gitops.read_blob(repo, base_sha, p))
