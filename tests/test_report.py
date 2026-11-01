@@ -72,7 +72,16 @@ def test_json_report_matches_the_schema() -> None:
     assert data["base"] == {"ref": "main", "sha": "a" * 40}
     assert data["candidate"] == {"tree": "b" * 40, "dirty": True}
     assert data["policy"] == {"source": "base", "sha256": "c" * 64}
-    assert set(data["findings"][0]) == {"rule", "severity", "file", "line", "message", "hint"}
+    assert set(data["findings"][0]) == {
+        "rule",
+        "severity",
+        "file",
+        "line",
+        "message",
+        "hint",
+        "fingerprint",
+        "accepted",
+    }
     assert set(data["commands"][0]) == {
         "name",
         "cmd",

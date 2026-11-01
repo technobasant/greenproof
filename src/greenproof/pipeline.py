@@ -9,7 +9,8 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from greenproof import __version__, gitops
+from greenproof import __version__, accept, github, gitops
+from greenproof.accept import Acceptance
 from greenproof.cache import PassCache, cache_key
 from greenproof.changeset import ChangeSet, build_changeset
 from greenproof.errors import UsageError
@@ -41,7 +42,19 @@ class CheckOptions:
     allow_policy_change: bool = False
     no_cache: bool = False
     isolate: bool = False
+    github_accept: bool = False
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
+    # Injectable HTTP fetch for --github-accept; None means urllib (tests pass recorded JSON).
+    fetch: github.Fetcher | None = None
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """Where the check runs: the repository, the snapshot tree and the resolved base."""
+
+    repo: Path
+    tree: str
+    base: gitops.Base
 
 
 def resolve_checks(explicit: Sequence[str] | None, policy: Policy, mode: str) -> list[str]:
@@ -72,16 +85,53 @@ def _static_findings(loaded: LoadedPolicy, opts: CheckOptions, changes: ChangeSe
     return found
 
 
-def run_check(opts: CheckOptions) -> Report:
+def locate(opts: CheckOptions, repo: Path | None = None) -> Candidate:
+    """Steps 1-3 of SPEC 3.1: find the repository, snapshot the candidate, resolve the base."""
+    repo = repo if repo is not None else gitops.find_repo(opts.cwd)
+    gitops.require_commits(repo)
+    tree = gitops.snapshot_tree(repo)
+    base = gitops.resolve_base(repo, opts.base, opts.env)
+    return Candidate(repo, tree, base)
+
+
+def nothing_to_verify(candidate: Candidate) -> bool:
+    """True when the candidate tree equals the base tree: nothing changed since the base."""
+    return gitops.tree_of(candidate.repo, candidate.base.sha) == candidate.tree
+
+
+def nothing_to_verify_report(opts: CheckOptions, candidate: Candidate) -> Report:
+    report = Report(
+        version=__version__,
+        mode=opts.mode,
+        base=candidate.base,
+        tree=candidate.tree,
+        dirty=candidate.tree != gitops.head_tree(candidate.repo),
+        notes=["nothing to verify: the candidate tree equals the base tree"],
+    )
+    return report.finish()
+
+
+def _load_acceptances(opts: CheckOptions, repo: Path, report: Report) -> dict[str, Acceptance]:
+    """Local acceptances in local and hook mode; PR comment acceptances in ci mode with
+    --github-accept. Never mixed: ci ignores the local file (SPEC 6.6)."""
+    if opts.mode == "ci":
+        if not opts.github_accept:
+            return {}
+        report.pr_accept_hint = github.is_pr_event(opts.env)
+        found, notes = github.github_acceptances(opts.env, opts.fetch)
+        report.notes.extend(notes)
+        return found
+    return accept.load_local(repo)
+
+
+def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
     if opts.mode not in MODES:
         raise UsageError(f"--mode: unknown mode {opts.mode!r} (allowed: {', '.join(MODES)})")
     if opts.isolate:
         raise UsageError("--isolate is not implemented yet")
 
-    repo = gitops.find_repo(opts.cwd)
-    gitops.require_commits(repo)
-    tree = gitops.snapshot_tree(repo)
-    base = gitops.resolve_base(repo, opts.base, opts.env)
+    candidate = candidate if candidate is not None else locate(opts)
+    repo, tree, base = candidate.repo, candidate.tree, candidate.base
 
     loaded = load_policy(
         gitops.read_blob(repo, base.sha, POLICY_FILE), gitops.read_blob(repo, tree, POLICY_FILE)
@@ -99,7 +149,11 @@ def run_check(opts: CheckOptions) -> Report:
         policy_sha256=loaded.sha256,
     )
 
+    available = _load_acceptances(opts, repo, report)
     flags = ["allow-policy-change"] if opts.allow_policy_change else []
+    if opts.mode != "ci":
+        # A cached pass may have leaned on an acceptance; revoking it must miss the cache.
+        flags.extend(f"accepted:{fp}" for fp in available)
     key = cache_key(tree, base.sha, loaded.sha256, __version__, opts.mode, checks, flags)
     cache = PassCache(gitops.greenproof_dir(repo))
     # ci mode never reads or writes the cache: the file is writable by anything running as
@@ -122,11 +176,14 @@ def run_check(opts: CheckOptions) -> Report:
             changes = build_changeset(repo, base.sha, tree, policy.test_paths)
             found = apply_severities(_static_findings(loaded, opts, changes), policy.rules)
             report.findings.extend(found)
-            failed = any(f.severity == "block" for f in found)
+            report.accepted = {
+                f.fingerprint: available[f.fingerprint] for f in found if f.fingerprint in available
+            }
+            failed = any(f.severity == "block" and f.fingerprint not in available for f in found)
             # In hook mode a blocking static finding skips the rest to keep the loop fast.
             skip_rest = failed and opts.mode == "hook"
         else:
-            results = _run_commands(policy, repo, tail_lines)
+            results = _run_commands(policy, repo, tail_lines, opts.mode)
             report.commands.extend(results)
             failed = any(r.failed for r in results)
         elapsed = int((time.monotonic() - started) * 1000)
@@ -156,8 +213,15 @@ def _replayable(stored: list[dict[str, Any]] | None) -> list[CheckStatus] | None
     return out
 
 
-def _run_commands(policy: Policy, repo: Path, tail_lines: int) -> list[CommandResult]:
+def _run_commands(policy: Policy, repo: Path, tail_lines: int, mode: str) -> list[CommandResult]:
+    """`setup` first in ci mode only (a fresh checkout); when it fails nothing else runs."""
     results: list[CommandResult] = []
+    setup = policy.commands.get("setup", "").strip()
+    if mode == "ci" and setup:
+        result = run_command("setup", setup, repo, policy.timeout, tail_lines)
+        results.append(result)
+        if result.failed:
+            return results
     for name, cmd in policy.runnable_commands():
         results.append(run_command(name, cmd, repo, policy.timeout, tail_lines))
     return results

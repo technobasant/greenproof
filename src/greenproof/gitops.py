@@ -158,8 +158,13 @@ def snapshot_tree(repo: Path, seed_from_index: bool = True) -> str:
         return _out(git(repo, "write-tree", env=env))
 
 
+def tree_of(repo: Path, rev: str) -> str:
+    """The tree object id of a commit (`git rev-parse <rev>^{tree}`)."""
+    return _out(git(repo, "rev-parse", f"{rev}^{{tree}}"))
+
+
 def head_tree(repo: Path) -> str:
-    return _out(git(repo, "rev-parse", "HEAD^{tree}"))
+    return tree_of(repo, "HEAD")
 
 
 def write_session_marker(repo: Path) -> Path:
@@ -170,7 +175,7 @@ def write_session_marker(repo: Path) -> Path:
     return marker
 
 
-def _read_session_marker(repo: Path) -> str | None:
+def read_session_marker(repo: Path) -> str | None:
     marker = session_marker_path(repo)
     try:
         sha = marker.read_text().strip()
@@ -227,7 +232,7 @@ def resolve_base(repo: Path, explicit: str | None, env: Mapping[str, str]) -> Ba
             raise UsageError(f"no merge base between HEAD and {ref}. {_FETCH_HINT}")
         return Base(ref, _out(proc))
 
-    marker = _read_session_marker(repo)
+    marker = read_session_marker(repo)
     if marker is not None:
         return Base(SESSION_MARKER, marker)
 
