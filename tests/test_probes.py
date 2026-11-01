@@ -637,3 +637,286 @@ def test_dropped_cases_and_weaker_rewrites_still_block(
     code, found = check(cases_repo, run, tmp_path / "out.json")
     assert code == 1, (name, found)
     assert (rule, "block") in found, (name, found)
+
+
+# ---- exact checks loosened (SPEC 5.4, 5.7) ------------------------------------------------
+
+SHOP_SRC = "def refund(x):\n    return x - 1\n\n\ndef total():\n    return 100\n"
+SHOP_HEAD = "from shop import refund, total\n"
+SHOP_BASE = (
+    f"{SHOP_HEAD}\n\ndef test_refund():\n    assert refund(100) == 99\n\n\n"
+    "def test_total():\n    assert total() == 100\n"
+)
+SHOP_PATH = "tests/test_shop.py"
+
+
+def shop(
+    refund_test: str, total_test: str = "def test_total():\n    assert total() == 100\n"
+) -> str:
+    return f"{SHOP_HEAD}\n\n{refund_test}\n\n{total_test}"
+
+
+BLOCK_WEAKENED = {("tests.weakened", "block")}
+BLOCK_REPLACED = {("tests.replaced", "block")}
+
+LOOSENED: list[tuple[str, str, int, set[tuple[str, str]]]] = [
+    ("Q1", shop("def test_refund():\n    assert refund(100) > 0\n"), 1, BLOCK_WEAKENED),
+    (
+        "Q2",
+        shop("def test_refund():\n    assert isinstance(refund(100), int)\n"),
+        1,
+        BLOCK_WEAKENED,
+    ),
+    (
+        "Q3",
+        shop(
+            "def test_refund():\n    assert refund(100) == 99\n",
+            "def test_total_in_range():\n    assert total() > 0\n    assert total() < 1000\n",
+        ),
+        1,
+        BLOCK_REPLACED,
+    ),
+    (
+        "Q4",
+        shop("def test_refund_type():\n    assert isinstance(refund(100), int)\n"),
+        1,
+        BLOCK_REPLACED,
+    ),
+    (
+        "Q5",
+        shop("def test_refund_rounds_down():\n    got = refund(100)\n    assert got == 99\n"),
+        0,
+        {("tests.replaced", "warn")},
+    ),
+    ("Q6", shop("def test_refund():\n    assert refund(100) == 98\n"), 0, set()),
+    ("Q7", shop("def test_refund_any():\n    assert refund(100) != 0\n"), 1, BLOCK_REPLACED),
+    ("Q8", shop("def test_refund():\n    assert refund(100) >= 99\n"), 1, BLOCK_WEAKENED),
+    (
+        "Q9",
+        shop("def test_refund_is_int():\n    assert type(refund(100)) is int\n"),
+        1,
+        BLOCK_REPLACED,
+    ),
+    (
+        "Q10",
+        "import pytest\n\n"
+        + shop(
+            "@pytest.mark.parametrize('x', [100])\ndef test_refund_param(x):\n"
+            "    assert refund(x) == x - 1\n"
+        ),
+        1,
+        BLOCK_REPLACED,
+    ),
+    (
+        "Q11",
+        shop("def test_refund():\n    assert len(refund(100)) == 2\n"),
+        1,
+        BLOCK_WEAKENED,
+    ),
+    ("Q12", shop("def test_refund():\n    assert not refund(100) == 99\n"), 1, BLOCK_WEAKENED),
+]
+
+
+@pytest.mark.parametrize(
+    ("new", "code", "expected"), [c[1:] for c in LOOSENED], ids=[c[0] for c in LOOSENED]
+)
+def test_loosened_exact_checks_block_and_rewrites_warn(
+    new, code, expected, tmp_path: Path, run
+) -> None:
+    repo = init_repo(tmp_path / "shop")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write("src/shop.py", SHOP_SRC)
+    repo.write(SHOP_PATH, SHOP_BASE)
+    repo.commit("base")
+    repo.write(SHOP_PATH, new)
+    got, found = check(repo, run, tmp_path / "out.json")
+    assert (got, found) == (code, expected)
+
+
+def test_loosened_message_names_subject_and_new_assertion(tmp_path: Path, run) -> None:
+    repo = init_repo(tmp_path / "shop")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write("src/shop.py", SHOP_SRC)
+    repo.write(SHOP_PATH, SHOP_BASE)
+    repo.commit("base")
+    repo.write(SHOP_PATH, shop("def test_refund():\n    assert refund(100) > 0\n"))
+    run(repo.path, "check", "--checks", "static", "--json", str(tmp_path / "o.json"))
+    message = load_json(tmp_path / "o.json")["findings"][0]["message"]
+    assert "exact check on `refund(100)` loosened to `refund(100) > 0`" in message
+
+
+def body(*lines: str) -> str:
+    return "def test_t():\n" + "".join(f"    {ln}\n" for ln in lines)
+
+
+def case(*lines: str) -> str:
+    return "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_t(self):\n" + "".join(
+        f"        {ln}\n" for ln in lines
+    )
+
+
+PY_CONTROLS: list[tuple[str, str, str, set[tuple[str, str]]]] = [
+    (
+        "exact check kept, loose one added",
+        body("x = f()", "assert x == 5"),
+        body("x = f()", "assert x == 5", "assert x > 0"),
+        set(),
+    ),
+    (
+        "assertEqual operands swapped",
+        case("self.assertEqual(f(), 3)"),
+        case("self.assertEqual(3, f())"),
+        set(),
+    ),
+    (
+        "len check kept, truthiness added",
+        body("assert len(rows) == 3"),
+        body("assert len(rows) == 3", "assert rows"),
+        set(),
+    ),
+    (
+        "different expression stays the existing warning",
+        body("assert resp.status == 200"),
+        body("assert resp.ok"),
+        {("tests.weakened", "warn")},
+    ),
+    (
+        "loose check on another attribute of the same object",
+        body("assert resp.status == 200", "assert resp.body"),
+        body("assert resp.status == 200", "assert resp.headers", "assert resp.body"),
+        set(),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [c[1:] for c in PY_CONTROLS],
+    ids=[c[0] for c in PY_CONTROLS],
+)
+def test_clean_controls_for_loosening(old, new, expected, tmp_path: Path, run) -> None:
+    repo = init_repo(tmp_path / "ctl")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write("tests/test_t.py", old)
+    repo.commit("base")
+    repo.write("tests/test_t.py", new)
+    got, found = check(repo, run, tmp_path / "out.json")
+    assert (got, found) == (0, expected)
+
+
+LINE_LOOSENED: list[tuple[str, str, str, str, str]] = [
+    (
+        "tests/shop.test.js",
+        "test('t', () => {\n  expect(total()).toBe(100);\n});\n",
+        "test('t', () => {\n  expect(total()).toBeGreaterThan(0);\n});\n",
+        "js",
+        "",
+    ),
+    (
+        "shop_test.go",
+        'package shop\n\nimport (\n\t"testing"\n\t"github.com/stretchr/testify/assert"\n)\n\n'
+        "func TestTotal(t *testing.T) {\n\tassert.Equal(t, 100, Total())\n}\n",
+        'package shop\n\nimport (\n\t"testing"\n\t"github.com/stretchr/testify/assert"\n)\n\n'
+        "func TestTotal(t *testing.T) {\n\tassert.Greater(t, Total(), 0)\n}\n",
+        "go",
+        "",
+    ),
+    (
+        "src/lib.rs",
+        "pub fn total() -> i32 { 100 }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n"
+        "    #[test]\n    fn t() {\n        assert_eq!(total(), 100);\n    }\n}\n",
+        "pub fn total() -> i32 { 100 }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n"
+        "    #[test]\n    fn t() {\n        assert!(total() > 0);\n    }\n}\n",
+        "rust",
+        "",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("path", "old", "new"), [c[:3] for c in LINE_LOOSENED], ids=[c[3] for c in LINE_LOOSENED]
+)
+def test_line_engines_block_a_loosened_matcher(path, old, new, tmp_path: Path, run) -> None:
+    repo = init_repo(tmp_path / "line")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write(path, old)
+    repo.commit("base")
+    repo.write(path, new)
+    got, found = check(repo, run, tmp_path / "out.json")
+    assert (got, found) == (1, BLOCK_WEAKENED)
+
+
+def test_js_keeping_equality_and_adding_a_length_check_is_clean(tmp_path: Path, run) -> None:
+    repo = init_repo(tmp_path / "js")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write("tests/r.test.js", "test('t', () => {\n  expect(rows()).toEqual([1, 2, 3]);\n});\n")
+    repo.commit("base")
+    repo.write(
+        "tests/r.test.js",
+        "test('t', () => {\n  expect(rows()).toEqual([1, 2, 3]);\n"
+        "  expect(rows()).toHaveLength(3);\n});\n",
+    )
+    got, found = check(repo, run, tmp_path / "out.json")
+    assert (got, found) == (0, set())
+
+
+UNITTEST_LOOSENED = [
+    "self.assertGreater(f(), 0)",
+    "self.assertGreaterEqual(f(), 3)",
+    "self.assertLess(f(), 9)",
+    "self.assertLessEqual(f(), 9)",
+    "self.assertNotEqual(f(), 0)",
+    "self.assertNotIn(f(), [0])",
+    "self.assertIsNotNone(f())",
+    "self.assertIsInstance(f(), int)",
+    "self.assertTrue(f())",
+    "self.assertTrue(f() > 0)",
+    "self.assertFalse(not f())",
+    "self.assertTrue(bool(f()))",
+    "self.assertEqual(len(f()), 3)",
+]
+ASSERT_LOOSENED = [
+    "assert 0 < f() < 10",
+    "assert f() and f() > 0",
+    "assert bool(f())",
+    "assert issubclass(f(), int)",
+    "assert f() is not None",
+    "assert len(f()) == 3",
+    "assert not f() == 3",
+]
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [(case("self.assertEqual(f(), 3)"), case(line)) for line in UNITTEST_LOOSENED]
+    + [(body("assert f() == 3"), body(line)) for line in ASSERT_LOOSENED]
+    + [(case("self.assertIsNone(f())"), case("self.assertIsNotNone(f())"))],
+)
+def test_every_loose_form_blocks_an_exact_check_it_replaces(
+    old: str, new: str, tmp_path: Path, run
+) -> None:
+    repo = init_repo(tmp_path / "forms")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write("tests/test_t.py", old)
+    repo.commit("base")
+    repo.write("tests/test_t.py", new)
+    got, found = check(repo, run, tmp_path / "out.json")
+    assert (got, found) == (1, BLOCK_WEAKENED), new
+
+
+def test_rewrite_keeping_its_literals_and_exact_subjects_warns(tmp_path: Path, run) -> None:
+    repo = init_repo(tmp_path / "rw")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write("src/shop.py", SHOP_SRC)
+    repo.write(SHOP_PATH, SHOP_BASE)
+    repo.commit("base")
+    repo.write(
+        SHOP_PATH,
+        "import pytest\n\n"
+        + shop(
+            "@pytest.mark.parametrize(('x', 'want'), [(100, 99), (10, 9)])\n"
+            "def test_refund_cases(x, want):\n    assert refund(x) == want\n    assert want > 0\n"
+        ),
+    )
+    got, found = check(repo, run, tmp_path / "out.json")
+    assert (got, found) == (0, {("tests.replaced", "warn")})

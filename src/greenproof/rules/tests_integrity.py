@@ -137,6 +137,16 @@ class _Added:
     cases: set[str]
 
 
+def _loosened(b: Unit, c: Unit) -> list[tuple[str, str]]:
+    """(subject, new assertion) for each subject of an exact check at the base that the candidate
+    no longer pins exactly but still checks loosely (SPEC 5.4)."""
+    return [
+        (source, c.loose_targets[shape])
+        for shape, source in b.exact_subjects.items()
+        if shape not in c.exact_subjects and shape in c.loose_targets
+    ]
+
+
 def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> list[_Reason]:
     if b.engine != c.engine:
         return []
@@ -159,15 +169,16 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
                 BLOCK,
             )
         )
-    if c.strong < b.strong and c.weak > b.weak:
-        # Replacing a comparison by its own operand is a plain weakening; a different
-        # expression is often a legitimate refactor, so it only warns.
-        own = bool(c.weak_operands & b.strong_operands) or b.engine != "python"
+    loosened = _loosened(b, c) if b.engine == "python" else []
+    out.extend((f"exact check on `{x}` loosened to `{src}`", c.line, BLOCK) for x, src in loosened)
+    if c.strong < b.strong and c.weak > b.weak and not loosened:
+        # An exact check loosened is reported above; replacing a check by a different
+        # expression is often a legitimate refactor, so on Python it only warns.
         out.append(
             (
                 "a strong assertion was replaced by a weaker one",
                 c.line,
-                BLOCK if own else WARN,
+                WARN if b.engine == "python" else BLOCK,
             )
         )
     if c.broad_raises > b.broad_raises and c.specific_raises < b.specific_raises:
@@ -331,8 +342,8 @@ def _group_checks(units: list[Unit], literal: bool) -> int:
 
 
 def _is_rewrite(removed: list[Unit], added: list[Unit]) -> bool:
-    """SPEC 5.7: the new tests keep every subject, at least as many checks, and no weak check
-    on an operand the removed tests compared."""
+    """SPEC 5.7: the new tests keep every subject, at least as many checks, loosen no exact check
+    and keep every literal the removed tests pinned."""
     if any(u.engine != "python" for u in (*removed, *added)):
         return False
     subjects = set().union(*(u.subjects for u in removed))
@@ -341,8 +352,13 @@ def _is_rewrite(removed: list[Unit], added: list[Unit]) -> bool:
     literal = all(u.param_literal for u in (*removed, *added))
     if _group_checks(added, literal) < _group_checks(removed, literal):
         return False
-    strong = set().union(*(u.strong_operands for u in removed))
-    return not strong & set().union(*(u.weak_operands for u in added))
+    exact_after = set().union(*(u.exact_subjects.keys() for u in added))
+    checked_after = exact_after | set().union(*(u.loose_targets.keys() for u in added))
+    for u in removed:
+        if any(s in checked_after and s not in exact_after for s in u.exact_subjects):
+            return False
+    pinned = {lit for u in removed for lit, _ in u.expected}
+    return pinned <= set().union(*(u.constants for u in added))
 
 
 def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]:

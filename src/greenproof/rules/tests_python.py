@@ -40,6 +40,21 @@ _EQUAL_METHODS = {
     "assertAlmostEqual",
     "assertAlmostEquals",
 }
+_EXACT_METHODS = _EQUAL_METHODS | {"assertIs", "assertIsNone", "assertMultiLineEqual"}
+_LOOSE_PAIR_METHODS = {
+    "assertNotEqual",
+    "assertNotEquals",
+    "assertNotAlmostEqual",
+    "assertGreater",
+    "assertGreaterEqual",
+    "assertLess",
+    "assertLessEqual",
+    "assertNotIn",
+}
+_EXACT_OPS = (ast.Eq, ast.Is)
+_INEXACT_OPS = (ast.NotEq, ast.IsNot)
+_ORDER_OPS = (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.NotIn)
+_WRAPPERS = frozenset({"type", "len", "bool"})
 _FuncDef = ast.FunctionDef | ast.AsyncFunctionDef
 _CONDITIONAL = {"mark.skipif", "pytest.importorskip", "unittest.skipIf", "unittest.skipUnless"}
 _KEEP_NAMES = set(dir(builtins)) | {"self", "cls", "pytest", "mock", "unittest"}
@@ -91,6 +106,20 @@ class _Renamer(ast.NodeTransformer):
 def _shape(node: ast.AST) -> str:
     """Structural form of an expression or statement: identifiers renamed, rest kept."""
     return digest(ast.dump(_Renamer().visit(copy.deepcopy(node))))
+
+
+class _Locals(ast.NodeTransformer):
+    """Alpha-renames only the names bound inside the test; globals, attributes and builtins keep
+    their spelling, so `f(x)` and `g(x)` or `resp.status` and `resp.ok` stay different."""
+
+    def __init__(self, bound: set[str]) -> None:
+        self.bound = bound
+        self.names: dict[str, str] = {}
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id in self.bound and node.id not in _KEEP_NAMES:
+            node.id = self.names.setdefault(node.id, f"_{len(self.names)}")
+        return node
 
 
 def _has_call(node: ast.AST) -> bool:
@@ -426,12 +455,71 @@ class _Stats(ast.NodeVisitor):
         self.forms: list[str] = []
         self.vacuous = 0
         self.vacuous_line = 0
-        self.strong_operands: set[str] = set()
-        self.weak_operands: set[str] = set()
+        self.exact: dict[str, str] = {}  # shape -> source of each exact-check subject
+        self.loose: dict[str, str] = {}  # shape -> source of the loose check on it
+        self.constants: set[str] = set()
         self.first_line = 0
 
     def _opshape(self, node: ast.AST) -> str:
-        return _shape(self.consts.inline(node))
+        return digest(ast.dump(_Locals(self.consts.stores).visit(self.consts.inline(node))))
+
+    # -- exact and loose checks (SPEC 5.4) ---------------------------------------------
+    def _exact(self, node: ast.expr, src: str) -> None:
+        """`node` is a subject of an exact check; a `type(X)`, `len(X)`, `bool(X)` wrapper also
+        makes X the target of a loose one."""
+        if self.consts.is_const(node):
+            return
+        self.exact.setdefault(self._opshape(node), ast.unparse(self.consts.inline(node)))
+        self._unwrap(node, src)
+
+    def _loosen(self, node: ast.expr, src: str) -> None:
+        if self.consts.is_const(node):
+            return
+        self.loose.setdefault(self._opshape(node), src)
+        self._unwrap(node, src)
+
+    def _unwrap(self, node: ast.expr, src: str) -> None:
+        while (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in _WRAPPERS
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            node = node.args[0]
+            if not self.consts.is_const(node):
+                self.loose.setdefault(self._opshape(node), src)
+
+    def _test_checks(self, test: ast.expr, src: str, negated: bool = False) -> None:
+        """Classify the condition of an assert (or the argument of assertTrue/assertFalse)."""
+        if isinstance(test, ast.BoolOp):
+            for value in test.values:
+                self._test_checks(value, src, False)
+        elif isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            self._test_checks(test.operand, src, not negated)
+        elif isinstance(test, ast.Compare):
+            left = test.left
+            for op, right in zip(test.ops, test.comparators, strict=True):
+                self._compare(left, op, right, src, negated)
+                left = right
+        elif isinstance(test, ast.Call) and dotted(test.func) in {"isinstance", "issubclass"}:
+            if test.args:
+                self._loosen(test.args[0], src)
+        else:
+            self._loosen(test, src)
+
+    def _compare(self, left: ast.expr, op: ast.cmpop, right: ast.expr, src: str, neg: bool) -> None:
+        if isinstance(op, (*_EXACT_OPS, *_INEXACT_OPS)):
+            exact = isinstance(op, _EXACT_OPS) != neg
+        elif isinstance(op, _ORDER_OPS) or neg:
+            exact = False
+        else:  # `in`: neither an exact nor a loose check
+            return
+        for side in (left, right):
+            if exact:
+                self._exact(side, src)
+            else:
+                self._loosen(side, src)
 
     # -- assertions ---------------------------------------------------------------------
     def _counted(self, node: ast.AST) -> None:
@@ -450,20 +538,19 @@ class _Stats(ast.NodeVisitor):
             self.first_line = self.first_line or node.lineno
             return
         self._counted(node.test)
+        self._constants_of(node.test)
+        self._test_checks(test, ast.unparse(test))
         if isinstance(test, ast.Compare):
-            if (
+            weak = (
                 len(test.ops) == 1
                 and isinstance(test.ops[0], ast.IsNot)
                 and isinstance(test.comparators[0], ast.Constant)
                 and test.comparators[0].value is None
-            ):
+            )
+            if weak:
                 self.weak += 1
-                self.weak_operands.add(self._opshape(test.left))
             else:
                 self.strong += 1
-                self.strong_operands.update(
-                    self._opshape(o) for o in (test.left, *test.comparators)
-                )
             if len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq):
                 for side in (test.left, test.comparators[0]):
                     lit = _expected_of(side)
@@ -471,15 +558,19 @@ class _Stats(ast.NodeVisitor):
                         self.expected.append((ast.dump(lit), node.lineno))
         elif isinstance(test, (ast.Name, ast.Attribute, ast.Subscript)):
             self.weak += 1
-            self.weak_operands.add(self._opshape(test))
         elif isinstance(test, ast.Call):
             # A bare truthiness check on a call is weak; type checks pin a concrete fact.
             if dotted(test.func) in {"isinstance", "issubclass"}:
                 self.strong += 1
             else:
                 self.weak += 1
-                self.weak_operands.add(self._opshape(test))
         self.generic_visit(node)
+
+    def _constants_of(self, node: ast.AST) -> None:
+        """Literals the assertion compares against, after local inlining."""
+        for n in ast.walk(self.consts.inline(node)):
+            if _is_literal(n):
+                self.constants.add(ast.dump(n))
 
     def _raises(self, call: ast.Call) -> None:
         self._counted(call)
@@ -515,13 +606,12 @@ class _Stats(ast.NodeVisitor):
                 self.first_line = self.first_line or node.lineno
                 return
             self._counted(node)
+            self._constants_of(node)
+            self._method_checks(tail, node)
             if tail in _WEAK_METHODS:
                 self.weak += 1
-                if node.args:
-                    self.weak_operands.add(self._opshape(node.args[0]))
             else:
                 self.strong += 1
-                self.strong_operands.update(self._opshape(a) for a in node.args[:2])
             if tail in _EQUAL_METHODS:
                 for arg in node.args[:2]:
                     lit = _expected_of(arg)
@@ -542,6 +632,20 @@ class _Stats(ast.NodeVisitor):
         else:
             self._credit_helper(node)
         self.generic_visit(node)
+
+    def _method_checks(self, tail: str, node: ast.Call) -> None:
+        src = ast.unparse(node)
+        args = node.args
+        if tail in _EXACT_METHODS:
+            for arg in args[: 1 if tail == "assertIsNone" else 2]:
+                self._exact(arg, src)
+        elif tail in _LOOSE_PAIR_METHODS:
+            for arg in args[:2]:
+                self._loosen(arg, src)
+        elif tail in {"assertTrue", "assertFalse"} and args:
+            self._test_checks(args[0], src, negated=tail == "assertFalse")
+        elif tail in {"assertIsNotNone", "assertIsInstance"} and args:
+            self._loosen(args[0], src)
 
     def _const_call(self, node: ast.Call) -> bool:
         """`self.assertEqual(4, 4)`: every argument is a constant, so nothing is checked."""
@@ -618,6 +722,18 @@ class _Stats(ast.NodeVisitor):
             ):
                 self._count_inside(node.body, node.lineno)
         self.generic_visit(node)
+
+
+def _param_constants(fn: _FuncDef) -> set[str]:
+    """Literals among the cases of the test's parametrize decorators."""
+    out: set[str] = set()
+    for dec in fn.decorator_list:
+        if not (isinstance(dec, ast.Call) and dotted(dec.func).endswith("mark.parametrize")):
+            continue
+        values = [dec.args[1]] if len(dec.args) > 1 else []
+        values += [kw.value for kw in dec.keywords if kw.arg == "argvalues"]
+        out.update(ast.dump(n) for v in values for n in ast.walk(v) if _is_literal(n))
+    return out
 
 
 def _parametrize(fn: _FuncDef) -> tuple[int | None, bool, list[str]]:
@@ -759,8 +875,9 @@ def _unit(
         vacuous_line=stats.vacuous_line,
         unreachable=lost.asserts,
         unreachable_line=lost.first_line,
-        strong_operands=stats.strong_operands,
-        weak_operands=stats.weak_operands,
+        exact_subjects=stats.exact,
+        loose_targets=stats.loose,
+        constants=stats.constants | _param_constants(fn),
         classes=classes,
         testcase=testcase,
         disabled=disabled,

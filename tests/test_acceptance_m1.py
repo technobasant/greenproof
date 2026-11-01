@@ -72,16 +72,20 @@ def test_2_skip_marker_on_a_failing_test_is_blocked_at_the_decorator(
     assert "test_total" in data["findings"][0]["message"]
 
 
-def test_3_weakened_assertion_is_blocked(repo: Repo, run, tmp_path: Path) -> None:
-    # The base asserts `total() == 100`; the candidate asserts only that it is truthy.
+@pytest.mark.parametrize(
+    "loose", ["assert total()", "assert total() > 0", "assert isinstance(total(), int)"]
+)
+def test_3_weakened_assertion_is_blocked(repo: Repo, run, tmp_path: Path, loose: str) -> None:
+    # The base asserts `total() == 100`; the candidate checks the same value only loosely.
     repo.write(
         "tests/test_app.py",
-        "from app import total\n\n\ndef test_total():\n    assert total()\n",
+        f"from app import total\n\n\ndef test_total():\n    {loose}\n",
     )
     code, _, data = check(run, repo, tmp_path)
     assert code == 1
     assert rules(data) == ["tests.weakened"]
     assert "test_total" in data["findings"][0]["message"]
+    assert "loosened" in data["findings"][0]["message"]
     assert data["findings"][0]["line"] == 4
 
 
@@ -93,8 +97,8 @@ def test_4_delete_one_test_and_add_another_is_replaced(repo: Repo, run, tmp_path
     repo.commit("test_a")
     repo.write(
         "tests/test_app.py",
-        "from app import other\n\n\ndef test_b():\n    assert other() > 0\n"
-        "    assert other() < 1000\n",
+        "from app import total\n\n\ndef test_b():\n    assert total() > 0\n"
+        "    assert total() < 1000\n",
     )
     code, _, data = check(run, repo, tmp_path)
     assert code == 1
