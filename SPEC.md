@@ -436,10 +436,14 @@ Writes the session marker and gives the agent its instructions:
 The hook command is `greenproof` when it is on PATH at init time, else
 `uvx greenproof@<version>`; `--hook-command CMD` overrides it (for example
 `uv run greenproof`). Hook timeout = policy timeout × runnable commands + 60 seconds, at
-most 3600. An entry is greenproof's when its command contains `greenproof check --hook` or
-`greenproof session-start`. Re-running `init` replaces greenproof's entries and leaves
-every other key and hook untouched. An unparseable existing file → exit 4, nothing
-written. JSON is written with two-space indent and a trailing newline.
+most 3600. An entry is greenproof's when its command matches
+`greenproof(@\S+)?\s+(check\s+--hook|session-start)`, so `uvx greenproof@0.1.0 check --hook
+claude` and `uv run greenproof session-start` are recognised; a `--hook-command` that does
+not contain `greenproof` (a wrapper script) is not, and re-running `init` adds a second
+entry beside it. Re-running `init` replaces greenproof's entries and leaves every other key
+and hook untouched. An existing file that is not UTF-8, not valid JSON, not a JSON object,
+or whose `hooks` (or `hooks.<event>`) has the wrong type → exit 4, nothing written. JSON is
+written with two-space indent and a trailing newline.
 
 - **Claude Code**: `.claude/settings.json`, the committed project file the team shares:
 
@@ -578,7 +582,8 @@ through that an agent cannot forge.
    with the heading `## Verify`, the commands, "Before you say a task is done, run
    `greenproof check`.", the fix-the-code rule and "Never run `greenproof accept`". Create
    the file when it is missing, append the section when there are no markers, replace
-   between the markers otherwise. **CLAUDE.md**: when it exists and has no `@AGENTS.md`
+   between the markers otherwise. A begin marker without an end marker (or the reverse) →
+   exit 4, nothing written; the user fixes the markers by hand. **CLAUDE.md**: when it exists and has no `@AGENTS.md`
    line, add one inside its own marker pair at the end (so Claude Code, which
    reads CLAUDE.md, sees the section too). Never create CLAUDE.md.
 6. **Hooks** (6.4). `--agents auto` (the default) installs claude when `.claude/` or
@@ -594,9 +599,11 @@ through that an agent cannot forge.
    oven-sh/setup-bun; Go → actions/setup-go (`go-version-file: go.mod`); Rust → nothing
    (the runner image ships rustup). Dependencies install through `setup`, which greenproof
    runs in ci mode, so the workflow has no install step of its own.
-8. **Summary**: each file `created`, `updated`, `unchanged` or `kept`, the verification
-   results and next steps. Exit 0 even when a command was red; 4 on an unparseable existing
-   config file; 5 on an internal error.
+8. **Summary**: each file `created`, `updated`, `unchanged` (the new content equals the file)
+   or `kept` (an existing policy or workflow left alone without `--yes`), the verification
+   results and next steps. Exit 0 even when a command was red; 4 outside a git repository or
+   on an existing file it cannot safely edit; 5 on an internal error. Every file is planned
+   before any is written, so an exit 4 leaves the repository as it was.
 
 `init` works in a repository without commits (the summary says `check` needs one) and never
 commits.
