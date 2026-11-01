@@ -57,6 +57,26 @@ jobs:
       - run: uv sync --locked
       - run: uv run pytest -n auto --cov --cov-report=term-missing --cov-fail-under=85
 
+  # greenproof checks its own pull requests: the gate it ships, run on the change that
+  # would modify it. The policy is read from the base revision, so a pull request cannot
+  # weaken it in the same change.
+  greenproof:
+    name: Done gate (greenproof on greenproof)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv run greenproof check --mode ci
+
   # Builds what a release would publish and checks it the way PyPI and a user would.
   package:
     name: Package as published
