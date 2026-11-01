@@ -410,10 +410,53 @@ def test_expected_literal_change_with_code_change_warns(tmp_path: Path) -> None:
     assert found[0].line is not None
 
 
-def test_expected_literal_change_without_code_change_is_clean(tmp_path: Path) -> None:
+def test_expected_literal_change_without_code_change_warns(tmp_path: Path) -> None:
+    repo = make(tmp_path)
+    repo.write("tests/test_x.py", BASE_TESTS.replace("assert total == 100", "assert total == 99"))
+    found = static_findings(repo)
+    assert rule_ids(found) == ["tests.expected_changed"]
+    assert found[0].severity == "warn"
+    assert found[0].line is not None
+    assert (
+        found[0].message == "expected value changed in test test_total and no non-test code changed"
+    )
+    assert found[0].hint == (
+        "A test edited to match what the code returns hides the bug; "
+        "confirm the old value was wrong."
+    )
+
+
+def test_expected_literal_change_with_docs_only_change_still_says_no_code(tmp_path: Path) -> None:
     repo = make(tmp_path)
     repo.write("tests/test_x.py", BASE_TESTS.replace("assert total == 100", "assert total == 99"))
     repo.write("README.md", "docs only\n")
+    found = static_findings(repo)
+    assert rule_ids(found) == ["tests.expected_changed"]
+    assert "no non-test code changed" in found[0].message
+
+
+def test_expected_literal_change_with_code_change_keeps_old_message(tmp_path: Path) -> None:
+    repo = make(tmp_path)
+    repo.write("app.py", "def total():\n    return 99\n")
+    repo.write("tests/test_x.py", BASE_TESTS.replace("assert total == 100", "assert total == 99"))
+    found = static_findings(repo)
+    assert (
+        found[0].message == "expected value changed in test test_total while non-test code changed"
+    )
+    assert found[0].hint == (
+        "Confirm the new expected value comes from the requirement, not from "
+        "what the code now returns."
+    )
+
+
+def test_added_assertion_without_code_change_is_clean(tmp_path: Path) -> None:
+    repo = make(tmp_path)
+    repo.write(
+        "tests/test_x.py",
+        BASE_TESTS.replace(
+            "    assert helper(1) == 1\n", "    assert helper(1) == 1\n    assert helper(2) == 2\n"
+        ),
+    )
     assert static_findings(repo) == []
 
 

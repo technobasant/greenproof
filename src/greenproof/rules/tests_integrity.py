@@ -492,17 +492,19 @@ def _weakened(sides: list[_Side], pairing: _Pairing, changes: ChangeSet) -> list
                     "Restore the original assertions and fix the code instead.",
                 )
             )
-        if code_changed:
-            line = _expected_change(b, c)
-            if line is not None:
-                out.append(
-                    finding(
-                        "tests.expected_changed",
-                        c.path,
-                        line,
-                        f"expected value changed in test {c.name} while non-test code changed",
-                        "Confirm the new expected value comes from the requirement, not from "
-                        "what the code now returns.",
-                    )
+        line = _expected_change(b, c)
+        if line is not None:
+            if code_changed:
+                what = f"expected value changed in test {c.name} while non-test code changed"
+                hint = (
+                    "Confirm the new expected value comes from the requirement, not from "
+                    "what the code now returns."
                 )
+            else:
+                what = f"expected value changed in test {c.name} and no non-test code changed"
+                hint = (
+                    "A test edited to match what the code returns hides the bug; "
+                    "confirm the old value was wrong."
+                )
+            out.append(finding("tests.expected_changed", c.path, line, what, hint))
     return out

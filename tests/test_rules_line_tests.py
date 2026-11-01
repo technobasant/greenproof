@@ -170,12 +170,28 @@ def test_js_commented_or_quoted_markers_are_ignored(tmp_path: Path) -> None:
     assert static_findings(repo) == []
 
 
-def test_js_expected_value_change_warns_only_with_code_change(tmp_path: Path) -> None:
+def test_js_expected_value_change_warns_with_or_without_code_change(tmp_path: Path) -> None:
     repo = make(tmp_path, "src/app.test.ts", JS)
     repo.write("src/app.test.ts", JS.replace("toBe(100)", "toBe(99)"))
-    assert static_findings(repo) == []
+    found = static_findings(repo)
+    assert rule_ids(found) == ["tests.expected_changed"]
+    assert "no non-test code changed" in found[0].message
     repo.write("src/app.ts", "export const total = () => 99;\n")
-    assert rule_ids(static_findings(repo)) == ["tests.expected_changed"]
+    found = static_findings(repo)
+    assert rule_ids(found) == ["tests.expected_changed"]
+    assert "while non-test code changed" in found[0].message
+
+
+def test_go_testify_expected_change_warns_without_code_change(tmp_path: Path) -> None:
+    base = (
+        'package app\n\nimport (\n\t"testing"\n\n\t"github.com/stretchr/testify/assert"\n)\n\n'
+        "func TestTotal(t *testing.T) {\n\tassert.Equal(t, 100, Total())\n}\n"
+    )
+    repo = make(tmp_path, "app_test.go", base)
+    repo.write("app_test.go", base.replace("100", "99"))
+    found = static_findings(repo)
+    assert rule_ids(found) == ["tests.expected_changed"]
+    assert "no non-test code changed" in found[0].message
 
 
 # ---- Go -----------------------------------------------------------------------------------
