@@ -1,0 +1,13 @@
+repo: /private/tmp/gp-replay/zustand
+commits scanned: 166
+blocked: 9 (5.4%)
+blocked commits per rule:
+  tests.replaced: 4
+  tests.removed: 2
+  ci.tampered: 1
+  tests.deleted: 1
+  tests.focused: 1
+  tests.skipped: 1
+  tests.weakened: 1
+check duration ms: median 310, p95 807
+process wall time ms: median 662, p95 1436

@@ -1,0 +1,11 @@
+repo: /private/tmp/gp-replay/cobra
+commits scanned: 200
+blocked: 23 (11.5%)
+blocked commits per rule:
+  tests.weakened: 9
+  tests.removed: 6
+  tests.deleted: 4
+  tests.replaced: 3
+  tests.skipped: 2
+check duration ms: median 258, p95 496
+process wall time ms: median 629, p95 922

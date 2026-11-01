@@ -56,6 +56,21 @@ First release. Nothing has been published yet.
   requests.
 - A README covering the problem, install, quick start, how a check works, the rules, agent
   support and its caveats, CI, accepting findings, smoke setup and the limits.
+- A benchmark (`bench/run.py`, 107 cases on Python, JavaScript and Go fixtures) and a
+  real-history replay (`bench/replay.py`). MEASUREMENTS.md reports the benchmark, a replay
+  of 698 commits from click, httpx, zustand and cobra with every block triaged, a Claude
+  Code end-to-end run, and the known false-block patterns. The raw results are in
+  `bench/results/`.
+- `tests.expected_changed` also reports a test whose expected value changed when no
+  non-test code changed (a test edited to match what the code returns).
+- Calibration from the replay triage. Tests pair across renames by leaf name, by a body hash
+  without the test's own name, and by a structural hash with identifiers renamed.
+  JavaScript counts `expectTypeOf`, `assertType` and testing-library queries that throw
+  (`getBy…`, awaited `findBy…`) as checks, once per statement. Go counts calls to same-file
+  assertion helpers and no longer treats benchmarks as tests. A test inside a block
+  comment is not a test. A drop made only of loose checks, a removed test with no checks in
+  a file that gains tests, and suppressions in a newly adopted linter or type-checker table
+  are warnings, not blocks.
 
 ### Changed
 

@@ -1,0 +1,200 @@
+ad460ea8f	0	-	431	Add cobra unique args validator (#2397)
+746ef0715	0	-	380	fix: prevent completions from mutating os.Args via append side effect 
+6dec1ae26	0	-	338	The default ShellCompDirective can be customized for a command and its
+4af7b64d3	0	suppress.added(warn)	496	refactor: apply golangci-lint autofixes, work around false positives
+75790e48f	0	suppress.added(warn)	401	chore(golangci-lint): upgrade to v2
+1995054b0	0	suppress.added(warn)	238	Flow context to command in SetHelpFunc (#2241)
+40b5bc143	1	tests.removed(block)	278	Revert "Make detection for test-binary more universal (#2173)" (#2235)
+a97f9fd47	0	-	357	fix CompletionFunc implementation (#2234)
+24ada7fe7	0	-	473	Remove the default "completion" cmd if it is alone (#1559)
+8cb30f9ca	0	-	541	feat: add CompletionWithDesc helper (#2231)
+ab5cadcc1	0	-	246	Allow to reset the templates to the default (#2229)
+611e16c32	0	tests.skipped(warn)	403	Allow linker to perform deadcode elimination for program using Cobra (
+01ffff4ec	0	-	198	chore: fix function name in comment (#2216)
+0745e5576	0	-	262	completion: improve detection for flags that accept multiple values (#
+d1e9d85fc	0	-	425	Make detection for test-binary more universal (#2173)
+851963075	1	tests.weakened(block)	331	Update to latest go-md2man (#2201)
+5bef9d8d8	0	-	245	Fix --version help and output for plugins (#2180)
+511af59cb	0	-	415	Replace deprecated ioutil usage (#2181)
+6b5f577eb	0	-	423	More linting (#2099)
+bd914e58d	0	-	199	fix: remove deprecated io/ioutils package (#2120)
+0dec88e79	0	-	163	Add tests for funcs in cobra.go (#2094)
+a73b9c391	0	-	346	Fix help text for runnable plugin command
+df547f5fc	0	-	262	Fix help text for plugins
+e63925d32	0	-	331	Add env variable to suppress completion descriptions on create (#1938)
+a0a6ae020	0	-	235	Improve API to get flag completion function (#2063)
+890302a35	0	-	261	Support usage as plugin for tools like kubectl (#2018)
+00b68a1c2	0	-	309	Add tests for flag completion registration (#2053)
+b711e8760	0	-	245	Don't complete --help flag when flag parsing disabled (#2061)
+4cafa37bc	1	tests.weakened(block)	315	Allow running persistent run hooks of all parents (#2044)
+0c72800b8	0	-	310	Customizable error message prefix (#2023)
+fd865a44e	0	-	315	minor corrections to unit tests (#2003)
+60d056d15	0	-	211	doc: fix typo, Deperecated -> Deprecated (#2000)
+c81c46a01	0	-	353	Add 'one required flag' group (#1952)
+fdee73b4a	0	-	243	powershell: escape variable with curly brackets (#1960)
+988bd7613	1	tests.weakened(block)	177	test: make fish_completions_test more robust (#1980)
+9e6b58afc	0	-	2366	update copyright year (#1927)
+b4f979ae3	0	-	342	completions: do not detect arguments with dash as 2nd char as flag (#1
+ad6db7f8f	0	-	218	Create unit test illustrating unknown flag bug (#1854)
+6b0bd3076	0	-	238	fix: don't remove flag value that matches subcommand name (#1781)
+10cf7be99	0	-	298	Check for group presence after full initialization (#1839)
+2169adb57	0	-	465	Add groups for commands in help (#1003)
+212ea4078	0	-	353	Include --help and --version flag in completion (#1813)
+7039e1fa2	0	-	235	Add '--version' flag to Help output (#1707)
+6d978a911	0	-	2164	add missing license headers (#1809)
+fe08012ed	0	-	152	Rename Powershell completion tests (#1803)
+d689184a4	0	-	412	Support for case-insensitive command names (#1802)
+70e53f62b	1	tests.replaced(block)	257	Deprecate ExactValidArgs() and test combinations of args validators (#
+22b617914	1	tests.replaced(block)	222	fix: show flags that shadow parent persistent flag in child help (#177
+7790bf97f	0	-	185	fix: correct command path in see_also for YAML doc (#1771)
+5f2ec3c89	0	-	397	Update shell completion to respect flag groups (#1659)
+b9ca5949e	0	-	258	use errors.Is() to check for errors (#1730)
+ed7bb9dda	0	-	151	Add unit test for fish completion (#1515)
+f464d6c82	0	-	683	Add Active Help support (#1482)
+25f5bb5f9	0	-	396	Prefer ReplaceAll instead of Replace(..., -1) (#1530)
+68b6b24f0	0	-	308	Add ability to mark flags as required or exclusive as a group (#1654)
+f848943af	0	-	310	Add Command.SetContext (#1551)
+5d066b77b	0	-	315	Introduce FixedCompletions (#1574)
+94e552d8d	0	-	151	Add backwards-compatibility tests for legacyArgs() (#1547)
+5b2b9e9f6	1	tests.deleted(block)	1143	Removes viper dependency by removing cobra/ CLI tool (#1604)
+9054739e0	0	-	353	Remove __complete cmd for program without subcmds (#1563)
+1854bb5c9	0	-	291	Fix some typos (mostly found by codespell) (#1514)
+6f84ef487	0	-	229	Provide option to hide default 'completion' cmd (#1541)
+c3573e220	0	-	228	Completion: Capitalize short desc, and remove extra space from long (#
+45e521ea9	0	-	276	enable composing PositionalArgs (#896)
+9e1d6f1c2	1	tests.weakened(block)	222	args_test: add helper functions  (#1426)
+62a72cdd0	0	-	168	fix(diff): use arg '--strip-trailing-cr' (#949)
+9388e79fb	0	-	291	Cobra generator now works within Go modules
+c9edb78ac	0	-	300	Change generator default license to none
+dcf42b25f	0	-	320	Change generator to require opting in to viper.
+d2c0cb310	0	-	343	DisableFlagParsing must disable flag completion (#1161)
+2a5277810	0	-	235	go.mod: cpuguy83/go-md2man/v2 v2.0.1 (#1460)
+de187e874	0	-	353	Fix flag completion (#1438)
+5d46ac904	0	-	215	custom comp: do not complete flags after args when interspersed is fal
+b36196066	1	tests.weakened(block)	492	Bash completion V2 with completion descriptions (#1146)
+459015016	0	-	375	Correcting misspelled words (#1349)
+2d94892a8	0	-	244	Custom completion handle multiple shorhand flags together (#1258)
+6d0090912	0	suppress.added(warn)	357	Pass context to completion (#1265)
+b312f0a8e	0	-	312	Create 'completion' command automatically (#1192)
+652c755d3	1	tests.weakened(block)	1657	Use golangci-lint (#1044)
+ff416ad43	1	tests.removed(block)	188	Revert "Add the ability to specify a filePostpender in GenMarkdownTree
+23a6174c7	0	-	192	Add the ability to specify a filePostpender in GenMarkdownTreeCustom (
+a4ab3fa09	1	tests.deleted(block)	350	powershell completion with custom comp (#1208)
+40d34bca1	0	-	294	Fix stderr printing functions (#894)
+8a63648dd	0	-	209	Handle linebreaks in custom completions. (#1162)
+50258f15e	0	-	315	Complete subcommands when TraverseChildren is set (#1171)
+02a0d2fbc	0	-	366	doc: GenMarkdown skip Synopsis on empty long cmd (#1207)
+675ae5f5a	0	-	263	Fish does not accept - or : in vars (#1122)
+2c5a0d300	1	tests.deleted(block)	761	Extend Go completions and revamp zsh comp (#1070) (#1070)
+04318720d	0	-	292	Add completion for help command (#1136)
+ed7b60e29	0	-	196	YAML documentation contains "Usage" (#1037)
+515594634	0	-	233	Ignore required flags when DisableFlagParsing (#1095)
+e392f3204	0	-	404	Man pages won't have auto gen tag when option is disabled (#1104)
+41fd44e1d	0	-	200	Fix cobra init cmd help documentation (#1108)
+a684a6d7f	0	-	385	Fish completion using Go completion (#1048)
+7fead4bf3	0	-	189	Remove/replace SetOutput on Command - deprecated (#1078)
+b84ef4033	0	-	331	Rename BashCompDirectives to ShellCompDirectives (#1082)
+b80aeb17f	0	-	315	Add support for custom completions in Go (#1035)
+f62883520	0	-	404	Replace deprecated SetOutput func with SetOut and SetErr in test (#105
+6607e6b86	0	-	257	Partial Revert of #922 (#1068)
+95f2f73ed	0	-	324	Add short version flag -v when not otherwise set (#996)
+0da068742	0	-	286	Add support for context.Context
+19cf35ea7	0	-	256	fix: ensure that testproject is removed even after a failure (#948)
+51f06c7dd	0	-	432	Correct all complaints from golint
+9334a46bd	0	-	231	Return an error in the case of unrunnable subcommand
+f2b07da1e	0	-	171	fixing linter issues
+b63572608	0	-	366	considering stderr in UsageString
+e35034f0d	0	-	172	Add tests
+984374f5b	0	-	206	clean up testproject files after test executes
+11aa61238	0	-	395	test add
+303a3e516	1	tests.removed(block)	227	vgo - strip out unused methods
+50665e999	0	-	399	vgo - update golden templates
+642c3c7a0	0	-	154	vgo - compare generated files against golden files
+c3b51f3a2	1	tests.removed(block),tests.weakened(block)	220	simplify test
+21ccc7b30	0	-	143	Add basic PowerShell completions
+e2c45ac9e	0	-	352	Started working on Unified API for the various shell completions:
+edbb6712e	0	-	257	zsh-completions: implemented argument completion.
+d26215409	0	-	187	zsh-completion: tidy up function and variable names
+8822449c0	0	-	305	zsh-completion: added escapinng of single quotes in flag description.
+66a98807d	0	-	164	zsh-completion: test to verify that we're always running on root cmd.
+7b62c7df7	1	tests.skipped(block)	144	zsh-completion: --version and --help still doesn't work correctly
+7ce08e227	0	-	307	zsh-completion: completion should always parse the root command!
+91e80cc4a	0	-	148	zsh-completion: remove bad test
+50f385938	0	-	227	zsh-completion: added support for filename globbing.
+df12a0a24	1	tests.skipped(block)	364	zsh-completion: two fixes for identifying flag usage:
+ec4b8c974	0	-	204	zsh-completions: revised flags completion rendering + new features:
+266278769	0	-	194	zsh-completion: added support for subcommand description.
+f0508c8e7	0	-	191	zsh-completion ignores hidden commands and flags :)
+a15d09901	0	-	281	zsh-completion fixed reference to cmd name
+7e2436b79	1	tests.replaced(block)	264	First try at better zsh completions:
+5755ecf10	0	-	364	[TrivialPatches] Typos in README.md, fix and update CI, update project
+ba1052d4c	0	-	195	Fix two word flags (#807)
+7547e83b2	0	-	369	Run tests against go 1.11 and drop 1.9 (#737)
+f619abc1d	0	-	342	Added ExactValidArgs (#765)
+6fd8e29b0	0	-	226	Qualify custom bash func name (#730)
+a114f312e	0	-	181	fix test build breakage with go1.11 (#712)
+0ab5b6bcf	0	-	362	doc: hide hidden parent flags (#686)
+4dab30cb3	0	-	329	Add support for ignoring parse errors (#662)
+6644d46b8	0	-	184	Prefix bash functions with root command name (#643)
+fd32f09af	0	-	189	Fix generated bash completion for Bash 3 (OSX) (#520)
+eb5898335	0	-	257	Add `CalledAs` method to cobra.Command (w/ tests) (#567)
+ccaecb155	0	-	315	Ensure that '--version' flag works properly for root command (#595)
+b1ec2ce1a	0	-	239	Add support for --version flag (#584)
+19e54c4a2	0	-	216	Update error message for missing required flags (#580)
+2da4a54c5	1	tests.weakened(block)	341	Improve tests in doc/
+d6a430541	0	-	321	Edit ResetFlags and ResetCommands descriptions
+65c8acb22	1	tests.removed(block),tests.skipped(warn)	524	Improve tests
+18eefcde1	0	-	128	Add tests for args.go
+7b2c5ac9f	0	-	201	Create new buffer if not present yet (#549)
+7cd9cc6d4	0	-	168	add test for c.Name() if c.Use gets changed (#548)
+4d6af280c	0	-	309	enforce required flags (#502)
+83b1f0396	0	-	252	Add a TraverseChildren option to allow for flags on each command in th
+419e0f8d5	0	-	198	doc: add ReST doc generation (#537)
+0dacccfba	0	-	199	Improve consistency of flags when using SetGlobalNormalizationFunc (#5
+3c0b56b67	0	-	158	correct spelling mistake (#524)
+b26b538f6	0	-	145	Fix remaining reproducibility in TestGoldenAddCmd
+3da102d46	0	-	218	cmd: Fix golden tests if user has config at $HOME
+99838a52f	0	-	254	cmd: Small fixes
+d7ba19510	0	-	139	Add basic zsh completion (command hierarchy only)
+75c6acfc8	0	-	157	cmd: Add "-u" to output unified diff in golden tests
+750ba8ac9	0	-	254	Fix reproducibility in TestGolden{Add,Init}Cmd
+161584fc2	0	-	189	Fix minor typos: "Know" → "Known"
+34594c771	0	-	165	Fix TestGlobalNormFuncPropagation() on gccgo
+f20b4e9c3	0	-	402	Refactor TakesArgs to use an interface for arg validation.
+d89c49996	0	-	365	Allow commands to explicitly state if they do, or do not take arbitrar
+8c6fa02d2	0	-	195	Fix InitDefaultHelpCmd when custom help command is set
+99b5d838c	0	-	197	Show messages if deprecated flags are used
+84f471618	0	-	275	Make BenchmarkBashCompletion more honest
+fb1f39915	0	-	147	Add benchmark for GenBashCompletion
+de6b168d9	0	-	200	Simplify bash_completions.go
+4cdb38c07	0	-	300	cmd: Use correct HasPrefix function for paths
+51b7cf57e	1	tests.weakened(block)	203	Fix tests so they give correct args (#445)
+b5366273a	0	-	273	cmd: Fix some gometalinter complaints
+7d22e77cc	0	-	243	Fix incorrect merge of pflag.CommandLine to cmd.Flags()
+e97db2b86	0	-	172	cmd: Fix tests
+fe69f2e3a	0	-	184	Make initHelpFlag public
+7bb5276f5	0	-	184	cmd: Fix panic if cmd ends on dash or underscore
+efbe9b05d	0	-	170	cmd: Use Fatalf instead of Fatal
+76a9a6677	0	-	354	cmd: Add tests
+d20925b93	0	-	314	cmd: Small correctives
+6bcf16326	0	-	168	cmd: Validate cmd names
+32756eb44	1	tests.deleted(block)	497	cmd: Rewrite
+6dd90846b	0	-	194	doc: Use w.Write instead of fmt in yaml_docs
+97af803f3	0	-	290	doc: Cleanup md_docs
+de484eefb	0	-	197	doc: Refactor man docs
+ea3c5beef	0	-	207	Add TestHelpFlagInHelp
+6d4267ffb	0	-	403	cmd: Delete redundant symbols from helpers_test.go and licenses.go
+f58a8d6bd	0	-	246	Add TestSortedFlags
+458d79748	0	-	212	Add merging of CommandLine flags to Root command
+37a4355fa	0	-	165	Fix tests
+3d89ed490	0	-	297	Add only missing persistent flags of parents in mergePersistentFlags
+6202b5942	1	tests.removed(block)	214	Refactor flags mechanisms
+f95d58bdf	0	-	577	Fix #401 (#402)
+7aeaa2cce	0	-	237	Avoid storing pointer to nil (#411)
+642111551	0	-	170	doc: Fix govet complaints (#408)
+35136c09d	0	-	300	Added support for yaml ouptut in docs gen (#380)
+9495bc009	0	-	204	echo msg not echo msg msg (#364)
+6e91dded2	0	-	150	Make gofmt -s pass (#355)
+b3f29e98e	0	-	473	Issue #195: Move doc generation into separate pkg
+ee6224d01	0	-	181	Ugly fix for filepath.IsAbs not playing nicely with windows
+1f27c0953	0	-	231	Fixed tests for how they are run
