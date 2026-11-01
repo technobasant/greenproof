@@ -55,7 +55,7 @@ jobs:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
-      - run: uv run pytest --cov --cov-report=term-missing --cov-fail-under=85
+      - run: uv run pytest -n auto --cov --cov-report=term-missing --cov-fail-under=85
 
   # Builds what a release would publish and checks it the way PyPI and a user would.
   package:

@@ -10,7 +10,7 @@ uv sync
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy src
-uv run pytest --cov --cov-fail-under=85
+uv run pytest -n auto --cov --cov-fail-under=85
 ```
 
 All five must pass. Do not delete, skip or weaken a test to get green, and do not loosen
