@@ -11,8 +11,9 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 MAX_ENTRIES = 50
 
@@ -48,7 +49,7 @@ class PassCache:
     def __init__(self, directory: Path) -> None:
         self.path = directory / "cache.json"
 
-    def _load(self) -> list[dict[str, object]]:
+    def _load(self) -> list[dict[str, Any]]:
         try:
             data = json.loads(self.path.read_text())
             entries = data["entries"]
@@ -58,12 +59,20 @@ class PassCache:
             return []
         return [e for e in entries if isinstance(e, dict) and isinstance(e.get("key"), str)]
 
-    def has_pass(self, key: str) -> bool:
-        return any(e["key"] == key for e in self._load())
+    def get_pass(self, key: str) -> list[dict[str, Any]] | None:
+        """The check statuses of the original passing run, or None on a miss."""
+        for entry in self._load():
+            checks = entry.get("checks")
+            if entry["key"] == key and isinstance(checks, list):
+                return [c for c in checks if isinstance(c, dict)]
+        return None
 
-    def record_pass(self, key: str) -> None:
+    def has_pass(self, key: str) -> bool:
+        return self.get_pass(key) is not None
+
+    def record_pass(self, key: str, checks: Sequence[Mapping[str, Any]]) -> None:
         entries = [e for e in self._load() if e["key"] != key]
-        entries.append({"key": key, "at": int(time.time())})
+        entries.append({"key": key, "at": int(time.time()), "checks": [dict(c) for c in checks]})
         entries = entries[-MAX_ENTRIES:]
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix="cache-", suffix=".tmp")

@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from greenproof import __version__, gitops
 from greenproof.cache import PassCache, cache_key
@@ -100,8 +101,12 @@ def run_check(opts: CheckOptions) -> Report:
     flags = ["allow-policy-change"] if opts.allow_policy_change else []
     key = cache_key(tree, base.sha, loaded.sha256, __version__, opts.mode, checks, flags)
     cache = PassCache(gitops.greenproof_dir(repo))
-    if not opts.no_cache and cache.has_pass(key):
-        report.checks = [CheckStatus(c, "pass") for c in checks]
+    # ci mode never reads or writes the cache: the file is writable by anything running as
+    # the user, an agent included, so a cached pass is a local speed-up and never evidence.
+    use_cache = not opts.no_cache and opts.mode != "ci"
+    replay = _replayable(cache.get_pass(key)) if use_cache else None
+    if replay is not None:
+        report.checks = replay
         report.cached = True
         return report.finish()
 
@@ -128,9 +133,27 @@ def run_check(opts: CheckOptions) -> Report:
         report.checks.append(CheckStatus(check, "fail" if failed else "pass", elapsed))
 
     report.finish()
-    if report.exit_code == 0 and not opts.no_cache:
-        cache.record_pass(key)
+    if report.exit_code == 0 and use_cache:
+        cache.record_pass(key, [asdict(c) for c in report.checks])
     return report
+
+
+def _replayable(stored: list[dict[str, Any]] | None) -> list[CheckStatus] | None:
+    """The original run's check statuses, or None when absent or malformed (a miss)."""
+    if stored is None:
+        return None
+    out: list[CheckStatus] = []
+    for item in stored:
+        ident, status, ms = item.get("id"), item.get("status"), item.get("duration_ms", 0)
+        if (
+            not isinstance(ident, str)
+            or status not in ("pass", "skipped")
+            or isinstance(ms, bool)
+            or not isinstance(ms, int)
+        ):
+            return None
+        out.append(CheckStatus(ident, status, ms))
+    return out
 
 
 def _run_commands(policy: Policy, repo: Path, tail_lines: int) -> list[CommandResult]:
