@@ -64,6 +64,7 @@ def run_command(
 ) -> CommandResult:
     env = {**os.environ, "GREENPROOF": "1", **(extra_env or {})}
     tail: deque[str] = deque(maxlen=tail_lines)
+    tail_lock = threading.Lock()  # the reader appends while this thread joins the tail
     started = time.monotonic()
     proc = subprocess.Popen(
         ["sh", "-c", cmd],
@@ -79,7 +80,9 @@ def run_command(
 
     def drain() -> None:
         for raw in stream:
-            tail.append(raw.decode(errors="replace").rstrip("\r\n"))
+            line = raw.decode(errors="replace").rstrip("\r\n")
+            with tail_lock:
+                tail.append(line)
 
     reader = threading.Thread(target=drain, daemon=True)
     reader.start()
@@ -99,11 +102,13 @@ def run_command(
         reader.join(timeout=1)
         if not reader.is_alive():
             stream.close()
+    with tail_lock:
+        output_tail = "\n".join(tail)
     return CommandResult(
         name=name,
         cmd=cmd,
         exit_code=proc.returncode,
         duration_ms=int((time.monotonic() - started) * 1000),
         timed_out=timed_out,
-        output_tail="\n".join(tail),
+        output_tail=output_tail,
     )
