@@ -66,6 +66,12 @@ _JS_QUERY = re.compile(
     r"\bawait\s+(?:screen\.)?find(?:All)?By\w+\s*\(|\bscreen\.get(?:All)?By\w+\s*\("
     r"|(?<![\w.])get(?:All)?By\w+\s*\("
 )
+# `const x = await screen.findByText(..)`: a bound query that a later `expect(x` reads counts zero,
+# because that expect already counts (SPEC 5.4). Unread, it counts once.
+_JS_BOUND_QUERY = re.compile(
+    r"^\s*(?:const|let|var)\s+([\w$]+)\s*(?::[^=]+)?=\s*(?:await\s+)?(?:screen\.)?"
+    r"(?:get|find)(?:All)?By\w+\s*\("
+)
 # `expect(<literal>)` checks nothing about the code (SPEC 5.4): it is not counted.
 _JS_CONST_EXPECT = re.compile(
     r"\bexpect\s*\(\s*(?:-?\d[\w.]*|'[^'\n]*'|\"[^\"\n]*\"|`[^`$\n]*`|true|false|null|undefined)\s*\)"
@@ -405,6 +411,15 @@ def _go_call(names: set[str]) -> re.Pattern[str]:
     return re.compile(rf"(?<![\w.])(?:{alt})\s*\(")
 
 
+def _read_by_expect(masked: list[str], k: int, end: int) -> bool:
+    """Line `k` binds a query result to a name that a later line of the test passes to expect."""
+    bound = _JS_BOUND_QUERY.match(masked[k])
+    if bound is None:
+        return False
+    read = re.compile(rf"\bexpect\s*\(\s*{re.escape(bound.group(1))}(?![\w$])")
+    return any(read.search(masked[j]) for j in range(k + 1, end + 1))
+
+
 def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
     """`lang` is js, go, rust or python-lines."""
     raw = split_lines(text)
@@ -431,6 +446,7 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
                 lang == "js"
                 and _ASSERTS[lang].search(masked[k]) is None
                 and _JS_QUERY.search(masked[k]) is not None
+                and not _read_by_expect(masked, k, span.end)
             )
             for k in range(span.start, span.end + 1)
         ]

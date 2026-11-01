@@ -368,6 +368,25 @@ def test_js_find_by_to_get_by_migration_is_no_drop() -> None:
     before = "  await findByText('a');\n  await screen.findByRole('button');"
     after = "  getByText('a');\n  screen.getByRole('button');"
     assert _js_asserts(before) == _js_asserts(after) == 2
+    # A bound pair collapsing into one inline expect is no drop either.
+    bound = "  const el = await screen.findByText('a');\n  expect(el).toBeInTheDocument();"
+    inline = "  expect(screen.getByText('a')).toBeInTheDocument();"
+    assert _js_asserts(bound) == _js_asserts(inline) == 1
+
+
+def test_js_bound_query_read_by_expect_counts_once_with_it() -> None:
+    assert _js_asserts("  const el = getByText('a');\n  expect( el ).toBeVisible();") == 1
+    assert (
+        _js_asserts("  let el = await screen.getAllByRole('b');\n  expect(el[0]).toBeVisible();")
+        == 1
+    )
+
+
+def test_js_bound_query_nobody_reads_still_counts() -> None:
+    assert _js_asserts("  const el = await screen.findByText('a');") == 1
+    assert _js_asserts("  const el = getByText('a');\n  expect(other).toBe(1);") == 2
+    # A longer name that merely starts with the bound one is not a read.
+    assert _js_asserts("  const el = getByText('a');\n  expect(element).toBe(1);") == 2
 
 
 GO_HELPER = """\
