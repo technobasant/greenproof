@@ -615,9 +615,11 @@ through that an agent cannot forge.
    "the suite is red before greenproof; fix it or remove it before relying on the gate".
 4. **Write `.greenproof.toml`**: `version = 1`; the commands, each with a comment saying
    where it came from; `timeout = 900`; `[modes.hook]` and `[modes.local]` checks
-   `["static", "commands"]`, `[modes.ci]` checks `["static", "commands", "revert"]`, plus
-   `"smoke"` when the policy has a `[smoke]` table. An existing
-   policy is kept (and used for the rest of init) unless `--yes`.
+   `["static", "commands"]`, `[modes.ci]` checks `["static", "commands", "revert"]`. init
+   never writes a `[smoke]` table, because it cannot know how to start the application;
+   the user adds `[smoke]` and `"smoke"` in `[modes.ci]` by hand (8.2). An existing
+   policy is kept (and used for the rest of init) unless `--yes`, which rewrites the whole
+   file: hand-written tables such as `[rules]` and `[smoke]` are not carried over.
 5. **AGENTS.md**: a section between `<!-- greenproof:begin -->` and `<!-- greenproof:end -->`
    with the heading `## Verify`, the commands, "Before you say a task is done, run
    `greenproof check`.", the fix-the-code rule and "Never run `greenproof accept`". Create
