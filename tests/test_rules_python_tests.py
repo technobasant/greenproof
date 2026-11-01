@@ -444,4 +444,4 @@ def test_equality_replaced_by_call_truthiness_fires_and_call_to_call_is_clean(
     same = "def test_t():\n    assert valid(1)\n"
     assert weakened(tmp_path / "b", same, "def test_t():\n    assert valid(2)\n") == []
     typed = "def test_t():\n    assert isinstance(total(), int)\n"
-    assert weakened(tmp_path / "c", old, typed) == []
+    assert rule_ids(weakened(tmp_path / "c", old, typed)) == ["tests.weakened"]

@@ -226,7 +226,10 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   without re-raising;
 - an assertion made vacuous or tautological: `assert <truthy constant>` (`assert True`,
   `assert 1`), `self.assertTrue(True)`, an `or` with a truthy constant operand
-  (`assert x == 3 or True`), or a comparison of an expression with itself;
+  (`assert x == 3 or True`), or a comparison of an expression with itself, also after
+  single-assignment locals (assigned exactly once in the test body, before the assertion,
+  from any expression, and not used before it in any other way) are inlined:
+  `expected = refund(100)` then `assert refund(100) == expected` checks nothing;
 - an assertion whose inputs are all constants, so it checks nothing about the code:
   every operand is a literal, a pure builtin (`len`, `abs`, `min`, `max`, `sum`, `sorted`,
   `reversed`, `list`, `tuple`, `set`, `frozenset`, `dict`, `str`, `int`, `float`, `bool`,
@@ -241,17 +244,46 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
 - an assertion made unreachable: an unconditional `return`/`raise` (outside a
   `pytest.raises`/`assertRaises` block) placed before it in the test body, or the
   assertion moved under `if False:`/`if 0:`. Unreachable assertions do not count;
-- severity split for replaced assertions: when the new assertion is the old comparison's
-  own operand (`assert total() == 100` → `assert total()`, `assert a == b` →
-  `assert a is not None`) the finding is `block`; when it is a different expression
-  (`assert f(x) == 1` → `assert is_one(x)`) it is `warn`, because that is often a
-  legitimate refactor.
+- an **exact check loosened**. An exact check pins a value: an `assert` whose test is a
+  single `==` or `is` comparison (including `is None`), `assertEqual`, `assertIs`,
+  `assertIsNone`, `assertListEqual`, `assertDictEqual`, `assertTupleEqual`,
+  `assertSetEqual`, `assertSequenceEqual`, `assertMultiLineEqual`, `assertCountEqual` or
+  `assertAlmostEqual`. Its **subjects** are its operands that are not constant (a literal,
+  or an operator, container or pure builtin over literals, as in the constant rule above),
+  compared as shapes after single-assignment locals are inlined (names bound inside the
+  test, its locals and parameters, are alpha-renamed; globals, attributes and builtins keep
+  their spelling, so `resp.status` and `resp.ok` differ). A **loose check** on `X`
+  is any other assertion in which `X` is: the whole test (`assert X`, `assertTrue(X)`); an
+  operand of `is not`, `!=`, `<`, `<=`, `>`, `>=`, `not in` (`assert X > 0`,
+  `assert 0 < X < 10`, `assertNotEqual`, `assertGreater`, `assertGreaterEqual`,
+  `assertLess`, `assertLessEqual`, `assertIsNotNone`); the first argument of `isinstance`,
+  `issubclass` or `assertIsInstance`; or wrapped as `type(X)`, `len(X)` or `bool(X)` in
+  any comparison (`assert type(X) is int`, `assert len(X) == 3`). Negations count as
+  loose checks on what they negate (`assert not X`, `assertFalse(X)`, `assert not X == 1`,
+  `assertNotIn`, `assertNotAlmostEqual`); `and`/`or` operands and each link of a chained
+  comparison are classified separately. A subject of an exact
+  check in the base test that is the subject of no exact check in the candidate test, and
+  is the target of a loose check there, is loosened: `tests.weakened` (block), "exact
+  check on `<X>` loosened to `<the new assertion's source>`". This includes
+  `assert total() == 100` → `assert total()`, → `assert total() > 0`, →
+  `assert isinstance(total(), int)` and `assert rows == [a, b]` → `assert len(rows) == 2`.
+  Any other comparison on `X` replaced by a truthiness check on `X` alone
+  (`assert x < 5` → `assert x`) is also `tests.weakened` (block). When the new assertion
+  is a different expression (`assert f(x) == 1` → `assert is_one(x)`) it is a `warn` for a
+  strong check replaced by a different one, because that is often a legitimate refactor.
 
 JS/TS, Go, Rust (line level, per test file): count of assertion calls drops (`expect(`,
 `assert.`, `t.Error`/`t.Fatal`/`require.`/`assert.`, `assert!`/`assert_eq!`), or strong
-matchers (`toEqual`, `toBe(`, `toStrictEqual`, `toMatchObject`, `toThrow(<arg>)`) are
-removed while weak ones (`toBeDefined`, `toBeTruthy`, `not.toThrow`, `toBeGreaterThanOrEqual(0)`)
-are added. An `expect(<literal>)` (number, string, `true`/`false`/`null`/`undefined`) is
+matchers are removed while weak ones are added: JS/TS strong `toEqual`, `toBe(`,
+`toStrictEqual`, `toMatchObject`, `toThrow(<arg>)`, weak `toBeDefined`, `toBeTruthy`,
+`toBeFalsy`, `not.toBeNull`, `not.toBeUndefined`, `not.toThrow`, `toBeGreaterThan`,
+`toBeGreaterThanOrEqual`, `toBeLessThan`, `toBeLessThanOrEqual`, `toBeInstanceOf`,
+`toHaveLength`, `expect.any(`, `not.toBe(`, `not.toEqual(`; Go strong `assert.Equal(`,
+`assert.EqualValues(`, `require.Equal(`, `require.EqualValues(`, weak `.NotNil(`,
+`.True(`, `.NotEmpty(`, `.Greater(`, `.GreaterOrEqual(`, `.Less(`, `.LessOrEqual(`,
+`.IsType(`, `.NotEqual(`, `.Len(`; Rust strong `assert_eq!(`, weak `assert_ne!(`,
+`.is_some())`, `.is_ok())`, `.is_empty())`, and `assert!(` lines containing `>`, `<`
+or `!=`. An `expect(<literal>)` (number, string, `true`/`false`/`null`/`undefined`) is
 vacuous and not counted, so `expect(add(1, 2)).toBe(3)` → `expect(3).toBe(3)` drops the count.
 
 ### 5.5 Suppressions (`suppress.added`, warn by default; each pattern its own sub-id in the message)
@@ -323,13 +355,37 @@ a rewrite, when all of these hold:
   the dotted name of a called function or method that is not a builtin, not
   pytest/unittest/mock vocabulary, and not bound inside the test itself;
 - their combined effective check count (5.4) is at least the removed tests';
-- none of their assertions is a truthiness or existence check on an operand of a
-  comparison the removed tests made (the 5.4 `block` case).
+- every subject of an exact check in the removed tests that the new tests check at all
+  is the subject of an exact check in the new tests (no loosened check, 5.4);
+- the new tests pin at least as many values as the removed tests. A **pinned check** is
+  an exact check whose other side, after inlining single-assignment locals, is a literal
+  (a constant, a negated number, a tuple, list, set or dict display of literals, or
+  `approx(<literal>)`) or a parametrize argument whose cases are all literals; it counts
+  once per parametrize case, like effective checks (5.4). An expected value computed from
+  the inputs (`refund(x) == x - 1`) or by calling code is not pinned. A rewrite may change
+  the expected values (the requirement may have changed); it may not stop pinning them.
 
-Otherwise it is `block`. A removed test with no new test in its file stays
-`tests.removed` (block). Replacing `test_parse` with a test that calls `total`, or with
-a test whose inputs are constants, still blocks. A rename that rewrites the test into a
-parametrized superset warns.
+Otherwise it is `block`.
+
+**Absorbing tests.** A paired test in the same file whose effective check count (5.4)
+grew is an absorbing test: removed tests were often folded into it (two tests merged into
+one parametrized test that keeps one of the names). When a file has removed uncovered
+tests and absorbing tests, the four rewrite conditions above are evaluated on the removed
+tests plus the base versions of the absorbing tests, against the new unpaired tests plus
+the candidate versions of the absorbing tests. When they hold, the removed tests are
+`tests.replaced` (warn), and the message names the absorbing tests; when they do not, the
+removed tests keep the finding they would have without absorbing tests. Example:
+`test_refund` (`refund(100) == 99`) and `test_refund_small` (`refund(2) == 1`) folded into
+`test_refund` parametrized over `[(100, 99), (2, 1)]` warns; folded into one case
+`[(100, 99)]`, or with expected values computed by calling code, still blocks.
+
+A removed test with no new test and no absorbing test in its file stays
+`tests.removed` (block). Replacing `test_parse` with a test that calls `total`, with
+a test whose inputs are constants, or with `test_total_in_range` checking
+`0 < total() < 1000` where `test_total` checked `total() == 100`, still blocks, and so does
+replacing `assert refund(100) == 99` with a parametrized `assert refund(x) == x - 1`. A
+rename that rewrites the test into a parametrized superset with literal expected values
+warns, even when the old test's literal no longer appears.
 
 ## 6. Agent and CI adapters
 
@@ -723,9 +779,11 @@ bench/              testwashing benchmark (milestone 4)
 1. Agent deletes `tests/test_math.py` → exit 1, `tests.deleted`.
 2. Agent adds `@pytest.mark.skip` to a failing test → exit 1, `tests.skipped` at the
    decorator line.
-3. Agent replaces `assert total == 100` with `assert total` → exit 1, `tests.weakened`.
-4. Agent deletes `test_a` and adds `test_b` in the same file → exit 1, `tests.replaced`
-   naming both.
+3. Agent replaces `assert total == 100` with `assert total`, `assert total > 0` or
+   `assert isinstance(total, int)` → exit 1, `tests.weakened`.
+4. Agent deletes `test_a` (`assert total() == 100`) and adds `test_b` in the same file
+   (`assert total() > 0` and `assert total() < 1000`) → exit 1, `tests.replaced` naming
+   both.
 5. Agent edits `.greenproof.toml` to set `test = "true"` → exit 1 `policy.changed`, and the
    test command that runs is the base's, which fails → also reported (exit stays 1).
 6. Agent adds `--deselect tests/test_api.py::test_x` to `addopts` → `runner.tampered`.

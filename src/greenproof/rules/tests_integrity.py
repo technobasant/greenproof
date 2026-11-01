@@ -137,6 +137,16 @@ class _Added:
     cases: set[str]
 
 
+def _loosened(b: Unit, c: Unit) -> list[tuple[str, str]]:
+    """(subject, new assertion) for each subject of an exact check at the base that the candidate
+    no longer pins exactly but still checks loosely (SPEC 5.4)."""
+    return [
+        (source, c.loose_targets[shape])
+        for shape, source in b.exact_subjects.items()
+        if shape not in c.exact_subjects and shape in c.loose_targets
+    ]
+
+
 def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> list[_Reason]:
     if b.engine != c.engine:
         return []
@@ -159,9 +169,12 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
                 BLOCK,
             )
         )
-    if c.strong < b.strong and c.weak > b.weak:
-        # Replacing a comparison by its own operand is a plain weakening; a different
-        # expression is often a legitimate refactor, so it only warns.
+    loosened = _loosened(b, c) if b.engine == "python" else []
+    out.extend((f"exact check on `{x}` loosened to `{src}`", c.line, BLOCK) for x, src in loosened)
+    if c.strong < b.strong and c.weak > b.weak and not loosened:
+        # Cutting a comparison to a truthiness check on its own operand is a plain weakening
+        # (an exact check loosened is reported above); a different expression is often a
+        # legitimate refactor, so on Python it only warns.
         own = bool(c.weak_operands & b.strong_operands) or b.engine != "python"
         out.append(
             (
@@ -330,9 +343,13 @@ def _group_checks(units: list[Unit], literal: bool) -> int:
     return sum(u.asserts * ((u.param_cases or 1) if literal else 1) for u in units)
 
 
+def _group_pinned(units: list[Unit], literal: bool) -> int:
+    return sum(u.pinned * ((u.param_cases or 1) if literal else 1) for u in units)
+
+
 def _is_rewrite(removed: list[Unit], added: list[Unit]) -> bool:
-    """SPEC 5.7: the new tests keep every subject, at least as many checks, and no weak check
-    on an operand the removed tests compared."""
+    """SPEC 5.7: the new tests keep every subject, at least as many checks, loosen no exact check
+    and pin at least as many expected values as the removed tests."""
     if any(u.engine != "python" for u in (*removed, *added)):
         return False
     subjects = set().union(*(u.subjects for u in removed))
@@ -341,8 +358,24 @@ def _is_rewrite(removed: list[Unit], added: list[Unit]) -> bool:
     literal = all(u.param_literal for u in (*removed, *added))
     if _group_checks(added, literal) < _group_checks(removed, literal):
         return False
-    strong = set().union(*(u.strong_operands for u in removed))
-    return not strong & set().union(*(u.weak_operands for u in added))
+    exact_after = set().union(*(u.exact_subjects.keys() for u in added))
+    checked_after = exact_after | set().union(*(u.loose_targets.keys() for u in added))
+    for u in removed:
+        if any(s in checked_after and s not in exact_after for s in u.exact_subjects):
+            return False
+    return _group_pinned(added, literal) >= _group_pinned(removed, literal)
+
+
+def _absorbing(pairing: _Pairing, path: str) -> list[tuple[Unit, Unit]]:
+    """Paired Python tests of `path` whose effective check count grew (SPEC 5.7): removed tests
+    were often folded into them."""
+    found = []
+    for b, c in pairing.pairs:
+        if c.path == path and b.engine == c.engine == "python":
+            before, after = _effective(b, c)
+            if after > before:
+                found.append((b, c))
+    return found
 
 
 def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]:
@@ -376,18 +409,36 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
                 )
             continue
         added = added_by_path.get(path, [])
-        rewrite = bool(names and added) and _is_rewrite(names, added)
+        absorbing = _absorbing(pairing, path) if names else []
+        if absorbing:
+            rewrite = _is_rewrite(
+                [*names, *(b for b, _ in absorbing)], [*added, *(c for _, c in absorbing)]
+            )
+            folded = ", ".join(c.name for _, c in absorbing)
+        else:
+            rewrite = bool(names and added) and _is_rewrite(names, added)
+            folded = ""
         for i, removed in enumerate(names):
-            if i >= len(added) and not rewrite:
+            if rewrite and folded:
+                line = added[min(i, len(added) - 1)].line if added else absorbing[0][1].line
+                what = f"test {removed.name} was removed and folded into {folded}"
+            elif i < len(added):
+                line = added[i].line
+                what = f"test {removed.name} was removed and a different test {added[i].name} added"
+            elif rewrite:
+                line = added[-1].line
+                what = (
+                    f"test {removed.name} was removed and a different test {added[-1].name} added"
+                )
+            else:
                 break
-            new = added[min(i, len(added) - 1)]
             out.append(
                 sev_finding(
                     "tests.replaced",
                     WARN if rewrite else BLOCK,
                     path,
-                    new.line,
-                    f"test {removed.name} was removed and a different test {new.name} added"
+                    line,
+                    what
                     + (" (a rewrite: same subjects, at least as many checks)" if rewrite else ""),
                     "Keep the original test; add new tests alongside it, not in its place.",
                 )

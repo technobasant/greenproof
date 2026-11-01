@@ -62,12 +62,21 @@ _JS_CONST_EXPECT = re.compile(
     r"\bexpect\s*\(\s*(?:-?\d[\w.]*|'[^'\n]*'|\"[^\"\n]*\"|`[^`$\n]*`|true|false|null|undefined)\s*\)"
 )
 _JS_STRONG = re.compile(
-    r"\.(?:toEqual|toStrictEqual|toMatchObject)\b|\.toBe\s*\(|\.toThrow\s*\(\s*[^)\s]"
+    r"(?<!\.not)\.(?:toEqual|toStrictEqual|toMatchObject)\b|(?<!\.not)\.toBe\s*\("
+    r"|(?<!\.not)\.toThrow\s*\(\s*[^)\s]"
 )
 _JS_WEAK = re.compile(
-    r"\.(?:toBeDefined|toBeTruthy)\s*\(|\.not\.(?:toThrow|toBeUndefined|toBeNull)\s*\("
-    r"|\.toBeGreaterThanOrEqual\s*\(\s*0\s*\)"
+    r"\.(?:toBeDefined|toBeTruthy|toBeFalsy|toBeGreaterThan(?:OrEqual)?|toBeLessThan(?:OrEqual)?"
+    r"|toBeInstanceOf|toHaveLength)\s*\("
+    r"|\.not\.(?:toThrow|toBeUndefined|toBeNull|toBe|toEqual)\s*\(|\bexpect\.any\s*\("
 )
+_GO_STRONG = re.compile(r"\b(?:assert|require)\.(?:Equal|EqualValues)\s*\(")
+_GO_WEAK = re.compile(
+    r"\.(?:NotNil|True|NotEmpty|Greater|GreaterOrEqual|Less|LessOrEqual|IsType|NotEqual|Len)\s*\("
+)
+_RUST_STRONG = re.compile(r"\bassert_eq!\s*\(")
+_RUST_WEAK = re.compile(r"\bassert_ne!\s*\(|\.(?:is_some|is_ok|is_empty)\(\)\s*\)")
+_RUST_COMPARED = re.compile(r"\bassert!\s*\(.*(?:[<>]|!=)")
 _EXPECTED: dict[str, re.Pattern[str]] = {
     "js": re.compile(
         r"\.(?:toBe|toEqual|toStrictEqual|toBeCloseTo|toContain|toMatch|toHaveLength)\s*\(\s*"
@@ -300,6 +309,14 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
         if lang == "js":
             unit.strong = len(_JS_STRONG.findall(body_masked))
             unit.weak = len(_JS_WEAK.findall(body_masked))
+        elif lang == "go":
+            unit.strong = len(_GO_STRONG.findall(body_masked))
+            unit.weak = len(_GO_WEAK.findall(body_masked))
+        elif lang == "rust":
+            unit.strong = len(_RUST_STRONG.findall(body_masked))
+            unit.weak = len(_RUST_WEAK.findall(body_masked)) + sum(
+                1 for k in range(span.start, span.end + 1) if _RUST_COMPARED.search(masked[k])
+            )
         if lang in _EXPECTED:
             for k in range(span.start, span.end + 1):
                 for em in _EXPECTED[lang].finditer(code[k]):
