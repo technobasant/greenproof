@@ -65,8 +65,7 @@ DESCRIPTION = (
     "Done gate for coding agents: when the agent stops, greenproof runs your checks and "
     "blocks deleted, skipped or weakened tests."
 )
-CLAUDE_MATCHER = "startup|resume|clear|compact|fork"
-CODEX_MATCHER = "startup|resume|clear|compact"
+SESSION_START_MATCHER = "startup|resume|clear|compact|fork"
 STOP_TIMEOUT = 3600
 PINNED = f"uvx greenproof@{__version__}"
 
@@ -117,13 +116,13 @@ def test_hook_files_pin_the_running_version(agent: str) -> None:
 
 def test_claude_hooks_are_the_init_hooks_with_the_plugin_command() -> None:
     expected = json.loads(claude_hooks.render(None, PINNED, STOP_TIMEOUT))
-    expected["hooks"]["SessionStart"][0]["matcher"] = CLAUDE_MATCHER
+    assert expected["hooks"]["SessionStart"][0]["matcher"] == SESSION_START_MATCHER
     assert read_json(PLUGIN / "hooks" / "claude.json") == expected
 
 
 def test_codex_hooks_are_the_init_hooks_with_the_plugin_command() -> None:
     expected = json.loads(codex_hooks.render(None, PINNED, STOP_TIMEOUT))
-    assert expected["hooks"]["SessionStart"][0]["matcher"] == CODEX_MATCHER
+    assert expected["hooks"]["SessionStart"][0]["matcher"] == SESSION_START_MATCHER
     assert read_json(PLUGIN / "hooks" / "codex.json") == expected
 
 
