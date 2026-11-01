@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import Finding
@@ -19,16 +21,56 @@ _JS = (*JS_SUFFIXES, ".vue", ".svelte")
 _TS = (".ts", ".tsx", ".mts", ".cts")
 _PROSE = (".md", ".rst", ".txt", ".adoc")
 
+# Files where a shell-style suppression (`|| true`, `set +e`, `--no-verify`) has an effect
+# (SPEC 5.5): scripts, makefiles, CI and container files, package manifests that hold scripts.
+_SHELL_SUFFIXES = (".sh", ".bash", ".zsh", ".ksh", ".mk", ".yml", ".yaml", ".dockerfile")
+_SHELL_NAMES = frozenset(
+    {
+        "Makefile",
+        "GNUmakefile",
+        "makefile",
+        "justfile",
+        "Justfile",
+        ".justfile",
+        "package.json",
+        "pyproject.toml",
+        "tox.ini",
+        "setup.cfg",
+    }
+)
+_SHELL_NAME_PREFIXES = ("Dockerfile", "Containerfile")
+_HOOK_DIRS = frozenset({".husky", ".githooks"})
+
+
+def is_shell_capable(path: str) -> bool:
+    """Files that run shell commands: scripts, makefiles, CI, containers, hook directories."""
+    pure = PurePosixPath(path)
+    name = pure.name
+    return (
+        name.lower().endswith(_SHELL_SUFFIXES)
+        or name in _SHELL_NAMES
+        or name.startswith(_SHELL_NAME_PREFIXES)
+        or any(part in _HOOK_DIRS for part in pure.parent.parts)
+    )
+
+
+def _is_js_or_shell(path: str) -> bool:
+    return path.endswith((*_JS, *_TS)) or is_shell_capable(path)
+
 
 @dataclass(frozen=True)
 class _Pattern:
     sub_id: str
     regex: re.Pattern[str]
-    suffixes: tuple[str, ...] | None  # None: any file except prose
+    applies: Callable[[str], bool]
 
 
-def _p(sub_id: str, pattern: str, suffixes: tuple[str, ...] | None = None) -> _Pattern:
-    return _Pattern(sub_id, re.compile(pattern), suffixes)
+def _p(sub_id: str, pattern: str, where: tuple[str, ...] | Callable[[str], bool]) -> _Pattern:
+    """`where` is a tuple of file suffixes or a predicate on the path."""
+    if isinstance(where, tuple):
+        suffixes = where
+        return _Pattern(sub_id, re.compile(pattern), lambda path: path.endswith(suffixes))
+    return _Pattern(sub_id, re.compile(pattern), where)
 
 
 _PATTERNS = [
@@ -45,13 +87,14 @@ _PATTERNS = [
     _p("rust-allow", r"#!?\[\s*allow\s*\(", (".rs",)),
     _p("as-any", r"\bas\s+any\b", _TS),
     _p("any-type", r":\s*any\b", _TS),
-    _p("or-true", r"\|\|\s*true\b"),
-    _p("semicolon-true", r";\s*true\s*$"),
-    _p("set-plus-e", r"\bset\s+\+e\b"),
-    _p("pass-with-no-tests", r"--passWithNoTests"),
+    _p("or-true", r"\|\|\s*true\b", is_shell_capable),
+    _p("semicolon-true", r";\s*true\s*$", is_shell_capable),
+    _p("set-plus-e", r"\bset\s+\+e\b", is_shell_capable),
+    _p("pass-with-no-tests", r"--passWithNoTests", _is_js_or_shell),
     _p(
         "no-verify",
         r"\bgit\s+(?:commit|push|merge|am|rebase|cherry-pick)\b(?=.*--no-verify)",
+        is_shell_capable,
     ),
 ]
 
@@ -59,11 +102,7 @@ _PATTERNS = [
 def _matching(path: str, line: str) -> list[_Pattern]:
     if path.endswith(_PROSE):
         return []
-    return [
-        p
-        for p in _PATTERNS
-        if (p.suffixes is None or path.endswith(p.suffixes)) and p.regex.search(line)
-    ]
+    return [p for p in _PATTERNS if p.applies(path) and p.regex.search(line)]
 
 
 def _lines(text: str | None) -> list[str]:
