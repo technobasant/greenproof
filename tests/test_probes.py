@@ -679,6 +679,7 @@ def shop(
 
 BLOCK_WEAKENED = {("tests.weakened", "block")}
 BLOCK_REPLACED = {("tests.replaced", "block")}
+WARN_EXPECTED = {("tests.expected_changed", "warn")}
 
 LOOSENED: list[tuple[str, str, int, set[tuple[str, str]]]] = [
     ("Q1", shop("def test_refund():\n    assert refund(100) > 0\n"), 1, BLOCK_WEAKENED),
@@ -709,7 +710,7 @@ LOOSENED: list[tuple[str, str, int, set[tuple[str, str]]]] = [
         0,
         {("tests.replaced", "warn")},
     ),
-    ("Q6", shop("def test_refund():\n    assert refund(100) == 98\n"), 0, set()),
+    ("Q6", shop("def test_refund():\n    assert refund(100) == 98\n"), 0, WARN_EXPECTED),
     ("Q7", shop("def test_refund_any():\n    assert refund(100) != 0\n"), 1, BLOCK_REPLACED),
     ("Q8", shop("def test_refund():\n    assert refund(100) >= 99\n"), 1, BLOCK_WEAKENED),
     (
@@ -732,7 +733,7 @@ LOOSENED: list[tuple[str, str, int, set[tuple[str, str]]]] = [
         "Q11",
         shop("def test_refund():\n    assert len(refund(100)) == 2\n"),
         1,
-        BLOCK_WEAKENED,
+        BLOCK_WEAKENED | WARN_EXPECTED,
     ),
     ("Q12", shop("def test_refund():\n    assert not refund(100) == 99\n"), 1, BLOCK_WEAKENED),
 ]
