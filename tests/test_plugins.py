@@ -70,6 +70,11 @@ CODEX_MATCHER = "startup|resume|clear|compact"
 STOP_TIMEOUT = 3600
 PINNED = f"uvx greenproof@{__version__}"
 
+pytestmark = pytest.mark.skipif(
+    not (ROOT / "scripts" / "bump_version.py").exists(),
+    reason="plugins/ and scripts/ are not in this source tree (the sdist carries neither)",
+)
+
 
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
