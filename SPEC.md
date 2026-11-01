@@ -186,7 +186,7 @@ covering at least one true positive and one legitimate change that must NOT fire
 | `tests.expected_changed` | warn | a literal in an assertion's expected side changed while non-test code also changed (legitimate when the spec changed, so warn) |
 | `suppress.added` | warn | an added line introduces a type/lint/coverage suppression (see 5.5) |
 | `runner.tampered` | block | a change narrows or neuters how checks run: test selection, thresholds, strictness, test scripts (see 5.6) |
-| `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `|| true`, `if: false`, path filters excluding tests, or changes the greenproof step itself. A ref-only version bump of the greenproof action (same inputs) is `warn` |
+| `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `|| true`, `if: false`, path filters excluding tests, or changes the greenproof step itself. Only lines that mention greenproof outside a YAML comment count, and a workflow whose base version has none gaining them is adoption, not a change (a new workflow file included); commenting out or deleting an existing greenproof line still fires. A ref-only version bump of the greenproof action (same inputs) is `warn` |
 | `static.parse_error` | warn | a changed file in a parsed language (Python, TOML, JSON, INI) does not parse; that file falls back to the line-level checks |
 | `tests.self_mocked` | warn | an added or changed test patches (`monkeypatch.setattr`, `mock.patch`, `jest.mock`, `vi.mock`) the same callable its assertions call, so it tests the mock (5.8) |
 | `code.hardcoded` | warn | non-test code gains a literal table (≥ 8 entries) or an `if x == <literal>` branch whose literal also appears in added lines of a test file changed in this diff (5.8; Python AST only in v0.1) |
@@ -683,7 +683,7 @@ through that an agent cannot forge.
    file: hand-written tables such as `[rules]` and `[smoke]` are not carried over.
 5. **AGENTS.md**: a section between `<!-- greenproof:begin -->` and `<!-- greenproof:end -->`
    with the heading `## Verify`, the commands, "Before you say a task is done, run
-   `greenproof check`.", the fix-the-code rule and "Never run `greenproof accept`". Create
+   `greenproof check`." (with `--hook-command C`, "run `C check`"), the fix-the-code rule and "Never run `greenproof accept`". Create
    the file when it is missing, append the section when there are no markers, replace
    between the markers otherwise. A begin marker without an end marker (or the reverse) →
    exit 4, nothing written; the user fixes the markers by hand. **CLAUDE.md**: when it exists and has no `@AGENTS.md`
