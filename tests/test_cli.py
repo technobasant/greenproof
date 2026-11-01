@@ -430,3 +430,16 @@ def test_runs_with_zero_runtime_dependencies() -> None:
 
     pyproject = Path(__file__).parent.parent / "pyproject.toml"
     assert tomllib.loads(pyproject.read_text())["project"]["dependencies"] == []
+
+
+def test_pre_commit_hook_definition_matches_the_spec() -> None:
+    text = (Path(__file__).parent.parent / ".pre-commit-hooks.yaml").read_text()
+    for line in (
+        "- id: greenproof",
+        "  entry: greenproof check",
+        "  language: python",
+        "  pass_filenames: false",
+        "  always_run: true",
+        "  stages: [pre-push]",
+    ):
+        assert line in text.splitlines()

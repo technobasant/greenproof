@@ -1,0 +1,8 @@
+- id: greenproof
+  name: greenproof
+  description: Run the greenproof done gate (is the green real?) before pushing.
+  entry: greenproof check
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-push]
