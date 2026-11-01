@@ -259,6 +259,40 @@ invoke greenproof, for example `uv run greenproof`.
 - **CI is the authority.** Run the same check in CI on every pull request, where the
   agent's edits to local files do not count.
 
+## Plugins
+
+One plugin installs the hooks in Claude Code, Codex and Cursor, without running
+`greenproof init` in each repository. On stop it runs `uvx greenproof@<version> check --hook
+AGENT`; on session start it runs `uvx greenproof@<version> session-start --hook AGENT`. It
+needs [uv](https://docs.astral.sh/uv/) on your PATH: without it the hook cannot start and
+fails open, so nothing is gated. See [plugins/greenproof/README.md](plugins/greenproof/README.md)
+for exactly what runs.
+
+Claude Code:
+
+```bash
+claude plugin marketplace add technobasant/greenproof
+claude plugin install greenproof@greenproof
+```
+
+Claude Code 2.1.275 or later can do both in one step:
+`/plugin install greenproof --marketplace technobasant/greenproof`.
+
+Codex, from this repository's marketplace (the public Codex directory does not accept
+plugins with lifecycle hooks):
+
+```bash
+codex plugin marketplace add technobasant/greenproof
+```
+
+Cursor: copy `plugins/greenproof` to `~/.cursor/plugins/local/greenproof` and reload the
+window, or have a team admin import this repository as a team marketplace.
+
+The plugin does not read your policy, so its Stop hook has a one-hour timeout. Add the
+policy with `uvx greenproof@<version> init --agents none`, which writes `.greenproof.toml`
+and the AGENTS.md section and no hooks. With both the plugin and `init` hooks installed,
+greenproof makes one decision per stop.
+
 ## CI
 
 ### The GitHub Action
