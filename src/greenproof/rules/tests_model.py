@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 
 
@@ -43,6 +44,10 @@ class Unit:
     classes: tuple[str, ...] = ()
     testcase: bool = False
     disabled: bool = False
+    # Last line of a line-engine test (1-based); 0 when the engine does not track it.
+    end_line: int = 0
+    # Python only: the test's function node, for rules that read the body (self_mocked).
+    node: ast.AST | None = field(default=None, repr=False, compare=False)
 
     @property
     def name(self) -> str:
@@ -68,3 +73,4 @@ class FileAnalysis:
     units: list[Unit] = field(default_factory=list)
     markers: list[Marker] = field(default_factory=list)
     collected: bool = True  # whether the runner's file patterns pick this file up
+    tree: ast.Module | None = field(default=None, repr=False, compare=False)  # Python only

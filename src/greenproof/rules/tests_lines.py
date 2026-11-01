@@ -289,6 +289,7 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
             line=span.name_line + 1,
             body_hash=digest("".join(code[span.start : span.end + 1])),
             engine=lang,
+            end_line=span.end + 1,
             asserts=len(_ASSERTS[lang].findall(body_masked)) - sum(const_hits),
             vacuous=sum(const_hits),
             vacuous_line=next((span.start + i + 1 for i, h in enumerate(const_hits) if h), 0),

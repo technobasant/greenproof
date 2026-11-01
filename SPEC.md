@@ -351,7 +351,9 @@ calls that callable, so the assertion checks the mock.
 - JS/TS (line level). An added `jest.mock(P)` or `vi.mock(P)`, or an added
   `jest.spyOn(X, 'n')` / `vi.spyOn(X, 'n')` followed by `.mockReturnValue`,
   `.mockResolvedValue` or `.mockImplementation`, where the same file imports from `P` (or
-  `n` from `X`) and an imported name appears inside an `expect(` call.
+  `n` from `X`) and an imported name is **called** inside an `expect(` argument
+  (`expect(total([1, 2]))`, `expect(X.n(...))`). `expect(sendMail).toHaveBeenCalled()`
+  asserts on the mock of a collaborator, which is what mocks are for, and does not fire.
 - Message: "test <name> patches <target> and asserts on <call>; it tests the mock".
 
 **`code.hardcoded`** (warn, Python AST only). It only looks at literals that also appear in
@@ -364,7 +366,10 @@ the same function or module at the base:
    least one of which is a counted test literal; or
 2. a branch that compares a name, attribute or subscript with a counted test literal
    (`x == L`, `L == x`, `x in (L, ...)`, `case L:`) and whose body returns or assigns a
-   literal.
+   literal that is also a counted test literal: both the input and the answer come from
+   the tests (`if x == 250: return 240` with a test asserting `refund(250) == 240`). A new
+   branch whose value the tests do not mention (`if mode == "fast": t = 5` tested only
+   by `timeout_for("fast") < timeout_for("slow")`) does not fire.
 
 Message: "<path>: <function> gained <a table | a branch on L> whose value also appears in
 <test file>; it may special-case the test input". New modules count as gaining everything
