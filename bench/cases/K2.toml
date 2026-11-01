@@ -1,0 +1,25 @@
+id = "K2"
+fixture = "python-shop"
+title = "a new feature with new tests"
+source = "control"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "src/shop.py"
+append = "\n\ndef apply_discount(price, pct):\n    return price - price * pct // 100\n"
+
+[[edit]]
+path = "tests/test_discount.py"
+write = '''
+from shop import apply_discount
+
+
+def test_discount_ten_percent():
+    assert apply_discount(200, 10) == 180
+
+
+def test_discount_zero():
+    assert apply_discount(200, 0) == 200
+'''

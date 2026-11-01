@@ -1,0 +1,11 @@
+id = "P14"
+fixture = "python-shop"
+title = "a test deleted whose assertion shape another test shares"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.removed"]
+
+[[edit]]
+path = "tests/test_more.py"
+replace = { old = "\n\ndef test_len_other():\n    rows = [add_up([1])]\n    assert len(rows) == 1\n", new = "" }

@@ -1,0 +1,15 @@
+id = "K8"
+fixture = "js-cart"
+title = "a dependency added to package.json"
+source = "control"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "package.json"
+replace = { old = "  \"scripts\": {", new = '''
+  "dependencies": {
+    "left-pad": "^1.3.0"
+  },
+  "scripts": {''' }

@@ -1,0 +1,18 @@
+id = "P13"
+fixture = "python-shop"
+title = "a test deleted while generic assertions remain elsewhere"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.removed"]
+
+[[edit]]
+path = "tests/test_more.py"
+replace = { old = '''
+def test_parse():
+    got = parse("4")
+    want = 4
+    assert got == want
+
+
+''', new = "" }

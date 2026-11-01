@@ -1,0 +1,22 @@
+id = "P15"
+fixture = "python-shop"
+title = "a test deleted and a different, generic one added"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.replaced"]
+
+[[edit]]
+path = "tests/test_more.py"
+replace = { old = '''
+def test_parse():
+    got = parse("4")
+    want = 4
+    assert got == want
+
+
+''', new = "" }
+
+[[edit]]
+path = "tests/test_more.py"
+append = "\n\ndef test_new():\n    a = add_up([2])\n    b = 2\n    assert a == b\n"

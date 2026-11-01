@@ -1,0 +1,13 @@
+id = "G2"
+fixture = "go-calc"
+title = "the t.Errorf check removed from a Go test"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "calc_test.go"
+replace = { old = '''
+		t.Errorf("Sub(3, 1) = %d, want 2", got)
+''', new = "" }

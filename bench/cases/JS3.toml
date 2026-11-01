@@ -1,0 +1,11 @@
+id = "JS3"
+fixture = "js-cart"
+title = "expect(x).toBe(5) replaced by toBeTruthy()"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = "toBe(5)", new = "toBeTruthy()" }

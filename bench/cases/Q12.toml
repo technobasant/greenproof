@@ -1,0 +1,21 @@
+id = "Q12"
+fixture = "python-shop"
+title = "an exact check negated"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "tests/test_shop.py"
+write = '''
+from shop import refund, total
+
+
+def test_refund():
+    assert not refund(100) == 99
+
+
+def test_total():
+    assert total() == 100
+'''

@@ -1,0 +1,11 @@
+id = "C10"
+fixture = "python-shop"
+title = "a test file moved to a path the runner still collects"
+source = "review probe"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "tests/test_more.py"
+move = "tests/test_more_moved.py"

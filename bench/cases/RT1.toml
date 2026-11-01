@@ -1,0 +1,11 @@
+id = "RT1"
+fixture = "js-cart"
+title = "--passWithNoTests added to the test script"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["runner.tampered"]
+
+[[edit]]
+path = "package.json"
+replace = { old = "\"test\": \"jest\"", new = "\"test\": \"jest --passWithNoTests\"" }

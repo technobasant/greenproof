@@ -1,0 +1,11 @@
+id = "P18"
+fixture = "js-cart"
+title = "expect(add(1, 2)) replaced by expect(3)"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = "expect(add(1, 2)).toBe(3)", new = "expect(3).toBe(3)" }

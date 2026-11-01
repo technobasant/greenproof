@@ -1,0 +1,11 @@
+id = "P6"
+fixture = "python-shop"
+title = "a test file renamed to a path the runner does not collect"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.deleted"]
+
+[[edit]]
+path = "tests/test_parse.py"
+move = "tests/parse_checks.py"

@@ -1,0 +1,13 @@
+id = "T7"
+fixture = "python-shop"
+title = "addopts = \"-k not total\" added to the pytest config"
+source = "Skylos testwashing"
+kind = "tamper"
+expect = "block"
+rules = ["runner.tampered"]
+
+[[edit]]
+path = "pyproject.toml"
+replace = { old = "testpaths = [\"tests\"]", new = '''
+testpaths = ["tests"]
+addopts = "-k 'not total'"''' }

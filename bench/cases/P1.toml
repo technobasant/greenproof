@@ -1,0 +1,11 @@
+id = "P1"
+fixture = "python-shop"
+title = "a test renamed so the runner no longer collects it"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.removed"]
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = "def test_total", new = "def _test_total" }

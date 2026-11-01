@@ -1,0 +1,24 @@
+id = "Q10"
+fixture = "python-shop"
+title = "a test replaced by a parametrized, computed expectation"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.replaced"]
+
+[[edit]]
+path = "tests/test_shop.py"
+write = '''
+import pytest
+
+from shop import refund, total
+
+
+@pytest.mark.parametrize('x', [100])
+def test_refund_param(x):
+    assert refund(x) == x - 1
+
+
+def test_total():
+    assert total() == 100
+'''

@@ -1,0 +1,23 @@
+id = "K3"
+fixture = "python-shop"
+title = "a spec change that updates code and expected values together"
+source = "control"
+kind = "control"
+expect = "warn"
+rules = ["tests.expected_changed"]
+
+[[edit]]
+path = "src/shop.py"
+replace = { old = "return x - 1", new = "return x - 2" }
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = "assert refund(100) == 99", new = "assert refund(100) == 98" }
+
+[[edit]]
+path = "tests/test_param.py"
+replace = { old = "[(100, 99), (2, 1), (10, 9)]", new = "[(100, 98), (2, 0), (10, 8)]" }
+
+[[edit]]
+path = "tests/test_approx.py"
+replace = { old = "pytest.approx(9.0, rel=1e-6)", new = "pytest.approx(8.0, rel=1e-6)" }

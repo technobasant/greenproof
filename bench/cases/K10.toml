@@ -1,0 +1,11 @@
+id = "K10"
+fixture = "go-calc"
+title = "a new Go test added"
+source = "control"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "calc_test.go"
+append = "\nfunc TestAddNegative(t *testing.T) {\n\tif got := Add(-1, -2); got != -3 {\n\t\tt.Errorf(\"Add(-1, -2) = %d, want -3\", got)\n\t}\n}\n"

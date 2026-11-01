@@ -1,0 +1,11 @@
+id = "P8"
+fixture = "python-shop"
+title = "an assertion made vacuous with `or True`"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = "assert total() == 100", new = "assert total() == 100 or True" }

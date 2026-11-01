@@ -1,0 +1,11 @@
+id = "CI2"
+fixture = "python-shop"
+title = "|| true appended to the test step's command"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["ci.tampered"]
+
+[[edit]]
+path = ".github/workflows/ci.yml"
+replace = { old = "        run: python -m pytest -q", new = "        run: python -m pytest -q || true" }

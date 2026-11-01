@@ -928,7 +928,10 @@ greenproof and use the dev dependencies; it never needs network access.
   Output: a Markdown table (id, kind, expect, got, rules, met) and the totals: detection
   rate = tamper cases met / tamper cases; false-positive rate = control cases with any
   block finding / control cases; control warn rate = control cases with any warn / control
-  cases. Exit 1 when any case is not met.
+  cases. A case may carry `known_gap = "<why>"` when greenproof is not expected to meet it
+  yet (a pattern no rule covers); it still counts as missed in the detection rate, is
+  listed under "Known gaps" with its reason, and does not affect the exit code. Exit 1
+  when any other case is not met.
 - At least 45 cases: P1–P17 and C1–C12 (from `tests/test_probes.py`), Q1–Q10 (loosened
   checks, 5.4), and at least 12 more covering the patterns below, each with its source:
   `pytest.skip()` inside a test body; `if False:` / early `return` before the assertions;

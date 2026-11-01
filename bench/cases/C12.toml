@@ -1,0 +1,24 @@
+id = "C12"
+fixture = "js-cart"
+title = "one JS test split into two"
+source = "review probe"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = '''
+  it('adds', () => {
+    expect(add(1, 2)).toBe(3);
+    expect(add(2, 2)).toBe(4);
+  });
+''', new = '''
+  it('adds one pair', () => {
+    expect(add(1, 2)).toBe(3);
+  });
+
+  it('adds another pair', () => {
+    expect(add(2, 2)).toBe(4);
+  });
+''' }

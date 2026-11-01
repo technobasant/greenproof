@@ -1,0 +1,11 @@
+id = "C17"
+fixture = "python-shop"
+title = "a new test over constants alongside the old ones"
+source = "review probe"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "tests/test_more.py"
+append = "\n\ndef test_arithmetic():\n    assert 2 + 2 == 4\n"

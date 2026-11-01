@@ -1,0 +1,16 @@
+id = "G1"
+fixture = "go-calc"
+title = "t.Skip() added to a Go test"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.skipped"]
+
+[[edit]]
+path = "calc_test.go"
+replace = { old = '''
+func TestSub(t *testing.T) {
+''', new = '''
+func TestSub(t *testing.T) {
+	t.Skip("flaky")
+''' }

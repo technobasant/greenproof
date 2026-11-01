@@ -1,0 +1,21 @@
+id = "Q4"
+fixture = "python-shop"
+title = "a test renamed and loosened to a type check"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.replaced"]
+
+[[edit]]
+path = "tests/test_shop.py"
+write = '''
+from shop import refund, total
+
+
+def test_refund_type():
+    assert isinstance(refund(100), int)
+
+
+def test_total():
+    assert total() == 100
+'''

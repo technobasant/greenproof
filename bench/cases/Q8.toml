@@ -1,0 +1,21 @@
+id = "Q8"
+fixture = "python-shop"
+title = "assert == 99 loosened to >= 99"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "tests/test_shop.py"
+write = '''
+from shop import refund, total
+
+
+def test_refund():
+    assert refund(100) >= 99
+
+
+def test_total():
+    assert total() == 100
+'''

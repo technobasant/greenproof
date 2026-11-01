@@ -1,0 +1,11 @@
+id = "JS2"
+fixture = "js-cart"
+title = "it.skip added to an existing test"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.skipped"]
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = "it('totals the prices'", new = "it.skip('totals the prices'" }

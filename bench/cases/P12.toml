@@ -1,0 +1,22 @@
+id = "P12"
+fixture = "python-shop"
+title = "a test that patches the function it asserts on"
+source = "review probe"
+kind = "tamper"
+expect = "warn"
+rules = ["tests.self_mocked"]
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = "from shop import refund, total", new = '''
+import shop
+from shop import refund, total''' }
+
+[[edit]]
+path = "tests/test_shop.py"
+replace = { old = '''
+def test_total():
+    assert total() == 100''', new = '''
+def test_total(monkeypatch):
+    monkeypatch.setattr(shop, "total", lambda: 100)
+    assert total() == 100''' }

@@ -1,0 +1,43 @@
+id = "K6"
+fixture = "js-cart"
+title = "a JS test that mocks a collaborator and asserts on the call"
+source = "control"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "src/notify.js"
+write = '''
+const { sendMail } = require('./mailer');
+
+function notify(user) {
+  return sendMail(user);
+}
+
+module.exports = { notify };
+'''
+
+[[edit]]
+path = "src/mailer.js"
+write = '''
+function sendMail(user) {
+  return 'sent:' + user;
+}
+
+module.exports = { sendMail };
+'''
+
+[[edit]]
+path = "test/notify.test.js"
+write = '''
+const { notify } = require('../src/notify');
+const { sendMail } = require('../src/mailer');
+jest.mock('../src/mailer');
+
+test('notifies', () => {
+  notify('a');
+  expect(sendMail).toHaveBeenCalledWith('a');
+  expect(sendMail.mock.calls.length).toBe(1);
+});
+'''

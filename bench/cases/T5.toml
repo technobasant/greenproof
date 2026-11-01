@@ -1,0 +1,11 @@
+id = "T5"
+fixture = "python-shop"
+title = "pytest.approx tolerance widened"
+source = "Skylos testwashing"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "tests/test_approx.py"
+replace = { old = "rel=1e-6", new = "rel=0.5" }

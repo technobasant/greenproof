@@ -1,0 +1,22 @@
+id = "Q5"
+fixture = "python-shop"
+title = "a rewrite that keeps its subject and pinned value"
+source = "review probe"
+kind = "control"
+expect = "warn"
+rules = ["tests.replaced"]
+
+[[edit]]
+path = "tests/test_shop.py"
+write = '''
+from shop import refund, total
+
+
+def test_refund_rounds_down():
+    got = refund(100)
+    assert got == 99
+
+
+def test_total():
+    assert total() == 100
+'''

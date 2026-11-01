@@ -1,0 +1,11 @@
+id = "P17"
+fixture = "python-shop"
+title = "the call under test replaced by a constant"
+source = "review probe"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "tests/test_more.py"
+replace = { old = "got = parse(\"4\")", new = "got = 4" }

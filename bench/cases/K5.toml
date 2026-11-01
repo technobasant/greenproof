@@ -1,0 +1,21 @@
+id = "K5"
+fixture = "python-shop"
+title = "a test that mocks a collaborator, not the code under test"
+source = "control"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "tests/test_notify.py"
+write = '''
+from unittest import mock
+
+import shop
+
+
+def test_notify():
+    with mock.patch("shop.mailer.send", return_value="ok") as send:
+        assert shop.notify("a") == "ok"
+        send.assert_called_once_with("a")
+'''
