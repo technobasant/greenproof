@@ -404,6 +404,11 @@ state counts as empty. In order:
    again: the agent was told and chose to stop without changing anything.
 3. Otherwise run the check. Pass → clear the state, pass. Failure → block and record the
    tree, unless this would be the 8th consecutive block in the session, which releases.
+   A release starts the count again and keeps the tree, so the same tree stays released
+   and later work in the session is gated again.
+
+Outside a git repository there is nowhere to keep state, so a hook releases with the
+"could not run" note instead of blocking.
 
 Local acceptances apply in hook mode (6.6). Cursor's own `loop_limit` (default 5) and
 Claude Code's cap of 8 consecutive stop-hook continuations still apply on top. All of this

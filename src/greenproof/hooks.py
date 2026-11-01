@@ -351,7 +351,6 @@ def _fail(
     blocks = previous + 1
     note = release_note(report)
     tree = candidate.tree if candidate is not None else ""
-    save_state(repo, HookState(payload.session_id, tree, blocks, note, report.exit_code))
     # An error before the tree was known cannot match trees, but the same session erroring
     # again is the same situation: release rather than block again.
     repeated_error = (
@@ -360,7 +359,12 @@ def _fail(
         and state.session == payload.session_id
         and state.tree == ""
     )
-    if blocks >= MAX_CONSECUTIVE_BLOCKS or repeated_error:
+    release = blocks >= MAX_CONSECUTIVE_BLOCKS or repeated_error
+    # A release starts the count again but keeps the tree: the same tree stays released
+    # without a rerun, and a later change in the session is gated again.
+    kept = 0 if release else blocks
+    save_state(repo, HookState(payload.session_id, tree, kept, note, report.exit_code))
+    if release:
         report.notes.append(f"released after {blocks} consecutive failures in this session")
         result = protocol_release(agent, note)
     else:

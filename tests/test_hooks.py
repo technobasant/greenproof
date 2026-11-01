@@ -237,12 +237,18 @@ def test_the_eighth_consecutive_block_releases(agent: str, tmp_path: Path, fire)
     data = load_json(tmp_path / "r.json")
     assert data["verdict"] == "fail"  # the real report of the failing run
     assert any("released after 8 consecutive" in n for n in data["notes"])
+    # The release starts the count again and keeps the tree.
     state = hooks.load_state(repo.path)
     assert state is not None
-    assert state.blocks == 8
-    # Still failing on yet another tree: still released, never trapped.
-    repo.write("app.py", "x = 9\n")
+    assert state.blocks == 0
+    # A question-only turn on the same tree stays released without a rerun.
     expect_release(agent, fire(agent, payload(agent, repo)))
+    # New work later in the same session is gated again, not released for good.
+    repo.write("app.py", "x = 9\n")
+    expect_block(agent, fire(agent, payload(agent, repo)))
+    state = hooks.load_state(repo.path)
+    assert state is not None
+    assert state.blocks == 1
 
 
 def test_a_pass_clears_the_state(tmp_path: Path, fire) -> None:
