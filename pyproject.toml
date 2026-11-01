@@ -1,0 +1,100 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "greenproof"
+dynamic = ["version"]
+description = "A definition-of-done gate for code written by LLM coding agents: is the green real?"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Basant Bhattarai" }]
+requires-python = ">=3.11"
+keywords = ["llm", "coding-agents", "testing", "ci", "git", "quality-gate"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/technobasant/greenproof"
+Source = "https://github.com/technobasant/greenproof"
+Issues = "https://github.com/technobasant/greenproof/issues"
+Changelog = "https://github.com/technobasant/greenproof/blob/main/CHANGELOG.md"
+
+[project.scripts]
+greenproof = "greenproof.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8.3",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+
+[tool.hatch.version]
+path = "src/greenproof/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/greenproof"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/greenproof",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/CHANGELOG.md",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["greenproof"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
+
+[tool.uv]
+# Supply-chain guard: never resolve a release younger than three days. It lives
+# here, not only in a personal uv.toml, so the lockfile means the same thing on
+# every machine and in CI.
+exclude-newer = "3 days"
