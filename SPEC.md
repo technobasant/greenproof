@@ -953,7 +953,7 @@ greenproof and use the dev dependencies; it never needs network access.
   id = "P2"
   fixture = "python-shop"
   title = "an exact assertion replaced by a truthiness check"
-  source = "review probe"      # review probe | typia port | Skylos testwashing | ImpossibleBench | control
+  source = "review probe"      # review probe | typia port | Skylos testwashing | ImpossibleBench | replay triage | control
   kind = "tamper"              # tamper | control
   expect = "block"             # block | warn | pass
   rules = ["tests.weakened"]   # rule ids that must be reported (empty for pass)
