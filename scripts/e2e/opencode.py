@@ -24,7 +24,8 @@ runs a warm-up message (so the session exists and greenproof's session marker is
 edits the tree, then continues the session with a second message; that second stop is the one
 the gate judges.
 
-Scenarios: `tamper` (a deleted-test style change is blocked and the fake model receives
+Scenarios: `tamper` (the prompt hook starts the session, with source `startup` and then `resume` on
+`--continue`; a deleted-test style change is blocked and the fake model receives
 greenproof's message as its next input; the next idle on the same tree is released without
 another continuation), `honest` (a change that keeps the tests is not continued), `two-copies`
 (the project file written by init plus a copy in the user-level plugin directory: one stop
@@ -571,13 +572,43 @@ def checks(scenario: Scenario) -> list[dict]:
     return [e for e in read_hook_log(scenario.log) if "check" in e["args"]]
 
 
+def session_starts(scenario: Scenario) -> list[dict]:
+    """The session-start hook calls so far, each as its parsed stdin payload."""
+    out = []
+    for e in read_hook_log(scenario.log):
+        if "session-start" in e["args"]:
+            out.append(json.loads(e["stdin"]) if e["stdin"].strip().startswith("{") else {})
+    return out
+
+
+def opencode_log_lines(scenario: Scenario, needle: str) -> list[str]:
+    """Lines of OpenCode's own log files (under this scenario's XDG_DATA_HOME) with `needle`."""
+    lines: list[str] = []
+    for path in sorted((scenario.home / ".local/share/opencode/log").glob("*.log")):
+        lines += [ln for ln in path.read_text(errors="replace").splitlines() if needle in ln]
+    return lines
+
+
+def with_log_on_fail(results: list[Result], scenario: Scenario) -> list[Result]:
+    """On any FAIL, add OpenCode's log lines that mention greenproof (truncated) as evidence."""
+    if any(not r.ok for r in results):
+        lines = [ln[:240] for ln in opencode_log_lines(scenario, "greenproof")[:20]]
+        extra = [f"opencode.log: {ln}" for ln in lines] or ["opencode.log: no greenproof lines"]
+        for r in results:
+            if not r.ok:
+                r.evidence = [*r.evidence, *extra]
+    return results
+
+
 def scenario_tamper(ctx: dict) -> list[Result]:
     s = Scenario("tamper", ctx["tmp"] / "tamper", ctx["model"], ctx["cli"], ctx["npm"])
     s.build_repo(project_copy=True, user_copy=False)
     first = warm_up(s)
-    starts = [e for e in read_hook_log(s.log) if "session-start" in e["args"]]
-    start_ok = len(starts) == 1 and json.loads(starts[0]["stdin"]).get("session_id", "").startswith(
-        "ses"
+    starts = session_starts(s)
+    start_ok = (
+        len(starts) == 1
+        and str(starts[0].get("session_id", "")).startswith("ses")
+        and starts[0].get("source") == "startup"
     )
     warm_checks = len(checks(s))
     s.tamper()
@@ -592,60 +623,83 @@ def scenario_tamper(ctx: dict) -> list[Result]:
             block_reason = json.loads(e["stdout"]).get("reason", "")
     reason_ok = bool(block_reason) and any(block_reason.strip() in r["last_user"] for r in hits)
     released_ok = len(hits) == 1 and decisions[-1:] == ["release"] and run["requests"][-1] in hits
+    after = session_starts(s)
+    resume_ok = (
+        start_ok
+        and len(after) == 2
+        and after[1].get("source") == "resume"
+        and after[1].get("session_id") == starts[0].get("session_id")
+    )
     ev = evidence_lines(s, run)
     first_ev = f"warm-up: {first['total']} model request(s), exit {first['code']}"
-    return [
-        Result(
-            "session-start",
-            start_ok,
-            "one session-start hook call, with a ses_ session id, on the first message"
-            if start_ok
-            else f"expected one session-start call with a ses id, saw {len(starts)}",
-            [
-                "session.created reaches plugins via ctx.event.subscribe and has data.sessionID",
-                "the plugin file in .opencode/plugins/*.js is discovered and loaded",
-                "{id, setup} default export passes the 2.x loader (excess keys not an issue)",
-                "spawn works in the plugin runtime",
-                "the provider config and @ai-sdk/openai-compatible work (the model answered)",
-            ],
-            [first_ev, *ev[:4]],
-        ),
-        Result(
-            "tamper blocked, model gets the message",
-            blocked_ok and reason_ok,
-            "greenproof blocked the tampered tree and the fake model received its message as "
-            "the next user input"
-            if blocked_ok and reason_ok
-            else f"decisions={decisions}, requests carrying the message={len(hits)}, reason "
-            f"matched={reason_ok}",
-            [
-                "experimental.idle fires with sessionID and runs the plugin",
-                "context() entries expose type 'assistant' and an id (message_id in the hook "
-                "payload)",
-                "ctx.location.directory is the project directory (cwd in the hook payload)",
-                "ctx.session.synthetic({sessionID, text}) inside the hook continues the same "
-                "run as the next user input",
-                "the driver "
-                + ("waited" if run["at_exit"] == run["total"] else "did NOT wait")
-                + " for a run the idle hook continued",
-            ],
-            ev,
-        ),
-        Result(
-            "same tree released, no second continuation",
-            released_ok,
-            "the next idle on the same tree was released and no further model request followed"
-            if released_ok
-            else f"decisions={decisions}, messages sent={len(hits)}, last request was the "
-            f"message={bool(run['requests']) and run['requests'][-1] in hits}",
-            [
-                "a continued run fires the idle hook again (the loop is bounded by "
-                "greenproof, 6.2)",
-                "a release is only console.warn: no extra model request, no hang",
-            ],
-            ev,
-        ),
-    ]
+    return with_log_on_fail(
+        [
+            Result(
+                "session-start",
+                start_ok,
+                "one session-start call on the first message of a new session: a ses id, source "
+                "startup"
+                if start_ok
+                else f"expected one session-start call with a ses id and source startup, saw "
+                f"{starts}",
+                [
+                    "the prompt hook fires on the first message of a new session",
+                    "the plugin file in .opencode/plugins/*.js is discovered and loaded",
+                    "{id, setup} default export passes the 2.x loader (excess keys not an issue)",
+                    "spawn works in the plugin runtime",
+                    "the provider config and @ai-sdk/openai-compatible work (the model answered)",
+                ],
+                [first_ev, *ev[:4]],
+            ),
+            Result(
+                "session-start on --continue",
+                resume_ok,
+                "a --continue run in a new process sent one more session-start, same session, "
+                "source resume"
+                if resume_ok
+                else f"expected a second session-start with source resume and the same session, "
+                f"saw {after}",
+                ["a --continue run in a new process sends source resume"],
+                [first_ev, *ev[:4]],
+            ),
+            Result(
+                "tamper blocked, model gets the message",
+                blocked_ok and reason_ok,
+                "greenproof blocked the tampered tree and the fake model received its message as "
+                "the next user input"
+                if blocked_ok and reason_ok
+                else f"decisions={decisions}, requests carrying the message={len(hits)}, reason "
+                f"matched={reason_ok}",
+                [
+                    "experimental.idle fires with sessionID and runs the plugin",
+                    "context() entries expose type 'assistant' and an id (message_id in the hook "
+                    "payload)",
+                    "ctx.location.directory is the project directory (cwd in the hook payload)",
+                    "ctx.session.synthetic({sessionID, text}) inside the hook continues the same "
+                    "run as the next user input",
+                    "the driver "
+                    + ("waited" if run["at_exit"] == run["total"] else "did NOT wait")
+                    + " for a run the idle hook continued",
+                ],
+                ev,
+            ),
+            Result(
+                "same tree released, no second continuation",
+                released_ok,
+                "the next idle on the same tree was released and no further model request followed"
+                if released_ok
+                else f"decisions={decisions}, messages sent={len(hits)}, last request was the "
+                f"message={bool(run['requests']) and run['requests'][-1] in hits}",
+                [
+                    "a continued run fires the idle hook again (the loop is bounded by "
+                    "greenproof, 6.2)",
+                    "a release is only console.warn: no extra model request, no hang",
+                ],
+                ev,
+            ),
+        ],
+        s,
+    )
 
 
 def scenario_honest(ctx: dict) -> list[Result]:
@@ -658,18 +712,21 @@ def scenario_honest(ctx: dict) -> list[Result]:
     hits = greenproof_requests(run)
     calls = checks(s)[warm_checks:]
     ok = not hits and bool(calls) and decision(calls[-1]) == "pass" and run["code"] == 0
-    return [
-        Result(
-            "honest change not continued",
-            ok,
-            "the check ran, passed, and the session stopped"
-            if ok
-            else f"messages sent={len(hits)}, last "
-            f"decision={decision(calls[-1]) if calls else 'no check call'}, exit {run['code']}",
-            ["a pass is empty stdout and adds nothing to the session"],
-            evidence_lines(s, run),
-        )
-    ]
+    return with_log_on_fail(
+        [
+            Result(
+                "honest change not continued",
+                ok,
+                "the check ran, passed, and the session stopped"
+                if ok
+                else f"messages sent={len(hits)}, last "
+                f"decision={decision(calls[-1]) if calls else 'no check call'}, exit {run['code']}",
+                ["a pass is empty stdout and adds nothing to the session"],
+                evidence_lines(s, run),
+            )
+        ],
+        s,
+    )
 
 
 def scenario_user_copy(ctx: dict) -> list[Result]:
@@ -682,20 +739,23 @@ def scenario_user_copy(ctx: dict) -> list[Result]:
     hits = greenproof_requests(run)
     tags = {e["tag"] for e in checks(s)[warm_checks:]}
     ok = len(hits) == 1 and tags == {"user-copy"}
-    return [
-        Result(
-            "user-level plugin directory is loaded",
-            ok,
-            "the copy in $XDG_CONFIG_HOME/opencode/plugins gated the stop alone"
-            if ok
-            else f"messages sent={len(hits)}, copies that ran a check={sorted(tags)}",
-            [
-                "2.x discovers plugins in $XDG_CONFIG_HOME/opencode/plugins/*.js (read from "
-                "1.x source only)"
-            ],
-            evidence_lines(s, run),
-        )
-    ]
+    return with_log_on_fail(
+        [
+            Result(
+                "user-level plugin directory is loaded",
+                ok,
+                "the copy in $XDG_CONFIG_HOME/opencode/plugins gated the stop alone"
+                if ok
+                else f"messages sent={len(hits)}, copies that ran a check={sorted(tags)}",
+                [
+                    "2.x discovers plugins in $XDG_CONFIG_HOME/opencode/plugins/*.js (read from "
+                    "1.x source only)"
+                ],
+                evidence_lines(s, run),
+            )
+        ],
+        s,
+    )
 
 
 def scenario_two_copies(ctx: dict) -> list[Result]:
@@ -709,22 +769,34 @@ def scenario_two_copies(ctx: dict) -> list[Result]:
     calls = checks(s)[warm_checks:]
     decisions = [decision(e) for e in calls]
     # One stop is one check (a block), the continued stop one more (a release), nothing else.
-    ok = len(hits) == 1 and decisions == ["block", "release"]
-    return [
-        Result(
-            "two copies, one continuation",
-            ok,
-            "both copies loaded; one stop ran one check and continued once"
-            if ok
-            else f"messages sent={len(hits)}, check decisions={[decision(c) for c in calls]}",
-            [
-                "the globalThis claim registry deduplicates two copies of the plugin in one "
-                "process",
-                "(meaningful only if user-copy passed: that shows the second copy really loads)",
-            ],
-            evidence_lines(s, run),
-        )
-    ]
+    paths = {
+        m.group(0)
+        for ln in opencode_log_lines(s, "loading plugin")
+        if (m := re.search(r"\S*greenproof\.js", ln))
+    }
+    loaded_project = any(".opencode/plugins/" in x for x in paths)
+    loaded_user = any(".config/opencode/plugins/" in x for x in paths)
+    ok = loaded_project and loaded_user and len(hits) == 1 and decisions == ["block", "release"]
+    return with_log_on_fail(
+        [
+            Result(
+                "two copies, one continuation",
+                ok,
+                "both copies appear in the OpenCode log as loaded; one stop ran one check and "
+                "continued once"
+                if ok
+                else f"project copy loaded={loaded_project}, user copy loaded={loaded_user}, "
+                f"messages sent={len(hits)}, check decisions={[decision(c) for c in calls]}",
+                [
+                    "the globalThis claim registry deduplicates two copies of the plugin in one "
+                    "process",
+                    "(meaningful only if user-copy passed: the second copy really loads)",
+                ],
+                evidence_lines(s, run),
+            )
+        ],
+        s,
+    )
 
 
 SCENARIOS = {

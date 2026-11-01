@@ -12,8 +12,11 @@ that, and runs without the plugin.
 
 ## What runs, and when
 
-- **New top-level session**: `uvx greenproof@0.1.0 session-start --hook opencode`, which writes
-  the session marker under the git directory so the gate knows what the session started from.
+- **First prompt of a top-level session**: `uvx greenproof@0.1.0 session-start --hook opencode`,
+  awaited before the model starts. It writes the session marker under the git directory so the
+  gate knows what the session started from. A new session sends source `startup`, a continued
+  one `resume`. (2.x has no session-start hook, and `session.created` is published before a
+  plugin can subscribe.)
 - **Top-level session about to go idle**: `uvx greenproof@0.1.0 check --hook opencode`, in the
   project. It looks at the change since the base revision for deleted, skipped or weakened
   tests and for edits to test, runner or CI configuration, then runs the commands in the

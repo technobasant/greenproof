@@ -261,16 +261,19 @@ one's decision again: one decision per stop, not a block followed by a release.
 OpenCode has no command hooks, so greenproof ships a plugin for it. It supports OpenCode 2.x
 only. OpenCode 1.x is not supported: its loader logs an error for the plugin and runs without
 it, so nothing is gated. The plugin runs `greenproof check --hook opencode` when a top-level
-session is about to go idle, and `greenproof session-start --hook opencode` when a top-level
-session is created. `uv` (for `uvx greenproof@<version>`) or `greenproof` itself must be on the
+session is about to go idle, and `greenproof session-start --hook opencode` on the first prompt
+of a top-level session. `uv` (for `uvx greenproof@<version>`) or `greenproof` itself must be on the
 PATH of the OpenCode process; without either the check cannot start and fails open. See
 [integrations/opencode/README.md](integrations/opencode/README.md) for exactly what runs.
 
 - A block continues the same run, with greenproof's message as the next input.
 - A release is only a console warning; 2.x gives plugins no toast or log API, so it is not
   shown in the session.
-- Session start depends on OpenCode's session-created event reaching plugins. If it does
-  not, the session start is skipped with a warning and the gate on stop still works.
+- Session start runs on the first prompt the OpenCode process sees for a top-level session
+  (2.x has no session-start hook, and `session.created` is published before plugins can
+  subscribe); a `--continue` run sends `resume`. If the hook cannot be registered or the
+  session cannot be read, the session start is skipped with a warning and the gate on stop
+  still works.
 - Every failure (a missing executable, an error exit, invalid output, a timeout after 3600
   seconds) fails open with a `greenproof could not run: ...` warning.
 

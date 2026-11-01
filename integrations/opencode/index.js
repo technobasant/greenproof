@@ -4,12 +4,14 @@
 // command hooks, so this plugin runs `greenproof check --hook opencode` when a top-level
 // session is about to go idle and maps greenproof's answer: a block continues the same run
 // with greenproof's message, a release is shown as a warning, anything else lets the session
-// stop. Every failure fails open; the CI gate is the backstop.
+// stop. Every failure fails open; the CI gate is the backstop. Session start runs on the first
+// prompt this process sees for a top-level session.
 import { spawn } from "node:child_process"
 
 const COMMAND = ["uvx", "greenproof@0.1.0"]
 
 const TIMEOUT_MS = 3600 * 1000
+const SESSION_START_TIMEOUT_MS = 120 * 1000
 const KILL_GRACE_MS = 10 * 1000
 const MAX_OUTPUT = 4 * 1024 * 1024
 const REGISTRY = Symbol.for("greenproof.opencode")
@@ -35,7 +37,7 @@ function claim(key) {
 
 // Runs `COMMAND ...args` without a shell, the JSON payload on stdin. Resolves with
 // {stdout} or {error}; it never rejects.
-function execute(args, payload, cwd) {
+function execute(args, payload, cwd, timeoutMs = TIMEOUT_MS) {
   return new Promise((resolve) => {
     let settled = false
     let child
@@ -78,8 +80,8 @@ function execute(args, payload, cwd) {
     timer = setTimeout(() => {
       child.kill("SIGTERM")
       setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS).unref?.()
-      finish({ error: `timed out after ${TIMEOUT_MS / 1000} seconds` })
-    }, TIMEOUT_MS)
+      finish({ error: `timed out after ${timeoutMs / 1000} seconds` })
+    }, timeoutMs)
   })
 }
 
@@ -120,8 +122,7 @@ async function lastAssistantMessageId(ctx, sessionID) {
 async function setup(ctx) {
   const cwd = ctx?.location?.directory || process.cwd()
   const running = new Set()
-  const abort = new AbortController()
-  let registration
+  const registrations = []
 
   async function isSubagent(sessionID) {
     try {
@@ -133,23 +134,43 @@ async function setup(ctx) {
     }
   }
 
-  async function onCreated(event) {
-    const sessionID = event?.data?.sessionID
-    if (typeof sessionID !== "string" || sessionID === "" || event.data.parentID) return
-    if (!claim(`session.created:${sessionID}:`)) return
-    const payload = {
-      session_id: sessionID,
-      cwd,
-      hook_event_name: "session.created",
-      source: "startup",
+  // Session start. OpenCode 2.x has no session-start hook, and a session.created event is
+  // published before plugin subscriptions are live, so the first prompt stands in for it.
+  // Never rejects: a rejected callback would fail the prompt.
+  async function onPrompt(event) {
+    try {
+      const sessionID = event?.sessionID
+      if (typeof sessionID !== "string" || sessionID === "") return
+      // Claimed before any await, so repeated and concurrent prompts, and a second copy of
+      // the plugin, start a session at most once.
+      if (!claim(`session-start:${sessionID}:`)) return
+      if (await isSubagent(sessionID)) return
+      // An earlier assistant message means the session is being resumed, not started.
+      let messageID
+      try {
+        messageID = await lastAssistantMessageId(ctx, sessionID)
+      } catch (error) {
+        warn(`greenproof could not read the session messages, so no session start: ${describe(error)}`)
+        return
+      }
+      const payload = {
+        session_id: sessionID,
+        cwd,
+        hook_event_name: "session.prompt",
+        source: messageID === "" ? "startup" : "resume",
+      }
+      const result = await execute(["session-start", "--hook", "opencode"], payload, cwd, SESSION_START_TIMEOUT_MS)
+      if (result.error !== undefined) warn(`greenproof could not run: ${result.error}`)
+    } catch (error) {
+      warn(`greenproof could not run: ${describe(error)}`)
     }
-    const result = await execute(["session-start", "--hook", "opencode"], payload, cwd)
-    if (result.error !== undefined) warn(`greenproof could not run: ${result.error}`)
   }
 
   async function onIdle(event) {
     const sessionID = event?.sessionID
     if (typeof sessionID !== "string" || sessionID === "") return
+    // A session whose first prompt this process never saw gets no session start after a check.
+    claim(`session-start:${sessionID}:`)
     // One check per session at a time. Registered before the first await.
     if (running.has(sessionID)) return
     running.add(sessionID)
@@ -187,39 +208,28 @@ async function setup(ctx) {
     }
   }
 
-  if (typeof ctx?.event?.subscribe === "function") {
-    void (async () => {
-      try {
-        const events = ctx.event.subscribe({ types: ["session.created"], signal: abort.signal })
-        for await (const event of events) {
-          onCreated(event).catch((error) => warn(`greenproof could not run: ${describe(error)}`))
-        }
-      } catch (error) {
-        if (!abort.signal.aborted) {
-          warn(`greenproof cannot see new sessions, so no session start: ${describe(error)}`)
-        }
-      }
-    })()
-  } else {
-    warn("greenproof: this OpenCode offers no session events, so no session start")
-  }
-
   if (typeof ctx?.session?.hook === "function") {
     try {
-      registration = await ctx.session.hook("experimental.idle", onIdle)
+      registrations.push(await ctx.session.hook("experimental.idle", onIdle))
     } catch (error) {
       warn(`greenproof is inactive: could not register the idle hook: ${describe(error)}`)
+    }
+    try {
+      registrations.push(await ctx.session.hook("prompt", onPrompt))
+    } catch (error) {
+      warn(`greenproof: could not register the prompt hook, so no session start: ${describe(error)}`)
     }
   } else {
     warn("greenproof is inactive: this OpenCode has no session.hook, so nothing gates a stop")
   }
 
   return async () => {
-    abort.abort()
-    try {
-      await registration?.dispose?.()
-    } catch {
-      // Unloading must not fail because of the registration.
+    for (const registration of registrations) {
+      try {
+        await registration?.dispose?.()
+      } catch {
+        // Unloading must not fail because of one registration.
+      }
     }
   }
 }

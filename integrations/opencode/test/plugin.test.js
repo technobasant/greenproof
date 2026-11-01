@@ -87,38 +87,6 @@ async function loadPlugin(command) {
   return import(pathToFileURL(file).href)
 }
 
-// An async iterable of events that the test pushes into; closes on abort or return().
-function eventStream(signal) {
-  const queue = []
-  const waiting = []
-  let done = false
-  const close = () => {
-    done = true
-    for (const resolve of waiting.splice(0)) resolve({ done: true, value: undefined })
-  }
-  signal?.addEventListener("abort", close, { once: true })
-  return {
-    push(event) {
-      const resolve = waiting.shift()
-      if (resolve) resolve({ done: false, value: event })
-      else queue.push(event)
-    },
-    [Symbol.asyncIterator]() {
-      return {
-        next: () => {
-          if (queue.length) return Promise.resolve({ done: false, value: queue.shift() })
-          if (done) return Promise.resolve({ done: true, value: undefined })
-          return new Promise((resolve) => waiting.push(resolve))
-        },
-        return: () => {
-          close()
-          return Promise.resolve({ done: true, value: undefined })
-        },
-      }
-    },
-  }
-}
-
 // A fake 2.x plugin context. `sessions` maps id to Session.Info, `messages` maps id to the
 // SessionMessage.Info list of ctx.session.context.
 function fakeContext(options = {}) {
@@ -128,7 +96,6 @@ function fakeContext(options = {}) {
     hooks: {},
     synthetic: [],
     disposed: 0,
-    subscriptions: [],
     sessions: options.sessions ?? {},
     messages: options.messages ?? {},
   }
@@ -146,9 +113,16 @@ function fakeContext(options = {}) {
       state.synthetic.push(input)
     },
     hook: async (name, callback) => {
-      if (options.hookThrows) throw new Error("registration refused")
+      if (options.hookThrows === true || options.hookThrows === name) {
+        throw new Error("registration refused")
+      }
       state.hooks[name] = callback
-      return { dispose: async () => void state.disposed++ }
+      return {
+        dispose: async () => {
+          state.disposed++
+          if (options.disposeThrows === name) throw new Error("dispose failed")
+        },
+      }
     },
   }
   if (options.withoutHook) delete session.hook
@@ -156,25 +130,12 @@ function fakeContext(options = {}) {
     location: { directory },
     options: {},
     session,
-    event: {
-      subscribe: (input) => {
-        const stream = eventStream(input?.signal)
-        state.subscriptions.push({ input, stream })
-        return stream
-      },
-    },
   }
-  if (options.withoutEvents) delete ctx.event
   return { ctx, state }
 }
 
 const assistant = (id) => ({ type: "assistant", id, content: [] })
 const user = (id) => ({ type: "user", id })
-const created = (sessionID, extra = {}) => ({
-  type: "session.created",
-  data: { sessionID, location: { directory: "/x" }, ...extra },
-})
-
 // Lets pending promises, microtasks and I/O callbacks run; polls until `until` holds.
 async function settle(until = () => false, limit = 5000) {
   const deadline = Date.now() + limit
@@ -222,21 +183,16 @@ describe("module shape", () => {
     assert.equal((source.match(/^export /gm) ?? []).length, 1)
   })
 
-  test("setup registers the experimental idle hook and returns a cleanup", async () => {
+  test("setup registers the idle and prompt hooks and returns a cleanup", async () => {
     const { state, cleanup } = await start()
-    assert.deepEqual(Object.keys(state.hooks), ["experimental.idle"])
+    assert.deepEqual(Object.keys(state.hooks).sort(), ["experimental.idle", "prompt"])
     assert.equal(typeof cleanup, "function")
-    assert.deepEqual(state.subscriptions[0].input.types, ["session.created"])
   })
 
-  test("cleanup stops the event subscription and disposes the hook", async () => {
-    const { state, cleanup, fake } = await start()
+  test("cleanup disposes both registrations, even when one dispose fails", async () => {
+    const { state, cleanup } = await start({}, { disposeThrows: "experimental.idle" })
     await cleanup()
-    assert.equal(state.disposed, 1)
-    assert.equal(state.subscriptions[0].input.signal.aborted, true)
-    state.subscriptions[0].stream.push(created("ses_late"))
-    await settle(() => false, 50)
-    assert.equal(fake.calls().length, 0)
+    assert.equal(state.disposed, 2)
   })
 })
 
@@ -480,97 +436,179 @@ describe("two copies in one process", () => {
     assert.equal(fake.calls().length, 2)
   })
 
-  test("a new session starts once", async () => {
-    const { fake, one, two } = await twoCopies({ start: "pass" }, {})
-    one.state.subscriptions[0].stream.push(created("ses_new"))
-    two.state.subscriptions[0].stream.push(created("ses_new"))
-    assert.ok(await settle(() => fake.calls().length >= 1))
-    await settle(() => false, 100)
-    assert.equal(fake.calls().length, 1)
-  })
 })
 
-describe("session start", () => {
-  test("a new top-level session runs session-start and ignores its output", async () => {
-    const { state, fake } = await start({ start: "block" })
-    state.subscriptions[0].stream.push(created("ses_new"))
-    assert.ok(await settle(() => fake.calls().length === 1))
-    const [call] = fake.calls()
+const prompt = (state, sessionID = "ses_1") => state.hooks.prompt({ sessionID, messageID: "m", prompt: "hi" })
+
+describe("session start (the prompt hook)", () => {
+  test("a new session runs session-start before the callback resolves, and ignores its output", async () => {
+    const { state, fake } = await start({ start: "slow", delayMs: 300 })
+    const began = Date.now()
+    await prompt(state)
+    assert.ok(Date.now() - began >= 250, "the callback resolved before the command finished")
+    const [call, ...rest] = fake.calls()
+    assert.deepEqual(rest, [])
     assert.deepEqual(call.args, ["session-start", "--hook", "opencode"])
     assert.deepEqual(call.stdin, {
-      session_id: "ses_new",
+      session_id: "ses_1",
       cwd: state.directory,
-      hook_event_name: "session.created",
+      hook_event_name: "session.prompt",
       source: "startup",
     })
-    await settle(() => false, 50)
     assert.equal(state.synthetic.length, 0)
     assert.deepEqual(warnings, [])
   })
 
-  test("a child session does not start a session", async () => {
-    const { state, fake } = await start({ start: "pass" })
-    state.subscriptions[0].stream.push(created("ses_child", { parentID: "ses_1" }))
-    state.subscriptions[0].stream.push({ type: "session.created", data: {} })
-    state.subscriptions[0].stream.push({ type: "session.created" })
-    await settle(() => false, 100)
-    assert.equal(fake.calls().length, 0)
-  })
-
-  test("a failing session-start is only a warning", async () => {
-    const { state, fake } = await start({ start: "error" })
-    state.subscriptions[0].stream.push(created("ses_new"))
-    assert.ok(await settle(() => warnings.length === 1))
+  test("a session with an earlier assistant message is a resume", async () => {
+    const { state, fake } = await start({ start: "pass" }, { messages: { ses_1: [user("u"), assistant("msg_a")] } })
+    await prompt(state)
     assert.equal(fake.calls().length, 1)
-    assert.match(warnings[0], /greenproof could not run: exit 3/)
+    assert.equal(fake.calls()[0].stdin.source, "resume")
   })
 
-  test("a failing event stream is a warning, and the idle hook still works", async () => {
-    const fake = fakeGreenproof({ check: "block" })
-    const plugin = await loadPlugin([fake.script])
-    const { ctx, state } = fakeContext({ messages: { ses_1: [assistant("msg_a")] } })
-    ctx.event.subscribe = () => ({
-      [Symbol.asyncIterator]: () => ({ next: () => Promise.reject(new Error("stream closed")) }),
-    })
-    await plugin.default.setup(ctx)
-    assert.ok(await settle(() => warnings.length === 1))
-    assert.match(warnings[0], /no session start: stream closed/)
+  test("a second prompt in the same session does not start it again", async () => {
+    const { state, fake } = await start({ start: "pass" })
+    await prompt(state)
+    await prompt(state)
+    await Promise.all([prompt(state), prompt(state)])
+    assert.equal(fake.calls().length, 1)
+    await prompt(state, "ses_2")
+    assert.deepEqual(fake.calls().map((call) => call.stdin.session_id), ["ses_1", "ses_2"])
+  })
+
+  test("concurrent prompts run it once", async () => {
+    const { state, fake } = await start({ start: "slow", delayMs: 200 })
+    await Promise.all([prompt(state), prompt(state), prompt(state)])
+    assert.equal(fake.calls().length, 1)
+  })
+
+  test("two copies in one process start a session once", async () => {
+    const fake = fakeGreenproof({ start: "pass" })
+    const [first, second] = await Promise.all([loadPlugin([fake.script]), loadPlugin([fake.script])])
+    const one = fakeContext()
+    const two = fakeContext({ directory: one.state.directory })
+    await first.default.setup(one.ctx)
+    await second.default.setup(two.ctx)
+    await Promise.all([prompt(one.state), prompt(two.state)])
+    await prompt(two.state)
+    await prompt(one.state)
+    assert.equal(fake.calls().length, 1)
+  })
+
+  test("a prompt after an idle on the same session does not start it", async () => {
+    const { state, fake } = await start({ check: "pass" }, { messages: { ses_1: [assistant("msg_a")] } })
+    await state.hooks["experimental.idle"]({ sessionID: "ses_1" })
+    await prompt(state)
+    assert.deepEqual(fake.calls().map((call) => call.args[0]), ["check"])
+  })
+
+  test("a continuation that passes through the prompt hook after a check does not start it", async () => {
+    const { state, fake } = await start({ check: "block" }, { messages: { ses_1: [assistant("msg_a")] } })
     await state.hooks["experimental.idle"]({ sessionID: "ses_1" })
     assert.equal(state.synthetic.length, 1)
+    await prompt(state)
+    assert.deepEqual(fake.calls().map((call) => call.args[0]), ["check"])
   })
 
-  test("a context without ctx.event warns once and still gates the stop", async () => {
-    const { state, fake } = await start({ check: "block" }, { withoutEvents: true, messages: { ses_1: [assistant("msg_a")] } })
-    assert.equal(warnings.length, 1)
-    assert.match(warnings[0], /no session events, so no session start/)
-    await state.hooks["experimental.idle"]({ sessionID: "ses_1" })
-    assert.equal(fake.calls().length, 1)
+  test("a child session is skipped", async () => {
+    const { state, fake } = await start({ start: "pass" }, { sessions: { ses_1: { id: "ses_1", parentID: "ses_0" } } })
+    await prompt(state)
+    assert.equal(fake.calls().length, 0)
+    assert.deepEqual(warnings, [])
+  })
+
+  test("a session that cannot be read is skipped with a warning", async () => {
+    const { state, fake } = await start({ start: "pass" }, { getThrows: true })
+    await prompt(state)
+    assert.equal(fake.calls().length, 0)
+    assert.match(warnings[0], /could not read the session, so it does nothing/)
+  })
+
+  test("messages that cannot be read: no session start, a warning", async () => {
+    const { state, fake } = await start({ start: "pass" }, { contextThrows: true })
+    await prompt(state)
+    assert.equal(fake.calls().length, 0)
+    assert.match(warnings[0], /could not read the session messages, so no session start: context failed/)
+  })
+
+  test("a failing command only warns, and the callback resolves", async () => {
+    const { state } = await start({ start: "error" })
+    await prompt(state)
+    assert.match(warnings[0], /greenproof could not run: exit 3: boom happened/)
+  })
+
+  test("a command that cannot be spawned only warns, and the callback resolves", async () => {
+    const { state } = await start({}, {}, [path.join(ROOT, "no-such-greenproof")])
+    await prompt(state)
+    assert.match(warnings[0], /greenproof could not run: .*ENOENT/)
+  })
+
+  test("a session start past 120 seconds is killed, and the callback resolves", async () => {
+    const { state, fake } = await start({ start: "hang" })
+    mock.timers.enable({ apis: ["setTimeout"] })
+    const done = prompt(state)
+    assert.ok(await settle(() => fake.calls().length === 1), "the fake was never started")
+    mock.timers.tick(120 * 1000 - 1)
+    await settle(() => false, 20)
+    assert.equal(warnings.length, 0)
+    mock.timers.tick(1)
+    await done
+    assert.deepEqual(warnings, ["greenproof could not run: timed out after 120 seconds"])
+    mock.timers.tick(10_000)
+  })
+
+  test("an event without a session id does nothing, and the event is never modified", async () => {
+    const { state, fake } = await start({ start: "pass" })
+    await state.hooks.prompt({ prompt: "hi" })
+    await state.hooks.prompt(undefined)
+    await state.hooks.prompt({ sessionID: "", prompt: "hi" })
+    const event = { sessionID: "ses_1", messageID: "m", prompt: "hi", metadata: { a: 1 }, delivery: "immediate" }
+    const before = structuredClone(event)
+    await state.hooks.prompt(event)
+    assert.deepEqual(event, before)
+    assert.deepEqual(fake.calls().map((call) => call.stdin.session_id), ["ses_1"])
   })
 })
 
 describe("a context that cannot gate", () => {
-  test("without session.hook: one warning, no throw, session start still works", async () => {
-    const { cleanup, state, fake } = await start({ start: "pass" }, { withoutHook: true })
-    const hookWarnings = warnings.filter((line) => /no session\.hook/.test(line))
-    assert.equal(hookWarnings.length, 1)
+  test("without session.hook: one warning, no throw", async () => {
+    const { cleanup, state } = await start({}, { withoutHook: true })
+    assert.equal(warnings.filter((line) => /no session\.hook/.test(line)).length, 1)
+    assert.equal(warnings.length, 1)
     assert.deepEqual(state.hooks, {})
-    state.subscriptions[0].stream.push(created("ses_new"))
-    assert.ok(await settle(() => fake.calls().length === 1))
     await cleanup()
   })
 
-  test("a registration that throws: one warning, no throw", async () => {
+  test("both registrations throwing: a warning for each, no throw", async () => {
     const { cleanup } = await start({}, { hookThrows: true })
-    assert.equal(warnings.length, 1)
+    assert.equal(warnings.length, 2)
     assert.match(warnings[0], /could not register the idle hook: registration refused/)
+    assert.match(warnings[1], /could not register the prompt hook, so no session start: registration refused/)
     await cleanup()
+  })
+
+  test("the prompt registration throwing leaves the idle gate working", async () => {
+    const { state, fake } = await start({ check: "block" }, { hookThrows: "prompt", messages: { ses_1: [assistant("msg_a")] } })
+    assert.deepEqual(Object.keys(state.hooks), ["experimental.idle"])
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /could not register the prompt hook, so no session start/)
+    await state.hooks["experimental.idle"]({ sessionID: "ses_1" })
+    assert.equal(fake.calls().length, 1)
+    assert.equal(state.synthetic.length, 1)
+  })
+
+  test("the idle registration throwing leaves session start working", async () => {
+    const { state, fake } = await start({ start: "pass" }, { hookThrows: "experimental.idle" })
+    assert.deepEqual(Object.keys(state.hooks), ["prompt"])
+    await prompt(state)
+    assert.equal(fake.calls().length, 1)
   })
 
   test("a context with nothing at all does not throw", async () => {
     const plugin = await loadPlugin(["greenproof"])
     const cleanup = await plugin.default.setup({})
     await cleanup()
-    assert.equal(warnings.length, 2)
+    assert.equal(warnings.length, 1)
   })
 })
 

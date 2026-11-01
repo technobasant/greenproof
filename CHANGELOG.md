@@ -21,9 +21,9 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   packaged inside greenproof): on a top-level session going idle it runs
   `greenproof check --hook opencode` and continues the same run with `ctx.session.synthetic`
   on a block; a release is a console warning and every failure fails open. It starts a
-  session on `session.created`, skips subagent sessions, runs one check per session at a
-  time and gives way to a second copy loaded in the same process. Plain ES module with only
-  `node:` imports; 2.x only.
+  session on the first prompt of a top-level session (the `prompt` hook), skips subagent
+  sessions, runs one check per session at a time and gives way to a second copy loaded in the
+  same process. Plain ES module with only `node:` imports; 2.x only.
 - `greenproof init --agents opencode` writes `.opencode/plugins/greenproof.js` with the hook
   command set. The file is replaced only when its first line says greenproof wrote it; any
   other file there is a usage error (exit 4) and nothing is written. `--agents auto` also

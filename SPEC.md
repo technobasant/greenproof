@@ -871,12 +871,17 @@ its output.
   cover copies in different processes.
 - **Top-level sessions only.** A session whose `ctx.session.get({sessionID})` has a
   `parentID` is a subagent and is skipped; the idle event carries no parent.
-- **New top-level session**: the session-created event of `ctx.event` (*verify* that the
-  contract has one, and its payload). Run `COMMAND session-start --hook opencode` with
-  stdin `{"session_id", "cwd", "hook_event_name": "session.created", "source":
-  "startup"}` and ignore stdout; the AGENTS.md section from `init` tells the agent about
-  the gate. Without such an event there is no session start, the base falls back to the
-  default branch, and the README says so.
+- **New top-level session**: 2.x has no session-start hook, and `ctx.event.subscribe` is
+  lazy, so `session.created` is published before any plugin subscription is live and is
+  never replayed. The plugin therefore uses `ctx.session.hook("prompt", fn)`: on the first
+  prompt this process sees for a top-level session it claims `session-start:<session>:` (a
+  later idle of the same session does too), then awaits `COMMAND session-start --hook
+  opencode` with stdin `{"session_id", "cwd", "hook_event_name": "session.prompt",
+  "source"}` and ignores stdout, so the marker exists before the model starts. `source` is
+  `startup` when the session has no assistant message yet and `resume` otherwise; the
+  callback never rejects, because a rejection fails the prompt. The AGENTS.md section from
+  `init` tells the agent about the gate. A failed registration or read means no session
+  start, the base falls back to the default branch, and the README says so.
 - **Idle of a top-level session**: `ctx.session.hook("experimental.idle", fn)`, event
   `{sessionID, ...}`. The runner awaits it after the model's work and before the session
   goes idle, and continues the same run when the hook leaves input
