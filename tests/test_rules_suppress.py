@@ -27,6 +27,8 @@ CASES = [
     ("run.sh", "set +e", "set-plus-e"),
     ("run.sh", "jest --passWithNoTests", "pass-with-no-tests"),
     ("run.sh", "git push --no-verify", "no-verify"),
+    ("run.sh", "git commit -m x --no-verify", "no-verify"),
+    ("run.sh", "git push --no-verify origin main", "no-verify"),
 ]
 
 
@@ -86,4 +88,13 @@ def test_deleted_file_and_clean_edit_are_clean(tmp_path: Path) -> None:
     repo.commit("base")
     repo.remove("a.py")
     repo.write("b.py", "y = 2\n")
+    assert static_findings(repo) == []
+
+
+def test_no_verify_on_other_tools_is_not_a_git_hook_bypass(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "r")
+    repo.write("a.py", "x = 1\n")
+    repo.commit("base")
+    repo.write("run.sh", "greenproof init --no-verify\n")
+    repo.write("a.py", 'x = 1\nrun(repo, "init", "--no-verify")\n')
     assert static_findings(repo) == []
