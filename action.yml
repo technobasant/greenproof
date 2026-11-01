@@ -1,0 +1,73 @@
+name: greenproof
+description: Definition-of-done gate for code written by LLM coding agents. Is the green real?
+author: Basant Bhattarai
+
+inputs:
+  base:
+    description: Base revision to compare against. Empty means the pull request's base branch.
+    required: false
+    default: ""
+  checks:
+    description: Comma-separated checks to run (static, commands, revert, smoke). Empty uses the policy.
+    required: false
+    default: ""
+  allow-policy-change:
+    description: Do not block when the pull request edits .greenproof.toml.
+    required: false
+    default: "false"
+  accept-comments:
+    description: Honour "/greenproof accept" comments from repository owners, members and collaborators.
+    required: false
+    default: "true"
+  token:
+    description: Token used to read pull request comments for acceptances.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  exit-code:
+    description: greenproof's exit code (0 means pass).
+    value: ${{ steps.greenproof.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+    - name: Fetch history when the checkout is shallow
+      shell: bash
+      run: |
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          git fetch --no-tags --unshallow origin
+          if [ -n "$GITHUB_BASE_REF" ]; then
+            git fetch --no-tags origin "+refs/heads/$GITHUB_BASE_REF:refs/remotes/origin/$GITHUB_BASE_REF"
+          fi
+        fi
+    - name: Run greenproof
+      id: greenproof
+      shell: bash
+      env:
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_CHECKS: ${{ inputs.checks }}
+        INPUT_ALLOW_POLICY_CHANGE: ${{ inputs.allow-policy-change }}
+        INPUT_ACCEPT_COMMENTS: ${{ inputs.accept-comments }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+      run: |
+        args=(check --mode ci --github-annotations --markdown "$GITHUB_STEP_SUMMARY" --json greenproof.json)
+        if [ -n "$INPUT_BASE" ]; then args+=(--base "$INPUT_BASE"); fi
+        if [ -n "$INPUT_CHECKS" ]; then args+=(--checks "$INPUT_CHECKS"); fi
+        if [ "$INPUT_ALLOW_POLICY_CHANGE" = "true" ]; then args+=(--allow-policy-change); fi
+        if [ "$INPUT_ACCEPT_COMMENTS" = "true" ]; then args+=(--github-accept); fi
+        code=0
+        uvx --from "$GITHUB_ACTION_PATH" greenproof "${args[@]}" || code=$?
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      if: always()
+      with:
+        name: greenproof-report
+        path: greenproof.json
+    - name: Exit with greenproof's code
+      if: steps.greenproof.outputs.exit-code != '0'
+      shell: bash
+      env:
+        EXIT_CODE: ${{ steps.greenproof.outputs.exit-code }}
+      run: exit "$EXIT_CODE"
