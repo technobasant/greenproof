@@ -14,7 +14,7 @@ def _toml_string(value: str) -> str:
     return json.dumps(value)
 
 
-def render_policy(commands: dict[str, ProposedCommand]) -> str:
+def render_policy(commands: dict[str, ProposedCommand], smoke: bool = False) -> str:
     lines = ["version = 1", "", "[commands]"]
     if not commands:
         lines.append("# Nothing was detected. The static checks still work; add lint, typecheck,")
@@ -26,6 +26,12 @@ def render_policy(commands: dict[str, ProposedCommand]) -> str:
         lines.append(f"# {slot}: from {proposed.source}")
         lines.append(f"{slot} = {_toml_string(proposed.command)}")
     lines.append(f"timeout = {DEFAULT_TIMEOUT}")
-    for mode in ("hook", "local", "ci"):
-        lines += ["", f"[modes.{mode}]", 'checks = ["static", "commands"]']
+    # ci also runs the revert check, and smoke when the policy has a [smoke] table (SPEC 8.2).
+    ci_checks = ["static", "commands", "revert", *(["smoke"] if smoke else [])]
+    for mode, checks in (
+        ("hook", ["static", "commands"]),
+        ("local", ["static", "commands"]),
+        ("ci", ci_checks),
+    ):
+        lines += ["", f"[modes.{mode}]", f"checks = {json.dumps(checks)}"]
     return "\n".join(lines) + "\n"
