@@ -411,6 +411,34 @@ def _go_call(names: set[str]) -> re.Pattern[str]:
     return re.compile(rf"(?<![\w.])(?:{alt})\s*\(")
 
 
+_JS_EXPECT_OPEN = re.compile(r"\bexpect\s*\(")
+
+
+def _inside_open_expect(masked: list[str], start: int, end: int) -> list[bool]:
+    """Per line of a test: is an `expect(` opened on an earlier line still unclosed at its start?
+
+    Parenthesis depth over the masked lines (string contents are blanked, so a paren in a string
+    does not count). A query on such a line is an argument of that expect, which already counts.
+    """
+    inside: list[bool] = []
+    depth = 0
+    open_at: list[int] = []  # depth right after each still-open expect(
+    for k in range(start, end + 1):
+        inside.append(bool(open_at))
+        line = masked[k]
+        expect_parens = {m.end() - 1 for m in _JS_EXPECT_OPEN.finditer(line)}
+        for i, ch in enumerate(line):
+            if ch == "(":
+                depth += 1
+                if i in expect_parens:
+                    open_at.append(depth)
+            elif ch == ")":
+                if open_at and open_at[-1] == depth:
+                    open_at.pop()
+                depth = max(depth - 1, 0)
+    return inside
+
+
 def _read_by_expect(masked: list[str], k: int, end: int) -> bool:
     """Line `k` binds a query result to a name that a later line of the test passes to expect."""
     bound = _JS_BOUND_QUERY.match(masked[k])
@@ -441,9 +469,15 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
             if lang == "js"
             else [0] * (span.end - span.start + 1)
         )
+        nested = (
+            _inside_open_expect(masked, span.start, span.end)
+            if lang == "js"
+            else [False] * (span.end - span.start + 1)
+        )
         query_hits = [
             int(
                 lang == "js"
+                and not nested[k - span.start]
                 and _ASSERTS[lang].search(masked[k]) is None
                 and _JS_QUERY.search(masked[k]) is not None
                 and not _read_by_expect(masked, k, span.end)

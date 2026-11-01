@@ -382,6 +382,27 @@ def test_js_bound_query_read_by_expect_counts_once_with_it() -> None:
     )
 
 
+def test_js_query_inside_a_wrapped_expect_is_not_counted_again() -> None:
+    wrapped = "  expect(\n    await screen.findByText('a'),\n  ).toBeInTheDocument();"
+    inline = "  expect(screen.getByText('a')).toBeInTheDocument();"
+    assert _js_asserts(wrapped) == _js_asserts(inline) == 1
+    # Nested parentheses inside the wrapped expect do not close it early.
+    nested = "  expect(\n    fn(1),\n    await screen.findByText('a'),\n  ).toBe(1);"
+    assert _js_asserts(nested) == 1
+
+
+def test_js_query_after_the_wrapped_expect_closes_counts() -> None:
+    text = "  expect(\n    x,\n  ).toBe(1);\n  await screen.findByText('a');"
+    assert _js_asserts(text) == 2
+
+
+def test_js_paren_in_a_string_does_not_leak_into_the_expect_depth() -> None:
+    text = "  expect(\n    ')',\n  ).toBe(1);\n  await screen.findByText('a');"
+    assert _js_asserts(text) == 2
+    text = "  expect('(' + x).toBe(1);\n  await screen.findByText('a');"
+    assert _js_asserts(text) == 2
+
+
 def test_js_bound_query_nobody_reads_still_counts() -> None:
     assert _js_asserts("  const el = await screen.findByText('a');") == 1
     assert _js_asserts("  const el = getByText('a');\n  expect(other).toBe(1);") == 2
