@@ -17,6 +17,24 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   every pinned command in the plugin, and `tests/test_plugins.py`, which fails when any of
   them differs from `__version__` and checks each manifest against its vendor's format.
 - `scripts/make_icon.py`, the standard-library script that draws the plugin icon.
+- An OpenCode 2.x plugin (`integrations/opencode`, package `opencode-greenproof`, also
+  packaged inside greenproof): on a top-level session going idle it runs
+  `greenproof check --hook opencode` and continues the same run with `ctx.session.synthetic`
+  on a block; a release is a console warning and every failure fails open. It starts a
+  session on the first prompt of a top-level session (the `prompt` hook), skips subagent
+  sessions, runs one check per session at a time and gives way to a second copy loaded in the
+  same process. Plain ES module with only `node:` imports; 2.x only.
+- `greenproof init --agents opencode` writes `.opencode/plugins/greenproof.js` with the hook
+  command set. The file is replaced only when its first line says greenproof wrote it; any
+  other file there is a usage error (exit 4) and nothing is written. `--agents auto` also
+  installs it when `.opencode/`, `opencode.json` or `opencode.jsonc` exists.
+- A CI job that runs `node --test` on the plugin (actions/setup-node pinned to a commit) and
+  checks that `npm pack` lists only `index.js`, `README.md`, `LICENSE` and `package.json`.
+- `scripts/e2e/opencode.py`, an end-to-end run of the plugin in the real OpenCode CLI against
+  a fake OpenAI-compatible model server (`--self-test` checks only the server). It is not
+  part of pytest.
+- `scripts/bump_version.py` also sets the npm package's version and the command pinned in
+  its copy of the plugin.
 - `check --hook opencode` and `session-start --hook opencode`, for the OpenCode plugin: the
   payload carries `session_id` and `cwd`, and the output is Codex's protocol (block, pass,
   release) and Claude Code's session-start output.

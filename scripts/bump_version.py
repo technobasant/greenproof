@@ -3,8 +3,10 @@
     python scripts/bump_version.py X.Y.Z
 
 `src/greenproof/_version.py` is the source of truth. The plugin manifests, the marketplace
-entries that carry a version and every pinned `uvx greenproof@X.Y.Z` command in the plugin
-(hook files, skill, README) must equal it; tests/test_plugins.py fails when one differs.
+entries that carry a version, every pinned `uvx greenproof@X.Y.Z` command in the plugin
+(hook files, skill, README) and the OpenCode npm package (its package.json version, the
+command pinned in index.js, its README) must equal it; tests/test_plugins.py fails when one
+differs.
 Nothing is changed unless every target matches what it expects.
 """
 
@@ -21,6 +23,7 @@ JSON_VERSION = re.compile(r'("version":\s*")[^"]+(")')
 MODULE_VERSION = re.compile(r'(__version__\s*=\s*")[^"]+(")')
 
 PLUGIN = Path("plugins/greenproof")
+OPENCODE = Path("integrations/opencode")
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,11 @@ def targets() -> list[Target]:
     ]
     found += [pins(PLUGIN / "hooks" / f"{agent}.json") for agent in ("claude", "codex", "cursor")]
     found += [pins(PLUGIN / "skills/greenproof/SKILL.md"), pins(PLUGIN / "README.md")]
+    found += [
+        json_version(f"{OPENCODE}/package.json"),
+        pins(OPENCODE / "index.js"),
+        pins(OPENCODE / "README.md"),
+    ]
     return found
 
 

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from types import ModuleType
 
-from greenproof.init.hooks import claude, codex, cursor, gemini
+from greenproof.init.hooks import claude, codex, cursor, gemini, opencode
 
-ADAPTERS: dict[str, ModuleType] = {m.NAME: m for m in (claude, cursor, codex, gemini)}
+ADAPTERS: dict[str, ModuleType] = {m.NAME: m for m in (claude, cursor, codex, gemini, opencode)}
 MAX_TIMEOUT = 3600
 TIMEOUT_MARGIN = 60
 

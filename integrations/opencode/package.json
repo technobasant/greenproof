@@ -1,0 +1,38 @@
+{
+  "name": "opencode-greenproof",
+  "version": "0.1.0",
+  "description": "Done gate for OpenCode 2.x: when the agent stops, greenproof runs your checks and blocks deleted, skipped or weakened tests.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./server": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "greenproof"
+  ],
+  "author": "Basant Bhattarai",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/technobasant/greenproof",
+  "bugs": {
+    "url": "https://github.com/technobasant/greenproof/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/technobasant/greenproof.git",
+    "directory": "integrations/opencode"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -515,3 +515,103 @@ def test_hook_command_is_named_in_the_agents_md_text(tmp_path: Path, run) -> Non
     again = run(repo.path, *args)
     assert statuses(again.out)["AGENTS.md"] == "unchanged"
     assert snapshot(repo.path) == before
+
+
+# ---- OpenCode plugin ----------------------------------------------------------------------
+
+OPENCODE_OWNER = (
+    "// greenproof plugin for OpenCode. Written by greenproof init; re-running init replaces it."
+)
+OPENCODE_PATH = ".opencode/plugins/greenproof.js"
+
+
+def test_opencode_plugin_is_written_with_the_hook_command_as_a_json_array(
+    tmp_path: Path, run, controlled_path
+) -> None:
+    controlled_path()
+    repo = fixture_repo(tmp_path, UV_PROJECT)
+    result = run(repo.path, "init", "--no-verify", "--agents", "opencode")
+    assert result.code == 0
+    text = (repo.path / OPENCODE_PATH).read_text()
+    assert text.split("\n", 1)[0] == OPENCODE_OWNER
+    commands = [line for line in text.split("\n") if line.startswith("const COMMAND = ")]
+    assert commands == ['const COMMAND = ["greenproof"]']
+    assert statuses(result.out)[OPENCODE_PATH] == "created"
+    assert "OpenCode: the plugin needs OpenCode 2.x" in result.out
+    assert not (repo.path / ".opencode/opencode.json").exists()
+
+
+def test_opencode_hook_command_is_split_like_a_shell_would(tmp_path: Path, run) -> None:
+    repo = fixture_repo(tmp_path, UV_PROJECT)
+    result = run(
+        repo.path,
+        "init",
+        "--no-verify",
+        "--agents",
+        "opencode",
+        "--hook-command",
+        'uvx "greenproof@1.2.3" --flag "a b"',
+    )
+    assert result.code == 0
+    text = (repo.path / OPENCODE_PATH).read_text()
+    assert 'const COMMAND = ["uvx", "greenproof@1.2.3", "--flag", "a b"]\n' in text
+    bad = run(repo.path, "init", "--no-verify", "--agents", "opencode", "--hook-command", "'x")
+    assert bad.code == 4 and "--hook-command" in bad.err
+
+
+def test_opencode_second_run_changes_nothing_and_a_new_command_replaces_the_file(
+    tmp_path: Path, run, controlled_path
+) -> None:
+    controlled_path()
+    repo = fixture_repo(tmp_path, UV_PROJECT)
+    run(repo.path, "init", "--no-verify", "--agents", "opencode")
+    first = snapshot(repo.path)
+    again = run(repo.path, "init", "--no-verify", "--agents", "opencode")
+    assert statuses(again.out)[OPENCODE_PATH] == "unchanged"
+    assert snapshot(repo.path) == first
+    changed = run(repo.path, "init", "--no-verify", "--agents", "opencode", "--hook-command", "gp")
+    assert statuses(changed.out)[OPENCODE_PATH] == "updated"
+    assert 'const COMMAND = ["gp"]\n' in (repo.path / OPENCODE_PATH).read_text()
+
+
+@pytest.mark.parametrize("content", ["", "export default {}\n", "\n" + OPENCODE_OWNER + "\n"])
+def test_opencode_file_not_written_by_greenproof_exits_4_and_writes_nothing(
+    content: str, tmp_path: Path, run
+) -> None:
+    repo = fixture_repo(tmp_path, {**UV_PROJECT, OPENCODE_PATH: content})
+    before = snapshot(repo.path)
+    result = run(repo.path, "init", "--no-verify", "--agents", "claude,opencode")
+    assert result.code == 4
+    assert OPENCODE_PATH in result.err and "Nothing was written" in result.err
+    assert snapshot(repo.path) == before
+
+
+def test_opencode_auto_detection(tmp_path: Path, run) -> None:
+    for name, files in {
+        "dir": {".opencode/x": ""},
+        "json": {"opencode.json": "{}"},
+        "jsonc": {"opencode.jsonc": "{}"},
+    }.items():
+        repo = fixture_repo(tmp_path, {**UV_PROJECT, **files}, name=name)
+        run(repo.path, "init", "--no-verify")
+        assert (repo.path / OPENCODE_PATH).is_file(), name
+    bare = fixture_repo(tmp_path, UV_PROJECT, name="bare")
+    run(bare.path, "init", "--no-verify")
+    assert not (bare.path / ".opencode").exists()
+
+
+def test_opencode_render_rejects_an_empty_command_and_a_damaged_template(monkeypatch) -> None:
+    from greenproof.errors import UsageError
+    from greenproof.init.hooks import opencode
+
+    with pytest.raises(UsageError, match="expected a command"):
+        opencode.render(None, "   ", 60)
+    text = opencode.template()
+    monkeypatch.setattr(
+        opencode, "template", lambda: text.replace("const COMMAND = ", "const C = ")
+    )
+    with pytest.raises(RuntimeError, match="COMMAND or owner line"):
+        opencode.render(None, "greenproof", 60)
+    monkeypatch.setattr(opencode, "template", lambda: "// something else\n" + text)
+    with pytest.raises(RuntimeError, match="COMMAND or owner line"):
+        opencode.render(None, "greenproof", 60)

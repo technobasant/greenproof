@@ -85,6 +85,31 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: uv run greenproof check --mode ci --github-accept
 
+  # The OpenCode 2.x plugin, tested against a fake 2.x context and a fake greenproof, and the
+  # npm package checked for exactly the files it should publish. Nothing is installed.
+  opencode:
+    name: OpenCode plugin (node --test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - run: node --test
+        working-directory: integrations/opencode
+      - name: The npm package lists only what it should
+        working-directory: integrations/opencode
+        run: |
+          npm pack --dry-run --json | node -e '
+            const [pack] = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            const files = pack.files.map((f) => f.path).sort().join(",");
+            const wanted = "LICENSE,README.md,index.js,package.json";
+            if (files !== wanted) { console.error("unexpected files: " + files); process.exit(1); }
+          '
+
   # Builds what a release would publish and checks it the way PyPI and a user would.
   package:
     name: Package as published
