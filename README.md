@@ -221,7 +221,7 @@ example `"tests.expected_changed" = "off"`.
 | `tests.expected_changed` | warn | the expected value in an assertion changed while non-test code also changed |
 | `suppress.added` | warn | an added line introduces a type, lint or coverage suppression |
 | `runner.tampered` | block | a change narrows or neuters how checks run: test selection, coverage thresholds, linter or type-checker strictness, test scripts, a conftest hook that rewrites outcomes |
-| `ci.tampered` | block | a CI workflow change removes or neuters a test or lint step, adds `continue-on-error`, `\|\| true` or `if: false`, or changes the greenproof step; a ref-only bump of the greenproof action is `warn` |
+| `ci.tampered` | block | a CI workflow change removes or neuters a test or lint step, adds `continue-on-error`, `\|\| true` or `if: false`, or changes or removes the greenproof step (adding the first one is fine); a ref-only bump of the greenproof action is `warn` |
 | `static.parse_error` | warn | a changed Python, TOML, JSON or INI file does not parse, so line-level checks are used for it |
 | `tests.self_mocked` | warn | a test patches the same callable its assertions call, so it tests the mock |
 | `code.hardcoded` | warn | non-test code gains a literal lookup table or an equality branch on a literal that also appears in a test changed in the same diff (Python only) |
@@ -365,7 +365,7 @@ greenproof reports patterns, not proofs. Read these before relying on it.
 - **Hooks are advisory,** as described above, and CI is where the gate holds.
 - **It does not judge code.** It does not review the change, scan for vulnerabilities or
   measure coverage. A suite that was weak at the base is still weak.
-- **Windows** is best effort.
+- **Windows is not tested.** CI runs on Linux and macOS.
 
 ## Measurements
 

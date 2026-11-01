@@ -33,7 +33,7 @@ greenproof runs these commands (from `.greenproof.toml`):
 - `uv run mypy src`
 - `uv run pytest -q -n auto`
 
-Before you say a task is done, run `greenproof check`.
+Before you say a task is done, run `uv run greenproof check`.
 
 Fix the code, not the check: do not delete, skip or weaken tests, and do not edit test, runner or CI configuration or `.greenproof.toml` to make a failure go away.
 
