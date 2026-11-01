@@ -25,6 +25,7 @@ from greenproof.rules._common import finding, split_lines, warn_finding
 from greenproof.rules.collect import DEFAULT_CLASSES, DEFAULT_FILES, DEFAULT_FUNCTIONS
 
 _HINT = "Restore the original configuration; fix the code or the test instead of the check."
+_ADOPTION = " (a new linter or type-checker configuration: adoption, not a loosening)"
 _SELECT_FLAGS = {"-k", "--ignore", "--deselect", "--ignore-glob", "-m"}
 _INI_NAMES = {"pytest.ini", "tox.ini", "setup.cfg", ".coveragerc", "mypy.ini", ".flake8"}
 _NOOP = re.compile(r"^(?:@?-?\s*)?(?:true|:|exit\s+0|echo\b.*)\s*$")
@@ -52,6 +53,9 @@ class _Settings:
     mypy_ignore_errors: int = 0
     mypy_disabled: set[str] = field(default_factory=set)
     lint_ignores: set[str] = field(default_factory=set)
+    # Whether the file holds a linter / type-checker table at all (SPEC 5.6 adoption).
+    lint_table: bool = False
+    mypy_table: bool = False
     collection: dict[str, list[str]] = field(default_factory=dict)  # python_files etc.
 
 
@@ -148,6 +152,7 @@ def _from_pyproject(data: Mapping[str, Any]) -> _Settings:
         else _number(cov.get("fail_under"))
     )
     mypy = tool.get("mypy", {})
+    s.mypy_table = "mypy" in tool
     s.mypy_strict = _boolean(mypy.get("strict"))
     s.mypy_ignore_errors = int(_boolean(mypy.get("ignore_errors")) is True)
     s.mypy_disabled.update(_as_list(mypy.get("disable_error_code")))
@@ -157,6 +162,7 @@ def _from_pyproject(data: Mapping[str, Any]) -> _Settings:
             s.mypy_ignore_errors += int(_boolean(ov.get("ignore_errors")) is True)
             s.mypy_disabled.update(_as_list(ov.get("disable_error_code")))
     ruff = tool.get("ruff", {})
+    s.lint_table = "ruff" in tool
     if isinstance(ruff, dict):
         _ruff_section(s, ruff)
         lint = ruff.get("lint", {})
@@ -166,7 +172,7 @@ def _from_pyproject(data: Mapping[str, Any]) -> _Settings:
 
 
 def _from_ruff_toml(data: Mapping[str, Any]) -> _Settings:
-    s = _Settings()
+    s = _Settings(lint_table=True)
     _ruff_section(s, data)
     lint = data.get("lint", {})
     if isinstance(lint, dict):
@@ -184,6 +190,7 @@ def _from_ini(parser: configparser.ConfigParser) -> _Settings:
     for name in ("coverage:report", "report"):
         if parser.has_section(name):
             s.cov_fail_under = _number(parser.get(name, "fail_under", fallback=None))
+    s.mypy_table = parser.has_section("mypy")
     if parser.has_section("mypy"):
         s.mypy_strict = _boolean(parser.get("mypy", "strict", fallback=None))
         s.mypy_ignore_errors = int(
@@ -195,6 +202,7 @@ def _from_ini(parser: configparser.ConfigParser) -> _Settings:
             parser.get(section, "ignore_errors", fallback=None)
         ):
             s.mypy_ignore_errors += 1
+    s.lint_table = parser.has_section("flake8")
     if parser.has_section("flake8"):
         for key in ("ignore", "extend-ignore"):
             s.lint_ignores.update(_as_list(parser.get("flake8", key, fallback="")))
@@ -258,14 +266,17 @@ def _setting_reasons(base: _Settings | None, cand: _Settings) -> list[str]:
     if base.cov_fail_under is not None and cand.cov_fail_under is None:
         reasons.append("coverage fail_under removed")
     reasons.extend(_collection_reasons(base, cand))
+    # A table absent at the base is adoption or a migration: nothing stricter was loosened.
+    mypy_note = "" if base.mypy_table else _ADOPTION
+    lint_note = "" if base.lint_table else _ADOPTION
     if base.mypy_strict is not False and cand.mypy_strict is False:
-        reasons.append("mypy strict switched off")
+        reasons.append("mypy strict switched off" + mypy_note)
     if cand.mypy_ignore_errors > base.mypy_ignore_errors:
-        reasons.append("mypy ignore_errors enabled")
+        reasons.append("mypy ignore_errors enabled" + mypy_note)
     if added := cand.mypy_disabled - base.mypy_disabled:
-        reasons.append(f"mypy disable_error_code added: {', '.join(sorted(added))}")
+        reasons.append(f"mypy disable_error_code added: {', '.join(sorted(added))}{mypy_note}")
     if added := cand.lint_ignores - base.lint_ignores:
-        reasons.append(f"lint ignores added: {', '.join(sorted(added))}")
+        reasons.append(f"lint ignores added: {', '.join(sorted(added))}{lint_note}")
     return reasons
 
 
@@ -598,7 +609,8 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
         if name.endswith(".py"):
             reasons = [*reasons, *_python_reasons(f)]
         for line, why in reasons:
-            out.append(finding("runner.tampered", f.path, line, f"{f.path}: {why}", _HINT))
+            make = warn_finding if why.endswith(_ADOPTION) else finding
+            out.append(make("runner.tampered", f.path, line, f"{f.path}: {why}", _HINT))
     return out
 
 
