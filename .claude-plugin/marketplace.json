@@ -1,0 +1,17 @@
+{
+  "name": "greenproof",
+  "owner": {
+    "name": "Basant Bhattarai",
+    "url": "https://github.com/technobasant"
+  },
+  "metadata": {
+    "description": "Done gate for coding agents."
+  },
+  "plugins": [
+    {
+      "name": "greenproof",
+      "source": "./plugins/greenproof",
+      "description": "Done gate for coding agents: when the agent stops, greenproof runs your checks and blocks deleted, skipped or weakened tests."
+    }
+  ]
+}
