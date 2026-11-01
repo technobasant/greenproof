@@ -3,9 +3,9 @@
 All notable changes are listed here. The project follows [Semantic Versioning](https://semver.org/)
 and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-11-01
 
-First release. Nothing has been published yet.
+First release.
 
 ### Added
 

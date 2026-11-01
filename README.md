@@ -35,9 +35,6 @@ uvx greenproof --version         # run without installing
 pipx install greenproof          # or install it
 ```
 
-greenproof has not been published to a package index yet. Until it is, neither line will
-find it; install from a checkout with `uv sync` and run `uv run greenproof`.
-
 ## Quick start
 
 From the root of a git repository with at least one commit:
