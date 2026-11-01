@@ -1,0 +1,21 @@
+version = 1
+
+[commands]
+# setup: from uv.lock
+setup = "uv sync --frozen"
+# lint: from [tool.ruff] in pyproject.toml
+lint = "uv run ruff check ."
+# typecheck: from [tool.mypy] in pyproject.toml; edited to src, as the gate in AGENTS.md runs it
+typecheck = "uv run mypy src"
+# test: from [tool.pytest.ini_options] in pyproject.toml; edited to run in parallel (pytest-xdist)
+test = "uv run pytest -q -n auto"
+timeout = 900
+
+[modes.hook]
+checks = ["static", "commands"]
+
+[modes.local]
+checks = ["static", "commands"]
+
+[modes.ci]
+checks = ["static", "commands", "revert"]
