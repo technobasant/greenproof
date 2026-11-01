@@ -238,17 +238,40 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
 - an assertion made unreachable: an unconditional `return`/`raise` (outside a
   `pytest.raises`/`assertRaises` block) placed before it in the test body, or the
   assertion moved under `if False:`/`if 0:`. Unreachable assertions do not count;
-- severity split for replaced assertions: when the new assertion is the old comparison's
-  own operand (`assert total() == 100` → `assert total()`, `assert a == b` →
-  `assert a is not None`) the finding is `block`; when it is a different expression
-  (`assert f(x) == 1` → `assert is_one(x)`) it is `warn`, because that is often a
-  legitimate refactor.
+- an **exact check loosened**. An exact check pins a value: an `assert` whose test is a
+  single `==` or `is` comparison (including `is None`), `assertEqual`, `assertIs`,
+  `assertIsNone`, `assertListEqual`, `assertDictEqual`, `assertTupleEqual`,
+  `assertSetEqual`, `assertSequenceEqual`, `assertMultiLineEqual`, `assertCountEqual` or
+  `assertAlmostEqual`. Its **subjects** are its operands that are not constant (a literal,
+  or an operator, container or pure builtin over literals, as in the constant rule above),
+  compared as shapes after single-assignment locals are inlined. A **loose check** on `X`
+  is any other assertion in which `X` is: the whole test (`assert X`, `assertTrue(X)`); an
+  operand of `is not`, `!=`, `<`, `<=`, `>`, `>=`, `not in` (`assert X > 0`,
+  `assert 0 < X < 10`, `assertNotEqual`, `assertGreater`, `assertGreaterEqual`,
+  `assertLess`, `assertLessEqual`, `assertIsNotNone`); the first argument of `isinstance`,
+  `issubclass` or `assertIsInstance`; or wrapped as `type(X)`, `len(X)` or `bool(X)` in
+  any comparison (`assert type(X) is int`, `assert len(X) == 3`). A subject of an exact
+  check in the base test that is the subject of no exact check in the candidate test, and
+  is the target of a loose check there, is loosened: `tests.weakened` (block), "exact
+  check on `<X>` loosened to `<the new assertion's source>`". This includes
+  `assert total() == 100` → `assert total()`, → `assert total() > 0`, →
+  `assert isinstance(total(), int)` and `assert rows == [a, b]` → `assert len(rows) == 2`.
+  When the new assertion is a different expression (`assert f(x) == 1` →
+  `assert is_one(x)`) it is a `warn` for a strong check replaced by a different one,
+  because that is often a legitimate refactor.
 
 JS/TS, Go, Rust (line level, per test file): count of assertion calls drops (`expect(`,
 `assert.`, `t.Error`/`t.Fatal`/`require.`/`assert.`, `assert!`/`assert_eq!`), or strong
-matchers (`toEqual`, `toBe(`, `toStrictEqual`, `toMatchObject`, `toThrow(<arg>)`) are
-removed while weak ones (`toBeDefined`, `toBeTruthy`, `not.toThrow`, `toBeGreaterThanOrEqual(0)`)
-are added. An `expect(<literal>)` (number, string, `true`/`false`/`null`/`undefined`) is
+matchers are removed while weak ones are added: JS/TS strong `toEqual`, `toBe(`,
+`toStrictEqual`, `toMatchObject`, `toThrow(<arg>)`, weak `toBeDefined`, `toBeTruthy`,
+`toBeFalsy`, `not.toBeNull`, `not.toBeUndefined`, `not.toThrow`, `toBeGreaterThan`,
+`toBeGreaterThanOrEqual`, `toBeLessThan`, `toBeLessThanOrEqual`, `toBeInstanceOf`,
+`toHaveLength`, `expect.any(`, `not.toBe(`, `not.toEqual(`; Go strong `assert.Equal(`,
+`assert.EqualValues(`, `require.Equal(`, `require.EqualValues(`, weak `.NotNil(`,
+`.True(`, `.NotEmpty(`, `.Greater(`, `.GreaterOrEqual(`, `.Less(`, `.LessOrEqual(`,
+`.IsType(`, `.NotEqual(`, `.Len(`; Rust strong `assert_eq!(`, weak `assert_ne!(`,
+`.is_some())`, `.is_ok())`, `.is_empty())`, and `assert!(` lines containing `>`, `<`
+or `!=`. An `expect(<literal>)` (number, string, `true`/`false`/`null`/`undefined`) is
 vacuous and not counted, so `expect(add(1, 2)).toBe(3)` → `expect(3).toBe(3)` drops the count.
 
 ### 5.5 Suppressions (`suppress.added`, warn by default; each pattern its own sub-id in the message)
@@ -320,12 +343,16 @@ a rewrite, when all of these hold:
   the dotted name of a called function or method that is not a builtin, not
   pytest/unittest/mock vocabulary, and not bound inside the test itself;
 - their combined effective check count (5.4) is at least the removed tests';
-- none of their assertions is a truthiness or existence check on an operand of a
-  comparison the removed tests made (the 5.4 `block` case).
+- every subject of an exact check in the removed tests that the new tests check at all
+  is the subject of an exact check in the new tests (no loosened check, 5.4);
+- every literal expected value of the removed tests (the literal side of an exact
+  check) appears as a constant somewhere in the new tests (their assertions or their
+  parametrize cases). A rewrite keeps what the old tests pinned.
 
 Otherwise it is `block`. A removed test with no new test in its file stays
-`tests.removed` (block). Replacing `test_parse` with a test that calls `total`, or with
-a test whose inputs are constants, still blocks. A rename that rewrites the test into a
+`tests.removed` (block). Replacing `test_parse` with a test that calls `total`, with
+a test whose inputs are constants, or with `test_total_in_range` checking
+`0 < total() < 1000` where `test_total` checked `total() == 100`, still blocks. A rename that rewrites the test into a
 parametrized superset warns.
 
 ## 6. Agent and CI adapters
@@ -491,9 +518,11 @@ bench/              testwashing benchmark (milestone 4)
 1. Agent deletes `tests/test_math.py` → exit 1, `tests.deleted`.
 2. Agent adds `@pytest.mark.skip` to a failing test → exit 1, `tests.skipped` at the
    decorator line.
-3. Agent replaces `assert total == 100` with `assert total` → exit 1, `tests.weakened`.
-4. Agent deletes `test_a` and adds `test_b` in the same file → exit 1, `tests.replaced`
-   naming both.
+3. Agent replaces `assert total == 100` with `assert total`, `assert total > 0` or
+   `assert isinstance(total, int)` → exit 1, `tests.weakened`.
+4. Agent deletes `test_a` (`assert total() == 100`) and adds `test_b` in the same file
+   (`assert total() > 0` and `assert total() < 1000`) → exit 1, `tests.replaced` naming
+   both.
 5. Agent edits `.greenproof.toml` to set `test = "true"` → exit 1 `policy.changed`, and the
    test command that runs is the base's, which fails → also reported (exit stays 1).
 6. Agent adds `--deselect tests/test_api.py::test_x` to `addopts` → `runner.tampered`.
