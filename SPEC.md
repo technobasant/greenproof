@@ -44,11 +44,14 @@ Windows support (best effort only).
 ## 3. Commands
 
 ```
-greenproof init   [--yes] [--agents auto|none|claude,cursor,codex,gemini] [--ci github|none] [--no-verify]
+greenproof init   [--yes] [--agents auto|none|claude,cursor,codex,gemini] [--ci github|none]
+                  [--no-verify] [--hook-command CMD]
 greenproof check  [--base REF] [--mode local|hook|ci] [--hook claude|cursor|codex|gemini]
                   [--checks static,commands,revert,smoke] [--json PATH] [--markdown PATH]
-                  [--github-annotations] [--allow-policy-change] [--no-cache] [--isolate]
+                  [--github-annotations] [--github-accept] [--allow-policy-change]
+                  [--no-cache] [--isolate]
 greenproof session-start [--hook claude|cursor|codex|gemini]
+greenproof accept FINGERPRINT... [--reason TEXT] | --list | --revoke FINGERPRINT
 greenproof explain RULE_ID
 greenproof --version
 ```
@@ -330,30 +333,47 @@ parametrized superset warns.
 
 ## 6. Agent and CI adapters
 
-All adapters call the same `greenproof check`. Formats below must be verified against the
-vendor's current documentation at implementation time; record the doc URL in a code
-comment next to each adapter. If a vendor's format cannot be verified, ship that adapter as
-`experimental` (behind `--agents` explicitly) and say so in the README.
+All adapters call the same `greenproof check`. Each adapter module names the vendor
+document it was verified against (fetched 2026-11-01) in a comment. An adapter whose format
+cannot be verified ships as `experimental`: `init` installs it only when it is named in
+`--agents`, and the README says so.
 
-- **Claude Code**: `Stop` hook (and `SubagentStop`) → `greenproof check --mode hook --hook claude`.
-  On failure write the agent message to stderr and exit 2 (blocks and feeds the reason
-  back). `SessionStart` hook → `greenproof session-start`. `init` merges into
-  `.claude/settings.json` without clobbering existing keys or hooks; idempotent.
-- **Cursor**: `.cursor/hooks.json` `stop` hook → on failure return the documented JSON that
-  asks the agent to continue with the message (`followup_message` per current docs).
-- **Codex CLI** and **Gemini CLI**: their documented hook files, if verified; else
-  experimental.
-- **Any agent / human**: git `pre-push` via the pre-commit framework
-  (`.pre-commit-hooks.yaml` in this repo exposing `id: greenproof`, `stages: [pre-push]`).
-  `init` never changes `core.hooksPath` or git config.
-- **GitHub Actions**: composite `action.yml` at the repo root (inputs: `base`,
-  `checks`, `allow-policy-change`, `version`); it fetches the base ref, runs
-  `uvx --from <action path> greenproof check --mode ci --github-annotations --markdown
-  "$GITHUB_STEP_SUMMARY" --json greenproof.json`, uploads `greenproof.json` as an artifact,
-  and exposes `exit-code`. `init --ci github` writes `.github/workflows/greenproof.yml`
-  using it, with actions pinned to SHAs.
+- Claude Code: https://code.claude.com/docs/en/hooks.md
+- Cursor: https://cursor.com/docs/agent/hooks
+- Codex CLI: https://developers.openai.com/codex/hooks, schemas in
+  `openai/codex` under `codex-rs/hooks/schema/generated`
+- Gemini CLI: https://geminicli.com/docs/hooks/reference/
 
-**Agent message (hook mode)** — short, because it lands in the agent's context:
+### 6.1 Hook protocol (`check --hook AGENT`)
+
+`--hook AGENT` implies `--mode hook`; `--hook` with `--mode local` or `--mode ci` → exit 4.
+greenproof reads the hook payload from stdin: a JSON object of at most 1 MiB. A TTY, empty
+or unparseable stdin counts as `{}` and the gate still runs. From the payload it uses:
+
+| agent | session id | start directory | loop fields |
+|---|---|---|---|
+| claude | `session_id` | `cwd` | `stop_hook_active` (unused, see 6.2) |
+| cursor | `conversation_id` | `workspace_roots[0]` | `status`, `loop_count` |
+| codex | `session_id` | `cwd` | `stop_hook_active` (unused) |
+| gemini | `session_id` | `cwd` | `stop_hook_active` (unused) |
+
+The start directory, when it exists, replaces the process cwd for repo discovery. In hook
+mode stdout carries only the protocol output below, never the text report; `--json` and
+`--markdown` files are still written. The outcomes:
+
+| outcome | claude `Stop` | cursor `stop` | codex `Stop` | gemini `AfterAgent` |
+|---|---|---|---|---|
+| pass | exit 0, no output | exit 0, `{}` | exit 0, no output | exit 0, no output |
+| block | exit 2, agent message on stderr | exit 0, `{"followup_message": msg}` | exit 0, `{"decision": "block", "reason": msg}` | exit 0, `{"decision": "deny", "reason": msg}` |
+| release | exit 0, `{"continue": false, "stopReason": note}` | exit 0, `{}` | exit 0, `{"continue": false, "stopReason": note}` | exit 0, `{"continue": false, "stopReason": note}` |
+
+A Cursor payload whose `status` is not `completed` (the user aborted, or the turn errored)
+→ exit 0, `{}`, nothing runs. An error inside the check (what would be exit 4 or 5) is a
+failure for the rules in 6.2, with the message "greenproof could not run: <error>. Tell the
+user; do not edit greenproof's configuration to get past it." Fail closed, but never trap
+the agent.
+
+**Agent message** (block) — short, because it lands in the agent's context:
 
 ```
 greenproof: not done.
@@ -362,37 +382,229 @@ greenproof: not done.
         FAILED tests/test_api.py::test_refund_total - assert 99 == 100
 Fix the code, not the check. Do not delete, skip or weaken tests, or edit CI or test
 configuration to get green. If the requirement itself changed, stop and tell the user
-which test and why.
+which test and why. Never run `greenproof accept`; accepting a finding is the user's call.
 ```
 
-Output tails are capped at 40 lines in hook mode and 200 lines in reports.
+Output tails are capped at 40 lines in hook mode and 200 lines in reports. The **release
+note** is for the user: "greenproof: the agent stopped with the gate failing", the first
+five findings or failed commands, and "run `greenproof check` for the full report".
+
+### 6.2 Blocking without trapping the agent
+
+The gate cannot force an agent to keep working, and an agent that cannot fix something (a
+changed requirement, a suite that was red before it started) must be able to stop and tell
+the user. State lives in `<git-dir>/greenproof/hook-state.json` (per worktree): session id,
+candidate tree, consecutive block count and the last release note. Missing or malformed
+state counts as empty. In order:
+
+1. The candidate tree equals the base tree (nothing changed since the base) → pass without
+   running anything; the report notes "nothing to verify". A question-only turn never runs
+   the suite.
+2. Same session and same candidate tree as the last block → **release** without running
+   again: the agent was told and chose to stop without changing anything.
+3. Otherwise run the check. Pass → clear the state, pass. Failure → block and record the
+   tree, unless this would be the 8th consecutive block in the session, which releases.
+
+Local acceptances apply in hook mode (6.6). Cursor's own `loop_limit` (default 5) and
+Claude Code's cap of 8 consecutive stop-hook continuations still apply on top. All of this
+is advisory: the agent shares the user's shell and can edit the state file or the session
+marker. CI (6.5) is the authoritative gate.
+
+### 6.3 `session-start --hook AGENT`
+
+Writes the session marker and gives the agent its instructions:
+
+- The payload's `source` is `resume`, `compact` or `fork` → keep the existing marker while it
+  is still valid (an ancestor of HEAD); otherwise (`startup`, `clear`, absent, cursor) write a
+  new one.
+- Context, at most six lines: greenproof is the done gate here; the commands it runs (from
+  the policy at HEAD, when there is one); that it inspects the diff for deleted, skipped or
+  weakened tests and edits to test, runner or CI configuration; "Fix the code, not the
+  check. Never run `greenproof accept`; accepting a finding is the user's call."
+- Output: claude, codex and gemini `{"hookSpecificOutput": {"hookEventName":
+  "SessionStart", "additionalContext": text}}`; cursor `{"additional_context": text}`.
+- Never blocks: with `--hook`, any error → exit 0, nothing on stdout, one line on stderr.
+  Without `--hook`, errors use the normal exit codes.
+
+### 6.4 Hook configuration written by `init`
+
+The hook command is `greenproof` when it is on PATH at init time, else
+`uvx greenproof@<version>`; `--hook-command CMD` overrides it (for example
+`uv run greenproof`). Hook timeout = policy timeout × runnable commands + 60 seconds, at
+most 3600. An entry is greenproof's when its command contains `greenproof check --hook` or
+`greenproof session-start`. Re-running `init` replaces greenproof's entries and leaves
+every other key and hook untouched. An unparseable existing file → exit 4, nothing
+written. JSON is written with two-space indent and a trailing newline.
+
+- **Claude Code**: `.claude/settings.json`, the committed project file the team shares:
+
+  ```json
+  {"hooks": {
+    "Stop": [{"hooks": [{"type": "command", "command": "greenproof check --hook claude", "timeout": 960}]}],
+    "SessionStart": [{"matcher": "startup|resume|clear|compact",
+                      "hooks": [{"type": "command", "command": "greenproof session-start --hook claude"}]}]}}
+  ```
+
+  No `SubagentStop`: a subagent stopping midway through the parent's task would be blocked
+  for the parent's unfinished work. The parent's `Stop` is the gate.
+- **Cursor**: `.cursor/hooks.json`:
+  `{"version": 1, "hooks": {"stop": [{"command": "greenproof check --hook cursor", "timeout": 960}], "sessionStart": [{"command": "greenproof session-start --hook cursor"}]}}`.
+  No `subagentStop`, for the same reason.
+- **Codex CLI**: `.codex/hooks.json`, verified against `codex-rs/config/src/hook_config.rs`
+  (`HooksFile`) and `codex-rs/protocol/src/hooks.rs`: top-level keys `description` and
+  `hooks` only (unknown keys are rejected), events nested like Claude's (`Stop`;
+  `SessionStart` with matcher `startup|resume|clear|compact`), handler
+  `{"type": "command", "command": ..., "timeout": seconds}`. `init` prints: "Codex: review
+  and trust the new hooks once with /hooks; Codex skips untrusted project hooks."
+- **Gemini CLI**: experimental. Gemini CLI was superseded by Antigravity CLI on 2026-06-18,
+  and the open issue google-gemini/gemini-cli#27712 reports `AfterAgent` hooks not firing.
+  `.gemini/settings.json`: `AfterAgent` (matcher `*`, `"name": "greenproof"`, timeout in
+  **milliseconds**) and `SessionStart` (matcher `startup|resume|clear`).
+
+Every agent treats a hook that cannot start as a non-blocking error, so hooks fail open
+when the greenproof executable is missing. The README says so; CI is the backstop.
+
+### 6.5 CI
+
+- **pre-commit framework**: `.pre-commit-hooks.yaml` exposes `id: greenproof`,
+  `entry: greenproof check`, `language: python`, `pass_filenames: false`,
+  `always_run: true`, `stages: [pre-push]`. `init` never changes `core.hooksPath` or git
+  config.
+- **GitHub Action**: a composite `action.yml` at the repo root. Inputs: `base`, `checks`,
+  `allow-policy-change` (default `false`), `accept-comments` (default `true`), `token`
+  (default `${{ github.token }}`). Output: `exit-code`. Steps: setup-uv; when the checkout
+  is shallow, `git fetch --no-tags --unshallow origin` and fetch the base branch; run
+  `uvx --from "$GITHUB_ACTION_PATH" greenproof check --mode ci --github-annotations
+  --markdown "$GITHUB_STEP_SUMMARY" --json greenproof.json`, plus `--github-accept` when
+  `accept-comments` is true; upload `greenproof.json` with upload-artifact (`if: always()`);
+  exit with greenproof's code. Inputs reach `run:` only through `env:`, never by `${{ }}`
+  interpolation.
+- **Workflow from `init --ci github`**: `.github/workflows/greenproof.yml`, independent of
+  the action so that it needs no release SHA of greenproof. `on: pull_request`;
+  `permissions: {contents: read, pull-requests: read}`; checkout with `fetch-depth: 0` and
+  `persist-credentials: false`; toolchain steps for the detected stacks (section 7);
+  setup-uv; `uvx greenproof@<version> check --mode ci --github-annotations --github-accept
+  --markdown "$GITHUB_STEP_SUMMARY" --json greenproof.json` with `GITHUB_TOKEN` in `env`;
+  upload-artifact with `if: always()`. An existing workflow file is kept unless `--yes`.
+- Every third-party action is pinned to a full commit SHA with the release tag in a
+  comment. The pins live in one module, `pins.py`, and a test keeps `action.yml` in step
+  with it.
+
+### 6.6 Accepting a finding
+
+A legitimate change (dropping the test of a removed feature, a platform skip) needs a way
+through that an agent cannot forge.
+
+- Every finding carries a `fingerprint`: the first 12 hex digits of sha256 over rule, path
+  and message, with line references (`line N`, `:N`) removed from the message. Messages
+  name the test and the evidence, so a fingerprint survives reruns and unrelated edits, and
+  a different tamper gets a different one.
+- **Locally (advisory).** `greenproof accept FINGERPRINT... [--reason TEXT]` records each in
+  `<git-common-dir>/greenproof/accepted.json` with the time and `git config user.name` /
+  `user.email`; `accept --list` prints them and `accept --revoke FINGERPRINT` removes one.
+  Local and hook modes honour these; ci mode ignores them. Agent messages say never to run
+  it, and every report lists accepted findings with who accepted them and when.
+- **In CI (authoritative).** With `--github-accept` in ci mode on a `pull_request` or
+  `pull_request_target` event, greenproof reads the PR's issue comments (`GITHUB_API_URL`,
+  `GITHUB_REPOSITORY`, the PR number from `GITHUB_EVENT_PATH`, `GITHUB_TOKEN`; stdlib
+  `urllib`, 10-second timeout, following `Link` pagination). A line
+  `/greenproof accept FP [FP ...]` in a comment whose `author_association` is `OWNER`,
+  `MEMBER` or `COLLABORATOR` and whose `user.type` is `User` accepts those fingerprints.
+  Bots and outside contributors cannot accept. Any API failure → no acceptances and a note
+  in the report (fail closed). When a finding blocks, the job summary shows the exact
+  comment to post and says to re-run the job. The workflow does not trigger on comments:
+  an `issue_comment` workflow runs with base-branch privileges, a known injection path.
+- An accepted finding keeps its severity, is marked accepted and does not affect the exit
+  code. It shows as `ACCEPTED` in text, in its own Markdown table and as a `::notice`
+  annotation.
 
 ## 7. `init`
 
-1. Detect stacks present (multiple allowed): Python (`pyproject.toml`, `setup.cfg`,
-   `requirements*.txt`; runner uv/poetry/pip by lockfile), Node (`package.json`; package
-   manager by lockfile: pnpm/yarn/bun/npm), Go (`go.mod`), Rust (`Cargo.toml`), plus
-   `Makefile`/`justfile` targets named `test`, `lint`, `check`, `typecheck`.
-2. Propose `[commands]` from what exists (only real scripts/targets/tools; never invent a
-   tool the repo does not use). Unless `--no-verify`, run each proposed command once with
-   the timeout and record pass/fail; a command that fails at adoption is kept but reported
-   ("the suite is red before greenproof; fix or remove before relying on the gate").
-3. Write `.greenproof.toml` (refuse to overwrite without `--yes`).
-4. Write or update a `## Verify` section in `AGENTS.md` between
-   `<!-- greenproof:begin -->` / `<!-- greenproof:end -->` markers listing the commands and
-   the rule "run `greenproof check` before saying you are done". If `CLAUDE.md` exists,
-   add an `@AGENTS.md` import line inside the same markers (Claude Code only reads
-   AGENTS.md when there is no CLAUDE.md).
-5. Install hooks for detected agents (`.claude/`, `.cursor/`, `.codex/`, `.gemini/`
-   present, or explicitly listed), and the CI workflow if `--ci github`.
-6. Print a summary of every file written or changed. Re-running `init` is idempotent.
+`greenproof init [--yes] [--agents auto|none|LIST] [--ci github|none] [--no-verify]
+[--hook-command CMD]`. It never prompts, so agents and CI can run it.
+
+1. **Detect** stacks at the repository root (several may apply):
+   - Python: `pyproject.toml`, `setup.py`, `setup.cfg` or `requirements*.txt`. Runner
+     prefix: `uv.lock` → `uv run `, `poetry.lock` → `poetry run `, else none and tools run
+     as `python -m <tool>`.
+   - Node: `package.json`. Package manager by lockfile: `pnpm-lock.yaml` pnpm, `yarn.lock`
+     yarn, `bun.lock` or `bun.lockb` bun, else npm.
+   - Go: `go.mod`. Rust: `Cargo.toml`.
+   - Targets `test`, `lint`, `check`, `typecheck` in `Makefile`, `GNUmakefile` or `justfile`
+     (a rule line starting at column 0: `name:` for make; `name:` or `name args...:` for
+     just).
+2. **Propose `[commands]`** from evidence only; never a tool the repo does not use:
+   - `test`: a make/just `test` target; else pytest (evidence: `[tool.pytest.ini_options]`,
+     `pytest.ini`, a `conftest.py`, or `pytest` named in pyproject dependencies,
+     optional-dependencies or dependency-groups, or in `requirements*.txt`) →
+     `<prefix>pytest -q` (`python -m pytest -q` without a prefix); Node `scripts.test`,
+     unless it is npm's placeholder (`echo "Error: no test specified" && exit 1`) →
+     `npm test`, `pnpm test`, `yarn test` or `bun run test`; Go → `go test ./...`;
+     Rust → `cargo test`.
+   - `lint`: a make/just `lint` target, else a `check` target; else ruff (`[tool.ruff]`,
+     `ruff.toml`, `.ruff.toml` or named in dependencies) → `<prefix>ruff check .`; Node
+     `scripts.lint` → `<pm> run lint`; Go: golangci config (`.golangci.yml`, `.yaml` or
+     `.toml`) → `golangci-lint run`, else `go vet ./...`; Rust with `clippy.toml` or
+     `.clippy.toml` → `cargo clippy --all-targets`.
+   - `typecheck`: a make/just `typecheck` target; else mypy (`[tool.mypy]`, `mypy.ini`,
+     `.mypy.ini` or named in dependencies) → `<prefix>mypy .`; pyright (`[tool.pyright]` or
+     `pyrightconfig.json`) → `<prefix>pyright`; Node `scripts.typecheck` or
+     `scripts["type-check"]` → `<pm> run <name>`.
+   - `build`: Node `scripts.build` → `<pm> run build`. Nothing else in v0.1.
+   - `setup` (section 8): `uv.lock` → `uv sync --frozen`; `poetry.lock` →
+     `poetry install`; `requirements.txt` → `python -m pip install -r requirements.txt`;
+     npm with a lockfile → `npm ci`; pnpm → `pnpm install --frozen-lockfile`; yarn →
+     `yarn install --immutable` when `.yarnrc.yml` exists, else
+     `yarn install --frozen-lockfile`; bun → `bun install --frozen-lockfile`; Go →
+     `go mod download`; Rust → `cargo fetch`.
+   - When several stacks fill one slot, the commands are joined with ` && ` in the order
+     Python, Node, Go, Rust. A make/just target replaces the language-derived command for
+     its slot.
+   - Nothing detected → a policy with empty commands and a summary line saying so; the
+     static checks still work.
+3. **Verify**, unless `--no-verify`: run each proposed command except `setup` once, in place,
+   with the timeout, and record pass, fail or timeout. A red command is kept and reported:
+   "the suite is red before greenproof; fix it or remove it before relying on the gate".
+4. **Write `.greenproof.toml`**: `version = 1`; the commands, each with a comment saying
+   where it came from; `timeout = 900`; `[modes.hook]` and `[modes.local]` checks
+   `["static", "commands"]`, `[modes.ci]` checks `["static", "commands"]`. An existing
+   policy is kept (and used for the rest of init) unless `--yes`.
+5. **AGENTS.md**: a section between `<!-- greenproof:begin -->` and `<!-- greenproof:end -->`
+   with the heading `## Verify`, the commands, "Before you say a task is done, run
+   `greenproof check`.", the fix-the-code rule and "Never run `greenproof accept`". Create
+   the file when it is missing, append the section when there are no markers, replace
+   between the markers otherwise. **CLAUDE.md**: when it exists and has no `@AGENTS.md`
+   line, add one inside its own marker pair at the end (so Claude Code, which
+   reads CLAUDE.md, sees the section too). Never create CLAUDE.md.
+6. **Hooks** (6.4). `--agents auto` (the default) installs claude when `.claude/` or
+   `CLAUDE.md` exists, cursor when `.cursor/` exists, codex when `.codex/` exists; never
+   gemini. `none` installs nothing. A list installs
+   exactly those, experimental ones with a warning.
+7. **CI** (`--ci github`; default `none`, and then the summary suggests `--ci github` when
+   `.github/workflows/` exists). Toolchain steps by stack: uv → setup-uv only (uv installs
+   Python); other Python → actions/setup-python (`python-version-file: .python-version`
+   when present, else `python-version: "3.x"`); Node → actions/setup-node
+   (`node-version-file` from `.nvmrc` or `.node-version` when present, else
+   `node-version: lts/*`) plus `corepack enable` for pnpm and yarn; bun →
+   oven-sh/setup-bun; Go → actions/setup-go (`go-version-file: go.mod`); Rust → nothing
+   (the runner image ships rustup). Dependencies install through `setup`, which greenproof
+   runs in ci mode, so the workflow has no install step of its own.
+8. **Summary**: each file `created`, `updated`, `unchanged` or `kept`, the verification
+   results and next steps. Exit 0 even when a command was red; 4 on an unparseable existing
+   config file; 5 on an internal error.
+
+`init` works in a repository without commits (the summary says `check` needs one) and never
+commits.
 
 ## 8. Commands, revert and smoke
 
 - **commands**: run each configured command with `sh -c` in the candidate tree (in place by
-  default; inside the isolated worktree with `--isolate`, after `setup`). The environment
-  is inherited unchanged except for `GREENPROOF=1`. Kill the whole process group on timeout.
-  Record exit code, duration, timed-out flag, output tail.
+  default; inside the isolated worktree with `--isolate`). The environment is inherited
+  unchanged except for `GREENPROOF=1`. Kill the whole process group on timeout. Record exit
+  code, duration, timed-out flag, output tail. `setup` runs first in ci mode (a fresh
+  checkout) and inside isolated worktrees, never in local or hook mode, where the
+  developer's environment is already set up. When `setup` fails, the remaining commands do
+  not run and the check fails with exit 2.
 - **revert** (`revert.passes_without_change`, default warn; block in CI if configured):
   only when the change touches both test files and non-test source. Build a worktree from
   the **base tree with the candidate's test files overlaid**, run `setup`, then run only
@@ -409,14 +621,19 @@ Output tails are capped at 40 lines in hook mode and 200 lines in reports.
 - JSON (`--json`): `{"schema": "greenproof/report@1", "version", "mode", "base": {"ref",
   "sha"}, "candidate": {"tree", "dirty"}, "policy": {"source", "sha256"}, "checks":
   [{"id", "status", "duration_ms"}], "findings": [{"rule", "severity", "file", "line",
-  "message", "hint"}], "commands": [{"name", "cmd", "exit_code", "duration_ms",
-  "timed_out", "output_tail"}], "verdict": "pass|fail|error", "exit_code", "cached",
-  "error"?}`. Check status is `pass|fail|skipped`. In an `error` report (exit 4 or 5,
+  "message", "hint", "fingerprint", "accepted"}], "commands": [{"name", "cmd",
+  "exit_code", "duration_ms", "timed_out", "output_tail"}], "notes": [str], "verdict":
+  "pass|fail|error", "exit_code", "cached", "error"?}`. `accepted` is null or
+  `{"by", "at", "source": "local|github", "reason"}`; `notes` carries lines such as
+  "nothing to verify" or "could not read PR comments: ...". Check status is `pass|fail|skipped`. In an `error` report (exit 4 or 5,
   still written when `--json` is given) `base`, `candidate` and `policy` may be null and
   `error` carries the message. Ship a JSON Schema file and test the output against it.
-- Markdown (`--markdown`): table of findings and commands for the job summary.
+- Text shows each finding's fingerprint (`[fp 3f9a1c2e01ab]`) so a user can accept it.
+- Markdown (`--markdown`): verdict; findings table with fingerprints; accepted findings in
+  their own table; commands table; output tails of failed commands in `<details>`; when a
+  finding blocks on a PR, the comment a maintainer can post to accept it (6.6).
 - GitHub annotations (`--github-annotations`): `::error file=…,line=…,title=<rule>::msg`
-  for block, `::warning` for warn.
+  for block, `::warning` for warn, `::notice` for accepted.
 
 ## 10. Repository layout and engineering rules
 
@@ -432,6 +649,9 @@ src/greenproof/
   revert.py, smoke.py
   report.py         text/json/markdown/annotations, verdict and exit code
   cache.py
+  hooks.py          hook payloads, per-agent output protocol, hook state and release rules
+  accept.py, github.py   local acceptances, PR comment acceptances
+  pins.py           SHA pins for third-party actions
   init/             detect.py, write_policy.py, agents_md.py, hooks/{claude,cursor,codex,gemini}.py, ci_github.py
   schema/report-v1.json
 tests/              pytest; fixture repos are built in tmp dirs by helpers (real git)
@@ -458,21 +678,21 @@ bench/              testwashing benchmark (milestone 4)
   commands runner; cache; text + JSON report with schema; exit codes; `check` and
   `explain`. Done when: `uv run pytest` green with ≥ 85% coverage, ruff + mypy strict
   clean, and the M1 acceptance scenarios below pass.
-- **M2 — adoption.** `init` (detection, verification run, policy, AGENTS.md/CLAUDE.md,
-  hooks for Claude Code and Cursor verified against current docs, Codex/Gemini verified or
-  experimental, CI workflow), `session-start`, hook modes, Markdown + annotations,
-  `action.yml`, `.pre-commit-hooks.yaml`. Done when: `init` on fixture repos for each stack
-  produces working config, and a scripted Claude Code Stop-hook payload is blocked/passed
-  correctly.
-  **Accepting a finding.** A legitimate change (dropping a test for removed behaviour, a
-  platform skip) needs an acceptance an agent cannot forge. Locally, an agent shares the
-  user's shell, so acceptance there is advisory. `greenproof accept <fingerprint>` records
-  it under the git dir with the time and git identity. Hook messages tell agents never to
-  run it, and the report lists every accepted finding. In CI, the authoritative gate,
-  acceptance is a PR label applied by a maintainer (`greenproof:accept`, name set in the
-  base policy). The action reads it from the event and honours it only when the label was
-  applied after the head commit was pushed. The fingerprint is the rule, path and test name
-  plus a digest of the finding's evidence, stable across reruns of the same change.
+- **M2 — adoption**, in two parts built in parallel on separate branches:
+  - **M2a runtime**: the hook protocol for the four agents and the release rules (6.1–6.3),
+    fingerprints, `accept` and `--github-accept` (6.6), `setup` in ci mode (section 8),
+    the report changes (section 9), `.pre-commit-hooks.yaml`. Done when scripted payload
+    tests for each agent cover pass, block, release on an unchanged tree, the 8-block cap,
+    nothing to verify, a Cursor payload that is not `completed` and an internal error; and
+    the PR comment reader is tested against recorded API JSON (no network in tests),
+    including a bot, an outside contributor, pagination and an API failure.
+  - **M2b init**: section 7, the hook installers (6.4), the workflow writer, `pins.py` and
+    `action.yml` (6.5). Done when `init` on fixture repos (Python with uv, Python with pip,
+    Node with npm, Node with pnpm, Go, Rust, and a mixed repo) produces the expected policy,
+    AGENTS.md, hooks and workflow; a second run changes nothing byte for byte; an existing
+    hook file keeps its other hooks; and the generated workflow and `action.yml` parse as
+    YAML in tests (PyYAML as a dev dependency only) and pass `actionlint` and `zizmor` when
+    they are installed.
 - **M3 — execution depth.** revert check, smoke runner, `code.hardcoded`, `tests.self_mocked`,
   `--isolate`.
 - **M4 — benchmark and release prep.** `bench/`: ≥ 30 cases (tamper patterns from the
