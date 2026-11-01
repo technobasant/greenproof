@@ -295,7 +295,10 @@ vacuous and not counted, so `expect(add(1, 2)).toBe(3)` → `expect(3).toBe(3)` 
 Line-engine assertion vocabulary also includes: JS/TS `expectTypeOf(`, `assertType(` and
 a testing-library query that throws when the element is missing (`getBy…(`,
 `getAllBy…(`, and awaited `findBy…(`/`findAllBy…(`, bare or on `screen.`), counted only on
-a line with no other assertion call, and not when its result is bound to a name
+a line with no other assertion call, not inside the arguments of an `expect(` still open from
+an earlier line (parenthesis depth on the comment- and string-masked text, so a
+Prettier-wrapped `expect(\n  await screen.findByText('a'),\n).toBeInTheDocument()` counts
+once), and not when its result is bound to a name
 (`const el = await findByText('a')`) that a later `expect(el` in the same test reads, since
 that `expect` already counts. So `expect(getByText('a')).toBeVisible()` and the bound pair
 `const el = await findByText('a')` + `expect(el).toBeVisible()` both count once, and
