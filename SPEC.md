@@ -293,8 +293,10 @@ or `!=`. An `expect(<literal>)` (number, string, `true`/`false`/`null`/`undefine
 vacuous and not counted, so `expect(add(1, 2)).toBe(3)` → `expect(3).toBe(3)` drops the count.
 
 Line-engine assertion vocabulary also includes: JS/TS `expectTypeOf(`, `assertType(` and
-an awaited testing-library query (`await findBy…(`, `await findAllBy…(`, and the same on
-`screen.`), which fails when the element never appears. Go **assertion helpers**: a
+a testing-library query that throws when the element is missing (`getBy…(`,
+`getAllBy…(`, and awaited `findBy…(`/`findAllBy…(`, bare or on `screen.`), counted only on
+a line with no other assertion call, so `expect(getByText('a')).toBeVisible()` counts once
+and `findByText` → `getByText` is not a drop; `queryBy…` returns null and is not counted. Go **assertion helpers**: a
 function declared in a `_test.go` file of the same directory (package) that takes a
 `*testing.T`, `*testing.B`, `*testing.F` or `testing.TB` parameter and contains an
 assertion call, directly or by calling another assertion helper, is an assertion helper.
