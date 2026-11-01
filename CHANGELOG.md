@@ -14,8 +14,9 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `init` writes), and the agent then runs both in parallel. Everything after repository
   discovery runs under an exclusive lock on `<git-dir>/greenproof/hook.lock`, the hook state
   records the payload's fingerprint (a sha256 of the sorted, compact payload), the decision
-  and the block message, and a second hook for the same stop outputs that decision again
-  (at most three replays) instead of finding the first one's block and releasing the agent.
+  and the block message, and a second hook for the same stop (same payload, same tree)
+  outputs that decision again (at most three replays) instead of finding the first one's
+  block and releasing the agent.
   When the lock file cannot be opened, the hook runs without the lock.
 - `fork` in the SessionStart matchers of the Claude Code and Codex CLI hooks `init` writes.
   Both agents document it as a source; the session marker is kept, as for `resume`.

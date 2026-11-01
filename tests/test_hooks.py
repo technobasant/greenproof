@@ -673,14 +673,16 @@ def test_a_replay_uses_its_own_agents_protocol(tmp_path: Path, fire) -> None:
 
 
 def test_the_same_payload_replays_a_pass_and_a_release(tmp_path: Path, fire) -> None:
-    repo = gate(tmp_path, "test -f ok")
+    ran = tmp_path / "ran.log"
+    repo = gate(tmp_path, f"echo run >> {ran}; test -f ok")
     repo.write("app.py", "x = 1\n")
     expect_block("codex", fire("codex", payload("codex", repo)))
     repo.write("ok", "")
     body = payload("codex", repo)
     expect_pass("codex", fire("codex", body))
-    repo.remove("ok")  # the tree would now fail, but the stop was already decided: pass
+    assert ran.read_text() == "run\nrun\n"
     expect_pass("codex", fire("codex", body, "--json", str(tmp_path / "p.json")))
+    assert ran.read_text() == "run\nrun\n"  # replayed, not run
     assert "replayed the decision" in " ".join(load_json(tmp_path / "p.json")["notes"])
     assert _stop_state(repo).replays == 1
 
@@ -692,7 +694,6 @@ def test_the_same_payload_replays_a_pass_and_a_release(tmp_path: Path, fire) -> 
     repo2.write("app.py", "x = 8\n")
     body2 = payload("claude", repo2)
     note = expect_release("claude", fire("claude", body2))
-    repo2.write("app.py", "x = 9\n")  # a changed tree does not matter to a replay
     assert expect_release("claude", fire("claude", body2)) == note
     assert _stop_state(repo2).replays == 1
 
@@ -719,7 +720,8 @@ def test_replays_stop_after_three(tmp_path: Path, fire) -> None:
         assert _stop_state(repo).replays == replay
     # From the fourth on the normal rules apply: same session, same tree as the block.
     expect_release("claude", fire("claude", body))
-    assert _stop_state(repo).replays == 3  # rule 2 changes nothing in the state
+    state = _stop_state(repo)  # rule 2 released and recorded the release itself
+    assert (state.decision, state.replays) == ("release", 0)
 
 
 def test_a_later_payload_on_the_same_tree_releases(tmp_path: Path, fire) -> None:
@@ -727,7 +729,7 @@ def test_a_later_payload_on_the_same_tree_releases(tmp_path: Path, fire) -> None
     repo.write("app.py", "x = 1\n")
     expect_block("claude", fire("claude", payload("claude", repo)))
     expect_release("claude", fire("claude", payload("claude", repo)))
-    assert _stop_state(repo).decision == "block"  # rule 2 records nothing new
+    assert _stop_state(repo).decision == "release"  # rule 2 records its release
     body = payload("claude", repo)
     expect_release("claude", fire("claude", body))
     expect_release("claude", fire("claude", body))
@@ -864,3 +866,76 @@ def test_two_concurrent_hooks_for_one_stop_give_one_decision(tmp_path: Path, fir
     assert (state.decision, state.blocks, state.replays) == ("block", 1, 1)
     # The next stop (a different payload) on the same tree releases instead of blocking.
     expect_release("claude", fire("claude", payload("claude", repo)))
+
+
+# ---- duplicate hooks: replay needs the same tree, a rule-2 release records itself ----------
+
+
+def test_a_repeated_payload_on_a_changed_tree_runs_the_check_instead_of_replaying_a_pass(
+    tmp_path: Path, fire
+) -> None:
+    repo = gate(tmp_path, "test -f ok")
+    repo.write("app.py", "x = 1\n")
+    repo.write("ok", "")
+    body = payload("claude", repo)
+    expect_pass("claude", fire("claude", body))
+    assert _stop_state(repo).decision == "pass"
+    # A later stop whose payload happens to repeat, on a tree that now fails.
+    repo.remove("ok")
+    message = expect_block("claude", fire("claude", body))
+    assert "FAIL  test  test -f ok" in message
+    state = _stop_state(repo)
+    assert (state.decision, state.blocks, state.replays) == ("block", 1, 0)
+
+
+def test_a_rule_2_release_records_itself_so_the_old_block_is_not_replayed(
+    tmp_path: Path, fire
+) -> None:
+    repo = gate(tmp_path, FAILING)
+    repo.write("app.py", "x = 1\n")
+    first = payload("claude", repo)
+    expect_block("claude", fire("claude", first))
+    # A later stop on the same tree: rule 2 releases and records the release.
+    expect_release("claude", fire("claude", payload("claude", repo)))
+    assert _stop_state(repo).decision == "release"
+    # The first payload again on the same tree (a question-only turn): released, not the old
+    # block replayed.
+    expect_release("claude", fire("claude", first))
+    state = _stop_state(repo)
+    assert (state.decision, state.fingerprint) == ("release", hooks.payload_fingerprint(first))
+
+
+def test_a_duplicate_of_a_rule_2_release_replays_the_release(tmp_path: Path, fire) -> None:
+    repo = gate(tmp_path, FAILING)
+    repo.write("app.py", "x = 1\n")
+    expect_block("claude", fire("claude", payload("claude", repo)))
+    body = payload("claude", repo)
+    note = expect_release("claude", fire("claude", body))
+    assert _stop_state(repo).replays == 0
+    assert (
+        expect_release("claude", fire("claude", body, "--json", str(tmp_path / "r.json"))) == note
+    )
+    assert _stop_state(repo).replays == 1
+    assert any("replayed the decision" in n for n in load_json(tmp_path / "r.json")["notes"])
+
+
+def test_two_hooks_that_cannot_locate_the_tree_give_one_block(
+    tmp_path: Path, fire, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = gate(tmp_path)
+    repo.write("app.py", "x = 1\n")
+    calls: list[int] = []
+
+    def broken(*_a: Any, **_k: Any) -> None:
+        calls.append(1)
+        raise GreenproofError("no tree today")
+
+    monkeypatch.setattr(pipeline, "locate", broken)
+    body = payload("claude", repo)
+    first = expect_block("claude", fire("claude", body))
+    assert "greenproof could not run: no tree today." in first
+    second = expect_block("claude", fire("claude", body))
+    assert second == first
+    assert len(calls) == 2  # one locate per hook, none repeated inside a hook
+    state = _stop_state(repo)
+    assert (state.tree, state.decision, state.blocks, state.replays) == ("", "block", 1, 1)

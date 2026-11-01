@@ -530,10 +530,11 @@ or unparseable stdin counts as `{}` and the gate still runs. From the payload it
 The **payload fingerprint** is the sha256 of the payload object serialized with sorted
 keys and compact separators. An empty payload (`{}`, which is also what a TTY or
 unparseable stdin counts as) has no fingerprint. Two hooks run for the same stop receive
-the same payload; a later stop differs in at least one field (Claude Code's
+the same payload; a later stop usually differs in at least one field (Claude Code's
 `stop_hook_active` and `last_assistant_message`, Codex's `turn_id`, Cursor's
-`loop_count`, the OpenCode plugin's `message_id`). It is used only by 6.2's duplicate
-rule.
+`loop_count`, the OpenCode plugin's `message_id`), but not always: a payload can repeat
+across stops. It is used only by 6.2's duplicate rule, which therefore also requires the
+same tree: a repeated payload on a changed tree runs the check.
 
 The start directory, when it exists, replaces the process cwd for repo discovery. In hook
 mode stdout carries only the protocol output below, never the text report; `--json` and
@@ -608,14 +609,21 @@ So:
   decision (`pass`, `block` or `release`), the agent message of a block, and a replay
   count. A pass now writes state (decision `pass`, zero blocks) instead of clearing it.
   Rule 1 (nothing to verify) still clears it.
-- After taking the lock and before rule 1: when the payload has a fingerprint, the state
-  has the same session and the same fingerprint, and its replay count is below 3, the hook
-  outputs the recorded decision again in its own agent's protocol (pass; block with the
-  recorded message; release with the recorded note), adds one to the replay count and
-  changes nothing else. The report notes "replayed the decision of another greenproof
-  hook for this stop". From the fourth replay on, the normal rules apply.
-- Rule 2 applies only when the recorded decision is `block` or `release`. A recorded pass
-  counts as zero previous blocks in rule 3.
+- The order under the lock is: locate the candidate tree, replay, rule 1, rule 2, rule 3.
+  The tree is `""` when locating it failed; that failure then goes straight to the
+  failure path of rule 3, without locating again. The **replay**: when the payload has a
+  fingerprint, and the state has the same session, the same fingerprint and the same tree,
+  and its replay count is below 3, the hook outputs the recorded decision again in its own
+  agent's protocol (pass; block with the recorded message; release with the recorded
+  note), adds one to the replay count and changes nothing else. The report notes
+  "replayed the decision of another greenproof hook for this stop". From the fourth replay
+  on, the normal rules apply. Because the tree must match, a repeated payload on a changed
+  tree never replays an earlier decision, a pass included.
+- Rule 2 applies only when the recorded decision is `block` or `release`. A rule-2 release
+  records itself: it saves the state with the payload's fingerprint, decision `release` and
+  zero replays, so a duplicate hook for that stop replays the release and the earlier
+  block's fingerprint cannot be replayed later. A recorded pass counts as zero previous
+  blocks in rule 3.
 - A state file without these fields (written by 0.1.0) counts as decision `block` with no
   fingerprint and zero replays.
 

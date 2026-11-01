@@ -420,18 +420,31 @@ def run_hook(agent: str, payload: Payload, opts: pipeline.CheckOptions) -> HookR
 
 def _decide(agent: str, repo: Path, payload: Payload, opts: pipeline.CheckOptions) -> HookResult:
     state = load_state(repo)
+    candidate: pipeline.Candidate | None = None
+    located: Exception | None = None
+    try:
+        candidate = pipeline.locate(opts, repo)
+    except Exception as exc:  # fail closed below, after the replay check
+        located = exc
+    # The current tree is "" when it could not be determined, the tree a failure before the
+    # tree was known records.
+    tree = candidate.tree if candidate is not None else ""
+    # A payload can repeat across stops, so a replay also needs the same tree: a changed tree
+    # is new work and runs the check.
     if (
         state is not None
         and payload.fingerprint is not None
         and state.session == payload.session_id
         and state.fingerprint == payload.fingerprint
+        and state.tree == tree
         and state.replays < MAX_REPLAYS
     ):
         return _replay(agent, repo, state)
 
-    candidate: pipeline.Candidate | None = None
     try:
-        candidate = pipeline.locate(opts, repo)
+        if located is not None:
+            raise located
+        assert candidate is not None
         if pipeline.nothing_to_verify(candidate):
             clear_state(repo)
             result = protocol_pass(agent)
@@ -443,6 +456,11 @@ def _decide(agent: str, repo: Path, payload: Payload, opts: pipeline.CheckOption
             and state.session == payload.session_id
             and state.tree == candidate.tree
         ):
+            # The release records itself, so a duplicate hook for this stop replays it and
+            # the earlier block's fingerprint cannot be replayed later.
+            save_state(
+                repo, replace(state, fingerprint=payload.fingerprint, decision="release", replays=0)
+            )
             result = protocol_release(agent, state.note)
             result.report = _released_report(state, candidate)
             return result
