@@ -1,7 +1,10 @@
 """Codex CLI hook installer. Verified against https://developers.openai.com/codex/hooks and
 the schemas in openai/codex under codex-rs/hooks/schema/generated (fetched 2026-11-01); the
 file shape follows codex-rs/config/src/hook_config.rs (`HooksFile`): top-level keys
-`description` and `hooks` only, events nested like Claude Code's."""
+`description` and `hooks` only, events nested like Claude Code's. The SessionStart matcher
+lists `fork` because Codex's source enum has it: `SessionStartSource` in
+codex-rs/hooks/src/events/session_start.rs has Startup, Resume, Clear, Compact and Fork, with
+`as_str()` values "startup", "resume", "clear", "compact" and "fork" (checked 2026-11-01)."""
 
 from __future__ import annotations
 
@@ -28,7 +31,7 @@ def render(existing: str | None, hook_command: str, timeout: int) -> str:
         ]
     }
     start = {
-        "matcher": "startup|resume|clear|compact",
+        "matcher": "startup|resume|clear|compact|fork",
         "hooks": [{"type": "command", "command": f"{hook_command} session-start --hook codex"}],
     }
     set_grouped_event(table, "Stop", stop, PATH)

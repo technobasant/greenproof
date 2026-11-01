@@ -236,7 +236,11 @@ is told what failed and is asked to fix the code, not the check.
 | Claude Code | `.claude/settings.json` | supported |
 | Cursor | `.cursor/hooks.json` | supported |
 | Codex CLI | `.codex/hooks.json` | supported; review and trust the hooks once with `/hooks`, because Codex skips untrusted project hooks |
+| OpenCode | `.opencode/plugins/greenproof.js` | via the OpenCode plugin, see OpenCode below |
 | Gemini CLI | `.gemini/settings.json` | experimental |
+
+The OpenCode section comes with the plugin; `greenproof check --hook opencode` and
+`greenproof session-start --hook opencode` already exist for it to call.
 
 `--agents auto` (the default) installs Claude Code when `.claude/` or `CLAUDE.md` exists,
 Cursor when `.cursor/` exists and Codex CLI when `.codex/` exists. It never installs the
@@ -244,6 +248,15 @@ experimental Gemini CLI adapter; name it in `--agents` to get it, with a warning
 was superseded by Antigravity CLI, and an open upstream issue reports its `AfterAgent`
 hooks not firing. `--agents none` installs nothing. `--hook-command CMD` sets how the hooks
 invoke greenproof, for example `uv run greenproof`.
+
+When greenproof is not on PATH at `init` time, the hook command is `uvx greenproof@<version>`,
+which needs `uv` on the PATH of the agent's process. Without it the hook cannot start, and a
+hook that cannot start fails open (see below).
+
+Installing the gate twice is safe. A plugin and the hooks `init` writes, or user and project
+settings, can both run for one stop, in parallel. greenproof serialises them with a lock in
+the git directory and records its decision for the stop, so the second hook gives the first
+one's decision again: one decision per stop, not a block followed by a release.
 
 ### What hooks can and cannot do
 
