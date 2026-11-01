@@ -1,0 +1,21 @@
+{
+  "name": "greenproof",
+  "version": "0.1.0",
+  "description": "Done gate for coding agents: when the agent stops, greenproof runs your checks and blocks deleted, skipped or weakened tests.",
+  "keywords": ["testing", "hooks", "done-gate", "code-review", "ci"],
+  "skills": "./skills/",
+  "hooks": "./hooks/codex.json",
+  "interface": {
+    "displayName": "greenproof",
+    "shortDescription": "A done gate: blocks deleted, skipped or weakened tests when the agent stops",
+    "longDescription": "When the agent tries to stop, greenproof checks the change for deleted, skipped or weakened tests and edits to test, runner or CI configuration, then runs the commands in the project's .greenproof.toml. A failing check goes back to the agent as the reason it is not done.",
+    "developerName": "Basant Bhattarai",
+    "category": "Coding",
+    "capabilities": ["Interactive", "Write"],
+    "websiteURL": "https://github.com/technobasant/greenproof",
+    "defaultPrompt": "Run the greenproof done gate on my changes and explain any finding",
+    "brandColor": "#1f9d55",
+    "composerIcon": "./assets/logo.png",
+    "logo": "./assets/logo.png"
+  }
+}

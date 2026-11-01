@@ -1,0 +1,14 @@
+{
+  "name": "greenproof",
+  "version": "0.1.0",
+  "description": "Done gate for coding agents: when the agent stops, greenproof runs your checks and blocks deleted, skipped or weakened tests.",
+  "author": {
+    "name": "Basant Bhattarai",
+    "url": "https://github.com/technobasant"
+  },
+  "homepage": "https://github.com/technobasant/greenproof",
+  "repository": "https://github.com/technobasant/greenproof",
+  "license": "Apache-2.0",
+  "keywords": ["testing", "hooks", "done-gate", "code-review", "ci"],
+  "hooks": "./hooks/claude.json"
+}

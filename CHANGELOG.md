@@ -7,6 +7,16 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A plugin for Claude Code, Codex and Cursor (`plugins/greenproof`) that installs the Stop
+  and SessionStart hooks without running `greenproof init`, with a marketplace file for each
+  agent (`.claude-plugin/`, `.agents/plugins/`, `.cursor-plugin/`). Each manifest names its
+  own hooks file, so no agent loads another's. The hooks run `uvx greenproof@<version>`,
+  pinned to the release; the plugin also carries a skill that tells the agent how to answer
+  a block.
+- `scripts/bump_version.py X.Y.Z`, which sets the version in `_version.py`, the manifests and
+  every pinned command in the plugin, and `tests/test_plugins.py`, which fails when any of
+  them differs from `__version__` and checks each manifest against its vendor's format.
+- `scripts/make_icon.py`, the standard-library script that draws the plugin icon.
 - `check --hook opencode` and `session-start --hook opencode`, for the OpenCode plugin: the
   payload carries `session_id` and `cwd`, and the output is Codex's protocol (block, pass,
   release) and Claude Code's session-start output.
