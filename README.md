@@ -236,14 +236,12 @@ is told what failed and is asked to fix the code, not the check.
 | Claude Code | `.claude/settings.json` | supported |
 | Cursor | `.cursor/hooks.json` | supported |
 | Codex CLI | `.codex/hooks.json` | supported; review and trust the hooks once with `/hooks`, because Codex skips untrusted project hooks |
-| OpenCode | `.opencode/plugins/greenproof.js` | via the OpenCode plugin, see OpenCode below |
+| OpenCode 2.x | `.opencode/plugins/greenproof.js` | a plugin file, see [OpenCode](#opencode); 2.x only |
 | Gemini CLI | `.gemini/settings.json` | experimental |
 
-The OpenCode section comes with the plugin; `greenproof check --hook opencode` and
-`greenproof session-start --hook opencode` already exist for it to call.
-
 `--agents auto` (the default) installs Claude Code when `.claude/` or `CLAUDE.md` exists,
-Cursor when `.cursor/` exists and Codex CLI when `.codex/` exists. It never installs the
+Cursor when `.cursor/` exists, Codex CLI when `.codex/` exists and OpenCode when `.opencode/`,
+`opencode.json` or `opencode.jsonc` exists. It never installs the
 experimental Gemini CLI adapter; name it in `--agents` to get it, with a warning. Gemini CLI
 was superseded by Antigravity CLI, and an open upstream issue reports its `AfterAgent`
 hooks not firing. `--agents none` installs nothing. `--hook-command CMD` sets how the hooks
@@ -257,6 +255,42 @@ Installing the gate twice is safe. A plugin and the hooks `init` writes, or user
 settings, can both run for one stop, in parallel. greenproof serialises them with a lock in
 the git directory and records its decision for the stop, so the second hook gives the first
 one's decision again: one decision per stop, not a block followed by a release.
+
+### OpenCode
+
+OpenCode has no command hooks, so greenproof ships a plugin for it. It supports OpenCode 2.x
+only. OpenCode 1.x is not supported: its loader logs an error for the plugin and runs without
+it, so nothing is gated. The plugin runs `greenproof check --hook opencode` when a top-level
+session is about to go idle, and `greenproof session-start --hook opencode` when a top-level
+session is created. `uv` (for `uvx greenproof@<version>`) or `greenproof` itself must be on the
+PATH of the OpenCode process; without either the check cannot start and fails open. See
+[integrations/opencode/README.md](integrations/opencode/README.md) for exactly what runs.
+
+- A block continues the same run, with greenproof's message as the next input.
+- A release is only a console warning; 2.x gives plugins no toast or log API, so it is not
+  shown in the session.
+- Session start depends on OpenCode's session-created event reaching plugins. If it does
+  not, the session start is skipped with a warning and the gate on stop still works.
+- Every failure (a missing executable, an error exit, invalid output, a timeout after 3600
+  seconds) fails open with a `greenproof could not run: ...` warning.
+
+Two ways to install it:
+
+```bash
+greenproof init --agents opencode
+```
+
+writes `.opencode/plugins/greenproof.js` with the hook command filled in. The file is
+greenproof's: its first line says so and re-running `init` replaces it. A file at that path
+without that first line is never overwritten; `init` exits with code 4 and writes nothing.
+Or use the npm package `opencode-greenproof` (after it is published) in `opencode.json`:
+
+```json
+{ "plugins": ["opencode-greenproof"] }
+```
+
+Having both is safe: when two copies of the plugin load in one process, one stop is checked
+and continued once.
 
 ### What hooks can and cannot do
 
