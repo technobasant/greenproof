@@ -218,7 +218,7 @@ example `"tests.expected_changed" = "off"`.
 | `tests.skipped` | block | a skip, xfail, ignore or todo marker is added to an existing test, or at module, class or conftest scope; `warn` for an unconditional skip on a brand-new test |
 | `tests.focused` | block | a focus marker is added (`it.only`, `fit`, `describe.only`, `test.only`) |
 | `tests.weakened` | block | a test checks less than before: fewer assertions, a weaker assertion, a wider tolerance, fewer parametrize cases, a vacuous or unreachable assertion, or one wrapped in a swallowing `try/except` |
-| `tests.expected_changed` | warn | the expected value in an assertion changed while non-test code also changed |
+| `tests.expected_changed` | warn | the expected value in an assertion changed, with or without a code change (a test edited to match what the code returns) |
 | `suppress.added` | warn | an added line introduces a type, lint or coverage suppression |
 | `runner.tampered` | block | a change narrows or neuters how checks run: test selection, coverage thresholds, linter or type-checker strictness, test scripts, a conftest hook that rewrites outcomes |
 | `ci.tampered` | block | a CI workflow change removes or neuters a test or lint step, adds `continue-on-error`, `\|\| true` or `if: false`, or changes or removes the greenproof step (adding the first one is fine); a ref-only bump of the greenproof action is `warn` |
