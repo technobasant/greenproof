@@ -15,7 +15,7 @@ Before a pull request, run what CI runs:
 
 ```bash
 uv run ruff format . && uv run ruff check . && uv run mypy src
-uv run pytest --cov
+uv run pytest -n auto --cov
 ```
 
 ## What a change needs

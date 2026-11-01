@@ -87,7 +87,9 @@ def test_timeout_kills_a_foreground_child_too(tmp_path: Path) -> None:
 def test_output_before_a_timeout_is_kept(tmp_path: Path) -> None:
     result = run_command("test", "echo started; sleep 30", tmp_path, 1)
     assert result.timed_out
-    assert result.output_tail == "started"
+    # The shell may add its own "Terminated" job line after ours when the group is killed;
+    # under load that line races with the shell's own exit, so only the first line is exact.
+    assert result.output_tail.splitlines()[0] == "started"
 
 
 def test_interrupt_kills_the_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
