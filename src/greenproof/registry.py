@@ -85,9 +85,9 @@ _RULES = [
     RuleInfo(
         "tests.expected_changed",
         WARN,
-        "The expected value in an assertion changed while non-test code also changed. That is "
+        "The expected value in an assertion changed, whether or not non-test code changed. That is "
         "legitimate when the specification changed, so it is a warning: confirm the new value "
-        "comes from the requirement, not from what the code now returns.",
+        "comes from the requirement, not from what the code returns.",
     ),
     RuleInfo(
         "suppress.added",
