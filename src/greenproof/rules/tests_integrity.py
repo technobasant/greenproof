@@ -17,6 +17,7 @@ from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import BLOCK, WARN, Finding
 from greenproof.rules._common import CODE_SUFFIXES, finding, language_of, sev_finding
 from greenproof.rules.collect import Collection, collection_from_base
+from greenproof.rules.self_mocked import check_self_mocked
 from greenproof.rules.tests_lines import analyse_lines
 from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
 from greenproof.rules.tests_python import analyse_python, marker_display
@@ -312,6 +313,14 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
     base_keys = {u.key for s in sides if s.base for u in s.base.units}
     cand_keys = {u.key for s in sides if s.cand for u in s.cand.units}
     out.extend(_marker_findings(sides, base_keys, cand_keys))
+    out.extend(
+        check_self_mocked(
+            [(None, u) for u in pairing.left_cand] + [(b, c) for b, c in pairing.pairs],
+            {s.base.path: s.base for s in sides if s.base},
+            {s.cand.path: s.cand for s in sides if s.cand},
+            changes,
+        )
+    )
     return out
 
 

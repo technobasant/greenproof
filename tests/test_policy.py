@@ -118,6 +118,7 @@ def test_registry_has_every_spec_rule_id() -> None:
         "suppress.added",
         "runner.tampered",
         "ci.tampered",
+        "tests.self_mocked",
         "code.hardcoded",
         "revert.passes_without_change",
         "smoke.failed",
