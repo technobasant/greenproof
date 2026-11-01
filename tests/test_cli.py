@@ -402,10 +402,21 @@ def test_explain(run, tmp_path: Path) -> None:
     assert "tests.deleted" in unknown.err
 
 
-def test_init_is_not_implemented(run, tmp_path: Path) -> None:
+def test_init_outside_a_repository_and_with_bad_flags_exits_4(run, tmp_path: Path) -> None:
     result = run(tmp_path, "init")
     assert result.code == 4
-    assert "not implemented yet" in result.err
+    assert "not inside a git repository" in result.err
+    assert run(tmp_path, "init", "--ci", "gitlab").code == 4
+
+
+def test_init_internal_error_exits_5(run, tmp_path: Path, monkeypatch) -> None:
+    def boom(_options):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("greenproof.init.command.run_init", boom)
+    result = run(tmp_path, "init")
+    assert result.code == EXIT_INTERNAL
+    assert "internal error: RuntimeError: boom" in result.err
 
 
 def test_bad_usage_exits_4_not_2(run, tmp_path: Path) -> None:
