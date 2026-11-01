@@ -75,7 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--agents",
         default="auto",
         metavar="auto|none|LIST",
-        help="agents to install hooks for: auto, none or a list of claude,cursor,codex,gemini",
+        help=(
+            "agents to install hooks for: auto, none or a list of "
+            "claude,cursor,codex,gemini,opencode"
+        ),
     )
     init.add_argument("--ci", choices=("github", "none"), default="none")
     init.add_argument("--no-verify", action="store_true", help="do not run the proposed commands")

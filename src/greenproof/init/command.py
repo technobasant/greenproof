@@ -17,6 +17,7 @@ from greenproof.init.detect import Detection, ProposedCommand, detect, propose
 from greenproof.init.hooks import ADAPTERS, hook_timeout
 from greenproof.init.hooks import codex as codex_adapter
 from greenproof.init.hooks import gemini as gemini_adapter
+from greenproof.init.hooks import opencode as opencode_adapter
 from greenproof.policy import POLICY_FILE, Policy, parse_policy
 from greenproof.runner import HOOK_TAIL_LINES, run_command
 
@@ -85,6 +86,10 @@ def parse_agents(spec: str, root: Path) -> list[str]:
             chosen.append("cursor")
         if (root / ".codex").is_dir():
             chosen.append("codex")
+        if (root / ".opencode").is_dir() or any(
+            (root / name).is_file() for name in ("opencode.json", "opencode.jsonc")
+        ):
+            chosen.append("opencode")
         return chosen
     names = [n.strip() for n in value.split(",") if n.strip()]
     if not names:
@@ -208,6 +213,8 @@ def run_init(options: InitOptions) -> str:
             notes.append(f"warning: {gemini_adapter.WARNING}")
         if name == "codex":
             notes.append(codex_adapter.NOTE)
+        if name == "opencode":
+            notes.append(opencode_adapter.NOTE)
 
     if options.ci == "github":
         workflow = ci_github.render_workflow(root, det, __version__)
