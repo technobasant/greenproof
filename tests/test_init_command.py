@@ -502,3 +502,16 @@ def test_ci_mode_runs_revert_and_smoke_only_with_a_smoke_table() -> None:
     for policy in (plain, with_smoke):
         assert policy.mode_checks["hook"] == ("static", "commands")
         assert policy.mode_checks["local"] == ("static", "commands")
+
+
+def test_hook_command_is_named_in_the_agents_md_text(tmp_path: Path, run) -> None:
+    repo = fixture_repo(tmp_path, UV_PROJECT)
+    args = ("init", "--no-verify", "--agents", "none", "--hook-command", "uv run greenproof")
+    assert run(repo.path, *args).code == 0
+    text = (repo.path / "AGENTS.md").read_text()
+    assert "run `uv run greenproof check`." in text
+    assert "Never run `greenproof accept`" in text
+    before = snapshot(repo.path)
+    again = run(repo.path, *args)
+    assert statuses(again.out)["AGENTS.md"] == "unchanged"
+    assert snapshot(repo.path) == before

@@ -11,7 +11,8 @@ END = "<!-- greenproof:end -->"
 CLAUDE_IMPORT = "@AGENTS.md"
 
 
-def render_section(commands: Sequence[tuple[str, str]]) -> str:
+def render_section(commands: Sequence[tuple[str, str]], check_command: str | None = None) -> str:
+    """`check_command` is the `--hook-command` value; without it the text says `greenproof`."""
     lines = [BEGIN, "## Verify", ""]
     if commands:
         lines.append("greenproof runs these commands (from `.greenproof.toml`):")
@@ -23,7 +24,7 @@ def render_section(commands: Sequence[tuple[str, str]]) -> str:
         )
     lines += [
         "",
-        "Before you say a task is done, run `greenproof check`.",
+        f"Before you say a task is done, run `{check_command or 'greenproof'} check`.",
         "",
         "Fix the code, not the check: do not delete, skip or weaken tests, and do not edit "
         "test, runner or CI configuration or `.greenproof.toml` to make a failure go away.",
