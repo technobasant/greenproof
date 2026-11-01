@@ -845,6 +845,7 @@ def _hook_process(repo: Repo, body: dict[str, Any], agent: str = "claude") -> su
     assert proc.stdin is not None
     proc.stdin.write(json.dumps(body))
     proc.stdin.close()
+    proc.stdin = None  # before 3.13, communicate() flushes stdin and raises on a closed pipe
     return proc
 
 
