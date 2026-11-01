@@ -284,3 +284,18 @@ def test_generated_workflow_and_action_pass_zizmor(tmp_path: Path, run) -> None:
             check=False,
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_generated_workflow_is_adoption_for_check_in_ci_mode(tmp_path: Path, run) -> None:
+    repo = fixture_repo(tmp_path, UV)
+    first = run(repo.path, "init", "--no-verify", "--agents", "none", "--ci", "github")
+    assert first.code == 0, first.err
+    workflow = (repo.path / WORKFLOW).read_text()
+    (repo.path / WORKFLOW).unlink()
+    repo.commit("base without the workflow")
+    (repo.path / WORKFLOW).parent.mkdir(parents=True, exist_ok=True)
+    (repo.path / WORKFLOW).write_text(workflow)
+    out = tmp_path / "r.json"
+    result = run(repo.path, "check", "--mode", "ci", "--checks", "static", "--json", str(out))
+    assert result.code == 0, result.out
+    assert "ci.tampered" not in out.read_text()

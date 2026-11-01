@@ -184,7 +184,9 @@ def run_init(options: InitOptions) -> str:
     planned = [policy_plan]
     runnable = policy.runnable_commands()
 
-    section = agents_md.render_section(runnable)
+    section = agents_md.render_section(
+        runnable, hook_command if options.hook_command is not None else None
+    )
     agents_existing = _read(root, "AGENTS.md")
     planned.append(
         _plan(root, "AGENTS.md", agents_md.upsert_section(agents_existing, section, "AGENTS.md"))
