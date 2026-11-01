@@ -344,10 +344,22 @@ def test_b():
 """
 
 
-def test_assertion_duplicated_in_base_and_kept_once_does_not_cover(tmp_path: Path) -> None:
-    # test_a keeps one `make() == 1`; the other copy was already there, so it replaces nothing.
+def test_exact_duplicate_of_a_surviving_test_is_covered(tmp_path: Path) -> None:
+    # test_b has the same body as the new test_a, so its check still runs (SPEC 5.7).
     new = "def test_a():\n    assert make() == 1\n"
-    assert "tests.removed" in rule_ids(change(tmp_path, new, TWINS))
+    assert rule_ids(change(tmp_path, new, TWINS)) == []
+
+
+def test_duplicate_with_different_parametrize_cases_is_not_covered(tmp_path: Path) -> None:
+    base = (
+        "import pytest\n\n\n"
+        '@pytest.mark.parametrize("x", [1, 2])\ndef test_a(x):\n    assert make(x) == x\n\n\n'
+        '@pytest.mark.parametrize("x", [3])\ndef test_b(x):\n    assert make(x) == x\n'
+    )
+    new = base.replace(
+        '\n\n@pytest.mark.parametrize("x", [3])\ndef test_b(x):\n    assert make(x) == x\n', ""
+    )
+    assert "tests.removed" in rule_ids(change(tmp_path, new, base))
 
 
 def test_assertion_added_to_a_paired_test_covers_the_removed_one(tmp_path: Path) -> None:
@@ -455,3 +467,84 @@ def test_js_expect_of_a_literal_is_not_counted(tmp_path: Path) -> None:
         assert ("tests.weakened", "block") in [(f.rule, f.severity) for f in found], literal
     live = base.replace("f(1)", "f(x)")
     assert rule_ids(change(tmp_path / "live", live, base, "tests/a.test.js")) == []
+
+
+# ---- subjects and the effective check count (5.4, 5.7) --------------------------------------
+
+
+def _unit(src: str, name: str = "test_a"):
+    from greenproof.rules.tests_python import analyse_python
+
+    analysis = analyse_python("tests/test_u.py", src)
+    assert analysis is not None
+    return next(u for u in analysis.units if u.name == name)
+
+
+def test_subjects_are_dotted_calls_without_builtins_vocabulary_or_locals() -> None:
+    src = (
+        "import pytest\n\n\n"
+        "def test_a(runner, tmp_path):\n"
+        "    def local(x):\n        return x\n"
+        "    made = Thing()\n"
+        "    made.go()\n"
+        "    result = runner.invoke(cli, ['x'])\n"
+        "    with pytest.raises(ValueError):\n        parse(1)\n"
+        "    assert len(local(1)) == sum([2])\n"
+        "    assert result.exit_code == 0\n"
+        "    mod.helper.run()\n"
+    )
+    assert _unit(src).subjects == {"Thing", "runner.invoke", "parse", "mod.helper.run"}
+
+
+def test_unittest_and_mock_vocabulary_is_not_a_subject() -> None:
+    src = (
+        "import unittest\nfrom unittest import mock\n\n\n"
+        "class T(unittest.TestCase):\n"
+        "    def test_a(self):\n"
+        "        m = mock.Mock()\n"
+        "        self.assertEqual(run(m), 1)\n"
+        "        m.assert_called_once()\n"
+    )
+    assert _unit(src, "test_a").subjects == {"run"}
+
+
+def test_stacked_parametrize_decorators_multiply_and_forms_are_recorded() -> None:
+    src = (
+        "import pytest\n\n\n"
+        '@pytest.mark.parametrize("a", [1, 2, 3])\n'
+        '@pytest.mark.parametrize("b", [4, 5])\n'
+        "def test_a(a, b):\n    assert f(a, b)\n    assert g(a)\n"
+    )
+    unit = _unit(src)
+    assert (unit.param_cases, unit.param_literal, len(unit.param_forms)) == (6, True, 5)
+
+
+def test_non_literal_argvalues_have_no_case_factor() -> None:
+    src = (
+        "import pytest\n\nCASES = [1, 2]\n\n\n"
+        '@pytest.mark.parametrize("a", CASES)\n'
+        "def test_a(a):\n    assert f(a) == 1\n"
+    )
+    unit = _unit(src)
+    assert (unit.param_cases, unit.param_literal) == (None, False)
+
+
+def test_non_literal_argvalues_compare_without_the_case_factor(tmp_path: Path) -> None:
+    base = (
+        "import pytest\n\nCASES = [1, 2]\n\n\n"
+        '@pytest.mark.parametrize("a", CASES)\n'
+        "def test_a(a):\n    assert make(a) == 1\n    assert make(a + 1) == 2\n"
+    )
+    new = base.replace("    assert make(a + 1) == 2\n", "")
+    found = change(tmp_path, new, base)
+    assert "checks dropped from 2 to 1" in found[0].message
+
+
+def test_folding_asserts_into_cases_is_not_a_drop(tmp_path: Path) -> None:
+    base = "def test_a():\n    assert make(1) == 1\n    assert make(2) == 2\n"
+    new = (
+        "import pytest\n\n\n"
+        '@pytest.mark.parametrize("n", [1, 2])\n'
+        "def test_a(n):\n    assert make(n) == n\n"
+    )
+    assert rule_ids(change(tmp_path, new, base)) == []

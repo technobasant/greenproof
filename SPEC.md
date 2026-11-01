@@ -176,7 +176,7 @@ covering at least one true positive and one legitimate change that must NOT fire
 | `policy.changed` | block | the candidate's `.greenproof.toml` differs from the base's |
 | `tests.deleted` | block | a test file is deleted, or renamed to a non-test path |
 | `tests.removed` | block | a test function/case present at base is gone and is not covered (5.7), including a test moved to a file or name the runner does not collect |
-| `tests.replaced` | block | in the same file, a test is removed and a different test is added (delete-and-replace) and the removed test is not covered (5.7); report both names |
+| `tests.replaced` | block | in the same file, a test is removed and a different test is added (delete-and-replace) and the removed test is not covered (5.7); report both names. `warn` when the new tests are at least as strong (5.7, a rewrite) |
 | `tests.skipped` | block | a skip/xfail/ignore/todo marker is added to a test that exists at base, or at module/class/conftest scope (see 5.3). On a brand-new test an unconditional skip/xfail is `warn` and a conditional one (`skipif(<condition>)`, `importorskip`) does not fire: neither hides existing verification |
 | `tests.focused` | block | a focus marker is added (`it.only`, `fit`, `describe.only`, `test.only`), which silently skips the rest |
 | `tests.weakened` | block | for a test present on both sides: fewer assertions, a strong assertion replaced by a weaker one, tolerance widened, parametrize cases reduced, an assertion made vacuous, tautological or unreachable, or an assertion wrapped in a swallowing `try/except` (see 5.4) |
@@ -201,14 +201,24 @@ covering at least one true positive and one legitimate change that must NOT fire
 ### 5.4 Weakening heuristics
 
 Python (AST, matched by qualified test name `path::Class::test_name`):
-- assertion count per test drops (count `assert` statements, `self.assert*` calls,
-  `pytest.raises`/`pytest.warns` contexts, `assert_*` calls on mocks);
+- the test's **effective check count** drops. It is the number of reachable, non-vacuous
+  assertions (`assert` statements, `self.assert*` calls, `pytest.raises`/`pytest.warns`
+  contexts, `assert_*` calls on mocks) times the test's parametrize cases (the product
+  over stacked `parametrize` decorators whose argvalues are a literal list or tuple; when
+  either side has a non-literal argvalues, both sides are compared without the case
+  factor). Turning six asserts into one assert over six cases is not a drop. There is no
+  finding when every distinct exact assertion form (5.7) of the base test still appears in
+  the candidate test or among the assertions the change adds: dropping a duplicated
+  assertion, or moving one into another test, is not weakening;
 - `assert a == b` / `assertEqual` / `assertIn` / `assertRaises(SpecificError)` replaced by
   a truthiness or existence check (`assert a`, `assert a is not None`, `assertTrue`,
   `assertIsNotNone`) or by a broader exception (`Exception`, `BaseException`);
 - `pytest.approx` `rel`/`abs` increased, `assertAlmostEqual` `places` decreased or `delta`
   increased;
-- `@pytest.mark.parametrize` case count reduced;
+- `@pytest.mark.parametrize` cases removed, unless every removed case (the exact form of
+  its argvalues element) appears among the cases the change adds (all cases of new tests,
+  plus the cases a paired test gained, as a multiset difference). Splitting cases out
+  into other tests or files is not weakening;
 - an assertion moved inside `try:` whose handler catches `AssertionError`/`Exception`
   without re-raising;
 - an assertion made vacuous or tautological: `assert <truthy constant>` (`assert True`,
@@ -298,6 +308,25 @@ replaces nothing. Renames that also rename identifiers are handled by pass 4, no
 coverage. This keeps renames, splits, merges (including into an existing test) and moves
 clean, while a deleted test, or one replaced by a weaker test, still fires. Paired tests
 are then compared by the 5.4 heuristics.
+
+A base test is also covered when a collected candidate test, new or pre-existing, has the
+same normalised body hash and the same parametrize cases. The removed test was an exact
+duplicate, and its checks still run.
+
+**`tests.replaced` severity** (Python; the line engines stay `block`). Per file, the
+removed uncovered tests are compared with the new unpaired tests. The finding is `warn`,
+a rewrite, when all of these hold:
+- the new tests together call every **subject** the removed tests called. A subject is
+  the dotted name of a called function or method that is not a builtin, not
+  pytest/unittest/mock vocabulary, and not bound inside the test itself;
+- their combined effective check count (5.4) is at least the removed tests';
+- none of their assertions is a truthiness or existence check on an operand of a
+  comparison the removed tests made (the 5.4 `block` case).
+
+Otherwise it is `block`. A removed test with no new test in its file stays
+`tests.removed` (block). Replacing `test_parse` with a test that calls `total`, or with
+a test whose inputs are constants, still blocks. A rename that rewrites the test into a
+parametrized superset warns.
 
 ## 6. Agent and CI adapters
 
@@ -435,6 +464,15 @@ bench/              testwashing benchmark (milestone 4)
   `action.yml`, `.pre-commit-hooks.yaml`. Done when: `init` on fixture repos for each stack
   produces working config, and a scripted Claude Code Stop-hook payload is blocked/passed
   correctly.
+  **Accepting a finding.** A legitimate change (dropping a test for removed behaviour, a
+  platform skip) needs an acceptance an agent cannot forge. Locally, an agent shares the
+  user's shell, so acceptance there is advisory. `greenproof accept <fingerprint>` records
+  it under the git dir with the time and git identity. Hook messages tell agents never to
+  run it, and the report lists every accepted finding. In CI, the authoritative gate,
+  acceptance is a PR label applied by a maintainer (`greenproof:accept`, name set in the
+  base policy). The action reads it from the event and honours it only when the label was
+  applied after the head commit was pushed. The fingerprint is the rule, path and test name
+  plus a digest of the finding's evidence, stable across reruns of the same change.
 - **M3 — execution depth.** revert check, smoke runner, `code.hardcoded`, `tests.self_mocked`,
   `--isolate`.
 - **M4 — benchmark and release prep.** `bench/`: ≥ 30 cases (tamper patterns from the
@@ -442,7 +480,10 @@ bench/              testwashing benchmark (milestone 4)
   controls: refactors, legitimate spec changes, added tests; seeded with the 20 review
   probes P1–P12 and C1–C8 from M1); a runner that reports
   detection and false-positive rates for greenproof and, when installed, other tools;
-  MEASUREMENTS.md; README; dogfood `greenproof init` on this repo. Release (GitHub repo,
+  a replay harness that runs the static rules over the last 200 test-touching commits of
+  ≥ 3 real repositories (pallets/click first) and reports the block rate per rule with a
+  triaged sample. The M1 baseline on click was 30 of 200 commits blocked, before the M1d
+  calibration. MEASUREMENTS.md; README; dogfood `greenproof init` on this repo. Release (GitHub repo,
   PyPI) only on the maintainer's explicit go-ahead.
 
 ### M1 acceptance scenarios (each is an automated test)

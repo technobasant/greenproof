@@ -93,8 +93,8 @@ def test_4_delete_one_test_and_add_another_is_replaced(repo: Repo, run, tmp_path
     repo.commit("test_a")
     repo.write(
         "tests/test_app.py",
-        "from app import total\n\n\ndef test_b():\n    assert total() > 0\n"
-        "    assert total() < 1000\n",
+        "from app import other\n\n\ndef test_b():\n    assert other() > 0\n"
+        "    assert other() < 1000\n",
     )
     code, _, data = check(run, repo, tmp_path)
     assert code == 1

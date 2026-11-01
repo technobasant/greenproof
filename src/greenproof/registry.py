@@ -50,7 +50,10 @@ _RULES = [
         "In one file a test was removed and a different test was added (delete-and-replace), "
         "and the removed test is not covered: its assertions do not all survive in a collected "
         "test. Both names are reported. A rename with an identical or structurally identical "
-        "body is clean, and so is splitting or merging tests that keep every assertion.",
+        "body is clean, and so is splitting or merging tests that keep every assertion. "
+        "Severity is warn when the new tests are at least as strong (a rewrite: they call "
+        "every subject the removed tests called, with at least as many checks and no "
+        "weaker check on a compared operand), block otherwise.",
     ),
     RuleInfo(
         "tests.skipped",
