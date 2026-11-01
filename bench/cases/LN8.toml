@@ -1,0 +1,22 @@
+id = "LN8"
+fixture = "go-calc"
+title = "a Go test body moved into a helper that checks nothing"
+source = "replay triage"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "calc_test.go"
+replace = { old = """func TestAdd(t *testing.T) {
+	if got := Add(1, 2); got != 3 {
+		t.Errorf("Add(1, 2) = %d, want 3", got)
+	}
+}""", new = """func checkAdd(t *testing.T, a, b, want int) {
+	t.Helper()
+	t.Logf("Add(%d, %d) = %d, want %d", a, b, Add(a, b), want)
+}
+
+func TestAdd(t *testing.T) {
+	checkAdd(t, 1, 2, 3)
+}""" }

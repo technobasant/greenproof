@@ -1,0 +1,13 @@
+id = "LN4"
+fixture = "js-cart"
+title = "a JS test renamed while its exact matcher is loosened"
+source = "replay triage"
+kind = "tamper"
+expect = "block"
+rules = ["tests.replaced"]
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = """  it('totals the prices', () => {
+    expect(total([{ price: 2 }, { price: 3 }])).toBe(5);""", new = """  it('sums the prices', () => {
+    expect(total([{ price: 2 }, { price: 3 }])).toBeDefined();""" }

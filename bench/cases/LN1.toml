@@ -1,0 +1,11 @@
+id = "LN1"
+fixture = "go-calc"
+title = "a Go test renamed, body untouched"
+source = "replay triage"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "calc_test.go"
+replace = { old = "func TestSub(t *testing.T) {", new = "func TestSubtract(t *testing.T) {" }

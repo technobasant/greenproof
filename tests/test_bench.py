@@ -56,7 +56,14 @@ def test_case_files_are_well_formed() -> None:
     runner = load_runner()
     cases = [runner.load_case(path) for path in sorted(runner.CASES.glob("*.toml"))]
     assert len(cases) >= 45
-    sources = {"review probe", "typia port", "Skylos testwashing", "ImpossibleBench", "control"}
+    sources = {
+        "review probe",
+        "typia port",
+        "Skylos testwashing",
+        "ImpossibleBench",
+        "control",
+        "replay triage",
+    }
     for case in cases:
         assert case["source"] in sources, case["id"]
         assert case["kind"] in {"tamper", "control"}, case["id"]

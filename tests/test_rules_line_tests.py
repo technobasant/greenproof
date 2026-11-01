@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from greenproof.rules.tests_lines import analyse_lines
 from tests.helpers import Repo, init_repo, rule_ids, static_findings
 
 JS = """\
@@ -287,3 +288,248 @@ def test_rust_tests_dir_deletion_and_source_with_ignore_word(tmp_path: Path) -> 
     assert static_findings(repo) == []
     repo.remove("tests/it.rs")
     assert rule_ids(static_findings(repo)) == ["tests.deleted"]
+
+
+# ---- Calibration: identity, vocabulary, helpers ------------------------------------------
+
+
+def _units(path: str, text: str, lang: str) -> dict[str, object]:
+    return {u.key: u for u in analyse_lines(path, text, lang).units}
+
+
+def test_hash_ignores_the_tests_own_name_but_not_its_body() -> None:
+    go = (
+        "func TestA(t *testing.T) {\n\tt.Error(1)\n}\n\n"
+        "func TestB(t *testing.T) {\n\tt.Error(1)\n}\n"
+    )
+    a, b = analyse_lines("x_test.go", go, "go").units
+    assert a.body_hash == b.body_hash and a.struct_hash == b.struct_hash
+    other = go.replace("TestB(t *testing.T) {\n\tt.Error(1)", "TestB(t *testing.T) {\n\tt.Error(2)")
+    assert analyse_lines("x_test.go", other, "go").units[1].body_hash != a.body_hash
+    rust = (
+        "#[test]\nfn one() {\n    assert_eq!(f(), 1);\n}\n"
+        "#[test]\nfn two() {\n    assert_eq!(f(), 1);\n}\n"
+    )
+    r1, r2 = analyse_lines("lib.rs", rust, "rust").units
+    assert r1.body_hash == r2.body_hash
+
+
+def test_js_title_is_masked_but_one_line_tests_still_differ() -> None:
+    js = (
+        "describe('d', () => {\n  it('one', () => { expect(f(1)).toBe(2); });\n"
+        "  it('two', () => { expect(f(1)).toBe(2); });\n"
+        "  it('three', () => { expect(f(1)).toBe(3); });\n});\n"
+    )
+    one, two, three = analyse_lines("a.test.js", js, "js").units
+    assert one.body_hash == two.body_hash
+    assert one.body_hash != three.body_hash
+    # The describe title is part of the key, not of the hash.
+    renamed = js.replace("describe('d'", "describe('e'")
+    assert analyse_lines("a.test.js", renamed, "js").units[0].body_hash == one.body_hash
+
+
+def test_struct_hash_alpha_renames_identifiers_and_keeps_literals() -> None:
+    a = "it('x', () => {\n  const got = add(1, 2);\n  expect(got).toBe(3);\n});\n"
+    b = "it('y', () => {\n  const res = plus(1, 2);\n  expect(res).toBe(3);\n});\n"
+    c = b.replace("toBe(3)", "toBe(4)")
+    d = b.replace("toBe(3)", "toEqual(3)")
+    sa, sb, sc, sd = (
+        analyse_lines("a.test.js", t, "js").units[0].struct_hash for t in (a, b, c, d)
+    )
+    assert sa == sb
+    assert len({sa, sc, sd}) == 3
+    # An identifier inside a string is not renamed.
+    e = a.replace("add(1, 2)", "add('foo', 2)")
+    f = a.replace("add(1, 2)", "add('bar', 2)")
+    assert (
+        analyse_lines("a.test.js", e, "js").units[0].struct_hash
+        != analyse_lines("a.test.js", f, "js").units[0].struct_hash
+    )
+
+
+def test_js_type_and_awaited_query_assertions_count() -> None:
+    js = (
+        "it('types', () => {\n  expectTypeOf(x).toEqualTypeOf<number>();\n"
+        "  assertType<string>('a');\n});\n"
+        "it('queries', async () => {\n  await findByText('a');\n"
+        "  await screen.findAllByRole('button');\n  const el = await screen.findByText('b');\n"
+        "  screen.queryByText('c');\n});\n"
+    )
+    types, queries = analyse_lines("a.test.tsx", js, "js").units
+    assert types.asserts == 2
+    assert queries.asserts == 3
+    assert len(queries.assertion_forms) == 3
+
+
+def _js_asserts(body: str) -> int:
+    (unit,) = analyse_lines("a.test.tsx", f"it('x', () => {{\n{body}\n}});\n", "js").units
+    return unit.asserts
+
+
+def test_js_get_by_queries_count_once_per_line_and_only_alone() -> None:
+    assert _js_asserts("  getByText('a');") == 1
+    assert _js_asserts("  screen.getAllByRole('button');") == 1
+    assert _js_asserts("  expect(getByText('a')).toBeVisible();") == 1
+    assert _js_asserts("  getByText('a'); getByText('b');") == 1
+    assert _js_asserts("  getByText('a');\n  getByText('b');") == 2
+    assert _js_asserts("  within(el).getByText('a');") == 0
+
+
+def test_js_query_by_is_not_counted_and_unawaited_find_by_is_not() -> None:
+    assert _js_asserts("  queryByText('a');\n  screen.queryAllByRole('x');") == 0
+    assert _js_asserts("  const p = findByText('a');") == 0
+
+
+def test_js_find_by_to_get_by_migration_is_no_drop() -> None:
+    before = "  await findByText('a');\n  await screen.findByRole('button');"
+    after = "  getByText('a');\n  screen.getByRole('button');"
+    assert _js_asserts(before) == _js_asserts(after) == 2
+    # A bound pair collapsing into one inline expect is no drop either.
+    bound = "  const el = await screen.findByText('a');\n  expect(el).toBeInTheDocument();"
+    inline = "  expect(screen.getByText('a')).toBeInTheDocument();"
+    assert _js_asserts(bound) == _js_asserts(inline) == 1
+
+
+def test_js_bound_query_read_by_expect_counts_once_with_it() -> None:
+    assert _js_asserts("  const el = getByText('a');\n  expect( el ).toBeVisible();") == 1
+    assert (
+        _js_asserts("  let el = await screen.getAllByRole('b');\n  expect(el[0]).toBeVisible();")
+        == 1
+    )
+
+
+def test_js_query_inside_a_wrapped_expect_is_not_counted_again() -> None:
+    wrapped = "  expect(\n    await screen.findByText('a'),\n  ).toBeInTheDocument();"
+    inline = "  expect(screen.getByText('a')).toBeInTheDocument();"
+    assert _js_asserts(wrapped) == _js_asserts(inline) == 1
+    # Nested parentheses inside the wrapped expect do not close it early.
+    nested = "  expect(\n    fn(1),\n    await screen.findByText('a'),\n  ).toBe(1);"
+    assert _js_asserts(nested) == 1
+
+
+def test_js_query_after_the_wrapped_expect_closes_counts() -> None:
+    text = "  expect(\n    x,\n  ).toBe(1);\n  await screen.findByText('a');"
+    assert _js_asserts(text) == 2
+
+
+def test_js_paren_in_a_string_does_not_leak_into_the_expect_depth() -> None:
+    text = "  expect(\n    ')',\n  ).toBe(1);\n  await screen.findByText('a');"
+    assert _js_asserts(text) == 2
+    text = "  expect('(' + x).toBe(1);\n  await screen.findByText('a');"
+    assert _js_asserts(text) == 2
+
+
+def test_js_bound_query_nobody_reads_still_counts() -> None:
+    assert _js_asserts("  const el = await screen.findByText('a');") == 1
+    assert _js_asserts("  const el = getByText('a');\n  expect(other).toBe(1);") == 2
+    # A longer name that merely starts with the bound one is not a read.
+    assert _js_asserts("  const el = getByText('a');\n  expect(element).toBe(1);") == 2
+
+
+GO_HELPER = """\
+package app
+
+import "testing"
+
+func assertEq(t *testing.T, got, want int) {
+\tt.Helper()
+\tif got != want {
+\t\tt.Errorf("got %d, want %d", got, want)
+\t}
+}
+
+func assertBoth(t testing.TB, a, b int) {
+\tassertEq(t, a, 1)
+\tassertEq(t, b, 2)
+}
+
+func notAHelper(t *testing.T) {
+\tt.Log("x")
+}
+
+func plain(x int) int {
+\treturn x
+}
+
+func TestHelpers(t *testing.T) {
+\tassertEq(t, Total(), 100)
+\tassertBoth(t, 1, 2)
+\tnotAHelper(t)
+\tplain(1)
+}
+"""
+
+
+def test_go_same_file_assertion_helpers_count_per_call() -> None:
+    (unit,) = analyse_lines("app_test.go", GO_HELPER, "go").units
+    assert unit.asserts == 2
+    assert len(unit.assertion_forms) == 2
+    moved = GO_HELPER.replace("assertEq(t, Total(), 100)", "assertEq( t, Total(), 100 )")
+    (again,) = analyse_lines("app_test.go", moved, "go").units
+    assert again.assertion_forms == unit.assertion_forms
+
+
+def test_go_helper_that_asserts_through_a_helper_chain_counts() -> None:
+    text = (
+        "func a(t *testing.T) {\n\tb(t)\n}\nfunc b(t *testing.T) {\n\tc(t)\n}\n"
+        "func c(t *testing.T) {\n\trequire.Equal(t, 1, 1)\n}\n"
+        "func TestX(t *testing.T) {\n\ta(t)\n}\n"
+    )
+    (unit,) = analyse_lines("x_test.go", text, "go").units
+    assert unit.asserts == 1
+
+
+def test_go_benchmarks_are_not_units_but_fuzz_and_test_are() -> None:
+    text = (
+        "func TestA(t *testing.T) {\n\tt.Error(1)\n}\n"
+        "func BenchmarkA(b *testing.B) {\n\tb.Error(1)\n}\n"
+        "func FuzzA(f *testing.F) {\n\tf.Fail()\n}\n"
+    )
+    assert [u.key for u in analyse_lines("x_test.go", text, "go").units] == ["TestA", "FuzzA"]
+
+
+def test_declarations_inside_block_comments_are_not_units() -> None:
+    go = "/*\nfunc TestOld(t *testing.T) {\n\tt.Error(1)\n}\n*/\nfunc TestNew(t *testing.T) {\n}\n"
+    assert [u.key for u in analyse_lines("x_test.go", go, "go").units] == ["TestNew"]
+    js = "/*\nit('old', () => {\n  expect(1).toBe(1);\n});\n*/\nit('new', () => {});\n"
+    assert [u.key for u in analyse_lines("a.test.js", js, "js").units] == ["new"]
+    rust = "/*\n#[test]\nfn old() {}\n*/\n#[test]\nfn new() {}\n"
+    assert [u.key for u in analyse_lines("lib.rs", rust, "rust").units] == ["new"]
+
+
+def test_go_rename_with_identical_body_is_clean(tmp_path: Path) -> None:
+    repo = make(tmp_path, "app_test.go", GO)
+    repo.write("app_test.go", GO.replace("TestName", "TestLabel"))
+    assert static_findings(repo) == []
+
+
+def test_go_rename_that_drops_an_assertion_still_blocks(tmp_path: Path) -> None:
+    repo = make(tmp_path, "app_test.go", GO)
+    renamed = GO.replace("TestTotal", "TestSum")
+    renamed = renamed.replace('\tif Total() < 0 {\n\t\tt.Fatal("negative")\n\t}\n', "")
+    repo.write("app_test.go", renamed)
+    assert set(rule_ids(static_findings(repo))) & {"tests.weakened", "tests.replaced"}
+
+
+def test_go_benchmark_removal_is_not_a_removed_test(tmp_path: Path) -> None:
+    bench = (
+        GO
+        + "\nfunc BenchmarkTotal(b *testing.B) {\n"
+        + "\tfor i := 0; i < b.N; i++ {\n\t\tTotal()\n\t}\n}\n"
+    )
+    repo = make(tmp_path, "app_test.go", bench)
+    repo.write("app_test.go", GO)
+    assert static_findings(repo) == []
+
+
+def test_js_pure_rename_pairs_by_body(tmp_path: Path) -> None:
+    repo = make(tmp_path, "src/app.test.ts", JS)
+    repo.write("src/app.test.ts", JS.replace("it('is a number'", "it('yields a number'"))
+    assert static_findings(repo) == []
+    repo.write(
+        "src/app.test.ts",
+        JS.replace("it('is a number'", "it('yields a number'").replace(
+            "expect(typeof total()).toBe('number');", "expect(typeof total()).toBeDefined();"
+        ),
+    )
+    assert static_findings(repo) != []

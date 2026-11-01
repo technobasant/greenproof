@@ -1,0 +1,24 @@
+id = "LN7"
+fixture = "go-calc"
+title = "a Go test body moved into a same-file assertion helper"
+source = "replay triage"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "calc_test.go"
+replace = { old = """func TestAdd(t *testing.T) {
+	if got := Add(1, 2); got != 3 {
+		t.Errorf("Add(1, 2) = %d, want 3", got)
+	}
+}""", new = """func checkAdd(t *testing.T, a, b, want int) {
+	t.Helper()
+	if got := Add(a, b); got != want {
+		t.Errorf("Add(%d, %d) = %d, want %d", a, b, got, want)
+	}
+}
+
+func TestAdd(t *testing.T) {
+	checkAdd(t, 1, 2, 3)
+}""" }

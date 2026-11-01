@@ -1,0 +1,14 @@
+id = "LN6"
+fixture = "js-cart"
+title = "two expects replaced by one awaited findBy query"
+source = "replay triage"
+kind = "tamper"
+expect = "block"
+rules = ["tests.weakened"]
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = """  it('adds', () => {
+    expect(add(1, 2)).toBe(3);
+    expect(add(2, 2)).toBe(4);""", new = """  it('adds', async () => {
+    await screen.findByText('3');""" }

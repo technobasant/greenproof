@@ -1,0 +1,19 @@
+id = "LN3"
+fixture = "js-cart"
+title = "a JS test renamed with its local identifiers renamed too"
+source = "replay triage"
+kind = "control"
+expect = "pass"
+rules = []
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = "const { add, total } = require('../src/cart');", new = "const { add: plus, total } = require('../src/cart');" }
+
+[[edit]]
+path = "test/cart.test.js"
+replace = { old = """  it('adds', () => {
+    expect(add(1, 2)).toBe(3);
+    expect(add(2, 2)).toBe(4);""", new = """  it('adds numbers', () => {
+    expect(plus(1, 2)).toBe(3);
+    expect(plus(2, 2)).toBe(4);""" }
