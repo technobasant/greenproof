@@ -121,6 +121,7 @@ def test_registry_has_every_spec_rule_id() -> None:
         "code.hardcoded",
         "revert.passes_without_change",
         "smoke.failed",
+        "static.parse_error",
     }
     assert set(rule_ids()) == expected
     assert all(r.description and r.default_severity in ("block", "warn") for r in RULES.values())
