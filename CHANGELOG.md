@@ -3,6 +3,36 @@
 All notable changes are listed here. The project follows [Semantic Versioning](https://semver.org/)
 and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- `check --hook opencode` and `session-start --hook opencode`, for the OpenCode plugin: the
+  payload carries `session_id` and `cwd`, and the output is Codex's protocol (block, pass,
+  release) and Claude Code's session-start output.
+- Duplicate hooks for one stop. The gate can be installed twice (a plugin and the hooks
+  `init` writes), and the agent then runs both in parallel. Everything after repository
+  discovery runs under an exclusive lock on `<git-dir>/greenproof/hook.lock`, the hook state
+  records the payload's fingerprint (a sha256 of the sorted, compact payload), the decision
+  and the block message, and a second hook for the same stop outputs that decision again
+  (at most three replays) instead of finding the first one's block and releasing the agent.
+  When the lock file cannot be opened, the hook runs without the lock.
+- `fork` in the SessionStart matchers of the Claude Code and Codex CLI hooks `init` writes.
+  Both agents document it as a source; the session marker is kept, as for `resume`.
+
+### Changed
+
+- A pass is now recorded in the hook state instead of clearing it, so a duplicate hook for
+  the same stop can replay it. Nothing to verify still clears the state. A state file
+  written by 0.1.0 is read as a block with no fingerprint.
+- `suppress.added` applies each generic pattern only where it has an effect. `|| true`,
+  `; true`, `set +e` and the git `--no-verify` pattern fire in shell-capable files (scripts,
+  makefiles, justfiles, CI and container files, `package.json`, `pyproject.toml`,
+  `tox.ini`, `setup.cfg`, `.husky/` and `.githooks/`), and `--passWithNoTests` also in
+  JavaScript and TypeScript. They no longer fire in `.toml` case files, `.json` data,
+  prose or source files of other languages.
+- The README says that `uvx` hook commands need `uv` on PATH.
+
 ## [0.1.0] - 2026-11-01
 
 First release.
