@@ -168,6 +168,18 @@ def _loosened(b: Unit, c: Unit) -> list[tuple[str, str]]:
     ]
 
 
+def _only_loose_dropped(b: Unit, c: Unit, added: _Added) -> bool:
+    """SPEC 5.4: every base assertion that is gone is a loose check, and every subject of an
+    exact check at the base is still the subject of one in the candidate."""
+    gone = Counter(b.assertion_forms) - Counter(c.assertion_forms)
+    gone_forms = [f for f in gone if f not in added.forms]
+    return (
+        bool(gone_forms)
+        and all(f in b.loose_forms for f in gone_forms)
+        and set(b.exact_subjects) <= set(c.exact_subjects)
+    )
+
+
 def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> list[_Reason]:
     if b.engine != c.engine:
         return []
@@ -175,7 +187,15 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
     if b.engine == "python":
         before, after = _effective(b, c)
         if after < before and not set(b.assertion_forms) <= set(c.assertion_forms) | added.forms:
-            out.append((f"checks dropped from {before} to {after}", c.line, BLOCK))
+            only_loose = _only_loose_dropped(b, c, added)
+            note = " (only loose checks dropped)" if only_loose else ""
+            out.append(
+                (
+                    f"checks dropped from {before} to {after}{note}",
+                    c.line,
+                    WARN if only_loose else BLOCK,
+                )
+            )
     elif count_drop_allowed and c.asserts < b.asserts:
         out.append((f"assertions dropped from {b.asserts} to {c.asserts}", c.line, BLOCK))
     if c.vacuous > b.vacuous:

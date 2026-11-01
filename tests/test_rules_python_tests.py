@@ -488,3 +488,72 @@ def test_equality_replaced_by_call_truthiness_fires_and_call_to_call_is_clean(
     assert weakened(tmp_path / "b", same, "def test_t():\n    assert valid(2)\n") == []
     typed = "def test_t():\n    assert isinstance(total(), int)\n"
     assert rule_ids(weakened(tmp_path / "c", old, typed)) == ["tests.weakened"]
+
+
+# ---- loose-only drops (SPEC 5.4) ------------------------------------------------------------
+
+STREAM = """\
+import typing
+
+
+def encode():
+    return b"x"
+
+
+def test_stream():
+    stream = encode()
+    assert isinstance(stream, typing.Iterable)
+    assert stream == b"x"
+    assert len(stream) == 1
+"""
+
+
+def loose_drop(tmp_path: Path, old: str, new: str):
+    return weakened(tmp_path, STREAM, STREAM.replace(old, new))
+
+
+def test_dropping_only_an_isinstance_check_warns(tmp_path: Path) -> None:
+    found = loose_drop(tmp_path, "    assert isinstance(stream, typing.Iterable)\n", "")
+    assert rule_ids(found) == ["tests.weakened"] and found[0].severity == "warn"
+    assert "only loose checks dropped" in found[0].message
+
+
+def test_dropping_other_loose_checks_warns(tmp_path: Path) -> None:
+    for i, loose in enumerate(
+        (
+            "assert stream",
+            "assert stream is not None",
+            "assert not stream == 2",
+            "assert stream != 2",
+        )
+    ):
+        base = STREAM.replace("    assert isinstance(stream, typing.Iterable)\n", f"    {loose}\n")
+        found = weakened(
+            tmp_path / str(i),
+            base,
+            STREAM.replace("    assert isinstance(stream, typing.Iterable)\n", ""),
+        )
+        assert rule_ids(found) == ["tests.weakened"], loose
+        assert found[0].severity == "warn", loose
+
+
+def test_dropping_an_exact_check_alongside_a_loose_one_still_blocks(tmp_path: Path) -> None:
+    new = STREAM.replace("    assert isinstance(stream, typing.Iterable)\n", "").replace(
+        '    assert stream == b"x"\n', ""
+    )
+    found = weakened(tmp_path, STREAM, new)
+    assert rule_ids(found) == ["tests.weakened"] and found[0].severity == "block"
+
+
+def test_dropping_only_an_exact_check_still_blocks(tmp_path: Path) -> None:
+    found = loose_drop(tmp_path, '    assert stream == b"x"\n', "")
+    assert rule_ids(found) == ["tests.weakened"] and found[0].severity == "block"
+
+
+def test_loose_drop_that_loses_the_exact_subject_still_blocks(tmp_path: Path) -> None:
+    # `len(stream) == 1` becomes a loose check: the exact subject len(stream) is gone
+    new = STREAM.replace("    assert isinstance(stream, typing.Iterable)\n", "").replace(
+        "assert len(stream) == 1", "assert len(stream) > 0"
+    )
+    found = weakened(tmp_path, STREAM, new)
+    assert any(f.severity == "block" for f in found)

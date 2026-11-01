@@ -555,6 +555,9 @@ class _Stats(ast.NodeVisitor):
         self.vacuous_line = 0
         self.exact: dict[str, str] = {}  # shape -> source of each exact-check subject
         self.loose: dict[str, str] = {}  # shape -> source of the loose check on it
+        self.cur_form = ""  # exact form of the assertion being classified
+        self.exact_hit: set[str] = set()  # forms of assertions holding an exact check
+        self.loose_hit: set[str] = set()  # forms of assertions holding a loose check
         self.pinned = 0  # exact checks against a literal or an all-literal parametrize argument
         self.literal_params: set[str] = set()
         self.strong_operands: set[str] = set()  # operands of comparisons
@@ -599,12 +602,14 @@ class _Stats(ast.NodeVisitor):
         makes X the target of a loose one."""
         if self.consts.is_const(node):
             return
+        self.exact_hit.add(self.cur_form)
         self.exact.setdefault(self._opshape(node), ast.unparse(self.consts.inline(node)))
         self._unwrap(node, src)
 
     def _loosen(self, node: ast.expr, src: str) -> None:
         if self.consts.is_const(node):
             return
+        self.loose_hit.add(self.cur_form)
         self.loose.setdefault(self._opshape(node), src)
         self._unwrap(node, src)
 
@@ -658,7 +663,8 @@ class _Stats(ast.NodeVisitor):
         self.asserts += 1
         self.first_line = self.first_line or getattr(node, "lineno", 0)
         self.shapes.append(_shape(node))
-        self.forms.append(digest(ast.dump(node)))
+        self.cur_form = digest(ast.dump(node))
+        self.forms.append(self.cur_form)
 
     def visit_Assert(self, node: ast.Assert) -> None:
         test = node.test
@@ -815,6 +821,8 @@ class _Stats(ast.NodeVisitor):
         self.specific += sub.specific
         self.shapes.extend(sub.shapes)
         self.forms.extend(sub.forms)
+        self.exact_hit |= sub.exact_hit
+        self.loose_hit |= sub.loose_hit
         self.vacuous += sub.vacuous
 
     # -- swallowing ---------------------------------------------------------------------
@@ -997,6 +1005,7 @@ def _unit(
         struct_hash=_struct_hash(fn),
         shapes=stats.shapes,
         assertion_forms=stats.forms,
+        loose_forms=sorted(stats.loose_hit - stats.exact_hit),
         vacuous=stats.vacuous,
         vacuous_line=stats.vacuous_line,
         unreachable=lost.asserts,
