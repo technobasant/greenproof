@@ -60,11 +60,19 @@ def build_parser() -> argparse.ArgumentParser:
     explain = sub.add_parser("explain", help="describe a rule")
     explain.add_argument("rule_id", metavar="RULE_ID")
 
-    init = sub.add_parser("init", help="set up greenproof in a repository (not implemented yet)")
-    init.add_argument("--yes", action="store_true")
-    init.add_argument("--agents")
-    init.add_argument("--ci", choices=("github", "none"))
-    init.add_argument("--no-verify", action="store_true")
+    init = sub.add_parser("init", help="set up greenproof in a repository")
+    init.add_argument(
+        "--yes", action="store_true", help="overwrite an existing policy and workflow"
+    )
+    init.add_argument(
+        "--agents",
+        default="auto",
+        metavar="auto|none|LIST",
+        help="agents to install hooks for: auto, none or a list of claude,cursor,codex,gemini",
+    )
+    init.add_argument("--ci", choices=("github", "none"), default="none")
+    init.add_argument("--no-verify", action="store_true", help="do not run the proposed commands")
+    init.add_argument("--hook-command", metavar="CMD", help="how the hooks invoke greenproof")
     return parser
 
 
@@ -123,9 +131,21 @@ def _cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_init(_args: argparse.Namespace) -> int:
-    sys.stderr.write("greenproof init: not implemented yet\n")
-    return EXIT_USAGE
+def _cmd_init(args: argparse.Namespace) -> int:
+    from greenproof.init.command import InitOptions, run_init
+
+    summary = run_init(
+        InitOptions(
+            cwd=Path.cwd(),
+            yes=args.yes,
+            agents=args.agents,
+            ci=args.ci,
+            no_verify=args.no_verify,
+            hook_command=args.hook_command,
+        )
+    )
+    sys.stdout.write(summary)
+    return 0
 
 
 def _fail(args: argparse.Namespace, message: str, code: int) -> int:
