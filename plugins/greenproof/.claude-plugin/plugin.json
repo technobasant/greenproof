@@ -1,6 +1,6 @@
 {
   "name": "greenproof",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Done gate for coding agents: when the agent stops, greenproof runs your checks and blocks deleted, skipped or weakened tests.",
   "author": {
     "name": "Basant Bhattarai",
