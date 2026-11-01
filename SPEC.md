@@ -223,7 +223,10 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   without re-raising;
 - an assertion made vacuous or tautological: `assert <truthy constant>` (`assert True`,
   `assert 1`), `self.assertTrue(True)`, an `or` with a truthy constant operand
-  (`assert x == 3 or True`), or a comparison of an expression with itself;
+  (`assert x == 3 or True`), or a comparison of an expression with itself, also after
+  single-assignment locals (assigned exactly once in the test body, before the assertion,
+  from any expression, and not used before it in any other way) are inlined:
+  `expected = refund(100)` then `assert refund(100) == expected` checks nothing;
 - an assertion whose inputs are all constants, so it checks nothing about the code:
   every operand is a literal, a pure builtin (`len`, `abs`, `min`, `max`, `sum`, `sorted`,
   `reversed`, `list`, `tuple`, `set`, `frozenset`, `dict`, `str`, `int`, `float`, `bool`,
@@ -359,7 +362,21 @@ a rewrite, when all of these hold:
   the inputs (`refund(x) == x - 1`) or by calling code is not pinned. A rewrite may change
   the expected values (the requirement may have changed); it may not stop pinning them.
 
-Otherwise it is `block`. A removed test with no new test in its file stays
+Otherwise it is `block`.
+
+**Absorbing tests.** A paired test in the same file whose effective check count (5.4)
+grew is an absorbing test: removed tests were often folded into it (two tests merged into
+one parametrized test that keeps one of the names). When a file has removed uncovered
+tests and absorbing tests, the four rewrite conditions above are evaluated on the removed
+tests plus the base versions of the absorbing tests, against the new unpaired tests plus
+the candidate versions of the absorbing tests. When they hold, the removed tests are
+`tests.replaced` (warn), and the message names the absorbing tests; when they do not, the
+removed tests keep the finding they would have without absorbing tests. Example:
+`test_refund` (`refund(100) == 99`) and `test_refund_small` (`refund(2) == 1`) folded into
+`test_refund` parametrized over `[(100, 99), (2, 1)]` warns; folded into one case
+`[(100, 99)]`, or with expected values computed by calling code, still blocks.
+
+A removed test with no new test and no absorbing test in its file stays
 `tests.removed` (block). Replacing `test_parse` with a test that calls `total`, with
 a test whose inputs are constants, or with `test_total_in_range` checking
 `0 < total() < 1000` where `test_total` checked `total() == 100`, still blocks, and so does
