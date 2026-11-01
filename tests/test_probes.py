@@ -456,3 +456,184 @@ def test_assertions_with_a_live_input_stay_clean(
     code, found = check(more_repo, run, tmp_path / "out.json")
     assert code == 0, (name, found)
     assert not any(sev == "block" for _, sev in found), (name, found)
+
+
+# ---- calibration against real history: folds, duplicates, splits and rewrites ---------------
+
+CASES = """\
+import pytest
+
+from mathx import parse, total
+
+
+@pytest.mark.parametrize(("raw", "want"), [("1", 1), ("2", 2), ("3", 3)])
+def test_parse(raw, want):
+    assert parse(raw) == want
+
+
+def test_fold():
+    assert parse("1") == 1
+    assert parse("2") == 2
+    assert parse("3") == 3
+
+
+def test_dup():
+    assert total([1]) == 1
+    assert total([1]) == 1
+
+
+def test_twin():
+    assert parse("9") == 9
+
+
+def test_twin_copy():
+    assert parse("9") == 9
+
+
+def test_sum():
+    assert total([1, 2]) == 3
+
+
+def test_one():
+    got = parse("4")
+    assert got == 4
+
+
+def test_abb():
+    assert total([1]) == 1
+    assert total([1]) == 1
+    assert total([2]) == 2
+"""
+
+CASES_PATH = "tests/test_cases.py"
+PARSE_HEAD = '@pytest.mark.parametrize(("raw", "want"), [("1", 1), ("2", 2), ("3", 3)])\n'
+
+
+@pytest.fixture
+def cases_repo(tmp_path: Path) -> Repo:
+    repo = init_repo(tmp_path / "cases")
+    repo.write(".greenproof.toml", 'version = 1\n\n[commands]\ntest = "true"\ntimeout = 60\n')
+    repo.write(
+        "src/mathx.py", "def total(xs):\n    return sum(xs)\n\n\ndef parse(s):\n    return int(s)\n"
+    )
+    repo.write(CASES_PATH, CASES)
+    repo.commit("base")
+    return repo
+
+
+def c18(r: Repo) -> None:
+    sub(
+        r,
+        CASES_PATH,
+        '    assert parse("1") == 1\n    assert parse("2") == 2\n    assert parse("3") == 3\n',
+        "    assert parse(raw) == want\n",
+    )
+    sub(r, CASES_PATH, "def test_fold():", PARSE_HEAD + "def test_fold(raw, want):")
+
+
+def c19(r: Repo) -> None:
+    sub(
+        r,
+        CASES_PATH,
+        "    assert total([1]) == 1\n    assert total([1]) == 1\n\n\ndef test_twin",
+        ("    assert total([1]) == 1\n\n\ndef test_twin"),
+    )
+
+
+def c20(r: Repo) -> None:
+    sub(r, CASES_PATH, PARSE_HEAD, '@pytest.mark.parametrize(("raw", "want"), [("1", 1)])\n')
+    r.write(
+        "tests/test_more_cases.py",
+        "import pytest\n\nfrom mathx import parse\n\n\n"
+        '@pytest.mark.parametrize(("raw", "want"), [("2", 2), ("3", 3)])\n'
+        "def test_parse_more(raw, want):\n    assert parse(raw) == want\n",
+    )
+
+
+def c21(r: Repo) -> None:
+    sub(r, CASES_PATH, '\n\ndef test_twin_copy():\n    assert parse("9") == 9\n', "")
+
+
+def c22(r: Repo) -> None:
+    sub(
+        r,
+        CASES_PATH,
+        "def test_sum():\n    assert total([1, 2]) == 3\n",
+        '@pytest.mark.parametrize(("xs", "want"), [([1, 2], 3), ([2, 2], 4)])\n'
+        "def test_sum_cases(xs, want):\n    assert total(xs) == want\n",
+    )
+
+
+def p19(r: Repo) -> None:
+    sub(r, CASES_PATH, '[("1", 1), ("2", 2), ("3", 3)]', '[("1", 1), ("2", 2)]')
+
+
+def p20(r: Repo) -> None:
+    sub(
+        r,
+        CASES_PATH,
+        'def test_one():\n    got = parse("4")\n    assert got == 4\n',
+        'def test_one_ok():\n    assert parse("4")\n',
+    )
+
+
+def p21(r: Repo) -> None:
+    sub(
+        r,
+        CASES_PATH,
+        "    assert total([1]) == 1\n    assert total([2]) == 2\n",
+        ("    assert total([1]) == 1\n"),
+    )
+
+
+def test_p15_and_p16_still_block(more_repo: Repo, run, tmp_path: Path) -> None:
+    p15(more_repo)
+    code, found = check(more_repo, run, tmp_path / "out.json")
+    assert code == 1
+    assert ("tests.replaced", "block") in found
+    more_repo.git("checkout", "--", ".")
+    more_repo.git("clean", "-fdq")
+    p16(more_repo)
+    code, found = check(more_repo, run, tmp_path / "out2.json")
+    assert code == 1
+    assert ("tests.replaced", "block") in found
+
+
+CALIBRATED: list[tuple[str, Callable[[Repo], None]]] = [
+    ("C18", c18),
+    ("C19", c19),
+    ("C20", c20),
+    ("C21", c21),
+    ("C22", c22),
+]
+
+
+@pytest.mark.parametrize(("name", "mutate"), CALIBRATED, ids=[c[0] for c in CALIBRATED])
+def test_folds_duplicates_splits_and_rewrites_stay_clean(
+    name, mutate, cases_repo: Repo, run, tmp_path: Path
+) -> None:
+    mutate(cases_repo)
+    code, found = check(cases_repo, run, tmp_path / "out.json")
+    assert code == 0, (name, found)
+    assert not any(sev == "block" for _, sev in found), (name, found)
+    if name == "C22":
+        assert ("tests.replaced", "warn") in found
+
+
+STILL_BLOCKED: list[tuple[str, Callable[[Repo], None], str]] = [
+    ("P19", p19, "tests.weakened"),
+    ("P20", p20, "tests.replaced"),
+    ("P21", p21, "tests.weakened"),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "mutate", "rule"), STILL_BLOCKED, ids=[t[0] for t in STILL_BLOCKED]
+)
+def test_dropped_cases_and_weaker_rewrites_still_block(
+    name, mutate, rule, cases_repo: Repo, run, tmp_path: Path
+) -> None:
+    mutate(cases_repo)
+    code, found = check(cases_repo, run, tmp_path / "out.json")
+    assert code == 1, (name, found)
+    assert (rule, "block") in found, (name, found)

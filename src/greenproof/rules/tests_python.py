@@ -176,6 +176,7 @@ class _Consts:
     def __init__(self, fn: _FuncDef | None = None) -> None:
         self.names: set[str] = set()
         self.stores: set[str] = set()
+        self.assigned: dict[str, ast.expr] = {}
         if fn is not None:
             self._analyse(fn)
 
@@ -223,6 +224,7 @@ class _Consts:
                 name = stmt.targets[0].id
                 if counts.get(name) == 1 and name not in bad:
                     candidates[name] = stmt
+                    self.assigned[name] = stmt.value
         for node in ast.walk(fn):
             if (
                 isinstance(node, ast.Name)
@@ -240,6 +242,20 @@ class _Consts:
                 and self.is_const(stmt.value)
             ):
                 self.names.add(stmt.targets[0].id)
+
+    def inline(self, node: ast.AST, depth: int = 0) -> ast.AST:
+        """A copy of `node` with single-assignment locals replaced by what they were assigned,
+        so `got = parse("4"); assert got == 4` and `assert parse("4") == 4` share operands."""
+        outer = self
+
+        class _Inline(ast.NodeTransformer):
+            def visit_Name(self, n: ast.Name) -> ast.AST:
+                if isinstance(n.ctx, ast.Load) and n.id in outer.assigned and depth < 3:
+                    return outer.inline(outer.assigned[n.id], depth + 1)
+                return n
+
+        result: ast.AST = _Inline().visit(copy.deepcopy(node))
+        return result
 
     def _benign_read(self, node: ast.Name, parents: dict[int, ast.AST]) -> bool:
         parent = parents.get(id(node))
@@ -414,6 +430,9 @@ class _Stats(ast.NodeVisitor):
         self.weak_operands: set[str] = set()
         self.first_line = 0
 
+    def _opshape(self, node: ast.AST) -> str:
+        return _shape(self.consts.inline(node))
+
     # -- assertions ---------------------------------------------------------------------
     def _counted(self, node: ast.AST) -> None:
         self.asserts += 1
@@ -439,10 +458,12 @@ class _Stats(ast.NodeVisitor):
                 and test.comparators[0].value is None
             ):
                 self.weak += 1
-                self.weak_operands.add(_shape(test.left))
+                self.weak_operands.add(self._opshape(test.left))
             else:
                 self.strong += 1
-                self.strong_operands.update(_shape(o) for o in (test.left, *test.comparators))
+                self.strong_operands.update(
+                    self._opshape(o) for o in (test.left, *test.comparators)
+                )
             if len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq):
                 for side in (test.left, test.comparators[0]):
                     lit = _expected_of(side)
@@ -450,14 +471,14 @@ class _Stats(ast.NodeVisitor):
                         self.expected.append((ast.dump(lit), node.lineno))
         elif isinstance(test, (ast.Name, ast.Attribute, ast.Subscript)):
             self.weak += 1
-            self.weak_operands.add(_shape(test))
+            self.weak_operands.add(self._opshape(test))
         elif isinstance(test, ast.Call):
             # A bare truthiness check on a call is weak; type checks pin a concrete fact.
             if dotted(test.func) in {"isinstance", "issubclass"}:
                 self.strong += 1
             else:
                 self.weak += 1
-                self.weak_operands.add(_shape(test))
+                self.weak_operands.add(self._opshape(test))
         self.generic_visit(node)
 
     def _raises(self, call: ast.Call) -> None:
@@ -497,10 +518,10 @@ class _Stats(ast.NodeVisitor):
             if tail in _WEAK_METHODS:
                 self.weak += 1
                 if node.args:
-                    self.weak_operands.add(_shape(node.args[0]))
+                    self.weak_operands.add(self._opshape(node.args[0]))
             else:
                 self.strong += 1
-                self.strong_operands.update(_shape(a) for a in node.args[:2])
+                self.strong_operands.update(self._opshape(a) for a in node.args[:2])
             if tail in _EQUAL_METHODS:
                 for arg in node.args[:2]:
                     lit = _expected_of(arg)
@@ -599,8 +620,12 @@ class _Stats(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _parametrize_cases(fn: _FuncDef) -> int | None:
+def _parametrize(fn: _FuncDef) -> tuple[int | None, bool, list[str]]:
+    """(cases, literal, case forms): the product of cases over stacked literal parametrize
+    decorators, whether every decorator was literal, and the exact form of each case."""
     total: int | None = None
+    literal = True
+    forms: list[str] = []
     for dec in fn.decorator_list:
         if not (isinstance(dec, ast.Call) and dotted(dec.func).endswith("mark.parametrize")):
             continue
@@ -612,9 +637,55 @@ def _parametrize_cases(fn: _FuncDef) -> int | None:
             isinstance(e, ast.Starred) for e in values.elts
         ):
             total = len(values.elts) * (total if total is not None else 1)
+            forms.extend(digest(ast.dump(e)) for e in values.elts)
         else:
-            return None
-    return total
+            literal = False
+    return (total if literal else None), literal, forms
+
+
+_VOCAB_ROOTS = frozenset(
+    {"pytest", "unittest", "mock", "mocker", "monkeypatch", "capsys", "capfd", "caplog", "request"}
+)
+_VOCAB_NAMES = frozenset({"patch", "MagicMock", "Mock", "AsyncMock", "PropertyMock", "call", "ANY"})
+_VOCAB_TAILS = frozenset({"fail", "skipTest", "subTest", "approx", "raises", "warns", "param"})
+
+
+def _subjects(fn: _FuncDef) -> set[str]:
+    """Dotted names of the functions and methods the test calls, minus builtins, test-framework
+    vocabulary and names bound inside the test body (locals and nested definitions)."""
+    bound: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            bound.add(node.id)
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node is not fn
+        ):
+            bound.add(node.name)
+    out: set[str] = set()
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        while isinstance(func, ast.Attribute):
+            func = func.value
+        if not isinstance(func, ast.Name):
+            continue  # a call on an expression result or literal: no stable name
+        name = dotted(node.func)
+        root, _, rest = name.partition(".")
+        tail = name.rsplit(".", 1)[-1]
+        if (
+            root in bound
+            or root in _VOCAB_ROOTS
+            or name in _VOCAB_NAMES
+            or tail in _VOCAB_TAILS
+            or tail.startswith("assert")
+            or (not rest and hasattr(builtins, root))
+            or (root in {"self", "cls"} and tail.startswith(("assert", "fail")))
+        ):
+            continue
+        out.add(name)
+    return out
 
 
 def _body_hash(fn: _FuncDef) -> str:
@@ -658,6 +729,7 @@ def _unit(
     stats = _Stats(helpers, consts=_Consts(live))
     for stmt in live.body:
         stats.visit(stmt)
+    cases, literal, case_forms = _parametrize(fn)
     lost = _Stats(helpers)
     for stmt in dropped:
         lost.visit(stmt)
@@ -673,7 +745,10 @@ def _unit(
         broad_raises=stats.broad,
         specific_raises=stats.specific,
         tolerances=stats.tolerances,
-        param_cases=_parametrize_cases(fn),
+        param_cases=cases,
+        param_literal=literal,
+        param_forms=case_forms,
+        subjects=_subjects(live),
         swallowed=stats.swallowed,
         swallow_line=stats.swallow_line,
         expected=stats.expected,

@@ -20,7 +20,10 @@ class Unit:
     broad_raises: int = 0
     specific_raises: int = 0
     tolerances: dict[str, float] = field(default_factory=dict)  # rel/abs/delta max, places min
-    param_cases: int | None = None
+    param_cases: int | None = None  # product over literal parametrize decorators, else None
+    param_literal: bool = True  # False when some parametrize argvalues is not a literal list
+    param_forms: list[str] = field(default_factory=list)  # exact form of each literal case
+    subjects: set[str] = field(default_factory=set)  # dotted names of the code under test called
     swallowed: int = 0
     swallow_line: int = 0
     expected: list[tuple[str, int]] = field(default_factory=list)  # (literal, line)

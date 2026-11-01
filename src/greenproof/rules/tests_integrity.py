@@ -115,11 +115,37 @@ def _covered(unit: Unit, universe: set[str]) -> bool:
 _Reason = tuple[str, int, str]  # text, line, severity
 
 
-def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool) -> list[_Reason]:
+def _effective(b: Unit, c: Unit) -> tuple[int, int]:
+    """Effective check counts (assertions x parametrize cases); without the case factor when
+    either side has a non-literal argvalues (SPEC 5.4)."""
+    if b.param_literal and c.param_literal:
+        return b.asserts * (b.param_cases or 1), c.asserts * (c.param_cases or 1)
+    return b.asserts, c.asserts
+
+
+def _added_cases(pairing: _Pairing) -> set[str]:
+    """Exact parametrize cases the change adds: those of new tests, and each paired test's gain."""
+    universe = {form for u in pairing.left_cand for form in u.param_forms}
+    for b, c in pairing.pairs:
+        universe.update((Counter(c.param_forms) - Counter(b.param_forms)).keys())
+    return universe
+
+
+@dataclass
+class _Added:
+    forms: set[str]
+    cases: set[str]
+
+
+def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> list[_Reason]:
     if b.engine != c.engine:
         return []
     out: list[_Reason] = []
-    if count_drop_allowed and c.asserts < b.asserts:
+    if b.engine == "python":
+        before, after = _effective(b, c)
+        if after < before and not set(b.assertion_forms) <= set(c.assertion_forms) | added.forms:
+            out.append((f"checks dropped from {before} to {after}", c.line, BLOCK))
+    elif count_drop_allowed and c.asserts < b.asserts:
         out.append((f"assertions dropped from {b.asserts} to {c.asserts}", c.line, BLOCK))
     if c.vacuous > b.vacuous:
         out.append(
@@ -156,7 +182,12 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool) -> list[_Reason]:
     places = (b.tolerances.get("places"), c.tolerances.get("places"))
     if places[0] is not None and places[1] is not None and places[1] < places[0]:
         out.append((f"`places` lowered to {places[1]:g}", c.line, BLOCK))
-    if b.param_cases is not None and c.param_cases is not None and c.param_cases < b.param_cases:
+    if (
+        b.param_cases is not None
+        and c.param_cases is not None
+        and c.param_cases < b.param_cases
+        and not set(b.param_forms) <= set(c.param_forms) | added.cases
+    ):
         out.append(
             (
                 f"parametrize cases reduced from {b.param_cases} to {c.param_cases}",
@@ -269,7 +300,12 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
     cand_units = _collected(sides, cfg, base=False)
     pairing = pair_units(base_units, cand_units)
     universe = _added_forms(pairing)
-    pairing.left_base = [u for u in pairing.left_base if not _covered(u, universe)]
+    twins = {(u.body_hash, tuple(sorted(u.param_forms))) for u in cand_units}
+    pairing.left_base = [
+        u
+        for u in pairing.left_base
+        if not _covered(u, universe) and (u.body_hash, tuple(sorted(u.param_forms))) not in twins
+    ]
     out: list[Finding] = []
     out.extend(_deleted_and_removed(sides, pairing))
     out.extend(_weakened(sides, pairing, changes))
@@ -288,6 +324,25 @@ def _collected(sides: list[_Side], cfg: Collection, base: bool) -> list[Unit]:
             continue
         out.extend(u for u in analysis.units if cfg.unit_collected(u))
     return out
+
+
+def _group_checks(units: list[Unit], literal: bool) -> int:
+    return sum(u.asserts * ((u.param_cases or 1) if literal else 1) for u in units)
+
+
+def _is_rewrite(removed: list[Unit], added: list[Unit]) -> bool:
+    """SPEC 5.7: the new tests keep every subject, at least as many checks, and no weak check
+    on an operand the removed tests compared."""
+    if any(u.engine != "python" for u in (*removed, *added)):
+        return False
+    subjects = set().union(*(u.subjects for u in removed))
+    if not subjects <= set().union(*(u.subjects for u in added)):
+        return False
+    literal = all(u.param_literal for u in (*removed, *added))
+    if _group_checks(added, literal) < _group_checks(removed, literal):
+        return False
+    strong = set().union(*(u.strong_operands for u in removed))
+    return not strong & set().union(*(u.weak_operands for u in added))
 
 
 def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]:
@@ -321,17 +376,23 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
                 )
             continue
         added = added_by_path.get(path, [])
-        for removed, new in zip(names, added, strict=False):
+        rewrite = bool(names and added) and _is_rewrite(names, added)
+        for i, removed in enumerate(names):
+            if i >= len(added) and not rewrite:
+                break
+            new = added[min(i, len(added) - 1)]
             out.append(
-                finding(
+                sev_finding(
                     "tests.replaced",
+                    WARN if rewrite else BLOCK,
                     path,
                     new.line,
-                    f"test {removed.name} was removed and a different test {new.name} added",
+                    f"test {removed.name} was removed and a different test {new.name} added"
+                    + (" (a rewrite: same subjects, at least as many checks)" if rewrite else ""),
                     "Keep the original test; add new tests alongside it, not in its place.",
                 )
             )
-        for removed in names[len(added) :]:
+        for removed in [] if rewrite else names[len(added) :]:
             out.append(
                 finding(
                     "tests.removed",
@@ -346,6 +407,7 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
 
 def _weakened(sides: list[_Side], pairing: _Pairing, changes: ChangeSet) -> list[Finding]:
     out: list[Finding] = []
+    added = _Added(_added_forms(pairing), _added_cases(pairing))
     added_asserts: dict[str, int] = {}
     for u in pairing.left_cand:
         added_asserts[u.path] = added_asserts.get(u.path, 0) + u.asserts
@@ -356,7 +418,7 @@ def _weakened(sides: list[_Side], pairing: _Pairing, changes: ChangeSet) -> list
     for b, c in pairing.pairs:
         # A test split in two keeps its assertions in the new test: not a weakening.
         allowed = added_asserts.get(c.path, 0) < drops.get(c.path, 0)
-        reasons = _weak_reasons(b, c, allowed)
+        reasons = _weak_reasons(b, c, allowed, added)
         if reasons:
             text = "; ".join(r for r, _, _ in reasons)
             severity = BLOCK if any(sev == BLOCK for _, _, sev in reasons) else WARN

@@ -292,7 +292,7 @@ def test_strong_assertion_replaced_by_truthiness_fires(tmp_path: Path) -> None:
 def test_assertion_count_drop_fires(tmp_path: Path) -> None:
     found = weakened(tmp_path, BASE_TESTS, BASE_TESTS.replace("    assert helper(1) == 1\n", ""))
     assert rule_ids(found) == ["tests.weakened"]
-    assert "assertions dropped from 2 to 1" in found[0].message
+    assert "checks dropped from 2 to 1" in found[0].message
 
 
 def test_split_test_keeping_its_assertions_is_clean(tmp_path: Path) -> None:
