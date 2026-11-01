@@ -489,3 +489,16 @@ def test_not_a_git_repository_exits_4(tmp_path: Path, run) -> None:
     result = run(tmp_path / "plain", "init", "--no-verify")
     assert result.code == 4
     assert "not inside a git repository" in result.err
+
+
+def test_ci_mode_runs_revert_and_smoke_only_with_a_smoke_table() -> None:
+    from greenproof.init.write_policy import render_policy
+    from greenproof.policy import parse_policy
+
+    plain = parse_policy(render_policy({}))
+    assert plain.mode_checks["ci"] == ("static", "commands", "revert")
+    with_smoke = parse_policy(render_policy({}, smoke=True))
+    assert with_smoke.mode_checks["ci"] == ("static", "commands", "revert", "smoke")
+    for policy in (plain, with_smoke):
+        assert policy.mode_checks["hook"] == ("static", "commands")
+        assert policy.mode_checks["local"] == ("static", "commands")
