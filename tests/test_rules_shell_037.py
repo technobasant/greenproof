@@ -156,7 +156,7 @@ def test_a_check_piped_into_another_command_hides_its_status(script: str) -> Non
 
 
 def test_a_check_at_the_end_of_a_pipeline_is_fine() -> None:
-    assert kinds("cat list | pytest\n") == []
+    assert kinds("ruff check .\ncat list | pytest\n") == []
 
 
 def pipe_scene(tmp_path: Path, run: str, base: str = "pytest", **kw: str) -> list:
