@@ -14,7 +14,7 @@ import re
 import shlex
 import tomllib
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from typing import Any
@@ -23,13 +23,18 @@ from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import Finding
 from greenproof.rules._common import finding, split_lines, warn_finding
 from greenproof.rules.collect import DEFAULT_CLASSES, DEFAULT_FILES, DEFAULT_FUNCTIONS
+from greenproof.rules.shell import (
+    SELECT_FLAGS,
+    find_swallows,
+    selection_flags,
+    split_segments,
+)
 
 _HINT = "Restore the original configuration; fix the code or the test instead of the check."
 _ADOPTION = " (a new linter or type-checker configuration: adoption, not a loosening)"
-_SELECT_FLAGS = {"-k", "--ignore", "--deselect", "--ignore-glob", "-m"}
+_SELECT_FLAGS = set(SELECT_FLAGS["pytest"])
 _INI_NAMES = {"pytest.ini", "tox.ini", "setup.cfg", ".coveragerc", "mypy.ini", ".flake8"}
 _NOOP = re.compile(r"^(?:@?-?\s*)?(?:true|:|exit\s+0|echo\b.*)\s*$")
-_SWALLOW = re.compile(r"\|\|\s*(?:true|:|exit\s+0)\b|;\s*true\s*$")
 _NARROW_TOKENS = {
     "-k",
     "--deselect",
@@ -302,10 +307,23 @@ def _first_line_with(text: str, needle: str) -> int | None:
     return None
 
 
-def neutering_reason(base_lines: list[str], cand_lines: list[str]) -> str | None:
-    """Whether a command (a script or recipe) was emptied, no-opped, narrowed or shortened."""
+def neutering_reason(
+    base_lines: list[str],
+    cand_lines: list[str],
+    *,
+    script: bool = False,
+    extra: Sequence[str] = (),
+) -> str | None:
+    """Whether a command (a script or recipe) was emptied, no-opped, narrowed or shortened.
+
+    `script` is for a whole shell file (no make-style `-` prefix, and fewer steps is not a
+    reason: scripts are refactored); `extra` are policy commands that also count as a check.
+    """
     base_c = [ln.strip() for ln in base_lines if ln.strip()]
     cand_c = [ln.strip() for ln in cand_lines if ln.strip()]
+    if script:  # a shebang and comments are not commands
+        base_c = [ln for ln in base_c if not ln.startswith("#")]
+        cand_c = [ln for ln in cand_c if not ln.startswith("#")]
     if base_c and not cand_c:
         return "it was emptied"
     if base_c == cand_c:
@@ -320,15 +338,63 @@ def neutering_reason(base_lines: list[str], cand_lines: list[str]) -> str | None
     after = Counter(tok for ln in cand_c for tok in _tokens(ln))
     if added := sorted(set((after - before).keys()) & _NARROW_TOKENS):
         return f"it now passes {added[0]}"
-    if any(_SWALLOW.search(ln) for ln in cand_c) and not any(_SWALLOW.search(ln) for ln in base_c):
-        return "a failure is now swallowed (`|| true`)"
-    if any(re.match(r"^@?-", ln) for ln in cand_c) and not any(
-        re.match(r"^@?-", ln) for ln in base_c
-    ):
+    if flag := _new_selection_flag(base_c, cand_c):
+        return f"it now passes {flag}"
+    if swallowed := _new_swallow(base_c, cand_c, script, extra):
+        return f"a failure is now swallowed (`{swallowed}`)"
+    if script and _early_exit(cand_c) and not _early_exit(base_c):
+        return "it now exits 0 before its checks run"
+    dash = [any(re.match(r"^@?-", ln) for ln in lines) for lines in (cand_c, base_c)]
+    if not script and dash[0] and not dash[1]:
         return "a recipe line now ignores its exit status"
-    if _steps(cand_c) < _steps(base_c):
+    if not script and _steps(cand_c) < _steps(base_c):
         return "it runs fewer steps than before"
     return None
+
+
+def _new_selection_flag(base: list[str], cand: list[str]) -> str | None:
+    before = {f for ln in base for f in selection_flags(ln)}
+    for ln in cand:
+        for family_flag in selection_flags(ln):
+            if family_flag not in before:
+                return family_flag[1]
+    return None
+
+
+def _swallow_counts(
+    lines: list[str], script: bool, extra: Sequence[str]
+) -> Counter[tuple[str, str]]:
+    """Swallows in a script, or in each recipe line on its own (make runs a shell per line)."""
+    chunks = ["\n".join(lines)] if script else [re.sub(r"^[@+-]+\s*", "", ln) for ln in lines]
+    return Counter(
+        (w.kind, w.text) for chunk in chunks for w in find_swallows(chunk, extra, opaque=True)
+    )
+
+
+def _new_swallow(
+    base: list[str], cand: list[str], script: bool, extra: Sequence[str]
+) -> str | None:
+    gained = _swallow_counts(cand, script, extra) - _swallow_counts(base, script, extra)
+    return next(iter(gained))[1] if gained else None
+
+
+_BLOCK_OPEN = re.compile(r"^(?:if|case|for|while|until|select)\b|^(?:function\s+)?\w+\s*\(\)|\{$")
+_BLOCK_CLOSE = re.compile(r"^(?:fi|esac|done|\})\b")
+
+
+def _early_exit(lines: list[str]) -> bool:
+    """An unconditional `exit 0` (or bare `exit`) with more commands after it in a shell file."""
+    depth = 0
+    for n, ln in enumerate(lines):
+        if ln.startswith("#"):
+            continue
+        if _BLOCK_CLOSE.match(ln):
+            depth = max(0, depth - 1)
+        elif _BLOCK_OPEN.search(ln) and not re.search(r"\bfi\b|\bdone\b|\besac\b", ln):
+            depth += 1
+        elif depth == 0 and re.fullmatch(r"exit(?:\s+0)?", ln):
+            return any(not later.startswith("#") for later in lines[n + 1 :])
+    return False
 
 
 def _tokens(line: str) -> list[str]:
@@ -357,6 +423,11 @@ def _package_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[
     new_scripts = cand.get("scripts", {}) if isinstance(cand, dict) else {}
     out: list[tuple[int | None, str]] = []
     wanted = _script_names(commands)
+    for name in list(wanted):  # one level deep: `"test": "npm run unit && npm run e2e"`
+        body = old_scripts.get(name)
+        if isinstance(body, str):
+            wanted.update(re.findall(r"(?:run|run-script)\s+([\w:.-]+)", body))
+    extra = list(commands.values())
     for name, old in old_scripts.items():
         if name not in wanted or not isinstance(old, str):
             continue
@@ -366,7 +437,7 @@ def _package_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[
         line = _first_line_with(f.new_text or "", f'"{name}"')
         if new is None:
             out.append((None, f"package.json script `{name}` was removed"))
-        elif isinstance(new, str) and (why := neutering_reason([old], [new])):
+        elif isinstance(new, str) and (why := neutering_reason([old], [new], extra=extra)):
             out.append((line, f"package.json script `{name}` changed and {why}"))
     return out
 
@@ -492,11 +563,12 @@ def _make_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int
         if m:
             names.update(t for t in re.findall(r"[\w.-]+", m.group(1)) if not t.startswith("-"))
     old, new = _targets(f.old_text, names), _targets(f.new_text, names)
+    extra = list(commands.values())
     out: list[tuple[int | None, str]] = []
     for name, old_body in old.items():
         if name not in new:
             out.append((None, f"target `{name}` was removed from {posixpath.basename(f.path)}"))
-        elif why := neutering_reason(old_body, new[name]):
+        elif why := neutering_reason(old_body, new[name], extra=extra):
             out.append(
                 (
                     _first_line_with(f.new_text or "", f"{name}:"),
@@ -585,15 +657,175 @@ def _python_reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
     return out
 
 
+# -- scripts and files the policy commands run ---------------------------------------------
+_INTERPRETERS = re.compile(
+    r"^(?:sh|bash|zsh|dash|ksh|python[\d.]*|node|nodejs|deno|ruby|perl|php|source|\.)$"
+)
+_WRAPPERS = {"env", "exec", "time", "sudo", "nohup", "command", "nice", "xvfb-run"}
+_RUN_WRAPPERS = {"uv", "poetry", "pipenv", "pdm", "hatch", "rye", "pipx", "npx", "bunx"}
+_SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".php")
+_SHELL_EXT = (".sh", ".bash", ".zsh")
+_MAX_INVOKED = 24
+
+
+def _script_of(tokens: list[str]) -> str | None:
+    """The script file a statement runs, when its command is a script or an interpreter's."""
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        is_assignment = (
+            "=" in tok
+            and not tok.startswith(("-", "/", "."))
+            and tok.partition("=")[0].isidentifier()
+        )
+        if is_assignment or tok in _WRAPPERS or tok in _RUN_WRAPPERS or tok == "run":
+            i += 1
+        elif _INTERPRETERS.match(tok):
+            rest = [t for t in tokens[i + 1 :] if not t.startswith("-")]
+            if tokens[i + 1 : i + 2] == ["-m"] or tokens[i + 1 : i + 2] == ["-c"]:
+                return None
+            return rest[0] if rest else None
+        else:
+            return tok if "/" in tok or tok.endswith(_SCRIPT_EXT) else None
+    return None
+
+
+def _scripts_in(text: str, here: str) -> list[str]:
+    """Repo-relative paths of the scripts the statements of `text` run."""
+    found: list[str] = []
+    for seg in split_segments(text):
+        try:
+            tokens = shlex.split(seg.text)
+        except ValueError:
+            tokens = seg.text.split()
+        tok = _script_of(tokens)
+        if tok is None or tok.startswith(("/", "~", "$")) or "$" in tok:
+            continue
+        norm = posixpath.normpath(tok)
+        if not norm.startswith(".."):
+            found.append(norm)
+        if here:
+            sibling = posixpath.normpath(posixpath.join(here, tok))
+            if sibling != norm and not sibling.startswith(".."):
+                found.append(sibling)
+    return found
+
+
+def _invoked_files(changes: ChangeSet, commands: Mapping[str, str]) -> dict[str, str]:
+    """Files at the base that a policy command runs, or that those files run: path -> command."""
+    out: dict[str, str] = {}
+    queue: list[tuple[str, str, int]] = []  # path, the policy command, depth
+    for command in commands.values():
+        for path in _scripts_in(command, ""):
+            queue.append((path, command, 0))
+    while queue and len(out) < _MAX_INVOKED:
+        path, command, depth = queue.pop(0)
+        text = changes.base_text(path)
+        if path in out or text is None:
+            continue
+        out[path] = command
+        if depth == 0 and len(text) < 200_000:
+            queue.extend((p, command, 1) for p in _scripts_in(text, posixpath.dirname(path)))
+    return out
+
+
+def _is_shell(path: str, text: str) -> bool:
+    if path.endswith(_SHELL_EXT):
+        return True
+    first = text.splitlines()[0] if text else ""
+    if first.startswith("#!"):
+        return bool(re.search(r"\b(?:ba|z|da|k)?sh\b", first))
+    return "." not in posixpath.basename(path)
+
+
+_TRIVIAL = re.compile(
+    r"^(?:#.*|pass|sys\.exit\(\s*0?\s*\)|exit(?:\(\s*0?\s*\))?|process\.exit\(\s*0?\s*\)"
+    r"|(?:import|from)\s+.*|(?:const|let|var)\s+\w+\s*=\s*require\(.*\);?|"
+    r"(?:print|console\.log|puts)\b.*|[\w.]+\(\))\s*;?$"
+)
+
+
+def _invoked_reasons(
+    f: ChangedFile, command: str, extra: list[str]
+) -> list[tuple[int | None, str]]:
+    run = f"`{command}` runs it"
+    if f.new_content is None:
+        return [(None, f"it was deleted, and {run}")]
+    old, new = f.old_text or "", f.new_text or ""
+    if _is_shell(f.path, old or new):
+        why = neutering_reason(split_lines(old), split_lines(new), script=True, extra=extra)
+    else:
+        why = _program_neutering(split_lines(old), split_lines(new))
+    return [(None, f"it changed and {why} ({run})")] if why else []
+
+
+def _program_neutering(base: list[str], cand: list[str]) -> str | None:
+    """Emptied, reduced to nothing, or given a top-level `exit 0`, for a non-shell script."""
+    base_c = [ln.strip() for ln in base if ln.strip()]
+    cand_c = [ln.strip() for ln in cand if ln.strip()]
+    if base_c and not cand_c:
+        return "it was emptied"
+    if (
+        cand_c
+        and all(_TRIVIAL.match(ln) for ln in cand_c)
+        and not all(_TRIVIAL.match(ln) for ln in base_c)
+    ):
+        return "it was reduced to a no-op"
+    top = [ln.strip() for ln in cand if _EXIT_CALL.match(ln)]
+    top_base = [ln.strip() for ln in base if _EXIT_CALL.match(ln)]
+    if len(top) > len(top_base):
+        return f"`{top[0][:40]}` now ends it at the top level"
+    return None
+
+
+# -- Go: TestMain ------------------------------------------------------------------------
+def _test_main_body(text: str | None) -> str | None:
+    if not text:
+        return None
+    m = re.search(r"^func\s+TestMain\s*\(\s*\w+\s+\*testing\.M\s*\)\s*\{", text, re.MULTILINE)
+    if not m:
+        return None
+    depth, i = 1, m.end()
+    while i < len(text) and depth:
+        depth += {"{": 1, "}": -1}.get(text[i], 0)
+        i += 1
+    return text[m.end() : i - 1]
+
+
+def _test_main_flaw(body: str) -> str | None:
+    code = "\n".join(re.sub(r"//.*$", "", ln) for ln in body.splitlines())
+    if "m.Run()" not in code:
+        return "TestMain never calls m.Run(), so no test runs"
+    if re.search(r"\bos\.Exit\(\s*0\s*\)", code):
+        return "TestMain exits 0 whatever the tests did"
+    return None
+
+
+def _go_reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
+    body = _test_main_body(f.new_text)
+    if body is None:
+        return []
+    flaw = _test_main_flaw(body)
+    old_body = _test_main_body(f.old_text)
+    if flaw is None or (old_body is not None and _test_main_flaw(old_body) == flaw):
+        return []
+    return [(_first_line_with(f.new_text or "", "func TestMain"), flaw)]
+
+
 # -- driver ------------------------------------------------------------------------------
 def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Finding]:
     out: list[Finding] = []
+    invoked = _invoked_files(changes, commands)
+    extra = list(commands.values())
     for f in changes.files:
-        if f.new_content is None:
+        run_by = invoked.get(f.old_path or f.path)
+        if f.new_content is None and run_by is None:
             continue
         name = posixpath.basename(f.path)
         try:
-            reasons = _file_reasons(f, name, commands)
+            reasons = [] if f.new_content is None else _file_reasons(f, name, commands)
+            if run_by is not None and not (f.is_test or f.was_test):
+                reasons = [*reasons, *_invoked_reasons(f, run_by, extra)]
         except (ValueError, configparser.Error, KeyError, TypeError, AttributeError) as exc:
             out.append(
                 warn_finding(
@@ -631,6 +863,8 @@ def _file_reasons(
         return _make_reasons(f, commands)
     if name == "noxfile.py":
         return _noxfile_reasons(f)
+    if name.endswith("_test.go"):
+        return _go_reasons(f)
     settings = None
     if name == "pyproject.toml" or name in ("ruff.toml", ".ruff.toml") or name in _INI_NAMES:
         old = _parse_settings(name, f.old_text) if f.old_text is not None else None
