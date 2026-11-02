@@ -26,17 +26,19 @@ from greenproof.rules.runner import (
     _RECIPE_PREFIX,
     _RUN_ALL,
     _SHELLS,
+    _VALUE_FLAGS,
     _script_lines,
     _script_refs,
     _shadowed,
     _Targets,
     _targets,
+    _unread_reasons,
     _variables,
+    make_ignores,
 )
 
 _MAX_RECIPE = _MAKE_RECIPE  # as the runner rule
 _MAX_PREREQS = 16  # how deep a target's prerequisites are followed
-_VALUE_FLAGS = "CfIjloW"  # short make options whose value follows (`-C dir`, `-j4`)
 _LONG_VALUE = frozenset(
     {
         "--directory",
@@ -141,30 +143,6 @@ class _Make:
     flags_ignore: bool
 
 
-def _ignores(flags: str) -> bool:
-    """Whether a `MAKEFLAGS` value turns on `-i`: the `--ignore-errors` word, or an `i` in a
-    cluster of short options (`-i`, `-ik`, or the bare letters of the first word, `ik`). A long
-    option is matched whole (`--no-print-directory` holds an `i` and is not `-i`), and a short
-    option that takes a value ends its cluster (`-j4i` is `-j 4i`)."""
-    for k, word in enumerate(flags.split()):
-        if word == "--ignore-errors":
-            return True
-        if word.startswith("--"):
-            continue
-        if word.startswith("-"):
-            cluster = word[1:]
-        elif k == 0 and "=" not in word:
-            cluster = word
-        else:
-            continue
-        for ch in cluster:
-            if ch == "i":
-                return True
-            if ch in _VALUE_FLAGS:
-                break
-    return False
-
-
 @lru_cache(maxsize=64)
 def _makefile(
     text: str, overrides: tuple[str, ...], env: tuple[tuple[str, str], ...] = ()
@@ -185,7 +163,38 @@ def _makefile(
             ignore.update(names)
             ignore_all = ignore_all or not names
     flags = _variables(joined, dict(env), overrides).get("MAKEFLAGS", "")
-    return _Make(targets, ignore_all, frozenset(ignore), _ignores(flags))
+    return _Make(targets, ignore_all, frozenset(ignore), make_ignores(flags))
+
+
+def _unread(
+    other: Callable[[str], str | None],
+    names: list[str],
+    files: list[str],
+    make: _Make,
+    order: list[str],
+    shadow: set[str],
+    overrides: list[str],
+    raw: str,
+    defs: Mapping[str, str],
+) -> list[str]:
+    """One message for each target the goal runs with a touched function call (see
+    `_unread_reasons`), the base's Makefile read as the candidate's is."""
+    texts = []
+    for path in names:
+        text = other(posixpath.normpath(path))
+        if text is not None:
+            texts.append(text)
+            if not files:
+                break
+    try:
+        old = _makefile("\n".join(texts), tuple(overrides), _make_env(raw, defs)).targets
+    except MakeUnreadable:
+        old = _Targets()
+    reached = [t for t in order if t not in shadow]
+    return [
+        f"target `{target}` runs `{call}`, a function call greenproof cannot read"
+        for target, call in _unread_reasons(old, make.targets, reached)
+    ]
 
 
 def _make_env(raw: str, defs: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
@@ -219,10 +228,14 @@ def make_children(
     cwd: str,
     read: Callable[[str], str | None],
     tree: Callable[[str], set[str]],
+    other: Callable[[str], str | None] | None = None,
+    unread: list[str] | None = None,
 ) -> list[Child] | None:
     """The recipe lines `make [-C dir] [-f file] [targets]` runs: the targets named (the default
     goal when none) and their prerequisites, in order. None when the statement is not a make call
-    or no target it names is in a Makefile that can be read."""
+    or no target it names is in a Makefile that can be read. With `other` (reads the same files
+    on the base side of the change) and `unread`, a target that runs a function call greenproof
+    cannot read on a line the change touched adds a message to `unread`."""
     if not toks or posixpath.basename(toks[0]) not in _MAKE_HEADS:
         return None
     directory, files, goals, overrides = cwd, [], [], []
@@ -314,11 +327,13 @@ def make_children(
 
     for goal in wanted:
         walk(goal, 0)
-    flags = make.flags_ignore or _ignores(defs.get("MAKEFLAGS", ""))
+    flags = make.flags_ignore or make_ignores(defs.get("MAKEFLAGS", ""))
     if m := _ENV_FLAGS.search(raw):
-        flags = flags or _ignores(m[1].strip("'\""))
+        flags = flags or make_ignores(m[1].strip("'\""))
     flags_why = ignore or ("`MAKEFLAGS` with `-i`" if flags else "")
     key = ("make", src, flags_why, *wanted)
+    if other is not None and unread is not None:
+        unread.extend(_unread(other, names, files, make, order, shadow, overrides, raw, defs))
     out: list[Child] = []
     size = 0
     for target in order:
