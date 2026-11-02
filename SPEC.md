@@ -558,16 +558,35 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   moves a path that, at the base, is a test file (SPEC 5.1, or the policy's `tests.paths`) or
   a directory holding one: `rm`, `git rm` (not `--cached`), `unlink`, `mv` (a source, or the
   file it overwrites), `find ... -delete` or `-exec rm` or `| xargs rm` (read through its
-  `-name` and `-type` filters; a negation, `-o`, `-path` or `-regex` makes it unfiltered),
-  `rimraf`, `del`, `shx rm`, `sh -c '...'`, and globs and `{a,b}` lists matched against the
-  base paths. Paths resolve from the directory of the file (and, for an invoked script, the
-  repo root); an absolute path or an unexpanded variable names nothing. A path not tracked at
+  `-name`, `-type`, `-maxdepth` and `-mindepth` filters, depth counted from each start
+  directory; a negation, `-o`, `-path`, `-regex` or any other filter makes it unfiltered; `rm`
+  without `-r`/`-R`/`-rf` takes files, not directories), `rimraf`, `del`, `shx rm`,
+  `sh -c '...'`, an interpreter one-liner (`python -c`, `node -e`, `ruby -e`, `perl -e`) whose
+  code calls a delete or move (`shutil.rmtree`, `os.remove`, `.unlink(`, `fs.rmSync`,
+  `FileUtils.rm`, `unlink`, ...) and holds a string literal that names a test file or a
+  directory holding tests (`.` and `..` are not read as one), and globs and `{a,b}` lists
+  matched against the base paths. Paths resolve from the directory of the file (and, for an
+  invoked script, the repo root), then follow `cd`, `pushd` and `popd`: in a script or a
+  package.json body a `cd` lasts to its end, in a make recipe to the end of its line, in a
+  `( ... )` group to the end of the group (a `{ ...; }` group and `&&`/`;` share the shell). A
+  `cd` that cannot be read (`cd -`, `cd "$X"`, `cd $(...)`, `cd`, `cd /abs`, `cd ..` out of the
+  repo, or one after `||`) leaves the directory unknown, and a relative path then hits when a
+  base test path ends with it on a `/` boundary (a directory when a test sits under it), so
+  `rm -rf build` passes unless a tracked test sits under a `build/` directory. An absolute
+  path or an unexpanded variable names nothing. A path not tracked at
   the base (`.pytest_cache`, `tests/__pycache__`, `coverage`, `build`) is not a test, and a
   statement the base already had (compared as written) says nothing. The base tree is listed
   once per check and only when such a statement is added, globs are matched against the sorted
   test paths from their literal prefix, and a glob past a fixed work limit counts as matching.
-  Known limits: a `cd` before the removal, `python -c 'shutil.rmtree(...)'` and a removal in a
-  target the policy does not run are not read. A nested `package.json` is a `warn`, not
+  A statement is the same as the base's only when it was in the same directory. Known limits:
+  code the one-liner builds its paths from (`os.path.join`, f-strings) is read by its literals,
+  a script file or `-m` module that deletes is not read, an `if`/`else` that `cd`s two ways is
+  read in order, and a removal in a target the policy does not run is not read. Setting
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD` to a value in what a policy command runs is a `warn`, like
+  `--disable-plugin-autoload`: `VAR=1 pytest`, `env VAR=1 pytest`, `export VAR=1` in a script
+  or recipe, or in a Makefile or justfile `export VAR = 1` (also `VAR = 1` with `export VAR`,
+  `.EXPORT_ALL_VARIABLES:`, `set export` or a target-specific `export`); an empty value, `env
+  -u` and an assignment the base already had say nothing, and a CI `env:` is `ci.tampered`'s. A nested `package.json` is a `warn`, not
   a block, only when it is known that no policy command reaches it: every policy command is a
   plain root package-manager run (`npm test`, `pnpm run x`, `yarn test`, `bun test`) with no
   workspace, filter, prefix or directory option, and the root scripts it reaches contain no
