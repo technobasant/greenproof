@@ -8,6 +8,7 @@ by body hash (a rename); only what is left over counts as removed, replaced or d
 
 from __future__ import annotations
 
+import posixpath
 import re
 from collections import Counter
 from collections.abc import Sequence
@@ -17,21 +18,23 @@ from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import BLOCK, WARN, Finding
 from greenproof.rules._common import CODE_SUFFIXES, finding, language_of, sev_finding
 from greenproof.rules.collect import Collection, collection_from_base
-from greenproof.rules.self_mocked import check_self_mocked
+from greenproof.rules.self_mocked import check_autouse_fixtures, check_self_mocked
 from greenproof.rules.tests_data import check_expected_data
 from greenproof.rules.tests_lines import analyse_lines, go_call_pattern
 from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
-from greenproof.rules.tests_python import analyse_python, marker_display
+from greenproof.rules.tests_python import Sources, analyse_python, marker_display
 
 _RUST_TEST_ATTR = re.compile(r"#\[\s*(?:\w+::)*test\b")
 
 
-def analyse(path: str, text: str, siblings: Sequence[str] = ()) -> FileAnalysis | None:
+def analyse(
+    path: str, text: str, siblings: Sequence[str] = (), sources: Sources | None = None
+) -> FileAnalysis | None:
     lang = language_of(path)
     if lang is None:
         return None
     if lang == "python":
-        return analyse_python(path, text) or analyse_lines(path, text, "python-lines")
+        return analyse_python(path, text, sources) or analyse_lines(path, text, "python-lines")
     return analyse_lines(path, text, lang, siblings)
 
 
@@ -180,6 +183,31 @@ def _loosened(b: Unit, c: Unit) -> list[tuple[str, str]]:
     ]
 
 
+def _band_floor(expected: float) -> float:
+    """The smallest tolerance that counts as loosening an exact numeric check: 1% of the
+    expected value, or 0.01 when it is 0 (SPEC 5.4)."""
+    return 0.01 * abs(expected) if expected else 0.01
+
+
+def _loosened_numeric(b: Unit, c: Unit) -> list[_Reason]:
+    """An exact (or default-`approx`) comparison to a number at the base that the candidate makes
+    with an explicit tolerance of 1% of the expected value or more."""
+    out: list[_Reason] = []
+    for (shape, expected), (band, src) in c.numeric_bands.items():
+        floor = _band_floor(expected)
+        before = b.numeric_bands.get((shape, expected))
+        if before is not None and before[0] < floor <= band:
+            out.append(
+                (
+                    f"exact check on `{src}` against {expected:g} loosened to a tolerance "
+                    f"of {band:g} (1% of the expected value or more)",
+                    c.line,
+                    BLOCK,
+                )
+            )
+    return out
+
+
 def _only_loose_dropped(b: Unit, c: Unit, added: _Added) -> bool:
     """SPEC 5.4: every base assertion that is gone is a loose check, and every subject of an
     exact check at the base is still the subject of one in the candidate. Beyond the spec text
@@ -227,6 +255,8 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
         )
     loosened = _loosened(b, c) if b.engine == "python" else []
     out.extend((f"exact check on `{x}` loosened to `{src}`", c.line, BLOCK) for x, src in loosened)
+    if b.engine == "python":
+        out.extend(_loosened_numeric(b, c))
     if c.strong < b.strong and c.weak > b.weak and not loosened:
         # Cutting a comparison to a truthiness check on its own operand is a plain weakening
         # (an exact check loosened is reported above); a different expression is often a
@@ -350,15 +380,87 @@ def _marker_finding(path: str, m: Marker, warn: bool = False) -> Finding:
     )
 
 
+_MAX_DEPENDENTS = 200
+
+
+def _helper_modules(sides: list[_Side]) -> tuple[set[str], set[str]]:
+    """Paths (base and candidate) of the changed Python modules in the test paths that hold no
+    test of their own (helpers), and the directories of the changed conftest.py files."""
+    helpers: set[str] = set()
+    conftests: set[str] = set()
+    for s in sides:
+        path, old = s.file.path, s.file.old_path or s.file.path
+        if not path.endswith(".py") and not old.endswith(".py"):
+            continue
+        if posixpath.basename(path) == "conftest.py" or posixpath.basename(old) == "conftest.py":
+            conftests.add(posixpath.dirname(path))
+            conftests.add(posixpath.dirname(old))
+        if not any(a is not None and a.units for a in (s.base, s.cand)):
+            helpers.update((path, old))
+    return helpers, conftests
+
+
+def _below(path: str, directory: str) -> bool:
+    return not directory or path.startswith(directory + "/")
+
+
+def _dependents(
+    changes: ChangeSet,
+    sides: list[_Side],
+    cfg: Collection,
+    base_src: Sources,
+    cand_src: Sources,
+) -> list[_Side]:
+    """Unchanged Python test files a changed helper module or conftest.py can affect, analysed as
+    if they had changed: the files at or below the helper's directory that import it, and for a
+    conftest.py every test file below it. A helper that lost its assertions then shows up as
+    weakened tests in its callers. Bounded to the first 200 files."""
+    helpers, conftests = _helper_modules(sides)
+    if not helpers and not conftests:
+        return []
+    known = {s.file.path for s in sides} | {s.file.old_path for s in sides if s.file.old_path}
+    out: list[_Side] = []
+    for path in sorted(changes.cand_paths()):
+        if len(out) >= _MAX_DEPENDENTS:
+            break
+        if (
+            path in known
+            or not path.endswith(".py")
+            or not changes.is_test(path)
+            or not cfg.file_collected(path)
+        ):
+            continue
+        under_conftest = any(_below(path, d) for d in conftests)
+        under_helper = any(_below(path, posixpath.dirname(h)) for h in helpers)
+        if not (under_conftest or under_helper):
+            continue
+        new_text, old_text = changes.cand_text(path), changes.base_text(path)
+        if new_text is None or old_text is None:
+            continue
+        cand = analyse_python(path, new_text, cand_src)
+        if cand is None or not (under_conftest or cand.imports & helpers):
+            continue
+        base = analyse_python(path, old_text, base_src)
+        if base is None:
+            continue
+        file = ChangedFile(
+            path, "M", None, old_text.encode(), new_text.encode(), is_test=True, was_test=True
+        )
+        out.append(_Side(base, cand, file))
+    return out
+
+
 def check_tests(changes: ChangeSet) -> list[Finding]:
+    base_src = Sources(changes.base_text, changes.is_test, changes.listing(True))
+    cand_src = Sources(changes.cand_text, changes.is_test, changes.listing(False))
     sides: list[_Side] = []
     for f in changes.files:
         old_path = f.old_path or f.path
         base = cand = None
         if _is_test_side(old_path, f.old_text, f.was_test) and f.old_text is not None:
-            base = analyse(f.path, f.old_text, _go_siblings(changes, old_path, True))
+            base = analyse(f.path, f.old_text, _go_siblings(changes, old_path, True), base_src)
         if _is_test_side(f.path, f.new_text, f.is_test) and f.new_text is not None:
-            cand = analyse(f.path, f.new_text, _go_siblings(changes, f.path, False))
+            cand = analyse(f.path, f.new_text, _go_siblings(changes, f.path, False), cand_src)
         if base is None and cand is None:
             continue
         if cand is None and base is not None and f.status not in ("D", "R"):
@@ -367,6 +469,7 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
     sides.extend(_go_callers(changes, sides))
 
     cfg = collection_from_base(changes)
+    sides.extend(_dependents(changes, sides, cfg, base_src, cand_src))
     for s in sides:
         for analysis, real_path in (
             (s.base, s.file.old_path or s.file.path),
@@ -399,6 +502,13 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
             changes,
         )
     )
+    out.extend(
+        check_autouse_fixtures(
+            {s.base.path: s.base for s in sides if s.base},
+            {s.cand.path: s.cand for s in sides if s.cand},
+        )
+    )
+    out.extend(_fixture_changes(sides, changes))
     return out
 
 
@@ -620,4 +730,32 @@ def _weakened(sides: list[_Side], pairing: _Pairing, changes: ChangeSet) -> list
                     "confirm the old value was wrong."
                 )
             out.append(finding("tests.expected_changed", c.path, line, what, hint))
+    return out
+
+
+def _fixture_changes(sides: list[_Side], changes: ChangeSet) -> list[Finding]:
+    """SPEC 5.4: a fixture whose returned or yielded literal changed (tests.expected_changed)."""
+    out: list[Finding] = []
+    code_changed = any(f.path.endswith(CODE_SUFFIXES) for f in changes.non_tests())
+    for s in sides:
+        if s.base is None or s.cand is None:
+            continue
+        for name, fx in s.cand.fixtures.items():
+            old = s.base.fixtures.get(name)
+            if old is None or not old.literals or not fx.literals:
+                continue
+            if Counter(old.literals) == Counter(fx.literals):
+                continue
+            shown = name.rsplit("::", 1)[-1]
+            tail = "while non-test code changed" if code_changed else "and no non-test code changed"
+            out.append(
+                finding(
+                    "tests.expected_changed",
+                    s.cand.path,
+                    fx.line,
+                    f"expected value changed in fixture {shown} ({s.cand.path}) {tail}",
+                    "Confirm the new value comes from the requirement, not from what the code "
+                    "now returns; every test that uses the fixture compares against it.",
+                )
+            )
     return out

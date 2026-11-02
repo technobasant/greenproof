@@ -78,22 +78,28 @@ _RULES = [
         BLOCK,
         "A test present on both sides checks less than before: fewer assertions, a strong "
         "assertion replaced by a weaker one, a wider tolerance, fewer parametrize cases, an "
-        "assertion made vacuous (`assert True`, `... or True`, `x == x`) or unreachable (after "
-        "an unconditional return or raise, or under `if False`; in JS, Go and Rust a bare "
-        "`return` at the top level of a test, or an `if false`, `if (false)` or `... && false` "
-        "block), or an assertion wrapped in a try/except that swallows the failure. In JS, Go "
-        "and Rust, comparing an expression with itself (`expect(X).toBe(X)`, `assert.Equal(t, "
-        "X, X)`, `assert_eq!(X, X)`, `if X != X`) is vacuous, and rows removed from an "
-        "`it.each`, `test.each` or `describe.each` table count as fewer cases. A helper that "
-        "checks counts as one check per call (JS: same file; Go: same directory), so a helper "
-        "that loses its checks weakens its callers. Replacing a comparison with its own operand "
+        "assertion made vacuous (`assert True`, `assert [x]`, `... or True`, `x == x`, "
+        "`f(x) == f(x)`) or unreachable (after an unconditional return or raise, or under "
+        "`if False`; in JS, Go and Rust a bare `return` at the top level of a test, or an "
+        "`if false`, `if (false)` or `... && false` block), an exact check loosened to a wide "
+        "`pytest.approx`/`math.isclose`/`assertAlmostEqual` tolerance, or an assertion wrapped "
+        "in a try/except or a swallowing decorator that swallows the failure. In JS, Go and "
+        "Rust, comparing an expression with itself (`expect(X).toBe(X)`, `assert.Equal(t, X, "
+        "X)`, `assert_eq!(X, X)`, `if X != X`) is vacuous, and rows removed from an `it.each`, "
+        "`test.each` or `describe.each` table count as fewer cases. In Python a later def, del "
+        "or rebinding of a test name shadows the earlier test, which Python never collects. A "
+        "helper that checks counts as one check per call (Python: helpers imported from other "
+        "test modules too; JS: same file; Go: same directory), so a helper or conftest that "
+        "loses its checks weakens the tests that use it. Replacing a comparison with its own "
+        "operand "
         "(`assert f() == 1` to `assert f()`) blocks; replacing it with a different expression "
         "is a warning, because that is often a legitimate refactor.",
     ),
     RuleInfo(
         "tests.expected_changed",
         WARN,
-        "The expected value in an assertion changed, whether or not non-test code changed. That is "
+        "The expected value in an assertion, or the literal a `@pytest.fixture` returns, changed, "
+        "whether or not non-test code changed. That is "
         "legitimate when the specification changed, so it is a warning: confirm the new value "
         "comes from the requirement, not from what the code returns. A modified expected-output "
         "data file (.json, .yaml, .yml, .txt, .csv, .snap, .golden, .out, .expected, .html, "
@@ -136,7 +142,8 @@ _RULES = [
         "jest.mock, vi.mock, a mocked spyOn) the same callable its assertions call, so the "
         "assertion checks the mock instead of the code. Patching a collaborator is fine; "
         "patching the subject of the test is not. A patch that was already in the same test "
-        "at the base does not fire.",
+        "at the base does not fire. An added or changed autouse fixture that patches a "
+        "callable the tests in its scope assert on fires too.",
     ),
     RuleInfo(
         "code.hardcoded",

@@ -46,6 +46,9 @@ class Unit:
     pinned: int = 0
     # Python only: forms of assertions that are loose checks only (no exact check inside).
     loose_forms: list[str] = field(default_factory=list)
+    # Python only: (subject shape, expected number) -> (tightest tolerance band, subject source)
+    # over the body's comparisons to a numeric literal; exact is band 0 (SPEC 5.4).
+    numeric_bands: dict[tuple[str, float], tuple[float, str]] = field(default_factory=dict)
     strong_operands: set[str] = field(default_factory=set)
     weak_operands: set[str] = field(default_factory=set)
     # Collection facts: enclosing classes, whether one is a TestCase, `__test__ = False`.
@@ -60,6 +63,21 @@ class Unit:
     @property
     def name(self) -> str:
         return self.key.rsplit("::", 1)[-1] if self.engine.startswith("python") else self.key
+
+
+@dataclass
+class Fixture:
+    """A `@pytest.fixture` function: where it is, whether every test in scope uses it, and the
+    literals it returns or yields (the expected values a test may compare against)."""
+
+    path: str
+    name: str  # `Class::name` for a fixture defined in a class
+    line: int
+    autouse: bool
+    literals: list[str]  # ast.dump of each returned or yielded literal
+    body_hash: str
+    scope: str = ""  # the class prefix (`Class::`) it is defined in, else ""
+    node: ast.AST | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -84,3 +102,6 @@ class FileAnalysis:
     tree: ast.Module | None = field(default=None, repr=False, compare=False)  # Python only
     # Go only: assertion helpers this file declares (SPEC 5.4), so callers can be re-analysed.
     helpers: frozenset[str] = frozenset()
+    # Python only: paths of the test-path modules whose functions this file imports and may call.
+    imports: set[str] = field(default_factory=set)
+    fixtures: dict[str, Fixture] = field(default_factory=dict)  # Python only, by name

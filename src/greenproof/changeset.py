@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import posixpath
 import re
 from collections.abc import Callable, Sequence
@@ -39,10 +40,37 @@ class ChangeSet:
     skipped_binary: list[str] = field(default_factory=list)
     # Reads any file as it was at the base revision (None when absent), changed or not.
     read_base: Callable[[str], bytes | None] | None = None
-    # The same for the candidate tree, and directory listings (file paths) at both revisions.
+    # The same for the candidate tree, and every file path of each tree.
     read_cand: Callable[[str], bytes | None] | None = None
-    list_base: Callable[[str], list[str]] | None = None
-    list_cand: Callable[[str], list[str]] | None = None
+    list_base: Callable[[], list[str]] | None = None
+    list_cand: Callable[[], list[str]] | None = None
+    test_patterns: tuple[str, ...] = ()
+
+    def cand_text(self, path: str) -> str | None:
+        """The file's text in the candidate tree, or None when it is not there. A file the change
+        did not touch reads the same as at the base when no tree reader is wired in."""
+        for f in self.files:
+            if f.path == path:
+                return f.new_text
+        if self.read_cand is not None:
+            blob = self.read_cand(path)
+            return None if blob is None else blob.decode(errors="replace")
+        return self.base_text(path)
+
+    def cand_paths(self) -> list[str]:
+        """Every file of the candidate tree (the changed ones only without a tree lister)."""
+        if self.list_cand is not None:
+            return self.list_cand()
+        return [f.path for f in self.files if f.new_content is not None]
+
+    def listing(self, base: bool) -> Callable[[], set[str]] | None:
+        """The set of files at the base or the candidate, or None when no lister is wired in
+        (callers then read paths directly instead of filtering by existence)."""
+        lister = self.list_base if base else self.list_cand
+        return None if lister is None else lambda: set(lister())
+
+    def is_test(self, path: str) -> bool:
+        return is_test_path(path, self.test_patterns)
 
     def base_text(self, path: str) -> str | None:
         """The file's text at the base revision, or None when it did not exist there."""
@@ -62,8 +90,8 @@ class ChangeSet:
         reader = self.read_base if base else self.read_cand
         out: dict[str, str] = {}
         if lister is not None and reader is not None:
-            for name in lister(directory):
-                if name != path and name.endswith(suffix):
+            for name in lister():
+                if name != path and name.endswith(suffix) and posixpath.dirname(name) == directory:
                     blob = reader(name)
                     if blob is not None:
                         out[name] = blob.decode(errors="replace")
@@ -161,11 +189,26 @@ def build_changeset(
                 was_test=entry.status != "A" and is_test_path(old_path, test_patterns),
             )
         )
+
+    # Rules read siblings, helpers and importers of the changed files, often the same ones, so
+    # each blob and each tree listing is read from git once per check.
+    def reader(rev: str) -> Callable[[str], bytes | None]:
+        return functools.cache(lambda p: gitops.read_blob(repo, rev, p))
+
+    def lister(rev: str) -> Callable[[], list[str]]:
+        @functools.cache
+        def list_tree() -> tuple[str, ...]:
+            proc = gitops.git(repo, "ls-tree", "-r", "--name-only", "-z", rev)
+            return tuple(p for p in proc.stdout.decode(errors="surrogateescape").split("\0") if p)
+
+        return lambda: list(list_tree())
+
     return ChangeSet(
         files,
         skipped,
-        lambda p: gitops.read_blob(repo, base_sha, p),
-        lambda p: gitops.read_blob(repo, tree, p),
-        lambda d: gitops.list_dir(repo, base_sha, d),
-        lambda d: gitops.list_dir(repo, tree, d),
+        read_base=reader(base_sha),
+        read_cand=reader(tree),
+        list_base=lister(base_sha),
+        list_cand=lister(tree),
+        test_patterns=tuple(test_patterns),
     )
