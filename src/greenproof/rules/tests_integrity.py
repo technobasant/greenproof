@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from greenproof.changeset import ChangedFile, ChangeSet
@@ -17,20 +18,31 @@ from greenproof.findings import BLOCK, WARN, Finding
 from greenproof.rules._common import CODE_SUFFIXES, finding, language_of, sev_finding
 from greenproof.rules.collect import Collection, collection_from_base
 from greenproof.rules.self_mocked import check_self_mocked
-from greenproof.rules.tests_lines import analyse_lines
+from greenproof.rules.tests_data import check_expected_data
+from greenproof.rules.tests_lines import analyse_lines, go_call_pattern
 from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
 from greenproof.rules.tests_python import analyse_python, marker_display
 
 _RUST_TEST_ATTR = re.compile(r"#\[\s*(?:\w+::)*test\b")
 
 
-def analyse(path: str, text: str) -> FileAnalysis | None:
+def analyse(path: str, text: str, siblings: Sequence[str] = ()) -> FileAnalysis | None:
     lang = language_of(path)
     if lang is None:
         return None
     if lang == "python":
         return analyse_python(path, text) or analyse_lines(path, text, "python-lines")
-    return analyse_lines(path, text, lang)
+    return analyse_lines(path, text, lang, siblings)
+
+
+_GO_TEST_SUFFIX = "_test.go"
+
+
+def _go_siblings(changes: ChangeSet, path: str, base: bool) -> tuple[str, ...]:
+    """Texts of the other `_test.go` files of the directory: where Go assertion helpers live."""
+    if not path.endswith(_GO_TEST_SUFFIX):
+        return ()
+    return tuple(changes.siblings(path, _GO_TEST_SUFFIX, base).values())
 
 
 def _is_test_side(path: str, text: str | None, flagged: bool) -> bool:
@@ -320,6 +332,14 @@ def _marker_finding(path: str, m: Marker, warn: bool = False) -> Finding:
             f"focus marker `{text}` added to {where}; every other test in the run is skipped",
             "Remove the focus marker so the whole suite runs.",
         )
+    if m.kind.startswith(("go:build", "+build")):
+        return finding(
+            "tests.skipped",
+            path,
+            m.line,
+            f"build constraint `{text}` added: `go test ./...` no longer compiles this file",
+            "Remove the constraint so the file's tests run in the default build.",
+        )
     return sev_finding(
         "tests.skipped",
         WARN if warn else BLOCK,
@@ -336,14 +356,15 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
         old_path = f.old_path or f.path
         base = cand = None
         if _is_test_side(old_path, f.old_text, f.was_test) and f.old_text is not None:
-            base = analyse(f.path, f.old_text)
+            base = analyse(f.path, f.old_text, _go_siblings(changes, old_path, True))
         if _is_test_side(f.path, f.new_text, f.is_test) and f.new_text is not None:
-            cand = analyse(f.path, f.new_text)
+            cand = analyse(f.path, f.new_text, _go_siblings(changes, f.path, False))
         if base is None and cand is None:
             continue
         if cand is None and base is not None and f.status not in ("D", "R"):
             cand = FileAnalysis(f.path, base.engine)  # the file stopped being a test file
         sides.append(_Side(base, cand, f))
+    sides.extend(_go_callers(changes, sides))
 
     cfg = collection_from_base(changes)
     for s in sides:
@@ -369,6 +390,7 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
     base_keys = {u.key for s in sides if s.base for u in s.base.units}
     cand_keys = {u.key for s in sides if s.cand for u in s.cand.units}
     out.extend(_marker_findings(sides, base_keys, cand_keys))
+    out.extend(check_expected_data(changes))
     out.extend(
         check_self_mocked(
             [(None, u) for u in pairing.left_cand] + [(b, c) for b, c in pairing.pairs],
@@ -377,6 +399,40 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
             changes,
         )
     )
+    return out
+
+
+def _go_callers(changes: ChangeSet, sides: list[_Side]) -> list[_Side]:
+    """Unchanged Go test files that call an assertion helper declared in a changed one (SPEC
+    5.4): re-analysed on both sides, so a helper that lost its checks weakens its callers."""
+    seen = {s.file.path for s in sides} | {s.file.old_path for s in sides if s.file.old_path}
+    out: list[_Side] = []
+    for s in sides:
+        names: set[str] = set()
+        for a in (s.base, s.cand):
+            if a is not None:
+                names |= a.helpers
+        if not names or not s.file.path.endswith(_GO_TEST_SUFFIX):
+            continue
+        call = go_call_pattern(names)
+        old_path = s.file.old_path or s.file.path
+        base_files = changes.siblings(old_path, _GO_TEST_SUFFIX, True)
+        cand_files = changes.siblings(s.file.path, _GO_TEST_SUFFIX, False)
+        for path in sorted(set(base_files) & set(cand_files)):
+            if path in seen:
+                continue
+            old, new = base_files[path], cand_files[path]
+            if not (call.search(old) or call.search(new)):
+                continue
+            seen.add(path)
+            file = ChangedFile(path, "M", None, old.encode(), new.encode(), True, True)
+            out.append(
+                _Side(
+                    analyse(path, old, _go_siblings(changes, path, True)),
+                    analyse(path, new, _go_siblings(changes, path, False)),
+                    file,
+                )
+            )
     return out
 
 
