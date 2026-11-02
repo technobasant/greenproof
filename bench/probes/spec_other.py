@@ -246,7 +246,7 @@ PROBES = [
         "js-self-equal",
         "js",
         "js",
-        [(JT, "expect(add(1, 2)).toBe(3);", "const r = add(1, 2);\n    expect(r).toBe(r);")],
+        [(JT, "expect(add(1, 2)).toBe(3);", "expect(add(1, 2)).toBe(add(1, 2));")],
         "block tests.weakened",
         **S,
     ),

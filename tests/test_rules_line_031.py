@@ -184,6 +184,92 @@ def test_memoization_check_is_clean_but_a_plain_self_check_blocks(tmp_path: Path
     assert rule_ids(found) == ["tests.weakened"] and "vacuous" in found[0].message
 
 
+# ---- L9: a self-comparison with calls is vacuous only when it replaces a real comparison ----
+
+MEMO = """\
+describe('sel', () => {
+  it('is memoized', () => {
+    expect(select(s)).toBe(select(s));
+  });
+});
+"""
+
+
+def test_probe_form_replacing_a_real_comparison_blocks(tmp_path: Path) -> None:
+    new = JS.replace("expect(add(1, 2)).toBe(3);", "expect(add(1, 2)).toBe(add(1, 2));")
+    found = change(tmp_path, JS_PATH, JS, new)
+    assert rule_ids(found) == ["tests.weakened"] and "vacuous" in found[0].message
+    for i, matcher in enumerate(("toEqual", "toStrictEqual")):
+        old = JS.replace("toBe(3)", f"{matcher}({{ a: 1 }})")
+        new = old.replace(f"{matcher}({{ a: 1 }})", f"{matcher}(add(1, 2))")
+        found = change(tmp_path / str(i), JS_PATH, old, new)
+        assert rule_ids(found) == ["tests.weakened"], matcher
+
+
+def test_go_and_rust_call_self_comparison_replacing_a_comparison_blocks(tmp_path: Path) -> None:
+    found = change(
+        tmp_path,
+        RUST_PATH,
+        RUST,
+        RUST.replace("assert_eq!(add(1, 2), 3);", "assert_eq!(add(1, 2), add(1, 2));"),
+    )
+    assert rule_ids(found) == ["tests.weakened"] and "vacuous" in found[0].message
+    old = GO.replace(
+        "if got := Add(1, 2); got != 3 {", "assert.Equal(t, Add(1, 2), 3)\n\tif false {"
+    )
+    new = old.replace("assert.Equal(t, Add(1, 2), 3)", "assert.Equal(t, Add(1, 2), Add(1, 2))")
+    found = change(tmp_path / "go", GO_PATH, old, new)
+    assert any("vacuous" in f.message for f in found)
+
+
+def test_memoization_test_that_was_already_there_stays_clean(tmp_path: Path) -> None:
+    edited = MEMO.replace(
+        "  it('is memoized', () => {\n", "  it('is memoized', () => {\n    const z = 1;\n"
+    )
+    assert change(tmp_path, JS_PATH, MEMO, edited) == []
+    other = MEMO.replace("  });\n", "    expect(other()).toBe(1);\n  });\n")
+    assert change(tmp_path / "b", JS_PATH, MEMO, other) == []
+
+
+def test_new_memoization_test_is_clean(tmp_path: Path) -> None:
+    assert change(tmp_path, JS_PATH, JS, JS + MEMO) == []
+
+
+def test_memoization_check_added_to_a_test_with_other_checks_is_clean(tmp_path: Path) -> None:
+    new = JS.replace(
+        "    expect(add(1, 2)).toBe(3);",
+        "    expect(add(1, 2)).toBe(3);\n    expect(select(s)).toBe(select(s));",
+    )
+    assert change(tmp_path, JS_PATH, JS, new) == []
+
+
+def test_memoization_test_edited_elsewhere_stays_clean(tmp_path: Path) -> None:
+    old = MEMO.replace(
+        "    expect(select(s)).toBe(select(s));",
+        "    expect(select(s)).toBe(select(s));\n    expect(other(s)).toBe(2);",
+    )
+    new = old.replace("toBe(2)", "toBe(3)")
+    assert [f.rule for f in change(tmp_path, JS_PATH, old, new)] == ["tests.expected_changed"]
+
+
+def test_self_comparison_already_in_the_base_beside_its_real_check_is_not_new(
+    tmp_path: Path,
+) -> None:
+    both = JS.replace(
+        "    expect(add(1, 2)).toBe(3);",
+        "    expect(add(1, 2)).toBe(3);\n    expect(add(1, 2)).toBe(add(1, 2));",
+    )
+    assert (
+        change(
+            tmp_path,
+            JS_PATH,
+            both,
+            both.replace("  it('adds', () => {\n", "  it('adds', () => {\n    const z = 1;\n"),
+        )
+        == []
+    )
+
+
 # ---- L3: brace-less branch before return -----------------------------------------------------
 
 BRACELESS = """\

@@ -388,8 +388,12 @@ string contents blanked, so brackets inside strings do not count:
   `assert.equal/strictEqual/deepEqual/deepStrictEqual(X, X)`; Go `assert.Equal(t, X, X)`,
   `require.Equal(t, X, X)` (also `EqualValues`, `Exactly`); Rust
   `assert_eq!(X, X)` and `assert!(X == X)`. Operands are compared with whitespace removed.
-  An `X` that contains a call (any `(`) is never vacuous: `expect(select(state)).toBe(
+  An `X` that contains a call (any `(`) is not vacuous by itself: `expect(select(state)).toBe(
   select(state))` checks memoization and `assert_eq!(h("ab"), h("ab"))` checks determinism.
+  Such a call self-comparison is vacuous only when it replaces a real comparison: the base
+  version of the same test compared the same normalised expression with a different one
+  (`expect(add(1, 2)).toBe(3)` → `expect(add(1, 2)).toBe(add(1, 2))`); one already in the base
+  test, in a new test, or on an expression the base did not compare is a real check.
   Go's `if got != got {` is not vacuous either: it is the NaN check. An `X` that names a
   nondeterministic source (`random`, `Date`, `now(`, `uuid`, `nanoid`,
   `rand`, `Instant`, `SystemTime`) is exempt. A vacuous check is not counted and raises the

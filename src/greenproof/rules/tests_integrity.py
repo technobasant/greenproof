@@ -241,10 +241,11 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
             )
     elif count_drop_allowed and c.asserts < b.asserts:
         out.append((f"assertions dropped from {b.asserts} to {c.asserts}", c.line, BLOCK))
-    if c.vacuous > b.vacuous:
-        out.append(
-            ("an assertion was made vacuous: it can never fail", c.vacuous_line or c.line, BLOCK)
-        )
+    replaced = [line for expr, line in c.self_calls if expr in b.compared]
+    base_replaced = sum(1 for expr, _ in b.self_calls if expr in b.compared)
+    if c.vacuous + len(replaced) > b.vacuous + base_replaced:
+        line = c.vacuous_line or (replaced[0] if replaced else c.line)
+        out.append(("an assertion was made vacuous: it can never fail", line, BLOCK))
     if c.unreachable > b.unreachable:
         out.append(
             (

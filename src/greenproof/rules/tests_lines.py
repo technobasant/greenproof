@@ -392,6 +392,24 @@ def _same(a: str, b: str) -> bool:
     return bool(x) and x == _norm(b) and "(" not in x and _NONDETERMINISTIC.search(a) is None
 
 
+def _same_call(a: str, b: str) -> bool:
+    """Both sides are the same deterministic expression and it contains a call."""
+    x = _norm(a)
+    return bool(x) and x == _norm(b) and "(" in x and _NONDETERMINISTIC.search(a) is None
+
+
+@dataclass
+class _SelfEq:
+    """What `_self_equal_lines` found in a test: lines with a call-free self-comparison (vacuous,
+    {line: count}); self-comparisons whose operand has a call, which are vacuous only when they
+    replace a real comparison at the base, as (normalised operand, line); and the normalised
+    operands of every comparison of two different expressions."""
+
+    vacuous: dict[int, int]
+    calls: list[tuple[str, int]]
+    compared: set[str]
+
+
 _JS_EXPECT_SELF = re.compile(r"\s*\.\s*(?:toBe|toEqual|toStrictEqual)\s*\(")
 _JS_NODE_EQ = re.compile(r"\bassert\s*\.\s*(?:equal|strictEqual|deepEqual|deepStrictEqual)\s*\(")
 _GO_EQUAL = re.compile(r"\b(?:assert|require)\s*\.\s*(?:Equal|EqualValues|Exactly)f?\s*\(")
@@ -399,16 +417,24 @@ _RUST_ASSERT_EQ = re.compile(r"\bassert_eq!\s*\(")
 _RUST_ASSERT = re.compile(r"\bassert!\s*\(")
 
 
-def _self_equal_lines(src: _Src, a: int, b: int, skip: dict[int, str]) -> dict[int, int]:
-    """Lines of `[a, b)` (offsets) holding a comparison of an expression with its own text, as
-    {line: count}: `expect(X).toBe(X)`, `assert.equal(X, X)`, `assert_eq!(X, X)` (SPEC 5.4)."""
+def _self_equal_lines(src: _Src, a: int, b: int, skip: dict[int, str]) -> _SelfEq:
+    """Comparisons of an expression with its own text in `[a, b)` (offsets): `expect(X).toBe(X)`,
+    `assert.equal(X, X)`, `assert_eq!(X, X)` (SPEC 5.4), and the operands of the others."""
     found: dict[int, int] = {}
+    calls: list[tuple[str, int]] = []
+    compared: set[str] = set()
     s = src.shadow
 
-    def hit(offset: int) -> None:
+    def pair(left: str, right: str, offset: int) -> None:
         line = src.line_of(offset)
-        if line not in skip:
+        if line in skip:
+            return
+        if _same(left, right):
             found[line] = found.get(line, 0) + 1
+        elif _same_call(left, right):
+            calls.append((_norm(left), line + 1))
+        else:
+            compared.update((_norm(left), _norm(right)))
 
     if src.lang == "js":
         for m in _JS_EXPECT_OPEN.finditer(s, a, b):
@@ -417,12 +443,12 @@ def _self_equal_lines(src: _Src, a: int, b: int, skip: dict[int, str]) -> dict[i
             if nm is None:
                 continue
             args = src.args(nm.end() - 1)
-            if args is not None and len(args) == 1 and _same(src.text[m.end() : close], args[0]):
-                hit(m.start())
+            if args is not None and len(args) == 1:
+                pair(src.text[m.end() : close], args[0], m.start())
         for m in _JS_NODE_EQ.finditer(s, a, b):
             args = src.args(m.end() - 1)
-            if args is not None and len(args) >= 2 and _same(args[0], args[1]):
-                hit(m.start())
+            if args is not None and len(args) >= 2:
+                pair(args[0], args[1], m.start())
     elif src.lang == "go":
         for m in _GO_EQUAL.finditer(s, a, b):
             args = src.args(m.end() - 1)
@@ -430,13 +456,13 @@ def _self_equal_lines(src: _Src, a: int, b: int, skip: dict[int, str]) -> dict[i
                 continue
             if args and args[0].strip() in ("t", "b", "tb") and len(args) >= 3:
                 args = args[1:]
-            if len(args) >= 2 and _same(args[0], args[1]):
-                hit(m.start())
+            if len(args) >= 2:
+                pair(args[0], args[1], m.start())
     elif src.lang == "rust":
         for m in _RUST_ASSERT_EQ.finditer(s, a, b):
             args = src.args(m.end() - 1)
-            if args is not None and len(args) >= 2 and _same(args[0], args[1]):
-                hit(m.start())
+            if args is not None and len(args) >= 2:
+                pair(args[0], args[1], m.start())
         for m in _RUST_ASSERT.finditer(s, a, b):
             close = src.close(m.end() - 1)
             if close < 0:
@@ -444,9 +470,9 @@ def _self_equal_lines(src: _Src, a: int, b: int, skip: dict[int, str]) -> dict[i
             if len(src.split(m.end(), close, "&&")) > 1 or len(src.split(m.end(), close, "||")) > 1:
                 continue
             sides = src.split(m.end(), close, "==")
-            if len(sides) == 2 and _same(sides[0], sides[1]):
-                hit(m.start())
-    return found
+            if len(sides) == 2:
+                pair(sides[0], sides[1], m.start())
+    return _SelfEq(found, calls, compared)
 
 
 def _strip_parens(expr: str) -> str:
@@ -1123,7 +1149,7 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
                 src, src.starts[span.start], src.starts[span.end] + len(code[span.end]), dead
             )
             if src is not None
-            else {}
+            else _SelfEq({}, [], set())
         )
         nested = (
             _inside_open_expect(masked, span.start, span.end)
@@ -1140,6 +1166,8 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
             param_cases=span.cases,
             param_forms=list(span.forms),
         )
+        unit.self_calls = selfeq.calls
+        unit.compared = selfeq.compared
         live: list[str] = []
         for k in lines:
             query = int(
@@ -1152,7 +1180,7 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
             hits = len(_ASSERTS[lang].findall(masked[k])) + query
             if helper_call:
                 hits += len(helper_call.findall(masked[k]))
-            vac = const_hits[k] + selfeq.get(k, 0)
+            vac = const_hits[k] + selfeq.vacuous.get(k, 0)
             if k in dead:
                 if hits:
                     unit.unreachable += hits

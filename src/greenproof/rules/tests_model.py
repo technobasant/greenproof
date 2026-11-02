@@ -36,6 +36,11 @@ class Unit:
     assertion_forms: list[str] = field(default_factory=list)
     vacuous: int = 0
     vacuous_line: int = 0
+    # JS/TS, Go, Rust: self-comparisons whose operand has a call, as (normalised operand, line),
+    # and the normalised operands of comparisons of two different expressions. A self-comparison
+    # is vacuous only when its operand was compared with something else at the base (SPEC 5.4).
+    self_calls: list[tuple[str, int]] = field(default_factory=list)
+    compared: set[str] = field(default_factory=set)
     unreachable: int = 0
     unreachable_line: int = 0
     # Python only (SPEC 5.4): shape -> source of each subject of an exact check, and of each
