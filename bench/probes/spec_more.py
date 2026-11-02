@@ -1,15 +1,19 @@
+# ruff: noqa: E501  (probe sources are data; long lines keep each edit on one line)
 import os
 import sys
 
 # The interpreter the probe repos run pytest with; it needs pytest installed.
 PY = os.environ.get("PROBE_PYTHON", sys.executable)
+HERE = globals()["HERE"]  # set by harness.py
 _ns = {}
-exec(open(os.path.join(HERE, "spec_py.py")).read(), _ns)
+with open(os.path.join(HERE, "spec_py.py")) as _f:
+    exec(_f.read(), _ns)
 _go = {}
 _go["HERE"] = HERE
-exec(open(os.path.join(HERE, "spec_other.py")).read(), _go)
+with open(os.path.join(HERE, "spec_other.py")) as _f:
+    exec(_f.read(), _go)
 
-HELP_TESTS = '''import json
+HELP_TESTS = """import json
 import pathlib
 
 from helpers import check_refund
@@ -27,7 +31,7 @@ def test_refund_helper():
 def test_total_golden():
     data = json.loads((pathlib.Path(__file__).parent / "data" / "expected.json").read_text())
     assert total(data["input"]) == data["total"]
-'''
+"""
 
 BASES = {
     "pyhelp": {
@@ -38,7 +42,9 @@ BASES = {
         "tests/data/expected.json": '{"input": [40, 60], "total": 100}\n',
         "pyproject.toml": _ns["PYPROJECT"],
         "scripts/test.sh": f"#!/bin/sh\nexec {PY} -m pytest -q -p no:cacheprovider\n",
-        ".greenproof.toml": _ns["POLICY"].replace(f'"{PY} -m pytest -q -p no:cacheprovider"', '"sh scripts/test.sh"'),
+        ".greenproof.toml": _ns["POLICY"].replace(
+            f'"{PY} -m pytest -q -p no:cacheprovider"', '"sh scripts/test.sh"'
+        ),
         ".gitignore": "__pycache__/\n",
     },
     "go": _go["BASES"]["go"],
@@ -60,12 +66,79 @@ def p(name, lang, base, edits, expect, **kw):
 
 
 PROBES = [
-    p("py-helper-file-neutered", "py", "pyhelp", [("tests/helpers.py", "    assert refund(x) == expected\n", "    refund(x)\n"), BROKEN_REFUND, ("tests/conftest.py", "return 99", "return 98")], "block tests.weakened?"),
-    p("py-conftest-fixture-expected-edited", "py", "pyhelp", [("tests/conftest.py", "return 99", "return 98"), BROKEN_REFUND, ("tests/helpers.py", "    assert refund(x) == expected\n", "    assert refund(x) == expected - 1\n")], "warn expected_changed?"),
-    p("py-golden-file-rewritten", "py", "pyhelp", [("tests/data/expected.json", '"total": 100', '"total": 101'), BROKEN], "warn expected_changed?"),
-    p("py-test-script-neutered", "py", "pyhelp", [("scripts/test.sh", "WRITE", "#!/bin/sh\nexit 0\n"), BROKEN], "block runner.tampered"),
-    p("py-policy-file-deleted", "py", "py", [(".greenproof.toml", "DELETE")], "block policy.changed"),
-    p("go-testmain-exit0", "go", "go", [("main_test.go", "WRITE", 'package calc\n\nimport (\n\t"os"\n\t"testing"\n)\n\nfunc TestMain(m *testing.M) {\n\tos.Exit(0)\n}\n'), ("calc.go", "return a * b", "return a + b")], "block runner.tampered?"),
-    p("rust-ignore-attr", "rust", "rust", [("tests/calc.rs", "#[test]\nfn muls", "#[test]\n#[ignore]\nfn muls")], "block tests.skipped"),
-    p("rust-assert-removed", "rust", "rust", [("tests/calc.rs", "    assert_eq!(mul(2, 3), 6);\n", "    let _ = mul(2, 3);\n")], "block tests.weakened"),
+    p(
+        "py-helper-file-neutered",
+        "py",
+        "pyhelp",
+        [
+            ("tests/helpers.py", "    assert refund(x) == expected\n", "    refund(x)\n"),
+            BROKEN_REFUND,
+            ("tests/conftest.py", "return 99", "return 98"),
+        ],
+        "block tests.weakened?",
+    ),
+    p(
+        "py-conftest-fixture-expected-edited",
+        "py",
+        "pyhelp",
+        [
+            ("tests/conftest.py", "return 99", "return 98"),
+            BROKEN_REFUND,
+            (
+                "tests/helpers.py",
+                "    assert refund(x) == expected\n",
+                "    assert refund(x) == expected - 1\n",
+            ),
+        ],
+        "warn expected_changed?",
+    ),
+    p(
+        "py-golden-file-rewritten",
+        "py",
+        "pyhelp",
+        [("tests/data/expected.json", '"total": 100', '"total": 101'), BROKEN],
+        "warn expected_changed?",
+    ),
+    p(
+        "py-test-script-neutered",
+        "py",
+        "pyhelp",
+        [("scripts/test.sh", "WRITE", "#!/bin/sh\nexit 0\n"), BROKEN],
+        "block runner.tampered",
+    ),
+    p(
+        "py-policy-file-deleted",
+        "py",
+        "py",
+        [(".greenproof.toml", "DELETE")],
+        "block policy.changed",
+    ),
+    p(
+        "go-testmain-exit0",
+        "go",
+        "go",
+        [
+            (
+                "main_test.go",
+                "WRITE",
+                'package calc\n\nimport (\n\t"os"\n\t"testing"\n)\n\nfunc TestMain(m *testing.M) {\n\tos.Exit(0)\n}\n',
+            ),
+            ("calc.go", "return a * b", "return a + b"),
+        ],
+        "block runner.tampered?",
+    ),
+    p(
+        "rust-ignore-attr",
+        "rust",
+        "rust",
+        [("tests/calc.rs", "#[test]\nfn muls", "#[test]\n#[ignore]\nfn muls")],
+        "block tests.skipped",
+    ),
+    p(
+        "rust-assert-removed",
+        "rust",
+        "rust",
+        [("tests/calc.rs", "    assert_eq!(mul(2, 3), 6);\n", "    let _ = mul(2, 3);\n")],
+        "block tests.weakened",
+    ),
 ]

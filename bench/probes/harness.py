@@ -11,7 +11,9 @@ A probe's `expect` starts with `block`, `warn` or `pass`. A `block` probe is cau
 check fails (a block finding, or a failing command). A `warn` probe is caught by a warning or a
 block. A `pass` probe (an honest change) is fine when the check passes, warnings allowed.
 """
+
 import argparse
+import contextlib
 import json
 import shutil
 import subprocess
@@ -109,13 +111,14 @@ def run_probe(runs: Path, bases: dict, pr: dict, gp: str) -> dict:
     out = runs / f"{name}.json"
     r = subprocess.run(
         [gp, "check", "--mode", "local", "--no-cache", "--checks", checks, "--json", str(out)],
-        cwd=d, capture_output=True, text=True, timeout=600,
+        cwd=d,
+        capture_output=True,
+        text=True,
+        timeout=600,
     )
     findings = []
-    try:
+    with contextlib.suppress(OSError, ValueError):
         findings = json.loads(out.read_text()).get("findings", [])
-    except (OSError, ValueError):
-        pass
     result, ok = score(pr.get("expect", ""), r.returncode, findings)
     row = {
         "probe": name,
@@ -151,7 +154,8 @@ def main() -> int:
             row = run_probe(runs, ns["BASES"], pr, args.gp)
             rows.append(row)
             mark = "ok  " if row["ok"] else "MISS"
-            print(f"{mark} {row['probe']:<40} {row['result']:<6} {row['rules']}  | expect: {row['expect']}")
+            print(f"{mark} {row['probe']:<40} {row['result']:<6} {row['rules']}", end="")
+            print(f"  | expect: {row['expect']}")
             if "stderr" in row:
                 print("     stderr:", row["stderr"])
 
