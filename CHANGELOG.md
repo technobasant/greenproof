@@ -14,22 +14,97 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   anything for PyPI, and after PyPI accepts the upload it creates the GitHub Release with that
   section as the notes and the built files attached.
 - Link references at the end of the CHANGELOG for each version and for `[Unreleased]`.
+- A report note on the default branch with no upstream: only uncommitted changes are checked,
+  and `--base REF` includes commits. `bench/replay.py` takes `--select runner` (commits that
+  touch CI, runner configs, `package.json`, Makefiles or shell scripts) and `--command CMD`.
 
 ### Changed
 
-- `ci.tampered` and `runner.tampered` block only when a change weakened what checks the code.
-  A swallow (`|| true`, `; exit 0`, `set +e`) counts only after a test, lint or type-check
-  command, so `rm -rf build || true` and `pip install x || true` are fine; GitHub `run:` steps
-  are read as `bash -e`; folded `>` scalars and heredoc bodies are read as YAML and the shell
-  do. CI is judged across all workflow files: splitting a workflow into a reusable one passes,
-  `paths` and `paths-ignore` are evaluated against the tree (excluding docs or meta files
-  passes), and branch, tag and type filters warn. New blocks: `--collect-only`,
-  `--passWithNoTests`, and `exit 0` before the first check in a CI step.
-- A Go `TestMain` is read by its declared parameter name, and a conditional `os.Exit(0)` is a
-  warning. Makefile recipes follow prerequisites and skip `define` blocks, and `run-s`,
-  `run-p` and `npm-run-all` are the same steps as chained `npm run`.
-- When the upstream exists but shares no history with HEAD (a shallow clone), the base is an
-  error with the `fetch-depth: 0` hint instead of a silent fall back to `HEAD`.
+- Base resolution: on the default branch the base is the merge base with the upstream, so
+  commits not yet pushed are checked with the uncommitted changes. With no upstream, or HEAD
+  equal to it (CI on a push), only uncommitted changes are compared. An upstream that shares
+  no history with HEAD (a shallow clone) is exit 4 with the `fetch-depth: 0` hint, not a
+  silent fall back to `HEAD`.
+- Python test analysis: `tests.weakened` (block) now fires for a test removed by a later `def`,
+  `del` or rebinding of its name, a swallowing decorator added to a test, `assert [x]` or a
+  non-empty string or tuple, `x == x`, and an exact numeric check loosened to a `pytest.approx`,
+  `math.isclose` or `assertAlmostEqual` band of 1% of the expected value or more. A bare
+  `pytest.approx(99)`, a tight tolerance and a retry or cleanup decorator that re-raises pass.
+- A comparison with a call (`f(x) == f(x)`, `get_settings() is get_settings()`) is a real
+  determinism or singleton check and passes, unless it replaces a comparison of that call in
+  the same test (`assert refund(100) == 99` to `== refund(100)`), which blocks. `del` of a base
+  class that tests subclass removes no tests.
+- Helper credit follows imports of test-path modules and of test-support modules (those that
+  import `pytest`, `unittest` or `hypothesis`, or sit under `testing`, `test_utils` or
+  `pytest_plugin`), up to 8 calls deep; application modules earn nothing. A helper or
+  `conftest.py` that loses checks re-analyses the unchanged tests that use it (at most 300
+  files read and 200 compared, with no note at the cap); one that loses none does not.
+- Python warnings: `tests.expected_changed` also fires when a `@pytest.fixture` returns a
+  different literal, and `tests.self_mocked` when an added or changed autouse fixture patches
+  a callable the tests in its scope assert on.
+- Go, JavaScript and Rust test analysis: `tests.weakened` (block) now fires for a top-level
+  bare `return`, `if (true) return;` or `x || true` guard before the checks, checks under
+  `if false` or `&& false`, `expect(X).toBe(X)` self-equality of a call-free expression, and
+  fewer rows in an `it.each`, `test.each` or `describe.each` table. Call self-comparisons follow
+  the Python rule. A `return` that is the body of a brace-less `if`, `else`, `for` or `while`,
+  `return expect(...)`, Go's `got != got` and a table with a spread or a non-literal table pass.
+  Helpers in the same file (JS) or directory (Go) earn credit.
+- A Go `//go:build` or `// +build` constraint added to an existing `_test.go` file that had none
+  is `tests.skipped` (block); one that differs from the file's own warns. gofmt's migration to
+  `//go:build`, go fix's `// +build` removal and a constraint on a new test file give nothing.
+- Data files: a modified, or renamed with changed content, expected-output file (`.json`,
+  `.snap`, `.golden`, `.csv` and similar) under a test path or `testdata`, `fixtures`, `golden`
+  or `__snapshots__` is `tests.expected_changed` (warn), once per file. Dependency, compose,
+  `Dockerfile*`, `.pre-commit*`, `codecov.yml` and `.env*` files and pure renames are skipped.
+- `ci.tampered` (block) judges CI across all workflow files and looks through local composite
+  actions, local scripts, `bash -c` and launchers such as `docker compose run` and `uv run`.
+  It blocks a swallowed check (`|| true`, `|| echo`, `set +e`, `; exit 0` under a shell with no
+  errexit), `continue-on-error: true` or `if: false` on a check, `--collect-only`,
+  `--passWithNoTests`, `exit 0` before the first check, a selection flag (`-k`, `-m`, `-run`),
+  fewer events, a `paths` filter that hides a test or source file, and a changed greenproof
+  step or `with:` input. Only GitHub `run:` steps get the flag checks; other CI files get the
+  swallow check.
+- A workflow keeps its greenproof step only if it keeps an automatic code trigger (`push`,
+  `pull_request`, `pull_request_target` or `merge_group`) that runs on every ref; moving the step
+  to a manual, scheduled or branch-filtered workflow blocks. Check kinds are per tool (`ruff` and
+  `flake8` differ), so swapping one for the other blocks; an unclassifiable replacement (`poe
+  test`) warns only in the same file and job, and fewer steps of a surviving kind warn.
+- `ci.tampered` passes a split into a reusable workflow, a `paths` filter that only excludes docs
+  or meta files, `rm -rf build || true`, `continue-on-error` on checkout, cache or upload steps,
+  and `pytest || pytest`, `pytest || pytest --lf` (a retry, not a swallow). Narrowed
+  `branches`, `tags` or `types`, a matrix-chosen flag, `continue-on-error: ${{ ... }}`, a mocha
+  selection change and a ref-only greenproof bump warn. An `if: ''` is read as false, and
+  `if: "false"` blocks.
+- `runner.tampered` (block) reads swallows in Makefiles, `package.json` scripts and the files a
+  policy command runs (deleted, emptied, no-op, swallow, selection flag, early `exit 0`). A Go
+  `TestMain` that skips `m.Run()` or always exits 0 blocks, a conditional exit warns. Fewer
+  steps count checks only, and a script that stops running a kind of check the base ran (`jest`
+  became `eslint`) blocks, with lint tools as one kind. Makefile variables are expanded, and a
+  target named like an existing path and not in `.PHONY` runs nothing.
+- Flags in `runner.tampered` belong to their tool (`-k` is pytest's, mocha's `-t` is a timeout).
+  `-p no:<plugin>` is judged by the plugin: `cacheprovider`, `randomly` and `xdist` pass,
+  `python`, `doctest`, `cov` and `asyncio` block, `warnings` blocks where the base turns warnings
+  into errors, unknown plugins warn, and `--disable-plugin-autoload` warns. A nested
+  `package.json` no policy command reaches warns; with a workspace, filter, `cd` or `lerna`
+  in the policy, it blocks.
+- The shared shell reader (`rules/shell.py`) counts only a known test runner, linter, type
+  checker or policy command in command position as a check, so `pip install pytest-xdist`
+  is not one. Heredocs are data, and only swallows the base lacked are reported.
+- Performance: git blobs are read through one `git cat-file --batch` process, workflows are
+  parsed once, and swallow detection, `paths` globs and `pnpm run '/regex/'` run in linear time.
+
+### Fixed
+
+- A `pnpm run '/regex/'` pattern from the candidate could hang the gate (`/^(a+)+$/`); it is now
+  matched by an automaton with a work budget. Names are no longer cut at 200 characters, which
+  let `/^[a-z]*$/` match a long name ending in `!`.
+- Dropping a workspace member from `pnpm-workspace.yaml` or `workspaces` made its neutered
+  `package.json` a warn; it now blocks.
+- A huge numeric literal or a very deep expression in a test no longer crashes the check, and
+  Rust character literals such as `'}'` no longer break brace matching.
+- False blocks cleared: a `|| true` after a command that is not a check (`rm -rf build`,
+  `pip install x`), `-p no:randomly` and other plugins that only reorder or report, and a
+  nested `package.json` that no policy command reaches (now a warn).
 
 ## [0.2.0] - 2026-11-02
 
