@@ -1472,7 +1472,12 @@ def selection_uses(
                 for t in tokens[tokens.index("--") + 1 :]
                 if (n := _flag_name(t, pytest_flags)) and not (retry and n in RERUN_FLAGS)
             )
+    if NEXTEST.search(command):  # nextest runs no doctest: `cargo test --doc` completes it
+        found = [use for use in found if use[1] != "--doc"]
     return found
+
+
+NEXTEST = re.compile(r"\bcargo\s+(?:\S+\s+)*?nextest\b")
 
 
 _VALUED_NOOP = frozenset({"-DskipTests", "-Dmaven.test.skip"})

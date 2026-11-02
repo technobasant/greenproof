@@ -23,6 +23,7 @@ from greenproof.rules._common import CODE_SUFFIXES, finding, sev_finding, split_
 from greenproof.rules.ci_expand import Child, make_children, pm_children
 from greenproof.rules.runner import _BaseTests, _tree_names
 from greenproof.rules.shell import (
+    NEXTEST,
     NOOP_FLAGS,
     check_kind,
     command_tokens,
@@ -1299,9 +1300,6 @@ def _line_of(lines: list[str], start: int, stop: int, needle: str) -> int:
     return start
 
 
-_NEXTEST = re.compile(r"\bcargo\s+(?:\S+\s+)*?nextest\b")
-
-
 def _github_step_reasons(text: str, world: _World) -> list[Reason]:
     out: list[Reason] = []
     lines = split_lines(text)
@@ -1350,12 +1348,14 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
             elif (at, why) not in reported:
                 reported.add((at, why))
                 out.append(_block(at, why))
-        for body in _bodies(world, wf, step, False):
+        bodies = _bodies(world, wf, step, False)
+        with_nextest = bool(NEXTEST.search(text)) or any(NEXTEST.search(b.text) for b in bodies)
+        for body in bodies:
             for family, flag, stmt in selection_uses(body.text, retries_ok=True, defs=body.defs):
                 if (family, flag) in base_flags:
                     continue
-                if flag == "--doc" and _NEXTEST.search(text):
-                    continue  # nextest runs no doctest: `cargo test --doc` completes it
+                if flag == "--doc" and with_nextest:
+                    continue  # nextest in another step: `cargo test --doc` completes it
                 noop = any(flag in flags for flags in NOOP_FLAGS.values())
                 if not noop and not world.base_has_tests:
                     continue

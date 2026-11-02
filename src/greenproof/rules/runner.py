@@ -25,6 +25,7 @@ from greenproof.rules import runner_config as rc
 from greenproof.rules._common import finding, split_lines, warn_finding
 from greenproof.rules.collect import DEFAULT_CLASSES, DEFAULT_FILES, DEFAULT_FUNCTIONS
 from greenproof.rules.shell import (
+    NEXTEST,
     NOOP_FLAGS,
     SELECT_FLAGS,
     check_kind,
@@ -1135,9 +1136,10 @@ def _dash_reason(
 
 def _new_selection_flag(base: list[str], cand: list[str]) -> str | None:
     before = {f for ln in base for f in selection_flags(ln)}
+    nextest = any(NEXTEST.search(ln) for ln in cand)  # which runs no doctest: `--doc` completes it
     for ln in cand:
         for family_flag in selection_flags(ln):
-            if family_flag not in before:
+            if family_flag not in before and not (nextest and family_flag[1] == "--doc"):
                 return family_flag[1]
     return None
 
