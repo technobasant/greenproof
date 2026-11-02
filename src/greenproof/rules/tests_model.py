@@ -6,6 +6,22 @@ import ast
 from dataclasses import dataclass, field
 
 
+@dataclass(frozen=True)
+class Table:
+    """The rows a table-driven JS, Go or Rust test runs: `test.each`/`it.each`/`describe.each`,
+    a `[]struct` or map ranged over, rstest `#[case]` or `#[test_case]`.
+
+    `rows` holds the literal tokens of each row (numbers, strings, true/false/null) and `forms`
+    its whitespace-free text. `runs` is True only when the rows reach the test body: the table is
+    iterated (or each-called) and the body reads a parameter of the row.
+    """
+
+    rows: tuple[tuple[str, ...], ...]
+    forms: tuple[str, ...]
+    runs: bool
+    implicit: bool = False  # Rust `#[test_case(.. => expected)]`: each row is its own check
+
+
 @dataclass
 class Unit:
     """One test. `key` is its qualified name without the path, so a move keeps its identity."""
@@ -61,6 +77,11 @@ class Unit:
     call_compared: set[str] = field(default_factory=set)
     strong_operands: set[str] = field(default_factory=set)
     weak_operands: set[str] = field(default_factory=set)
+    # JS, Go, Rust: the literals of the body (numbers and strings, never the test's name nor the
+    # table's rows) and the literal table the test runs, if any. They let a table-driven test
+    # account for the plain tests it replaced (tests_tables.py).
+    literals: tuple[str, ...] = ()
+    table: Table | None = None
     # Collection facts: enclosing classes, whether one is a TestCase, `__test__ = False`.
     classes: tuple[str, ...] = ()
     testcase: bool = False

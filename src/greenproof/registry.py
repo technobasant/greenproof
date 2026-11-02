@@ -42,7 +42,9 @@ _RULES = [
         "some of its assertions appear in no collected test of the candidate, so the behaviour "
         "it checked is no longer checked. A test moved to a file or name the runner does not "
         "collect counts as gone. Renamed, moved, split or merged tests whose assertions all "
-        "survive are covered and do not fire.",
+        "survive are covered and do not fire. A test folded into a table-driven test (pytest "
+        "parametrize, JS `each`, a Go table, Rust `#[case]` or `#[test_case]`) is covered only "
+        "while a row carries its values and the table runs; a dropped or unused row blocks.",
     ),
     RuleInfo(
         "tests.replaced",
@@ -53,7 +55,10 @@ _RULES = [
         "body is clean, and so is splitting or merging tests that keep every assertion. "
         "Severity is warn when the new tests are at least as strong (a rewrite: they call "
         "every subject the removed tests called, with at least as many checks and no "
-        "weaker check on a compared operand), block otherwise.",
+        "weaker check on a compared operand), block otherwise. A test converted into a row of a "
+        "table-driven test in the same file (JS `each`, a Go table, Rust `#[case]` or "
+        "`#[test_case]`) is a warn when a row carries its values, the table runs and no "
+        "check is lost.",
     ),
     RuleInfo(
         "tests.skipped",
