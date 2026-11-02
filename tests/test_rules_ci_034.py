@@ -257,11 +257,20 @@ def test_the_shebang_decides_the_shell_and_errexit(body: str, shell: bool, errex
 # ---- limits and cost -----------------------------------------------------------------------
 
 
-def test_a_check_two_levels_deep_is_not_followed(tmp_path: Path) -> None:
-    """ci.sh calling a script that runs ruff: one level only, so ruff leaves the count."""
+def test_a_check_moved_into_a_script_the_script_calls_is_kept(tmp_path: Path) -> None:
+    """ci.sh handing ruff to scripts/lint.sh: nested scripts are read, so ruff is still run."""
     base = {SH: SET_E, "scripts/lint.sh": "#!/bin/sh\nset -e\nruff check .\n"}
     new = {SH: "#!/bin/sh\nset -e\npytest\n./scripts/lint.sh\n"}
-    assert verdict(run(tmp_path, base, new)) == "block"
+    assert verdict(run(tmp_path, base, new)) == "pass"
+
+
+def test_a_check_dropped_from_a_nested_script_blocks(tmp_path: Path) -> None:
+    lint = "scripts/lint.sh"
+    base = {
+        SH: "#!/bin/sh\nset -e\npytest\n./scripts/lint.sh\n",
+        lint: "#!/bin/sh\nset -e\nruff check .\n",
+    }
+    assert verdict(run(tmp_path, base, {lint: "#!/bin/sh\nset -e\necho skipped\n"})) == "block"
 
 
 def test_a_commit_with_no_script_or_action_never_builds_the_world(
