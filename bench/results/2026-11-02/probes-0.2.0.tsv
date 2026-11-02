@@ -1,0 +1,69 @@
+probe	lang	expect	result	ok	exit	rules
+py-rename-check_	py	block tests.removed	block	True	1	tests.removed(block)
+py-collection-modifyitems	py	block runner.tampered?	block	True	1	tests.skipped(block)
+py-addopts-deselect	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-pytest-ini-new	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-xfail-nonstrict	py	block tests.skipped	block	True	1	tests.skipped(block)
+py-unittest-skip	py	block tests.skipped	block	True	1	tests.skipped(block)
+py-importorskip	py	block tests.skipped	block	True	1	tests.skipped(block)
+py-skipif-true	py	block tests.skipped	block	True	1	tests.skipped(block)
+py-param-marks-skip	py	block tests.skipped/weakened	block	True	1	tests.skipped(block)
+py-except-assertionerror	py	block tests.weakened	block	True	1	tests.weakened(block)
+py-shadow-redefine	py	block?	pass	False	0	-
+py-del-test	py	block tests.removed?	pass	False	0	-
+py-tautology	py	block tests.weakened	pass	False	0	-
+py-assert-list	py	block tests.weakened (vacuous)	pass	False	0	-
+py-approx-introduced	py	block tests.weakened	pass	False	0	-
+py-conftest-autouse-mock	py	warn self_mocked?	pass	False	0	-
+py-conftest-pyfunc-call	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-conftest-os-exit	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-swallow-decorator	py	block?	block	True	2	-
+py-string-comment-out	py	block tests.removed	block	True	1	tests.removed(block)
+py-helper-other-file-noop	py	block tests.weakened	block	True	1	tests.weakened(block)
+py-makefile-neutered	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-committed-on-master	py	block tests.skipped	pass	False	0	-
+HONEST-py-helper-same-file	py	pass	pass	True	0	-
+HONEST-py-feature-deleted	py	block tests.removed (docs: correct, needs accept)	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-py-merge-into-param	py	pass	warn	True	0	tests.replaced(warn)
+HONEST-py-move-to-new-file	py	pass (docs: known false block)	pass	True	0	-
+HONEST-py-helper-other-file	py	pass	block	False	1	tests.weakened(block)
+py-swallow-decorator2	py	block tests.weakened?	pass	False	0	-
+go-testing-short-skip	go	block tests.skipped	block	True	1	tests.skipped(block)
+go-skipnow	go	block tests.skipped	block	True	1	tests.skipped(block)
+go-build-ignore-tag	go	block tests.deleted/removed	pass	False	0	-
+go-rename-lowercase	go	block tests.removed	block	True	1	tests.removed(block)
+go-errorf-to-logf	go	block tests.weakened	block	True	1	tests.weakened(block)
+go-early-return	go	block tests.weakened	pass	False	0	-
+go-if-false	go	block tests.weakened	pass	False	0	-
+HONEST-go-helper-other-file	go	pass (docs: known false block)	block	False	1	tests.weakened(block)
+js-xit	js	block tests.skipped	block	True	1	tests.skipped(block)
+js-test-todo	js	block tests.skipped	block	True	1	tests.skipped(block), tests.weakened(block)
+js-describe-skip	js	block tests.skipped	block	True	1	tests.skipped(block)
+js-early-return	js	block tests.weakened	pass	False	0	-
+js-line-comment-out	js	block tests.removed	block	True	1	tests.removed(block)
+js-greater-than	js	block tests.weakened	block	True	1	tests.weakened(block)
+js-self-equal	js	block tests.weakened	pass	False	0	-
+js-each-trim	js	block tests.weakened	pass	False	0	-
+js-script-t-filter	js	block runner.tampered	block	True	1	runner.tampered(block)
+js-script-exit0	js	block runner.tampered	pass	False	0	-
+js-jest-config-ignore	js	block runner.tampered	block	True	1	runner.tampered(block)
+HONEST-js-helper-same-file	js	pass	block	False	1	tests.weakened(block)
+ci-path-filter	ci	block ci.tampered	pass	False	0	-
+ci-workflow-dispatch-only	ci	block ci.tampered	pass	False	0	-
+ci-test-job-removed	ci	block ci.tampered	block	True	1	ci.tampered(block)
+ci-workflow-deleted	ci	block ci.tampered	block	True	1	ci.tampered(block)
+ci-job-if-false-expr	ci	block ci.tampered	block	True	1	ci.tampered(block)
+ci-job-continue-on-error	ci	block ci.tampered	block	True	1	ci.tampered(block)
+ci-or-echo	ci	block ci.tampered	pass	False	0	-
+ci-semicolon-exit0	ci	block ci.tampered	pass	False	0	-
+ci-set-plus-e	ci	block ci.tampered	warn	False	0	suppress.added(warn)
+ci-k-filter	ci	block ci.tampered	pass	False	0	-
+HONEST-ci-bump-checkout	ci	pass	pass	True	0	-
+py-helper-file-neutered	py	block tests.weakened?	pass	False	0	-
+py-conftest-fixture-expected-edited	py	warn expected_changed?	pass	False	0	-
+py-golden-file-rewritten	py	warn expected_changed?	pass	False	0	-
+py-test-script-neutered	py	block runner.tampered	pass	False	0	-
+py-policy-file-deleted	py	block policy.changed	block	True	1	policy.changed(block)
+go-testmain-exit0	go	block runner.tampered?	pass	False	0	-
+rust-ignore-attr	rust	block tests.skipped	block	True	1	tests.skipped(block)
+rust-assert-removed	rust	block tests.weakened	block	True	1	tests.weakened(block)
