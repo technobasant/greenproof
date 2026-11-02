@@ -10,7 +10,7 @@ size budget: a body past `MAX_FLOW` characters is not read (the caller says so).
 from __future__ import annotations
 
 import re
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -22,6 +22,12 @@ if TYPE_CHECKING:
 # an assertion reads back to the row parameters they were computed from.
 MAX_FLOW = 100_000
 MAX_STEPS = 64
+# Past these a body is not read (the caller keeps the warn and says so): exits, assertions, nesting
+# depth, and the characters of a header or condition looked at.
+MAX_EXITS = 2_000
+MAX_REGIONS = 5_000
+MAX_DEPTH = 200
+MAX_TEXT = 2_000
 
 _IDENT = re.compile(r"[A-Za-z_$][\w$]*")
 _EXIT = {
@@ -37,22 +43,26 @@ _IF = re.compile(r"(?:else\s+)?if\b(.*)\Z", re.DOTALL)
 _ELSE = re.compile(r"else\Z")
 _JS_LOOP = re.compile(r"(?:for|while|do)\b")
 _JS_FUNC = re.compile(
-    r"=>\Z|\bfunction\b|(?:async\s+)?[\w$]+\s*\([^()]*\)\s*(?::[^{]*)?\Z",
+    r"=>\Z|\bfunction\b|(?<![\w$])(?:async\s+)?[\w$]+\s*\([^()]*\)\s*(?::[^{]*)?\Z",
 )
-_GO_FUNC = re.compile(r"\bfunc\b[^{]*\Z")
+_GO_FUNC = re.compile(r"\bfunc\b")  # a header holds no `{`, so nothing can follow that matters
 _RUST_FUNC = re.compile(r"\|[^|]*\|\s*(?:->\s*[^{]*)?\Z|\bfn\b")
 
+# `\w{0,80}` and not `\w*`: a name that repeats a keyword would be retried at every split, and a
+# helper named in more than 80 characters is read as no assertion (the safe way to be wrong)
 _JS_ASSERT = re.compile(
-    r"(?<![\w$.])(?:expect|assert(?:\.\w+)*|\w*(?:[Aa]ssert|[Cc]heck|[Vv]erify|[Ee]xpect|[Ee]qual)\w*)"
+    r"(?<![\w$.])(?:expect|assert(?:\.\w+)*|\w{0,80}(?:[Aa]ssert|[Cc]heck|[Vv]erify|[Ee]xpect|[Ee]qual)\w{0,80})"
     r"\s*\("
 )
 _GO_ASSERT = re.compile(
-    r"(?<![\w.])(?:\w+\.)?\w*(?:[Aa]ssert|[Rr]equire|[Cc]heck|[Vv]erify|[Ee]xpect|[Ee]qual|[Cc]ompare)"
-    r"\w*\s*\("
+    r"(?<![\w.])(?:\w{1,80}\.)?\w{0,80}(?:[Aa]ssert|[Rr]equire|[Cc]heck|[Vv]erify|[Ee]xpect|[Ee]qual|[Cc]ompare)"
+    r"\w{0,80}\s*\("
 )
 _GO_FAIL = re.compile(r"\b(?:Error|Errorf|Fatal|Fatalf|Fail|FailNow)\s*\(|\bpanic\s*\(")
-_RUST_ASSERT = re.compile(r"\b(\w*assert\w*)!\s*\(")
+_RUST_ASSERT = re.compile(r"\b(\w{0,80}assert\w{0,80})!\s*\(")
 _CHAIN = re.compile(r"\s*\.\s*[A-Za-z_$][\w$]*")
+_SPACE = re.compile(r"\s*")
+_IF_WORD = re.compile(r"\bif\b")
 
 _DECL = {
     "js": (
@@ -87,9 +97,13 @@ class Flow:
     shadow: str
 
 
+_PLAIN = re.compile(r"(?<![\w$.])[A-Za-z_$][\w$]*")
+
+
 def mentions(names: Iterable[str], text: str) -> bool:
     """A name is read as a plain identifier (not `x.name`) in `text`."""
-    return any(re.search(rf"(?<![\w$.]){re.escape(n)}(?![\w$])", text) for n in names if n)
+    wanted = names if isinstance(names, (set, frozenset)) else {n for n in names if n}
+    return any(m.group() in wanted for m in _PLAIN.finditer(text))
 
 
 def _kind(header: str, lang: str) -> tuple[str, str]:
@@ -126,6 +140,45 @@ def _kind(header: str, lang: str) -> tuple[str, str]:
     return "other", ""
 
 
+_BRACKETS = re.compile(r"[()\[\]{}]")
+_CLOSER = {"(": ")", "[": "]", "{": "}"}
+
+
+def _pairs(s: str, a: int, b: int) -> dict[int, int]:
+    """Open bracket -> its closing bracket for every balanced pair in [a, b), in one pass (a
+    mismatch drops what is open: those brackets close nowhere, which reads as no assertion)."""
+    out: dict[int, int] = {}
+    stack: list[tuple[int, str]] = []
+    for m in _BRACKETS.finditer(s, a, b):
+        c = m.group()
+        if c in _CLOSER:
+            stack.append((m.start(), _CLOSER[c]))
+        elif stack and stack[-1][1] == c:
+            out[stack.pop()[0]] = m.start()
+        else:
+            stack.clear()
+    return out
+
+
+def _comma(s: str, pair: dict[int, int], a: int, b: int, n: int) -> int:
+    """Offset of the `n`th comma of [a, b) outside brackets, else `b`; nested brackets are
+    jumped over, so a chain of nested calls costs a step each, not a rescan."""
+    i = a
+    while i < b:
+        c = s[i]
+        if c in _CLOSER:
+            j = pair.get(i)
+            if j is None:
+                return b
+            i = j
+        elif c == ",":
+            n -= 1
+            if n == 0:
+                return i
+        i += 1
+    return b
+
+
 def _regions(
     src: _Src, lang: str, a: int, b: int, ifs: list[tuple[int, int, int, int]]
 ) -> list[tuple[int, int]]:
@@ -134,11 +187,12 @@ def _regions(
     macros (Rust). `ifs` is (header start, open brace, close brace, kind id) of each `if`."""
     s = src.shadow
     out: list[tuple[int, int]] = []
+    pair = _pairs(s, a, b)
     if lang == "js" or lang == "go":
         pat = _JS_ASSERT if lang == "js" else _GO_ASSERT
         for m in pat.finditer(s, a, b):
             open_at = m.end() - 1
-            close = src.close(open_at)
+            close = pair.get(open_at, -1)
             if close < 0:
                 continue
             end = close + 1
@@ -148,41 +202,42 @@ def _regions(
                     if cm is None:
                         break
                     end = cm.end()
-                    ws = re.compile(r"\s*").match(s, end, b)
+                    ws = _SPACE.match(s, end, b)
                     if ws is not None and ws.end() < b and s[ws.end()] == "(":
-                        close = src.close(ws.end())
+                        close = pair.get(ws.end(), -1)
                         if close < 0:
                             break
                         end = close + 1
             out.append((m.start(), end))
     if lang == "go":
+        fails = [m.start() for m in _GO_FAIL.finditer(s, a, b)]
         for hs, open_at, close, _ in ifs:
-            if _GO_FAIL.search(s, open_at, close):
+            i = bisect_left(fails, open_at)
+            if i < len(fails) and fails[i] < close:
                 out.append((hs, open_at))
     if lang == "rust":
         for m in _RUST_ASSERT.finditer(s, a, b):
             open_at = m.end() - 1
-            close = src.close(open_at)
+            close = pair.get(open_at, -1)
             if close < 0:
                 continue
             name = m.group(1)
             keep = 2 if ("_eq" in name or "_ne" in name) else 1 if name.endswith("assert") else 0
             end = close
             if keep:
-                parts = src.split(open_at + 1, close, ",")
-                end = open_at + 1 + len(",".join(parts[:keep]))
+                end = _comma(s, pair, open_at + 1, close, keep)
             out.append((m.start(), end))
     return out
 
 
 def read_flow(src: _Src, lang: str, a: int, b: int) -> Flow | None:
-    """The exits, assertions and locals of the body in [a, b), or None past the size budget."""
+    """The exits, assertions and locals of the body in [a, b), or None past a size budget (its
+    length, its exits, its assertions or its nesting): the caller keeps the warn and says so."""
     if b - a > MAX_FLOW or b <= a:
         return None
     s = src.shadow
     bound = _BOUND[lang]
-    events = [(m.start(), m.group()) for m in re.finditer(r"[{}]", s[a:b])]
-    events = [(a + p, c) for p, c in events]
+    events = [(a + m.start(), m.group()) for m in re.finditer(r"[{}]", s[a:b])]
     edges = [a + m.start() for m in re.finditer(f"[{re.escape(bound)}]", s[a:b])]
 
     def header_start(pos: int) -> int:
@@ -191,6 +246,8 @@ def read_flow(src: _Src, lang: str, a: int, b: int) -> Flow | None:
         return edges[i - 1] + 1 if i else a
 
     exits = [(m.start(), m.group(0)) for m in _EXIT[lang].finditer(s, a, b)]
+    if len(exits) > MAX_EXITS:
+        return None
     merged = sorted([(p, 0, c) for p, c in events] + [(p, 1, w) for p, w in exits])
     # block id -> (open, header start, kind, condition); stack of open block ids
     blocks: list[tuple[int, int, str, str]] = []
@@ -199,6 +256,9 @@ def read_flow(src: _Src, lang: str, a: int, b: int) -> Flow | None:
     closes: dict[int, int] = {}
     found: list[Exit] = []
     ifs: list[tuple[int, int, int, int]] = []
+    fails = [m.start() for m in _GO_FAIL.finditer(s, a, b)] if lang == "go" else []
+    ifpos = [m.start() for m in _IF_WORD.finditer(s, a, b)] if lang == "js" else []
+    last_close = -1
     for pos, kind, text in merged:
         if kind == 0 and text == "{":
             hs = header_start(pos)
@@ -206,13 +266,15 @@ def read_flow(src: _Src, lang: str, a: int, b: int) -> Flow | None:
             k, cond = _kind(header, lang)
             if k == "else":
                 # the condition of the `if` this `else` follows: the block closed just before
-                prev = s.rfind("}", a, pos)
-                prior = by_close.get(prev)
+                prior = by_close.get(last_close)
                 if prior is not None:
                     cond = blocks[prior][3]
-            blocks.append((pos, hs, k, cond))
+            blocks.append((pos, hs, k, cond[:MAX_TEXT]))
             stack.append(len(blocks) - 1)
+            if len(stack) > MAX_DEPTH:
+                return None
         elif kind == 0:
+            last_close = pos
             if stack:
                 i = stack.pop()
                 by_close[pos] = i
@@ -224,7 +286,7 @@ def read_flow(src: _Src, lang: str, a: int, b: int) -> Flow | None:
             if any(k == "func" for _, _, k, _ in chain):
                 continue
             # the outermost Go loop is the table's own loop: its header says nothing about a row
-            skip_loop = lang == "go" and next((k for _, _, k, _ in chain if k == "loop"), "") != ""
+            skip_loop = lang == "go" and any(k == "loop" for _, _, k, _ in chain)
             guards = []
             for _, _, k, c in chain:
                 if k == "loop" and skip_loop:
@@ -234,16 +296,22 @@ def read_flow(src: _Src, lang: str, a: int, b: int) -> Flow | None:
             nested = any(k in ("loop", "switch") for _, _, k, _ in chain)
             inner = chain[-1][0] if chain and chain[-1][2] != "run" else -1
             if lang == "js":
-                pre = s[header_start(pos) : pos]
-                im = re.search(r"\bif\b(.*)\Z", pre, re.DOTALL)
-                if im is not None:
-                    guards.append(im.group(1))
-            reported = lang == "go" and any(
-                k in ("if", "else") and _GO_FAIL.search(s, o, pos) is not None
-                for o, _, k, _ in chain
-            )
+                # an `if (..) return` with no braces: the condition is in the statement
+                at = bisect_left(ifpos, header_start(pos))
+                if at < len(ifpos) and ifpos[at] < pos:
+                    guards.append(s[ifpos[at] + 2 : min(pos, ifpos[at] + 2 + MAX_TEXT)])
+            reported = False
+            if lang == "go":
+                for o, _, k, _ in chain:
+                    if k in ("if", "else"):
+                        at = bisect_left(fails, o)
+                        if at < len(fails) and fails[at] < pos:
+                            reported = True
+                            break
             found.append(Exit(pos, text, tuple(guards), inner, nested, reported))
     regions = _regions(src, lang, a, b, ifs)
+    if len(regions) > MAX_REGIONS or sum(r1 - r0 for r0, r1 in regions) > 4 * MAX_FLOW:
+        return None
     decls: dict[str, list[str]] = {}
     for pat in _DECL[lang]:
         for m in pat.finditer(s, a, b):
@@ -290,24 +358,39 @@ def leaves_early(flow: Flow, names: set[str], loop_scan: bool) -> str:
     """Why a row can leave the body before asserting, else "". An exit is excused when an
     assertion comes before it in its own block, or reads a row value; a guard that names no row
     value (an environment check) is not this rule's business. `loop_scan` reads a loop body, where
-    `continue` and `break` end the row; otherwise they belong to a loop of their own."""
+    `continue` and `break` end the row; otherwise they belong to a loop of their own.
+
+    Linear in the body: the assertions are indexed once (where each starts, where each ends, the
+    first one that reads a row value, the furthest start so far), and each exit is a lookup."""
+    s = flow.shadow
+    starts = {r0 for r0, _ in flow.regions}
+    by_end = sorted((r1, r0, mentions(names, s[r0:r1])) for r0, r1 in flow.regions)
+    ends = [r1 for r1, _, _ in by_end]
+    row_end = next((r1 for r1, _, reads in by_end if reads), None)
+    furthest: list[int] = []
+    for _, r0, _ in by_end:
+        furthest.append(max(r0, furthest[-1]) if furthest else r0)
+    read: dict[str, bool] = {}
     for e in flow.exits:
         if e.word in _LOOPS and (e.nested or not loop_scan):
             continue
-        after = e.pos + len(e.word)
-        if any(r0 >= after and not flow.shadow[after:r0].strip() for r0, _ in flow.regions):
+        gap = _SPACE.match(s, e.pos + len(e.word))
+        if gap is not None and gap.end() in starts:
             continue  # `return expect(..)`: the statement is the assertion
-        excused = any(
-            r1 <= e.pos and ((e.inner >= 0 and r0 > e.inner) or mentions(names, flow.shadow[r0:r1]))
-            for r0, r1 in flow.regions
-        )
-        if excused or e.reported:
+        done = bisect_right(ends, e.pos)  # the assertions that end before this exit
+        if row_end is not None and row_end <= e.pos:
+            continue
+        if e.inner >= 0 and done and furthest[done - 1] > e.inner:
+            continue
+        if e.reported:
             continue
         word = e.word.strip().rstrip("(").strip()
         if not e.guards:
             return f"the body leaves unconditionally with `{word}` before asserting"
         for g in e.guards:
-            if mentions(names, g):
+            if g not in read:
+                read[g] = mentions(names, g)
+            if read[g]:
                 cond = " ".join(g.split())
                 if cond.startswith("(") and cond.endswith(")"):
                     cond = cond[1:-1].strip()

@@ -6,9 +6,11 @@ Every tamper is paired with the honest shape next to it that must still be a war
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from greenproof.findings import Finding
+from greenproof.rules.tests_lines import analyse_lines
 from tests.helpers import init_repo, static_findings
 from tests.test_rules_tables_037 import (
     GO_BASE,
@@ -231,3 +233,86 @@ def test_rust_cfg_attr_with_another_attribute_is_a_warning(tmp_path: Path) -> No
 
 def test_rust_plain_rstest_is_a_warning(tmp_path: Path) -> None:
     assert folded(verdict(tmp_path, RS_PATH, RS_BASE, _rs(RS_CASES)))
+
+
+# ---- Speed: the flow reader is linear, and over a budget it keeps the warn and says so ----------
+
+
+def _cpu(lang: str, text: str) -> float:
+    started = time.process_time()
+    analyse_lines("t." + lang, text, lang)
+    return time.process_time() - started
+
+
+def _js_body(body: str) -> str:
+    return _js(f"test.each({JS_TWO})('adds %i + %i', (a, b, want) => {{\n{body}}});\n")
+
+
+def _go_body(inner: str) -> str:
+    return _go(inner)
+
+
+def _js_long_ident(n: int) -> str:
+    return _js_body("  " + "a" * n + "(a);\n  expect(add(a, b)).toBe(want);\n")
+
+
+def _js_repeated_keyword(n: int) -> str:
+    return _js_body("  " + "check" * n + "(a);\n  expect(add(a, b)).toBe(want);\n")
+
+
+def _js_exits(n: int) -> str:
+    return _js_body("  expect(add(a, b)).toBe(want);\n" + "  if (a > 9) return;\n" * n)
+
+
+def _go_exits(n: int) -> str:
+    return _go_body('\t\t\tif tt.a > 9 {\n\t\t\t\tt.Error("x")\n\t\t\t\treturn\n\t\t\t}\n' * n)
+
+
+def _go_repeated_func(n: int) -> str:
+    return _go_body("\t\t\tvar x = " + "func " * n + "\n")
+
+
+def _js_asserts(n: int) -> str:
+    return _js_body("  expect(add(a, b)).toBe(want);\n" * n)
+
+
+def _js_locals(n: int) -> str:
+    return _js_body(
+        "".join(f"  const x{i} = a + {i};\n" for i in range(n))
+        + f"  expect(x{n - 1}).toBe(want);\n"
+    )
+
+
+SPEED = [
+    ("js", _js_long_ident, 8_000),
+    ("js", _js_repeated_keyword, 3_000),
+    ("js", _js_exits, 300),
+    ("go", _go_exits, 250),
+    ("go", _go_repeated_func, 2_000),
+    ("js", _js_asserts, 300),
+    ("js", _js_locals, 300),
+]
+
+
+def test_flow_reading_is_linear() -> None:
+    """Four times the input costs about four times as much, never sixteen, and each stays small."""
+    for lang, make, n in SPEED:
+        small, large = make(n), make(4 * n)
+        _cpu(lang, small)  # warm the regex cache
+        base = max(_cpu(lang, small), 0.02)
+        big = _cpu(lang, large)
+        assert big < 3.0, (make.__name__, big)
+        assert big / base < 10, (make.__name__, base, big)
+
+
+def test_a_body_with_too_many_exits_keeps_the_warn_and_says_so(tmp_path: Path) -> None:
+    found = run(tmp_path, JS_PATH, JS_BASE, _js_exits(2_500))
+    assert folded(pair(found))
+    assert any("too large to check" in f.message for f in found)
+
+
+def test_a_body_nested_too_deep_keeps_the_warn_and_says_so(tmp_path: Path) -> None:
+    deep = "  if (a) {\n" * 300 + "    expect(add(a, b)).toBe(want);\n" + "  }\n" * 300
+    found = run(tmp_path, JS_PATH, JS_BASE, _js_body(deep))
+    assert folded(pair(found))
+    assert any("too large to check" in f.message for f in found)
