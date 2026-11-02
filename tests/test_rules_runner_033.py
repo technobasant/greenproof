@@ -78,8 +78,21 @@ def test_a_long_pattern_is_not_matched() -> None:
 
 def test_many_stars_on_a_long_name_run_in_linear_time() -> None:
     started = time.monotonic()
-    assert _expand(["/" + "a*" * 90 + "b/"], ["a" * 3000], False) == []
+    assert _expand(["/" + "a*" * 40 + "b/"], ["a" * 2000], False) == []
     assert time.monotonic() - started < 2
+
+
+def test_a_pattern_too_costly_to_match_matches_every_script_at_once() -> None:
+    started = time.monotonic()
+    names = ["a" * 256 + str(i) for i in range(500)]
+    assert _expand(["/" + "a*" * 99 + "b/"], names, False) == names
+    assert time.monotonic() - started < 1
+
+
+def test_a_long_script_name_is_matched_whole_not_cut_short() -> None:
+    pattern = "/^" + "[a-z]*" * 30 + "$/"
+    assert _expand([pattern], ["a" * 300 + "!"], False) == []
+    assert _expand([pattern], ["a" * 300], False) == ["a" * 300]
 
 
 def test_a_run_s_glob_with_many_stars_does_not_hang() -> None:
@@ -257,6 +270,50 @@ def test_the_zustand_shape_stays_a_warning(tmp_path: Path) -> None:
     base = {"package.json": root, "examples/demo/package.json": DEMO}
     new = {"examples/demo/package.json": DEMO_NO_TEST}
     assert verdict(scene(tmp_path, base, new, {"test": "pnpm test"})) == "warn"
+
+
+WS_YAML = "packages:\n  - 'packages/*'\n"
+MEMBER = {
+    "package.json": pkg({"test": "pnpm -r test"}),
+    "pnpm-workspace.yaml": WS_YAML,
+    "packages/a/package.json": pkg({"test": "jest"}),
+}
+
+
+def test_a_member_excluded_in_the_candidate_is_still_reached(tmp_path: Path) -> None:
+    new = {
+        "pnpm-workspace.yaml": WS_YAML + "  - '!packages/a'\n",
+        "packages/a/package.json": pkg({"test": "echo skip"}),
+    }
+    assert verdict(scene(tmp_path, MEMBER, new, {"test": "pnpm test"})) == "block"
+
+
+def test_a_member_dropped_from_the_workspace_blocks(tmp_path: Path) -> None:
+    new = {"pnpm-workspace.yaml": WS_YAML + "  - '!packages/a'\n"}
+    found = scene(tmp_path, MEMBER, new, {"test": "pnpm test"})
+    assert verdict(found) == "block"
+    assert "packages/a is no longer a workspace member" in found[0].message
+
+
+def test_an_npm_workspace_member_dropped_blocks(tmp_path: Path) -> None:
+    root = pkg({"test": "npm test --workspaces"}, workspaces=["packages/*"])
+    base = {"package.json": root, "packages/a/package.json": pkg({"test": "jest"})}
+    new = {"package.json": pkg({"test": "npm test --workspaces"}, workspaces=["packages/b"])}
+    assert verdict(scene(tmp_path, base, new, NPM_TEST)) == "block"
+
+
+def test_a_member_without_checks_dropped_from_the_workspace_passes(tmp_path: Path) -> None:
+    base = {**MEMBER, "packages/docs/package.json": pkg({"build": "vite build"})}
+    new = {"pnpm-workspace.yaml": WS_YAML + "  - '!packages/docs'\n"}
+    assert verdict(scene(tmp_path, base, new, {"test": "pnpm test"})) == "pass"
+
+
+def test_a_workspace_glob_added_for_a_new_package_passes(tmp_path: Path) -> None:
+    new = {
+        "pnpm-workspace.yaml": WS_YAML + "  - 'tools/*'\n",
+        "tools/x/package.json": pkg({"test": "jest"}),
+    }
+    assert verdict(scene(tmp_path, MEMBER, new, {"test": "pnpm test"})) == "pass"
 
 
 # ---- G3: nox arguments through starred lists, names and `.split()` ---------------------------

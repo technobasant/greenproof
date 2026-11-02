@@ -793,6 +793,7 @@ def _is_pattern(name: str) -> bool:
 # (one group of them at most). Anything else is "unknown", and unknown matches every script.
 _MAX_PATTERN = 200
 _MAX_BRANCHES = 64
+_MAX_WORK = 200_000  # pattern items times the characters of the script names matched against
 _Atom = tuple[str, str]  # ("lit", char) | ("any", "") | ("cls", "^a-z:" style body)
 _Item = tuple[_Atom, str]  # the atom and its quantifier: "", "*", "?"
 
@@ -953,40 +954,37 @@ def _parse_pattern(source: str) -> _Pattern | None:
 
 
 def _branch_matches(items: tuple[_Item, ...], text: str, start: bool, end: bool) -> bool:
-    """Whether the items match `text` (anywhere unless anchored), in time linear in both sizes."""
-
-    def close(states: set[int]) -> set[int]:
-        out = set(states)
-        for k in sorted(states):
-            while k < len(items) and items[k][1] in ("*", "?"):
-                k += 1
-                out.add(k)
-        return out
-
-    def step(states: set[int], ch: str) -> set[int]:
-        nxt: set[int] = set()
-        for k in states:
-            if k < len(items) and _atom_matches(items[k][0], ch):
-                nxt.add(k if items[k][1] == "*" else k + 1)
-        return close(nxt)
-
-    current = close({0})
-    if len(items) in current and (not end or not text):
+    """Whether the items match `text` (anywhere unless anchored). The states are bits of an int,
+    so each character costs at most one step per item."""
+    n = len(items)
+    # eps[k]: state k and every state reachable from it by skipping optional items.
+    eps = [0] * (n + 1)
+    eps[n] = 1 << n
+    for k in range(n - 1, -1, -1):
+        eps[k] = (1 << k) | (eps[k + 1] if items[k][1] in ("*", "?") else 0)
+    accept = 1 << n
+    current = eps[0]
+    if current & accept and (not end or not text):
         return True
     for pos, ch in enumerate(text):
-        current = step(current, ch)
-        if not start:
-            current |= close({0})
-        if len(items) in current and (not end or pos == len(text) - 1):
+        nxt, bits = 0, current & ~accept
+        while bits:
+            low = bits & -bits
+            bits ^= low
+            k = low.bit_length() - 1
+            if _atom_matches(items[k][0], ch):
+                nxt |= eps[k] if items[k][1] == "*" else eps[k + 1]
+        current = nxt if start else nxt | eps[0]
+        if current & accept and (not end or pos == len(text) - 1):
             return True
         if not current:
             return False
     return False
 
 
-def _pattern_matcher(name: str, glob: bool) -> Callable[[str], bool] | None:
-    """A matcher for a `/regex/` (pnpm run) or `test:*` glob (run-s) script pattern; None when
-    the pattern is outside the safe subset (callers then treat it as matching every script)."""
+def _parse_script_pattern(name: str, glob: bool) -> _Pattern | None:
+    """A `/regex/` (pnpm run) or `test:*` glob (run-s) script pattern, None when it is outside
+    the safe subset."""
     if len(name) > 2 and name[0] == "/" and name[-1] == "/":
         source = name[1:-1]
     elif glob and _is_pattern(name):
@@ -999,12 +997,24 @@ def _pattern_matcher(name: str, glob: bool) -> Callable[[str], bool] | None:
         source += "$"
     else:
         return None
-    pattern = _parse_pattern(source)
+    return _parse_pattern(source)
+
+
+def _pattern_matcher(
+    name: str, glob: bool, universe: Collection[str] = ()
+) -> Callable[[str], bool] | None:
+    """A matcher for a script pattern; None when the pattern is outside the safe subset, or when
+    matching it against `universe` would cost more than `_MAX_WORK` (callers then treat it as
+    matching every script). Matching is linear, but a gate that runs past its hook's timeout
+    lets the agent stop anyway."""
+    pattern = _parse_script_pattern(name, glob)
     if pattern is None:
         return None
+    items = sum(len(b) + 1 for b in pattern.branches)
+    if items * sum(len(u) + 1 for u in universe) > _MAX_WORK:
+        return None
     return lambda text: any(
-        _branch_matches(items, text[:_MAX_PATTERN], pattern.start, pattern.end)
-        for items in pattern.branches
+        _branch_matches(items, text, pattern.start, pattern.end) for items in pattern.branches
     )
 
 
@@ -1013,9 +1023,10 @@ def _is_matching(name: str, glob: bool) -> bool:
     return (len(name) > 2 and name[0] == "/" and name[-1] == "/") or (glob and _is_pattern(name))
 
 
-def _unknown_pattern(name: str, glob: bool) -> bool:
-    """A script pattern outside the safe subset (it matches every script)."""
-    return _is_matching(name, glob) and _pattern_matcher(name, glob) is None
+def _unknown_pattern(name: str, glob: bool, universe: Collection[str] = ()) -> bool:
+    """A script pattern outside the safe subset, or too costly to match against `universe` (it
+    matches every script)."""
+    return _is_matching(name, glob) and _pattern_matcher(name, glob, universe) is None
 
 
 def _expand(names: Sequence[str], universe: Collection[str], glob: bool) -> list[str]:
@@ -1025,7 +1036,7 @@ def _expand(names: Sequence[str], universe: Collection[str], glob: bool) -> list
     for name in names:
         if not _is_matching(name, glob):
             out.append(name)
-        elif (match := _pattern_matcher(name, glob)) is None:
+        elif (match := _pattern_matcher(name, glob, universe)) is None:
             out.extend(universe)
         else:
             out.extend(u for u in universe if match(u))
@@ -1091,7 +1102,7 @@ def _check_steps(
         # nothing, so the step it replaced is missing.
         if (
             base_texts is not None
-            and any(_unknown_pattern(n, run_all) for n in raw)
+            and any(_unknown_pattern(n, run_all, universe) for n in raw)
             and st not in (base_texts.texts if isinstance(base_texts, _Known) else base_texts)
         ):
             continue
@@ -2112,27 +2123,75 @@ def _body_leaves(body: str) -> _Leaves:
     return out
 
 
-def _is_member(changes: ChangeSet, roots: Sequence[str], directory: str) -> bool | None:
-    """Whether `directory` is a workspace member; None when the workspace files cannot be read."""
-    yamls = [
-        t
-        for t in (
-            changes.base_text("pnpm-workspace.yaml"),
-            changes.cand_text("pnpm-workspace.yaml"),
-        )
-        if t
-    ]
-    for text in yamls:
-        if re.search(r"^packages:[ \t]*\S", text, re.MULTILINE):
-            return None  # an inline list: not read here
-        if not _workspace_globs([], [text]):
-            return None
-    globs = _workspace_globs(roots, yamls)
-    if not globs:
+def _side_globs(changes: ChangeSet, base: bool) -> list[str] | None:
+    """The workspace globs at the base or in the candidate; None when there are none, or the
+    workspace file cannot be read (an inline list is not read here)."""
+    read = changes.base_text if base else changes.cand_text
+    pkg, yaml = read("package.json"), read("pnpm-workspace.yaml")
+    if yaml and (
+        re.search(r"^packages:[ \t]*\S", yaml, re.MULTILINE) or not _workspace_globs([], [yaml])
+    ):
         return None
-    return any(_glob_matches(directory, g) for g in globs if not g.startswith("!")) and not any(
-        _glob_matches(directory, g[1:]) for g in globs if g.startswith("!")
+    return _workspace_globs([pkg] if pkg else [], [yaml] if yaml else []) or None
+
+
+def _members(globs: Sequence[str], directories: Collection[str]) -> set[str]:
+    keep = [g for g in globs if not g.startswith("!")]
+    drop = [g[1:] for g in globs if g.startswith("!")]
+    return {
+        d
+        for d in directories
+        if any(_glob_matches(d, g) for g in keep) and not any(_glob_matches(d, g) for g in drop)
+    }
+
+
+def _is_member(changes: ChangeSet, directory: str) -> bool | None:
+    """Whether `directory` is a workspace member at the base or in the candidate (a candidate
+    that excludes it does not make it unreached); None when either side cannot be read."""
+    sides = [_side_globs(changes, base) for base in (True, False)]
+    if any(globs is None for globs in sides):
+        return None
+    return any(directory in _members(globs or [], {directory}) for globs in sides)
+
+
+def _has_check_script(text: str | None) -> bool:
+    try:
+        data = json.loads(text or "")
+    except ValueError:
+        return True
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if not isinstance(scripts, dict):
+        return False
+    return any(
+        name == "test" or name.startswith("test:") or (isinstance(body, str) and check_kind(body))
+        for name, body in scripts.items()
     )
+
+
+def _dropped_members(changes: ChangeSet) -> list[str]:
+    """Packages with a check script that were workspace members at the base and are not in the
+    candidate: `pnpm -r test` and `npm test --workspaces` no longer run them."""
+    old = _side_globs(changes, True)
+    lister = changes.listing(False)
+    if old is None or lister is None:
+        return []
+    new = _side_globs(changes, False)
+    if new == old:
+        return []
+    directories = {
+        posixpath.dirname(p)
+        for p in lister()
+        if posixpath.basename(p) == "package.json"
+        and posixpath.dirname(p)
+        and "node_modules" not in p.split("/")
+    }
+    gone = _members(old, directories) - (_members(new, directories) if new else set())
+    return [
+        f"{d} is no longer a workspace member, so a recursive run (`pnpm -r`, `--workspaces`) "
+        "skips its checks"
+        for d in sorted(gone)
+        if _has_check_script(changes.cand_text(f"{d}/package.json"))
+    ]
 
 
 def _provably_unreached(changes: ChangeSet, commands: Mapping[str, str], directory: str) -> bool:
@@ -2169,7 +2228,7 @@ def _provably_unreached(changes: ChangeSet, commands: Mapping[str, str], directo
                 leaves.add(_body_leaves(body))
     if leaves.opaque:
         return False
-    return not leaves.workspaces or _is_member(changes, roots, directory) is False
+    return not leaves.workspaces or _is_member(changes, directory) is False
 
 
 def _reaches_package(changes: ChangeSet, path: str, commands: Mapping[str, str]) -> bool:
@@ -2248,6 +2307,13 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
         for line, why in reasons:
             make = warn_finding if why.endswith(_ADOPTION) or isinstance(why, _Warn) else finding
             out.append(make("runner.tampered", f.path, line, f"{f.path}: {why}", _HINT))
+    workspace_files = [
+        f.path for f in changes.files if f.path in ("pnpm-workspace.yaml", "package.json")
+    ]
+    if workspace_files:
+        where = min(workspace_files, key=lambda path: path != "pnpm-workspace.yaml")
+        for why in _dropped_members(changes):
+            out.append(finding("runner.tampered", where, None, f"{where}: {why}", _HINT))
     return out
 
 

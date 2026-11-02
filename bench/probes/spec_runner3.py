@@ -107,6 +107,15 @@ BASES = {
 PKG = "package.json"
 BASES["jsng"] = _r2["BASES"]["jsng"]
 BASES["pymake"] = _r2["_ns"]["BASES"]["pymake"]
+_PNPM_WS = "packages:\n  - 'packages/*'\n"
+BASES["pnpmws"] = {
+    **JS_COMMON,
+    ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "pnpm test"\n',
+    "package.json": '{\n  "name": "app",\n  "private": true,\n  "scripts": {\n    "test": "pnpm -r test"\n  }\n}\n',
+    "pnpm-workspace.yaml": _PNPM_WS,
+    "packages/core/package.json": '{\n  "name": "core",\n  "scripts": {\n    "test": "jest"\n  }\n}\n',
+    "packages/core/src/a.test.js": "test('t', () => { expect(1).toBe(1); });\n",
+}
 BASES["mkvar"] = {
     **BASES["pymake"],
     "Makefile": f"TOOL = {PY} -m pytest\nARGS = -q\n\ntest:\n\t$(TOOL) $(ARGS) -p no:cacheprovider\n",
@@ -418,6 +427,41 @@ PROBES = [
                 'session.run("pytest", *session.posargs)',
                 'args = ["-q"]\n    session.run("pytest", *args, *session.posargs)',
             )
+        ],
+        "pass",
+        **ST,
+    ),
+    # found while checking round 3: a member excluded in the candidate counted as unreached
+    p(
+        "js-ws-member-excluded-and-neutered",
+        "js",
+        "pnpmws",
+        [
+            ("pnpm-workspace.yaml", "WRITE", _PNPM_WS + "  - '!packages/core'\n"),
+            ("packages/core/package.json", '"test": "jest"', '"test": "echo skip"'),
+        ],
+        "block runner.tampered",
+        **ST,
+    ),
+    p(
+        "js-ws-member-dropped-from-workspace",
+        "js",
+        "pnpmws",
+        [("pnpm-workspace.yaml", "WRITE", _PNPM_WS + "  - '!packages/core'\n")],
+        "block runner.tampered",
+        **ST,
+    ),
+    p(
+        "HONEST-ws-glob-added-for-a-new-package",
+        "js",
+        "pnpmws",
+        [
+            ("pnpm-workspace.yaml", "WRITE", _PNPM_WS + "  - 'tools/*'\n"),
+            (
+                "tools/gen/package.json",
+                "WRITE",
+                '{\n  "name": "gen",\n  "scripts": {\n    "test": "jest"\n  }\n}\n',
+            ),
         ],
         "pass",
         **ST,
