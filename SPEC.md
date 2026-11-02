@@ -507,16 +507,35 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `[tool.mypy]` (`strict` off, `ignore_errors`, `disable_error_code` added), `fail_under`
   removed (counts as lowered), `python_files`/`python_functions`/`python_classes` narrowed,
   `[tool.ruff.lint]` (`ignore`/`extend-ignore`/`per-file-ignores` added);
-- `pytest.ini`, `setup.cfg`, `tox.ini`, `noxfile.py` equivalents;
+- `pytest.ini`, `setup.cfg`, `tox.ini`, `noxfile.py` equivalents. In `tox.ini` and
+  `noxfile.py` (read with `ast`, so a reformatted call is the same call) a selection flag
+  counts only after the `pytest` token and only when the base's pytest commands did not
+  already have it; `coverage run -m pytest` is not a marker flag, and `*session.posargs` is
+  not a selection;
+- `-p no:<plugin>` in `addopts` is judged by the plugin: harmless ones (`cacheprovider`,
+  `randomly`, `xdist`, `logging`, `faulthandler`, `legacypath`, `pastebin`, `junitxml`, `sugar`,
+  `instafail`) say nothing, ones that decide outcomes (`python`, `unittest`, `doctest`, `cov`,
+  `pytest_cov`, `asyncio`, `anyio`, `trio`) block, `warnings` blocks only where the base turns
+  warnings into errors (`filterwarnings` with `error`, `-W error`, `-Werror`), and an unknown
+  plugin is a `warn`;
 - `package.json` `scripts` whose names appear in the base policy's commands, plus
   `test`, `lint`, `typecheck`, and the scripts those call through `npm run NAME`, `run-s`,
-  `run-p` or `npm-run-all` (one level deep; `npm run a && npm run b` and `run-s a b` are the
-  same steps); `jest.config.*`/`vitest.config.*` (`testPathIgnorePatterns`,
+  `run-p`, `npm-run-all` or `pnpm run '/regex/'`, followed transitively (`npm run a && npm run
+  b` and `run-s a b` are the same steps). `pre<name>` and `post<name>` run with `<name>`, so a
+  step split off into `pretest` is the same steps. Only checks count towards "fewer steps": a
+  cleanup line (`rm -rf`, `echo`, `mkdir`) removed, or moved to a prerequisite, is not a lost
+  check. A script the base did not run that the candidate's `test` now runs (a new alias) is
+  read as new: a narrowing flag, `--passWithNoTests` or a swallow in it blocks. A swallow added
+  to an opaque script (one with no recognised check, such as `ng test`) blocks when the edited
+  statement is one the base had. A nested `package.json` that no policy command reaches (not a
+  workspace member, not entered by `cd`, `--prefix`, `--dir` or `--filter`, not run
+  recursively) is a `warn`, not a block. `jest.config.*`/`vitest.config.*` (`testPathIgnorePatterns`,
   `exclude`, `coverageThreshold` lowered, `passWithNoTests`); `tsconfig*.json` (`strict`
   or `noImplicitAny` set false, `skipLibCheck` is ignored);
 - `Makefile`/`justfile` targets referenced by the base policy's commands (all targets are
   read, `define ... endef` bodies are not targets; a recipe emptied while gaining
-  prerequisites is judged by the recipes of those prerequisites, up to four deep). A `-`
+  prerequisites, or either side has prerequisites, is judged by the recipes of those
+  prerequisites, up to four deep). A `-`
   prefix on a line blocks only when the line is a check (`-rm -rf build` is fine);
 - a swallowed failure in any of those scripts or recipes, found by the shared shell reader.
   A *check* is a statement whose command, in command position (after environment
@@ -533,7 +552,9 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   base did not already have are reported. The selection-flag table (`-k`, `-m`,
   `--deselect`, `--ignore`, `-run`, `-short`, `-t`, `--testNamePattern`, `--skip`,
   `--grep` and their relatives, by runner) is shared with `ci.tampered`; a flag before the
-  runner (`python -m pytest`) does not count. Detection is linear in the script: 8000 checks
+  runner (`python -m pytest`) does not count. In `runner.tampered` the flags belong to their
+  tool: `-k` narrows only pytest, `-t` narrows jest and vitest but is mocha's timeout, mocha
+  narrows with `-g`, `--grep`, `-f`, `--fgrep` and `--only`, and `make -k` narrows nothing. Detection is linear in the script: 8000 checks
   and 2000 `exit 0` lines are read in under 3 seconds;
 - a file a base policy command runs (`sh scripts/test.sh`, `python scripts/run_tests.py`,
   `./ci/check`), and the files those run, one level deep: deleted, emptied, replaced by a
@@ -542,8 +563,10 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   arguments (`pytest tests/test_a.py`) are not scripts and are left to the test rules;
 - a Go `TestMain(<name> *testing.M)` (the parameter name is the one in the signature, and
   strings, raw strings, runes and comments are skipped when matching braces) that gains a
-  body which never calls `<name>.Run()` or calls `os.Exit(0)` unconditionally: a block,
-  unless the base already had the same flaw. A conditional `os.Exit(0)` is a `warn`;
+  body which never calls `<name>.Run()` or calls `os.Exit(0)` unconditionally after it: a
+  block, unless the base already had the same flaw. An `os.Exit(1)` inside a setup guard, and
+  an `os.Exit(0)` inside a guard that tests the result of `Run`, are not the flaw. A
+  conditional `os.Exit(0)` is a `warn`;
 - `conftest.py` or a local pytest plugin gaining a hook that can rewrite outcomes or
   collection (`pytest_runtest_makereport`, `pytest_runtest_call`, `pytest_runtest_protocol`,
   `pytest_pyfunc_call`, `pytest_report_teststatus`, `pytest_ignore_collect`,
@@ -594,6 +617,12 @@ A linter or type-checker configuration that does not exist at the base (a new
 disabled error codes are `runner.tampered` **warn**, not block, because there was no
 stricter configuration to loosen. Ignores added to a table that existed at the base
 still block.
+
+*Known limits.* A lint ignore for a rule that is new in a version bump of the linter still
+blocks (httpx `fa03b489f`: the ignore is the honest answer to a bump, and the rule cannot tell
+it from a loosening without the linter's changelog). Coverage floors moved from the pytest
+options into a `codecov` block are read as lowered (httpx `46402dd59`: the rule does not read
+`codecov.yml`).
 
 ### 5.7 Test identity and covered removals
 
