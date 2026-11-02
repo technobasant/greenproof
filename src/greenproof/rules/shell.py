@@ -357,9 +357,27 @@ def _cmd_name(token: str) -> str:
 
 def _tokens(statement: str) -> list[str]:
     try:
-        return shlex.split(statement, posix=True)
+        words = shlex.split(statement, posix=True)
     except ValueError:
         return statement.split()
+    return _join_substitutions(words)
+
+
+def _join_substitutions(words: list[str]) -> list[str]:
+    """`words` with each unfinished `$(...)` or backtick substitution rejoined: shlex splits
+    `A=$(cat opts) pytest` inside the parentheses, and the substitution is one word."""
+    out: list[str] = []
+    open_word: str | None = None
+    for word in words:
+        word = word if open_word is None else f"{open_word} {word}"
+        if (word.count("(") > word.count(")") and "$(" in word) or word.count("`") % 2:
+            open_word = word
+            continue
+        open_word = None
+        out.append(word)
+    if open_word is not None:
+        out.append(open_word)
+    return out
 
 
 def _skip_opts(toks: list[str], values: Collection[str], positional: int = 0) -> list[str]:
@@ -412,16 +430,173 @@ def _container_command(base: str, rest: list[str]) -> list[str] | None:
     return args
 
 
+class EnvUse:
+    """What the wrappers and assignments in front of a command put in its environment: the
+    variables it is given (`VAR=1 cmd`, `env VAR=1`, `cross-env VAR=1`, `dotenv -v VAR=1`), the
+    env files a dotenv-style wrapper loads, and whether one of them named no file (`.env`)."""
+
+    def __init__(self) -> None:
+        self.vars: dict[str, str] = {}
+        self.files: list[str] = []
+        self.default = False
+
+    def set(self, assignment: str) -> None:
+        name, _, value = assignment.partition("=")
+        if name.isidentifier():
+            self.vars[name] = value
+
+
+# Command wrappers that set up an environment and run what follows their options: name -> the
+# options that take a separate value, the options that name an env file, those that set a variable.
+_WRAP_NYC = frozenset(
+    {"-r", "--reporter", "-t", "--temp-dir", "--temp-directory", "--report-dir", "--cwd", "-n"}
+    | {"--include", "-x", "--exclude", "-e", "--extension", "-i", "--require", "--branches"}
+    | {"--lines", "--functions", "--statements", "--nycrc-path", "--extends", "--cache-dir"}
+    | {"--ignore-class-method", "--exclude-after-remap"}
+)
+_WRAP_C8 = frozenset(
+    {"-r", "--reporter", "-o", "--reports-dir", "--temp-directory", "-n", "--include", "-x"}
+    | {"--exclude", "-e", "--extension", "--config", "--lines", "--functions", "--branches"}
+    | {"--statements", "--watermarks", "--src"}
+)
+_NO_OPTS: frozenset[str] = frozenset()
+_WRAPPERS: dict[str, tuple[frozenset[str], frozenset[str], frozenset[str], bool]] = {
+    # name: (value options, env-file options, variable options, needs the word `run`)
+    "nyc": (_WRAP_NYC, _NO_OPTS, _NO_OPTS, False),
+    "c8": (_WRAP_C8, _NO_OPTS, _NO_OPTS, False),
+    "env-cmd": (
+        frozenset({"-f", "--file", "-r", "--rc-file", "-e", "--environments"}),
+        frozenset({"-f", "--file"}),
+        _NO_OPTS,
+        False,
+    ),
+    "dotenv": (
+        frozenset({"-e", "-v", "-p", "-f", "--file", "-q", "--quote"}),
+        frozenset({"-e", "-f", "--file"}),
+        frozenset({"-v"}),
+        False,
+    ),
+    "dotenvx": (
+        frozenset(
+            {"-f", "--env-file", "-fv", "--env-vault-file", "-fk", "--env-keys-file"}
+            | {"-e", "--env", "--convention", "--log-level", "--ignore"}
+        ),
+        frozenset({"-f", "--env-file"}),
+        frozenset({"-e", "--env"}),
+        True,
+    ),
+    "doppler": (
+        frozenset(
+            {"-p", "--project", "-c", "--config", "-t", "--token", "--mount"}
+            | {"--mount-format", "--mount-max-reads", "--mount-template"}
+            | {"--config-dir", "--scope", "--api-host", "--command"}
+            | {"--only-secrets", "--name-transformer", "--fallback"}
+        ),
+        _NO_OPTS,
+        _NO_OPTS,
+        True,
+    ),
+    "op": (
+        frozenset(
+            {"--env-file", "--account", "--config", "--environment", "--session"}
+            | {"--format", "--encoding", "--log-level"}
+        ),
+        frozenset({"--env-file"}),
+        _NO_OPTS,
+        True,
+    ),
+    "infisical": (
+        frozenset(
+            {"--env", "--projectId", "--path", "--token", "--domain", "--tags"}
+            | {"--command", "--log-level", "--workspaceId"}
+        ),
+        _NO_OPTS,
+        _NO_OPTS,
+        True,
+    ),
+}
+
+
+_WRAPPER_NAMES = frozenset({"cross-env", "cross-env-shell", *_WRAPPERS})
+
+
+def _wrap_opts(
+    toks: list[str], values: Collection[str], see: Callable[[str, str], None] | None = None
+) -> list[str]:
+    """`toks` without the leading options of a wrapper (a value option also drops its value,
+    `--opt=value` is one word) and one `--`; `see(option, value)` is told of each value."""
+    i = 0
+    while i < len(toks) and toks[i].startswith("-") and len(toks[i]) > 1 and toks[i] != "--":
+        name, eq, value = toks[i].partition("=")
+        if eq:
+            if see:
+                see(name, value)
+            i += 1
+        elif name in values:
+            if see:
+                see(name, toks[i + 1] if i + 1 < len(toks) else "")
+            i += 2
+        else:
+            i += 1
+    if i < len(toks) and toks[i] == "--":
+        i += 1
+    return toks[min(i, len(toks)) :]
+
+
+def _env_wrapper(base: str, toks: list[str], env: EnvUse) -> list[str] | None:
+    """The command a wrapper runs (`nyc --reporter lcov jest` is `jest`, `dotenv run -- pytest`
+    is `pytest`), None when `toks` is not such a wrapper call. What it puts in the environment
+    goes to `env`. Only its options are skipped: whether what follows is a check is the caller's
+    to judge, so `dotenv run echo pytest` is `echo pytest`."""
+    rest = toks[1:]
+    if base in ("cross-env", "cross-env-shell"):
+        i = 0
+        while i < len(rest) and _ASSIGN.match(rest[i]):
+            env.set(rest[i])
+            i += 1
+        tail = rest[i:]
+        if base == "cross-env-shell":  # its tail is a shell string
+            return ["sh", "-c", " ".join(tail)] if tail else []
+        return tail
+    spec = _WRAPPERS.get(base)
+    if spec is None:
+        return None
+    values, files, variables, needs_run = spec
+    named = len(env.files)
+    shell_string: list[str] = []
+
+    def see(option: str, value: str) -> None:
+        if option in files:
+            env.files.append(value)
+        elif option in variables:
+            env.set(value)
+        elif option == "--command":
+            shell_string.append(value)
+
+    rest = _wrap_opts(rest, values, see)
+    if needs_run or (base == "dotenv" and rest[:1] == ["run"]):
+        if rest[:1] != ["run"]:
+            return None
+        rest = _wrap_opts(rest[1:], values if needs_run else _NO_OPTS, see)
+    if base in ("dotenv", "dotenvx", "env-cmd") and len(env.files) == named:
+        env.default = True
+    return ["sh", "-c", shell_string[-1]] if shell_string else rest
+
+
 def _var_name(token: str) -> str | None:
     """`PYTEST` for `$PYTEST`, `${PYTEST}` and `$(PYTEST)` (a variable as the command word)."""
     m = _VAR.match(token)
     return (m["a"] or m["b"] or m["c"]) if m else None
 
 
-def _strip(tokens: list[str], defs: Mapping[str, str] | None = None) -> list[str]:
+def _strip(
+    tokens: list[str], defs: Mapping[str, str] | None = None, env: EnvUse | None = None
+) -> list[str]:
     """Drop what comes before the command: assignments, `if`/`then`/`!`, and wrappers. A variable
-    as the command word that `defs` defines is replaced by its value."""
+    as the command word that `defs` defines is replaced by its value. `env` collects what the
+    assignments and wrappers put in the command's environment."""
     toks = list(tokens)
+    sink = env if env is not None else EnvUse()
     substitutions = 0
     while toks:
         tok = toks[0]
@@ -431,13 +606,18 @@ def _strip(tokens: list[str], defs: Mapping[str, str] | None = None) -> list[str
             substitutions += 1
             toks = [*_tokens(defs[name]), *toks[1:]]
         elif _ASSIGN.match(tok) or tok in _LEADING:
+            if tok not in _LEADING:
+                sink.set(tok)
             toks = toks[1:]
         elif base in _OPT_VALUES or base in _PLAIN_WRAPPERS:
             rest = _skip_opts(toks[1:], _OPT_VALUES.get(base, frozenset()), int(base == "timeout"))
             if base == "env":
                 while rest and _ASSIGN.match(rest[0]):
+                    sink.set(rest[0])
                     rest = rest[1:]
             toks = rest
+        elif base in _WRAPPER_NAMES and (tail := _env_wrapper(base, toks, sink)) is not None:
+            toks = tail
         elif base in _RUN_TOOLS and nxt == "run":
             toks = _skip_opts(toks[2:], _RUN_VALUE_OPTS)
             if base == "hatch" and toks and re.match(r"^[\w.-]*:", toks[0]):
@@ -579,18 +759,50 @@ def shell_c_body(text: str, defs: Mapping[str, str] | None = None) -> str | None
     return _shell_c(_strip(_tokens(text), defs))
 
 
-def command_tokens(text: str, defs: Mapping[str, str] | None = None) -> list[str]:
-    """The words of a statement from its command on: the wrappers are gone, `python -m X` is X.
-    A variable command word that `defs` defines is replaced by its value."""
+def _command(text: str, defs: Mapping[str, str] | None, env: EnvUse) -> list[str]:
     toks = _tokens(text)
     previous: list[str] | None = None
     while toks != previous:
         previous = toks
-        toks = _strip(_collapse(_strip(toks, defs)), defs)
+        toks = _strip(_collapse(_strip(toks, defs, env)), defs, env)
         if (body := _shell_c(toks)) is not None:
             segs = split_segments(body)
             toks = _tokens(segs[0].text) if segs else []
     return toks
+
+
+# Variables that hand a test runner flags: the tool that reads them, and where its flags go.
+_FLAG_VARS = {"PYTEST_ADDOPTS": "pytest", "GOFLAGS": "go"}
+
+
+def _with_env_flags(toks: list[str], env: EnvUse) -> list[str]:
+    """`toks` with the flags the command's environment hands the runner (`PYTEST_ADDOPTS` to
+    pytest, `GOFLAGS` to `go test`) spliced in after the runner: `PYTEST_ADDOPTS='-k x' pytest`
+    selects like `pytest -k x`."""
+    if not toks or not env.vars:
+        return toks
+    name = _cmd_name(toks[0])
+    if name in ("pytest", "py.test") and (flags := env.vars.get("PYTEST_ADDOPTS")):
+        return [toks[0], *_tokens(flags), *toks[1:]]
+    if name == "go" and toks[1:2] == ["test"] and (flags := env.vars.get("GOFLAGS")):
+        return [*toks[:2], *_tokens(flags), *toks[2:]]
+    return toks
+
+
+def command_tokens(text: str, defs: Mapping[str, str] | None = None) -> list[str]:
+    """The words of a statement from its command on: the wrappers are gone, `python -m X` is X.
+    A variable command word that `defs` defines is replaced by its value. `PYTEST_ADDOPTS` and
+    `GOFLAGS` set in front of a runner are its flags."""
+    env = EnvUse()
+    toks = _command(text, defs, env)
+    return _with_env_flags(toks, env)
+
+
+def command_env(text: str, defs: Mapping[str, str] | None = None) -> EnvUse:
+    """The environment a statement's assignments and wrappers give its command."""
+    env = EnvUse()
+    _command(text, defs, env)
+    return env
 
 
 def _group_inner(text: str) -> str | None:

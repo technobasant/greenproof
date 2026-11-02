@@ -28,6 +28,7 @@ from greenproof.rules.shell import (
     SELECT_FLAGS,
     _group_inner,
     check_kind,
+    command_env,
     command_tokens,
     early_exit,
     find_swallows,
@@ -877,6 +878,8 @@ def _sets_autoload_off(statement: str) -> bool:
     empty as on."""
     if (inner := shell_c_body(statement)) is not None:
         return any(_sets_autoload_off(seg.text) for seg in split_segments(inner))
+    if command_env(statement).vars.get(_AUTOLOAD_VAR):  # `nyc`, `dotenv -v`, `cross-env`, ...
+        return True
     try:
         toks = shlex.split(statement)
     except ValueError:
@@ -919,6 +922,127 @@ def _makefile_sets_autoload_off(text: str | None) -> bool:
         ):
             exported = True
     return assigned and exported
+
+
+# -- flags handed to a runner through the environment -------------------------------------
+# `PYTEST_ADDOPTS` is pytest's own flags and `GOFLAGS` go's: `shell.command_tokens` reads them
+# in front of a command as that tool's flags. Here they are read from where else a script or
+# Makefile sets them (`export`, a Makefile's `export VAR = ...`) and from a `.env` file a
+# dotenv-style wrapper loads. Other variables (`JEST_*`, `NODE_OPTIONS`, `RUSTFLAGS`, `CI`,
+# `PYTEST_PLUGINS`, `PYTEST_CURRENT_TEST`...) are not read.
+_FLAG_VARS = ("PYTEST_ADDOPTS", "GOFLAGS")
+_UNREADABLE = re.compile(r"[$`]")
+_RUNNER_HEADS = frozenset({"pytest", "py.test", "go"})
+_JOINS = {"&&": " && ", "||": " || "}
+
+
+def _exports_in(statement: str, local: dict[str, str]) -> dict[str, str | None]:
+    """The flag variables a statement exports (`export VAR=x`, `export VAR` after `VAR=x`) or
+    unsets (None). `local` holds the plain assignments of the script so far."""
+    try:
+        toks = shlex.split(statement)
+    except ValueError:
+        toks = statement.split()
+    if not toks:
+        return {}
+    out: dict[str, str | None] = {}
+    if toks[0] == "export":
+        for tok in toks[1:]:
+            name, eq, value = tok.partition("=")
+            if name in _FLAG_VARS and eq:
+                out[name] = value
+            elif name in _FLAG_VARS and name in local:
+                out[name] = local[name]
+    elif toks[0] == "unset":
+        out = {t: None for t in toks[1:] if t in _FLAG_VARS}
+    else:
+        for tok in toks:
+            name, eq, value = tok.partition("=")
+            if not (eq and name.isidentifier()):
+                break
+            if name in _FLAG_VARS:
+                local[name] = value
+    return out
+
+
+def _with_exports(
+    lines: list[str], script: bool, preset: Mapping[str, str] | None = None
+) -> list[str]:
+    """`lines` with the exported flag variables written in front of each runner they reach: a
+    script's `export PYTEST_ADDOPTS='-k x'` goes to the runners after it, a Makefile's export
+    (`preset`) to every recipe line. Nothing exported leaves `lines` as they are."""
+    exports = dict(preset or {})
+    local: dict[str, str] = {}
+    out: list[str] = []
+    for ln in lines:
+        head = "" if script else (m.group(0) if (m := _RECIPE_PREFIX.match(ln)) else "")
+        parts: list[str] = []
+        touched = False
+        for seg in split_segments(ln[len(head) :]):
+            if script:
+                for name, value in _exports_in(seg.text, local).items():
+                    if value is None:
+                        exports.pop(name, None)
+                    else:
+                        exports[name] = value
+            text = seg.text
+            if exports and posixpath.basename((command_tokens(text) or [""])[0]) in _RUNNER_HEADS:
+                have = command_env(text).vars
+                given = "".join(
+                    f"{n}={shlex.quote(v)} " for n, v in exports.items() if n not in have
+                )
+                touched = touched or bool(given)
+                text = given + text
+            parts.append(_JOINS.get(seg.sep, "; ") * bool(parts) + text)
+        out.append(head + "".join(parts) if touched else ln)
+    return out
+
+
+def _unreadable_sets(statements: Sequence[str]) -> int:
+    return sum(_unreadable_flags(st) for st in statements)
+
+
+def _unreadable_flags(statement: str) -> bool:
+    """Whether a statement gives `PYTEST_ADDOPTS` or `GOFLAGS` a value greenproof cannot read
+    (`$(...)`, `${VAR}`, a backtick)."""
+    if (inner := shell_c_body(statement)) is not None:
+        return any(_unreadable_flags(seg.text) for seg in split_segments(inner))
+    values = dict(command_env(statement).vars)
+    values.update({n: v for n, v in _exports_in(statement, {}).items() if v})
+    return any(_UNREADABLE.search(values.get(name, "")) for name in _FLAG_VARS)
+
+
+_UNREADABLE_WHY = (
+    "`PYTEST_ADDOPTS` or `GOFLAGS` is now set from a value greenproof cannot read, and it may "
+    "hand the runner a selection flag"
+)
+_MAKE_FLAG = re.compile(
+    rf"^(?:[^=:#]*:\s*)?(?:override\s+)?(export\s+)?({'|'.join(_FLAG_VARS)})\s*[:?+!]*="
+)
+
+
+def _make_exports(text: str | None) -> dict[str, str]:
+    """The flag variables a Makefile or justfile exports, with their values: `export VAR = x`,
+    `VAR = x` with `export VAR` or `.EXPORT_ALL_VARIABLES:` (a justfile's `set export`)."""
+    values = _variables(text)
+    names: set[str] = set()
+    everything = False
+    for ln in (text or "").splitlines():
+        if ln.startswith("\t"):
+            continue
+        line = ln.strip()
+        if m := _MAKE_FLAG.match(line):
+            if m.group(1):
+                names.add(m.group(2))
+        elif m := re.match(rf"^export\s+((?:\S+\s+)*?(?:{'|'.join(_FLAG_VARS)})\b.*)$", line):
+            names.update(n for n in _FLAG_VARS if re.search(rf"\b{n}\b", m.group(1)))
+        elif re.match(r"^(?:\.EXPORT_ALL_VARIABLES\s*:|set\s+export\b|export\s*$)", line):
+            everything = True
+    out: dict[str, str] = {}
+    for name in _FLAG_VARS:
+        if name in values and (everything or name in names):
+            out[name] = values[name].strip().strip("'\"")
+    return out
 
 
 def _removed_tests(
@@ -973,6 +1097,7 @@ def neutering_reason(
     tests: _BaseTests | None = None,
     cwds: Sequence[str] = ("",),
     recipe: bool = False,
+    exports: tuple[Mapping[str, str], Mapping[str, str]] | None = None,
 ) -> str | None:
     """Whether a command (a script or recipe) was emptied, no-opped, narrowed or shortened.
 
@@ -984,7 +1109,8 @@ def neutering_reason(
     base ran from elsewhere, for a script that is new). Only the steps that are checks count
     towards "fewer steps": a cleanup line or a `pretest` split off is not a lost check. A kind of
     check the base ran and the candidate no longer does (`jest` became `eslint`) is a reason, with
-    `expanders` reading `npm run x` or `make x` into the body they run.
+    `expanders` reading `npm run x` or `make x` into the body they run. `exports` are the flag
+    variables (`PYTEST_ADDOPTS`, `GOFLAGS`) the base and the candidate Makefile export.
     """
     base_c = [ln.strip() for ln in base_lines if ln.strip()]
     cand_c = [ln.strip() for ln in cand_lines if ln.strip()]
@@ -993,7 +1119,9 @@ def neutering_reason(
         cand_c = [ln for ln in cand_c if not ln.startswith("#")]
     if base_c and not cand_c:
         return "it was emptied"
-    if base_c == cand_c:
+    base_e = _with_exports(base_c, script, exports[0] if exports else None)
+    cand_e = _with_exports(cand_c, script, exports[1] if exports else None)
+    if base_c == cand_c and base_e == cand_e:
         return None
     if (
         cand_c
@@ -1004,13 +1132,13 @@ def neutering_reason(
     ctx = _Ctx(extra, make_check, script_check, set(names[0]) | set(names[1]) if names else ())
     known = [ctx.has_check(lines, script) for lines in (base_c, cand_c)]
     base_texts = _Known([*_statements(base_c, script), *_statements(list(base_pool), script)])
-    before = _check_tokens(base_c, script, ctx, known[0], None)
-    after = _check_tokens(cand_c, script, ctx, known[1], base_texts)
+    before = _check_tokens(base_e, script, ctx, known[0], None)
+    after = _check_tokens(cand_e, script, ctx, known[1], base_texts)
     if added := sorted(after - before):
         return f"it now passes {added[0]}"
-    if flag := _new_selection_flag(base_c, cand_c):
+    if flag := _new_selection_flag(base_e, cand_e):
         return f"it now passes {flag}"
-    if narrowed := narrowed_selection(_statements(base_c, script), _statements(cand_c, script)):
+    if narrowed := narrowed_selection(_statements(base_e, script), _statements(cand_e, script)):
         return f"it now selects fewer paths ({narrowed})"
     if tests is not None and (
         gone := _removed_tests(base_c, cand_c, tests, cwds, recipe=recipe and not script)
@@ -1031,6 +1159,10 @@ def neutering_reason(
         return "it runs fewer steps than before"
     if _autoload_sets(_statements(cand_c, script)) > _autoload_sets(_statements(base_c, script)):
         return _Warn(_AUTOLOAD_WHY)
+    if _unreadable_sets(_statements(cand_c, script)) > _unreadable_sets(
+        _statements(base_c, script)
+    ):
+        return _Warn(_UNREADABLE_WHY)
     return None
 
 
@@ -2061,6 +2193,7 @@ def _make_reasons(
         old_shadow = _shadowed(f.old_text, old, _tree_names(changes, directory, True))
         new_shadow = _shadowed(f.new_text, new, _tree_names(changes, directory, False))
     resolve = _make_resolver(new, extra, new_shadow)
+    exported = (_make_exports(f.old_text), _make_exports(f.new_text))
     out: list[tuple[int | None, str]] = []
     for name in sorted(names):
         if name not in old:
@@ -2079,6 +2212,7 @@ def _make_reasons(
             tests=tests,
             cwds=(posixpath.dirname(f.path),),
             recipe=True,
+            exports=exported,
         )
         if why and not cand_lines and _effective(new, name):
             why = _SHADOW_WHY
@@ -2095,6 +2229,11 @@ def _make_reasons(
         and not _makefile_sets_autoload_off(f.old_text)
     ):
         out.append((_first_line_with(f.new_text or "", _AUTOLOAD_VAR), _Warn(_AUTOLOAD_WHY)))
+    for var in _FLAG_VARS:
+        value = exported[1].get(var, "")
+        if names and _UNREADABLE.search(value) and exported[0].get(var) != value:
+            out.append((_first_line_with(f.new_text or "", var), _Warn(_UNREADABLE_WHY)))
+            break
     return out
 
 
@@ -2893,6 +3032,8 @@ def _file_reasons(
         return _noxfile_reasons(f)
     if name.endswith("_test.go"):
         return _go_reasons(f)
+    if _ENV_FILE.match(name):
+        return _envfile_reasons(f, name, commands, changes)
     settings = None
     if name == "pyproject.toml" or name in ("ruff.toml", ".ruff.toml") or name in _INI_NAMES:
         old = _parse_settings(name, f.old_text) if f.old_text is not None else None
@@ -2907,6 +3048,86 @@ def _file_reasons(
             found.extend(_noxfile_reasons(f))
         return found
     return []
+
+
+_ENV_FILE = re.compile(r"^(?:\.env(?:\..+)?|.+\.env)$")
+_ENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*)$")
+
+
+def _dotenv_values(text: str | None) -> dict[str, str]:
+    """The `KEY=value` lines of a `.env` file (`export` allowed, quotes and a trailing comment
+    dropped)."""
+    out: dict[str, str] = {}
+    for raw in (text or "").splitlines():
+        if (m := _ENV_LINE.match(raw.strip())) is None:
+            continue
+        value = m.group(2).strip()
+        if value[:1] in ("'", '"') and value.count(value[0]) >= 2:
+            value = value[1 : value.index(value[0], 1)]
+        else:
+            value = re.split(r"\s+#", value)[0].strip()
+        out[m.group(1)] = value
+    return out
+
+
+def _env_statements(changes: ChangeSet, commands: Mapping[str, str], directory: str) -> list[str]:
+    """The statements on a policy path that load an env file through a dotenv-style wrapper:
+    the policy commands, the recipes of a Makefile or justfile and the scripts of a package.json
+    in the file's directory or the root, and the scripts a policy command runs."""
+    lines: list[str] = list(commands.values())
+    for where in dict.fromkeys((directory, "")):
+        for name in ("Makefile", "GNUmakefile", "makefile", "justfile", "Justfile"):
+            text = changes.cand_text(posixpath.join(where, name))
+            lines.extend(ln for ln in (text or "").splitlines() if ln[:1] in (" ", "\t"))
+        try:
+            data = json.loads(changes.cand_text(posixpath.join(where, "package.json")) or "{}")
+        except ValueError:
+            data = {}
+        scripts = data.get("scripts") if isinstance(data, dict) else None
+        if isinstance(scripts, dict):
+            lines.extend(v for v in scripts.values() if isinstance(v, str))
+    for path in _invoked_files(changes, commands):
+        lines.extend((changes.base_text(path) or "").splitlines())
+    found: dict[str, None] = {}
+    for ln in lines[:5000]:
+        for seg in split_segments(_RECIPE_PREFIX.sub("", ln.strip(), count=1)):
+            env = command_env(seg.text)
+            if env.files or env.default:
+                found[seg.text] = None
+    return list(found)
+
+
+def _envfile_reasons(
+    f: ChangedFile, name: str, commands: Mapping[str, str], changes: ChangeSet
+) -> list[tuple[int | None, str]]:
+    """A `.env` file that gained `PYTEST_ADDOPTS`, `GOFLAGS` or `PYTEST_DISABLE_PLUGIN_AUTOLOAD`
+    (or changed one), read as the variable set in front of each wrapper call that loads it: a
+    file named with `-e` or `-f` (`--env-file`), and `.env*` when the wrapper names none."""
+    old, new = _dotenv_values(f.old_text), _dotenv_values(f.new_text)
+    changed = [v for v in (*_FLAG_VARS, _AUTOLOAD_VAR) if new.get(v) and new[v] != old.get(v)]
+    if not changed:
+        return []
+    loaders = []
+    for st in _env_statements(changes, commands, posixpath.dirname(f.path)):
+        env = command_env(st)
+        if any(posixpath.basename(n) == name for n in env.files) or (
+            env.default and name.startswith(".env")
+        ):
+            loaders.append(st)
+    out: list[tuple[int | None, str]] = []
+    for var in changed:
+        value, line = new[var], _first_line_with(f.new_text or "", var)
+        if loaders and _UNREADABLE.search(value):
+            out.append((line, _Warn(f"`{var}` in {name} is `{value}`: {_UNREADABLE_WHY}")))
+            continue
+        for st in loaders:
+            before = f"{var}={shlex.quote(old[var])} {st}" if old.get(var) else st
+            why = neutering_reason([before], [f"{var}={shlex.quote(value)} {st}"])
+            if why:
+                text = f"{var} is now `{value}` in {name}, which `{st}` loads, and {why}"
+                out.append((line, _carry(why, text)))
+                break
+    return out
 
 
 def _anchor(reason: str) -> str:
