@@ -309,7 +309,7 @@ and continued once.
 - **The gate does not trap the agent.** If nothing has changed since the base, the check
   passes without running. If the agent stopped again with the same candidate tree after
   being blocked, it is released, so an agent that cannot fix something can stop and tell
-  you. After 8 consecutive blocks in a session it is released too.
+  you. The 8th consecutive failed stop in a session is released too.
 - **CI is the authority.** Run the same check in CI on every pull request, where the
   agent's edits to local files do not count.
 
