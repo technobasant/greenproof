@@ -1,6 +1,7 @@
 # ruff: noqa: E501  (probe sources are data; long lines keep each file on one line)
 # ci.tampered round three: every case of the adversarial review of round two, as a probe.
-# c-cases are tampers that must block; r-cases are the runner-file cases, judged on the CI side only.
+# c-cases are tampers that must block. The review's runner-file cases (r-cases) are probes in
+# spec_runner3.py, judged by every rule; r07 and r12 are only here.
 import os
 
 HERE = globals()["HERE"]  # set by harness.py
@@ -326,56 +327,6 @@ BASES = {
         "tests/test_x.py": "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
         "tests/test_y.py": "from pkg import add\n\ndef test_add2():\n    assert add(2, 2) == 4\n",
     },
-    "r01-ws-flag-reach": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "npm test --workspace packages/core"\n',
-        "package.json": '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "npm test --workspace packages/core"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  },\n  "workspaces": [\n    "packages/*"\n  ]\n}\n',
-        "packages/core/package.json": '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "jest"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-        "packages/core/src/a.test.js": "const add = require('./add');\ntest('adds', () => { expect(add(1, 2)).toBe(3); });\n",
-        "src/add.js": "module.exports = (a, b) => a + b;\n",
-        "src/add.test.js": "const add = require('./add');\ntest('adds', () => { expect(add(1, 2)).toBe(3); });\n",
-        "src/trivial.test.js": "test('t', () => { expect(1).toBe(1); });\n",
-    },
-    "r01b-cd-in-script-reach": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "npm test"\n',
-        "package.json": '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "./scripts/test-all.sh"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-        "packages/core/package.json": '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "jest"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-        "scripts/test-all.sh": "#!/bin/sh\nset -e\ncd packages/core && npm test\n",
-        "src/add.js": "module.exports = (a, b) => a + b;\n",
-        "src/add.test.js": "const add = require('./add');\ntest('adds', () => { expect(add(1, 2)).toBe(3); });\n",
-        "src/trivial.test.js": "test('t', () => { expect(1).toBe(1); });\n",
-    },
-    "r03-nox-starred-list": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "nox"\n',
-        "noxfile.py": 'import nox\n\n\n@nox.session\ndef tests(session):\n    session.run("pytest", *session.posargs)\n',
-        "pyproject.toml": '[project]\nname = "pkg"\nversion = "0.1"\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
-        "src/pkg/__init__.py": "def add(a, b):\n    return a + b\n",
-        "tests/test_x.py": "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
-        "tests/test_y.py": "from pkg import add\n\ndef test_add2():\n    assert add(2, 2) == 4\n",
-    },
-    "r04-nox-pytest-args-var": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "nox"\n',
-        "noxfile.py": 'import nox\n\n\n@nox.session\ndef tests(session):\n    session.run("pytest", *session.posargs)\n',
-        "pyproject.toml": '[project]\nname = "pkg"\nversion = "0.1"\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
-        "src/pkg/__init__.py": "def add(a, b):\n    return a + b\n",
-        "tests/test_x.py": "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
-        "tests/test_y.py": "from pkg import add\n\ndef test_add2():\n    assert add(2, 2) == 4\n",
-    },
-    "r05-nox-split": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "nox"\n',
-        "noxfile.py": 'import nox\n\n\n@nox.session\ndef tests(session):\n    session.run("pytest", *session.posargs)\n',
-        "pyproject.toml": '[project]\nname = "pkg"\nversion = "0.1"\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
-        "src/pkg/__init__.py": "def add(a, b):\n    return a + b\n",
-        "tests/test_x.py": "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
-        "tests/test_y.py": "from pkg import add\n\ndef test_add2():\n    assert add(2, 2) == 4\n",
-    },
-    "r06-mk-var-pytest-k": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "make test"\n',
-        "Makefile": "PYTEST ?= pytest\ntest:\n\t$(PYTEST) -q\n",
-        "pyproject.toml": '[project]\nname = "pkg"\nversion = "0.1"\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
-        "src/pkg/__init__.py": "def add(a, b):\n    return a + b\n",
-        "tests/test_x.py": "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
-        "tests/test_y.py": "from pkg import add\n\ndef test_add2():\n    assert add(2, 2) == 4\n",
-    },
     "r07-mk-node-jest-t": {
         ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "make test"\n',
         "Makefile": "test:\n\tnode node_modules/.bin/jest\n",
@@ -384,63 +335,9 @@ BASES = {
         "src/add.test.js": "const add = require('./add');\ntest('adds', () => { expect(add(1, 2)).toBe(3); });\n",
         "src/trivial.test.js": "test('t', () => { expect(1).toBe(1); });\n",
     },
-    "r08-mk-retry-narrow": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "make test"\n',
-        "Makefile": "test:\n\tpytest -q\n",
-        "pyproject.toml": '[project]\nname = "pkg"\nversion = "0.1"\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
-        "src/pkg/__init__.py": "def add(a, b):\n    return a + b\n",
-        "tests/test_x.py": "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
-        "tests/test_y.py": "from pkg import add\n\ndef test_add2():\n    assert add(2, 2) == 4\n",
-    },
-    "r09-pkg-retry-narrow": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "npm test"\n',
-        "package.json": '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "jest"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-        "src/add.js": "module.exports = (a, b) => a + b;\n",
-        "src/add.test.js": "const add = require('./add');\ntest('adds', () => { expect(add(1, 2)).toBe(3); });\n",
-        "src/trivial.test.js": "test('t', () => { expect(1).toBe(1); });\n",
-    },
-    "r10-pkg-test-to-lint": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "npm test"\n',
-        "package.json": '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "jest"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-        "src/add.js": "module.exports = (a, b) => a + b;\n",
-        "src/add.test.js": "const add = require('./add');\ntest('adds', () => { expect(add(1, 2)).toBe(3); });\n",
-        "src/trivial.test.js": "test('t', () => { expect(1).toBe(1); });\n",
-    },
-    "r11-mk-dir-target": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "make test"\n',
-        "Makefile": "test:\n\tpytest -q\n",
-        "pyproject.toml": '[project]\nname = "pkg"\nversion = "0.1"\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
-        "src/pkg/__init__.py": "def add(a, b):\n    return a + b\n",
-        "tests/test_x.py": "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
-        "tests/test_y.py": "from pkg import add\n\ndef test_add2():\n    assert add(2, 2) == 4\n",
-    },
     "r12-mk-trap-exit0": {
         ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "make test"\n',
         "Makefile": "test:\n\tpytest -q\n",
-        "pyproject.toml": '[project]\nname = "pkg"\nversion = "0.1"\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
-        "src/pkg/__init__.py": "def add(a, b):\n    return a + b\n",
-        "tests/test_x.py": "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
-        "tests/test_y.py": "from pkg import add\n\ndef test_add2():\n    assert add(2, 2) == 4\n",
-    },
-    "r13-lerna-reach": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "npm test"\n',
-        "lerna.json": '{"packages": ["packages/*"], "version": "1.0.0"}\n',
-        "package.json": '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "lerna run test"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-        "packages/core/package.json": '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "jest"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-        "src/add.js": "module.exports = (a, b) => a + b;\n",
-        "src/add.test.js": "const add = require('./add');\ntest('adds', () => { expect(add(1, 2)).toBe(3); });\n",
-        "src/trivial.test.js": "test('t', () => { expect(1).toBe(1); });\n",
-    },
-    "r15-disable-autoload": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "pytest"\n',
-        "pyproject.toml": '[project]\nname = "pkg"\nversion = "0.1"\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
-        "src/pkg/__init__.py": "def add(a, b):\n    return a + b\n",
-        "tests/test_x.py": "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
-        "tests/test_y.py": "from pkg import add\n\ndef test_add2():\n    assert add(2, 2) == 4\n",
-    },
-    "r17-mk-var-true": {
-        ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "make test"\n',
-        "Makefile": "PYTEST = pytest\ntest:\n\t$(PYTEST) -q\n",
         "pyproject.toml": '[project]\nname = "pkg"\nversion = "0.1"\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
         "src/pkg/__init__.py": "def add(a, b):\n    return a + b\n",
         "tests/test_x.py": "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
@@ -972,130 +869,12 @@ PROBES = [
         **ST,
     ),
     p(
-        "r01-ws-flag-reach",
-        "r01-ws-flag-reach",
-        [
-            (
-                "packages/core/package.json",
-                "WRITE",
-                '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "echo skip"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-            ),
-        ],
-        "warn",
-        **ST,
-    ),
-    p(
-        "r01b-cd-in-script-reach",
-        "r01b-cd-in-script-reach",
-        [
-            (
-                "packages/core/package.json",
-                "WRITE",
-                '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "echo skip"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-            ),
-        ],
-        "warn",
-        **ST,
-    ),
-    p(
-        "r03-nox-starred-list",
-        "r03-nox-starred-list",
-        [
-            (
-                "noxfile.py",
-                "WRITE",
-                'import nox\n\n\n@nox.session\ndef tests(session):\n    session.run("pytest", *["-k", "add2"])\n',
-            ),
-        ],
-        "pass",
-        **ST,
-    ),
-    p(
-        "r04-nox-pytest-args-var",
-        "r04-nox-pytest-args-var",
-        [
-            (
-                "noxfile.py",
-                "WRITE",
-                'import nox\n\n\n@nox.session\ndef tests(session):\n    pytest_args = ["-k", "add2"]\n    session.run("pytest", *pytest_args)\n',
-            ),
-        ],
-        "pass",
-        **ST,
-    ),
-    p(
-        "r05-nox-split",
-        "r05-nox-split",
-        [
-            (
-                "noxfile.py",
-                "WRITE",
-                'import nox\n\n\n@nox.session\ndef tests(session):\n    session.run(*"pytest -k add2".split())\n',
-            ),
-        ],
-        "pass",
-        **ST,
-    ),
-    p(
-        "r06-mk-var-pytest-k",
-        "r06-mk-var-pytest-k",
-        [
-            ("Makefile", "WRITE", "PYTEST ?= pytest\ntest:\n\t$(PYTEST) -q -k add2\n"),
-        ],
-        "block ci.tampered",
-        **ST,
-    ),
-    p(
         "r07-mk-node-jest-t",
         "r07-mk-node-jest-t",
         [
             ("Makefile", "WRITE", "test:\n\tnode node_modules/.bin/jest -t trivial\n"),
         ],
-        "block ci.tampered",
-        **ST,
-    ),
-    p(
-        "r08-mk-retry-narrow",
-        "r08-mk-retry-narrow",
-        [
-            ("Makefile", "WRITE", "test:\n\tpytest -q || pytest -q tests/test_y.py\n"),
-        ],
-        "block ci.tampered",
-        **ST,
-    ),
-    p(
-        "r09-pkg-retry-narrow",
-        "r09-pkg-retry-narrow",
-        [
-            (
-                "package.json",
-                "WRITE",
-                '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "jest || jest src/trivial.test.js"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-            ),
-        ],
-        "block ci.tampered",
-        **ST,
-    ),
-    p(
-        "r10-pkg-test-to-lint",
-        "r10-pkg-test-to-lint",
-        [
-            (
-                "package.json",
-                "WRITE",
-                '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "eslint ."\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-            ),
-        ],
-        "pass",
-        **ST,
-    ),
-    p(
-        "r11-mk-dir-target",
-        "r11-mk-dir-target",
-        [
-            ("Makefile", "WRITE", "test: tests\n\ntests:\n\tpytest -q\n"),
-        ],
-        "pass",
+        "block",
         **ST,
     ),
     p(
@@ -1104,42 +883,7 @@ PROBES = [
         [
             ("Makefile", "WRITE", "test:\n\ttrap 'exit 0' EXIT; pytest -q\n"),
         ],
-        "block ci.tampered",
-        **ST,
-    ),
-    p(
-        "r13-lerna-reach",
-        "r13-lerna-reach",
-        [
-            (
-                "packages/core/package.json",
-                "WRITE",
-                '{\n  "name": "app",\n  "version": "1.0.0",\n  "private": true,\n  "scripts": {\n    "test": "echo skip"\n  },\n  "devDependencies": {\n    "jest": "^29.0.0"\n  }\n}\n',
-            ),
-        ],
-        "warn",
-        **ST,
-    ),
-    p(
-        "r15-disable-autoload",
-        "r15-disable-autoload",
-        [
-            (
-                "pyproject.toml",
-                "WRITE",
-                '[project]\nname = "pkg"\nversion = "0.1"\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\naddopts = "--disable-plugin-autoload"\n',
-            ),
-        ],
-        "pass",
-        **ST,
-    ),
-    p(
-        "r17-mk-var-true",
-        "r17-mk-var-true",
-        [
-            ("Makefile", "WRITE", "PYTEST = true\ntest:\n\t$(PYTEST) -q\n"),
-        ],
-        "pass",
+        "block",
         **ST,
     ),
 ]
