@@ -20,7 +20,7 @@ from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import WARN, Finding
 from greenproof.rules import workflow
 from greenproof.rules._common import CODE_SUFFIXES, finding, sev_finding, split_lines
-from greenproof.rules.ci_expand import Child, make_children, pm_children
+from greenproof.rules.ci_expand import Child, make_children, nox_children, pm_children, tox_children
 from greenproof.rules.runner import _BaseTests, _tree_names
 from greenproof.rules.shell import (
     NOOP_FLAGS,
@@ -336,6 +336,10 @@ class _Walk:
             children = make_children(toks, stmt, body.defs, cwd, self.read, self.tree)
             if children is None:
                 children = pm_children(stmt, toks, cwd, self.read)
+            if children is None:
+                children = tox_children(toks, cwd, self.read)
+            if children is None:
+                children = nox_children(toks, cwd, self.read)
             if children is None:
                 self.script(body, stmt, toks, cwd, depth)
             else:
