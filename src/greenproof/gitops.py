@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import weakref
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -376,6 +377,88 @@ def read_blob(repo: Path, rev: str, path: str) -> bytes | None:
     """The content of `path` at `rev` (a commit or tree), or None when it is not a file there."""
     proc = git(repo, "cat-file", "blob", f"{rev}:{path}", check=False)
     return proc.stdout if proc.returncode == 0 else None
+
+
+def _stop_process(proc: subprocess.Popen[bytes]) -> None:
+    """Close a `git cat-file --batch` process: end its input, wait for it, drop its pipes."""
+    for stream in (proc.stdin, proc.stdout):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+class BlobReader:
+    """Reads blobs through one persistent `git cat-file --batch` process instead of one process
+    per file. The process starts on the first read and ends with `close()` (a finalizer is the
+    safety net). A path with a newline in it cannot be sent down the line protocol, so it, and
+    every read once the process has failed or been closed, goes through `read_blob`."""
+
+    def __init__(self, repo: Path) -> None:
+        self._repo = repo
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._finalizer: Any = None
+        self._broken = False
+
+    def _start(self) -> subprocess.Popen[bytes] | None:
+        if self._proc is None and not self._broken:
+            env = {**os.environ, **_override} if _override else None
+            try:
+                self._proc = subprocess.Popen(
+                    ["git", "cat-file", "--batch"],
+                    cwd=self._repo,
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                self._broken = True
+                return None
+            self._finalizer = weakref.finalize(self, _stop_process, self._proc)
+        return self._proc
+
+    def read(self, rev: str, path: str) -> bytes | None:
+        """The content of `path` at `rev`, or None when it is not a file there."""
+        if "\n" in path or "\n" in rev:
+            return read_blob(self._repo, rev, path)
+        proc = self._start()
+        if proc is None or proc.stdin is None or proc.stdout is None:
+            return read_blob(self._repo, rev, path)
+        try:
+            proc.stdin.write(f"{rev}:{path}\n".encode(errors="surrogateescape"))
+            proc.stdin.flush()
+            header = proc.stdout.readline()
+            if not header.endswith(b"\n"):
+                raise EOFError("git cat-file ended")
+            line = header[:-1]
+            if line.endswith((b" missing", b" ambiguous")):
+                return None
+            _sha, kind, size_text = line.rsplit(b" ", 2)
+            size = int(size_text)
+            data = proc.stdout.read(size)
+            if len(data) != size or proc.stdout.read(1) != b"\n":
+                raise EOFError("git cat-file ended")
+        except (OSError, EOFError, ValueError):
+            self.close()
+            self._broken = True
+            return read_blob(self._repo, rev, path)
+        return data if kind == b"blob" else None
+
+    def close(self) -> None:
+        """End the process. Later reads use `read_blob`."""
+        self._broken = True
+        if self._proc is not None:
+            if self._finalizer is not None:
+                self._finalizer.detach()
+            _stop_process(self._proc)
+            self._proc = None
 
 
 class _Interrupted(SystemExit):

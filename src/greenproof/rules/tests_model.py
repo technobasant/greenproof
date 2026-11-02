@@ -54,6 +54,11 @@ class Unit:
     # Python only: (subject shape, expected number) -> (tightest tolerance band, subject source)
     # over the body's comparisons to a numeric literal; exact is band 0 (SPEC 5.4).
     numeric_bands: dict[tuple[str, float], tuple[float, str]] = field(default_factory=dict)
+    # Python only (SPEC 5.4): calls compared with themselves (`f(x) == f(x)`) and the calls that
+    # were operands of a real comparison; a self-comparison is vacuous only where it replaces one.
+    call_self: dict[str, int] = field(default_factory=dict)
+    call_self_line: int = 0
+    call_compared: set[str] = field(default_factory=set)
     strong_operands: set[str] = field(default_factory=set)
     weak_operands: set[str] = field(default_factory=set)
     # Collection facts: enclosing classes, whether one is a TestCase, `__test__ = False`.

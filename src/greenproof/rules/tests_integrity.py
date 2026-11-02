@@ -8,10 +8,11 @@ by body hash (a rename); only what is left over counts as removed, replaced or d
 
 from __future__ import annotations
 
+import ast
 import posixpath
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 
 from greenproof.changeset import ChangedFile, ChangeSet
@@ -22,7 +23,16 @@ from greenproof.rules.self_mocked import check_autouse_fixtures, check_self_mock
 from greenproof.rules.tests_data import check_expected_data
 from greenproof.rules.tests_lines import analyse_lines, go_call_pattern
 from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
-from greenproof.rules.tests_python import Sources, analyse_python, marker_display
+from greenproof.rules.tests_python import (
+    HelperEffect,
+    Sources,
+    analyse_python,
+    call_self_replaced,
+    helper_effects,
+    is_test_support_text,
+    lost_helpers,
+    marker_display,
+)
 
 _RUST_TEST_ATTR = re.compile(r"#\[\s*(?:\w+::)*test\b")
 
@@ -246,6 +256,14 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
     if c.vacuous + len(replaced) > b.vacuous + base_replaced:
         line = c.vacuous_line or (replaced[0] if replaced else c.line)
         out.append(("an assertion was made vacuous: it can never fail", line, BLOCK))
+    if b.engine == "python" and call_self_replaced(b, c):
+        out.append(
+            (
+                "a comparison was replaced by a call compared with itself: it can never fail",
+                c.call_self_line or c.line,
+                BLOCK,
+            )
+        )
     if c.unreachable > b.unreachable:
         out.append(
             (
@@ -436,68 +454,191 @@ def _marker_finding(path: str, m: Marker, warn: bool = False) -> Finding:
     )
 
 
-_MAX_DEPENDENTS = 200
-
-
-def _helper_modules(sides: list[_Side]) -> tuple[set[str], set[str]]:
-    """Paths (base and candidate) of the changed Python modules in the test paths that hold no
-    test of their own (helpers), and the directories of the changed conftest.py files."""
-    helpers: set[str] = set()
-    conftests: set[str] = set()
-    for s in sides:
-        path, old = s.file.path, s.file.old_path or s.file.path
-        if not path.endswith(".py") and not old.endswith(".py"):
-            continue
-        if posixpath.basename(path) == "conftest.py" or posixpath.basename(old) == "conftest.py":
-            conftests.add(posixpath.dirname(path))
-            conftests.add(posixpath.dirname(old))
-        if not any(a is not None and a.units for a in (s.base, s.cand)):
-            helpers.update((path, old))
-    return helpers, conftests
+# Unchanged test files looked at because a helper or conftest changed: at most this many are
+# analysed, and at most `_MAX_KEPT` of those are compared as if they had changed. Rules have no
+# channel to the report's notes, so a file past a cap is skipped silently (SPEC 5.4).
+_MAX_ANALYSED = 300
+_MAX_KEPT = 200
 
 
 def _below(path: str, directory: str) -> bool:
     return not directory or path.startswith(directory + "/")
 
 
-def _dependents(
-    changes: ChangeSet,
-    sides: list[_Side],
-    cfg: Collection,
-    base_src: Sources,
-    cand_src: Sources,
-) -> list[_Side]:
-    """Unchanged Python test files a changed helper module or conftest.py can affect, analysed as
-    if they had changed: the files at or below the helper's directory that import it, and for a
-    conftest.py every test file below it. A helper that lost its assertions then shows up as
-    weakened tests in its callers. Bounded to the first 200 files."""
-    helpers, conftests = _helper_modules(sides)
-    if not helpers and not conftests:
+def _stem(path: str) -> str:
+    """The name an importer writes for a module: `helpers` for `tests/helpers.py` and for
+    `tests/helpers/__init__.py`."""
+    name = posixpath.basename(path)
+    if name == "__init__.py":
+        name = posixpath.basename(posixpath.dirname(path))
+    return name.removesuffix(".py")
+
+
+@dataclass
+class _Module:
+    """A changed helper module (importable from any test file) or conftest.py (its directory
+    and below), and the names whose checks the change lost."""
+
+    paths: set[str]
+    scope: str | None  # the conftest's directory; None for a helper module
+    names: set[str]
+    stems: set[str] = field(default_factory=set)
+
+    def reaches(self, path: str) -> bool:
+        return self.scope is None or _below(path, self.scope)
+
+    def mentioned_in(self, text: str) -> bool:
+        """The text names a lost helper as a word and, for a helper module, the module too."""
+        if not _word_pattern(self.names).search(text):
+            return False
+        return self.scope is not None or bool(_word_pattern(self.stems).search(text))
+
+
+def _word_pattern(words: set[str]) -> re.Pattern[str]:
+    return re.compile(r"\b(?:" + "|".join(re.escape(w) for w in sorted(words)) + r")\b")
+
+
+def _tree(text: str | None) -> ast.Module | None:
+    if text is None:
+        return None
+    try:
+        return ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+
+
+def _changed_modules(
+    changes: ChangeSet, sides: list[_Side], base_src: Sources, cand_src: Sources
+) -> list[_Module]:
+    """The changed Python helper modules and conftest.py files that lost something their callers
+    relied on. A helper module is a changed file that holds no test of its own and is in the test
+    paths or is a test-support module outside them (SPEC 5.4). Each is analysed on both sides: a
+    helper whose credited checks dropped or weakened, that now swallows, or that is gone puts
+    its name in `names`; a change that loses nothing yields no module, and re-analyses no file."""
+    sided = {s.file.path: s for s in sides}
+    out: list[_Module] = []
+    for f in changes.files:
+        path, old = f.path, f.old_path or f.path
+        if not path.endswith(".py") and not old.endswith(".py"):
+            continue
+        conftest = "conftest.py" in (posixpath.basename(path), posixpath.basename(old))
+        side = sided.get(path)
+        if not conftest:
+            if side is not None:
+                if any(a is not None and a.units for a in (side.base, side.cand)):
+                    continue  # a test file, not a helper module
+            elif not (
+                is_test_support_text(old, f.old_text) or is_test_support_text(path, f.new_text)
+            ):
+                continue
+        base_tree = _tree(f.old_text)
+        cand_tree = _tree(f.new_text)
+        before = helper_effects(old, base_tree, base_src) if base_tree is not None else None
+        if f.new_text is None:
+            after: dict[str, HelperEffect] | None = {}
+        else:
+            after = helper_effects(path, cand_tree, cand_src) if cand_tree is not None else None
+        lost = lost_helpers(before, after)
+        if not lost:
+            continue
+        out.append(
+            _Module(
+                {path, old},
+                None if not conftest else posixpath.dirname(path),
+                lost,
+                {_stem(path), _stem(old)},
+            )
+        )
+    return out
+
+
+class _Rescan:
+    """The unchanged Python test files a change can reach, analysed on demand and at most
+    `_MAX_ANALYSED` of them. Shared by the helper dependents and the autouse fixture scope."""
+
+    def __init__(
+        self,
+        changes: ChangeSet,
+        cfg: Collection,
+        base_src: Sources,
+        cand_src: Sources,
+        known: set[str],
+    ) -> None:
+        self.changes, self.cfg, self.base_src, self.cand_src = changes, cfg, base_src, cand_src
+        self.known = known
+        self.analysed = 0
+        self._cand: dict[str, FileAnalysis | None] = {}
+
+    @property
+    def full(self) -> bool:
+        return self.analysed >= _MAX_ANALYSED
+
+    def paths(self, directory: str | None = None) -> Iterator[str]:
+        """Unchanged collected test files at or below `directory` (anywhere when None)."""
+        for path in sorted(self.changes.cand_paths()):
+            if (
+                path not in self.known
+                and path.endswith(".py")
+                and (directory is None or _below(path, directory))
+                and self.changes.is_test(path)
+                and self.cfg.file_collected(path)
+            ):
+                yield path
+
+    def cand(self, path: str, text: str) -> FileAnalysis | None:
+        if path not in self._cand:
+            self.analysed += 1
+            self._cand[path] = analyse_python(path, text, self.cand_src)
+        return self._cand[path]
+
+    def mentioning(self, directory: str, name: str) -> list[FileAnalysis]:
+        """Candidate analyses of the unchanged test files below `directory` whose text has `name`
+        as a word: the autouse fixture scope (SPEC 5.8)."""
+        pattern = _word_pattern({name})
+        out: list[FileAnalysis] = []
+        for path in self.paths(directory):
+            if self.full and path not in self._cand:
+                break
+            text = self.changes.cand_text(path)
+            if text is None or not pattern.search(text):
+                continue
+            analysis = self.cand(path, text)
+            if analysis is not None:
+                out.append(analysis)
+        return out
+
+
+def _dependents(rescan: _Rescan, sides: list[_Side]) -> list[_Side]:
+    """Unchanged Python test files that a changed helper module or conftest.py can affect,
+    analysed as if they had changed, so a helper that lost its assertions shows up as weakened
+    tests in its callers. Only a helper or fixture that lost checks pulls anything in: files that
+    name it (and, for a helper module, the module) as a word, among the test files anywhere in
+    the tree that import it, or for a conftest.py those below its directory."""
+    changes = rescan.changes
+    modules = _changed_modules(changes, sides, rescan.base_src, rescan.cand_src)
+    if not modules:
         return []
-    known = {s.file.path for s in sides} | {s.file.old_path for s in sides if s.file.old_path}
     out: list[_Side] = []
-    for path in sorted(changes.cand_paths()):
-        if len(out) >= _MAX_DEPENDENTS:
+    for path in rescan.paths():
+        if len(out) >= _MAX_KEPT or rescan.full:
             break
-        if (
-            path in known
-            or not path.endswith(".py")
-            or not changes.is_test(path)
-            or not cfg.file_collected(path)
-        ):
+        new_text = changes.cand_text(path)
+        if new_text is None:
             continue
-        under_conftest = any(_below(path, d) for d in conftests)
-        under_helper = any(_below(path, posixpath.dirname(h)) for h in helpers)
-        if not (under_conftest or under_helper):
+        near = [m for m in modules if m.reaches(path) and m.mentioned_in(new_text)]
+        if not near:
             continue
-        new_text, old_text = changes.cand_text(path), changes.base_text(path)
-        if new_text is None or old_text is None:
+        old_text = changes.base_text(path)
+        if old_text is None:
             continue
-        cand = analyse_python(path, new_text, cand_src)
-        if cand is None or not (under_conftest or cand.imports & helpers):
+        cand = rescan.cand(path, new_text)
+        if cand is None:
             continue
-        base = analyse_python(path, old_text, base_src)
+        base = analyse_python(path, old_text, rescan.base_src)
         if base is None:
+            continue
+        imported = base.imports | cand.imports
+        if not any(m.scope is not None or m.paths & imported for m in near):
             continue
         file = ChangedFile(
             path, "M", None, old_text.encode(), new_text.encode(), is_test=True, was_test=True
@@ -525,7 +666,9 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
     sides.extend(_go_callers(changes, sides))
 
     cfg = collection_from_base(changes)
-    sides.extend(_dependents(changes, sides, cfg, base_src, cand_src))
+    known = {s.file.path for s in sides} | {s.file.old_path for s in sides if s.file.old_path}
+    rescan = _Rescan(changes, cfg, base_src, cand_src, known)
+    sides.extend(_dependents(rescan, sides))
     for s in sides:
         for analysis, real_path in (
             (s.base, s.file.old_path or s.file.path),
@@ -562,6 +705,7 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
         check_autouse_fixtures(
             {s.base.path: s.base for s in sides if s.base},
             {s.cand.path: s.cand for s in sides if s.cand},
+            rescan.mentioning,
         )
     )
     out.extend(_fixture_changes(sides, changes))

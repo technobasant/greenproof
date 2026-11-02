@@ -272,11 +272,21 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   (`assert x == 3 or True`), or a comparison of an expression with itself (`==`, `is`,
   `<=`, `>=`; `assertEqual(E, E)`, `assertIs(E, E)`, `assertTrue(E == E)`), also after
   single-assignment locals (assigned exactly once in the test body, before the assertion,
-  from any expression, and not used before it in any other way) are inlined:
-  `expected = refund(100)` then `assert refund(100) == expected` checks nothing. Two sides
-  that are AST-identical are the same value even when they contain calls (`f(x) == f(x)`),
-  except when they are stateful: `next`, `pop`, `random`, `uuid`, `time`, `now`, `await`,
-  `yield` and walrus expressions are never treated as identical;
+  from any expression, and not used before it in any other way) are inlined. An operand with
+  no call (names, attributes, subscripts, literals: `x == x`, `a.b is a.b`) is the same
+  value on both sides and is vacuous, like `assert True`. A comparison where either side
+  contains a call is never vacuous in itself, because a call can return a fresh or a
+  stateful value: `get_settings() is get_settings()` pins a singleton, `Money(5) ==
+  Money(5)` runs `__eq__`, `f(x) == f(x)` pins determinism. It is vacuous only where it
+  replaces a real comparison: the same test at the base had an assertion that compared that
+  call (any call inside the operand, locals alpha-renamed) with a different expression, and
+  the candidate has more self-comparisons of that call than the base and no longer compares
+  it with anything else. So `assert refund(100)
+  == 99` becoming `assert refund(100) == refund(100)` blocks, and a determinism or
+  singleton test that is new, unchanged, or whose call the base never compared passes.
+  Stateful calls (`next`, `pop`, `random`, `uuid`, `time`, `now`, `utcnow`, `today`,
+  `urandom`, `token_hex`, `token_bytes`, `rand`, `randn`, `randint`, `uniform`, `sample`,
+  `shuffle`, `choice`, `await`, `yield` and walrus expressions) never count, in either form;
 - an assertion whose inputs are all constants, so it checks nothing about the code:
   every operand is a literal, a pure builtin (`len`, `abs`, `min`, `max`, `sum`, `sorted`,
   `reversed`, `list`, `tuple`, `set`, `frozenset`, `dict`, `str`, `int`, `float`, `bool`,
@@ -335,21 +345,44 @@ Python also treats these as weakening:
   (`test_x = pytest.mark.slow(test_x)`) is a wrapper, not a rebinding. Duplicates that
   already exist in an unchanged base file produce no finding;
 - a **swallowing decorator** added to a test. The decorator resolves to a function in the
-  same file, or in a test-path module the file imports (5.4 helpers below), whose body
-  (nested wrappers included) has a `try`/`except` that swallows `AssertionError` or
-  `Exception` without re-raising. The test's checks are treated as swallowed, with the same
-  message as an assertion wrapped in such a `try`. A retry decorator that re-raises is
-  clean;
+  same file, or in a test-path or test-support module the file imports (5.4 helpers below).
+  It swallows only when its wrapper (a nested def, at any depth, that may be a decorator
+  factory's inner def) has a `try` whose body calls the wrapped callable (the decorator's
+  own parameter, or a name bound in an enclosing wrapper) and a handler that catches
+  `AssertionError`, `Exception`, `BaseException` or a bare `except` without re-raising. A
+  `raise` anywhere in the wrapper, outside nested defs, means it is not swallowing, and a
+  `try` that does not call the wrapped callable is ignored. So a retry decorator that
+  re-raises after its loop, and a cleanup `finally: try: rmtree() except Exception: pass`
+  around the wrapped call, are clean. The test's checks are treated as swallowed, with the
+  same message as an assertion wrapped in such a `try`;
 - **cross-file helpers.** A test that calls a function imported from a test-path Python
   module (`from helpers import f`, `from tests.helpers import f`, `from .helpers import f`,
   `import helpers` with `helpers.f()`) gets the same helper credit as a helper in the test's
   own file: the helper's own assertions count, and a helper that only does `return a == b`
-  still counts as no check. The module is resolved against the test file's directory, the
-  repository root and the test roots, and read at the same revision as the test file. When
-  a helper module (a test-path file with no tests of its own) or a `conftest.py` changes,
-  the unchanged test files that import it (for a conftest, every collected test file at or
-  below its directory), at most 200, are analysed as if they changed, so a helper that is
-  neutered weakens every test that relied on it.
+  still counts as no check. Credit follows helper calls up to 8 levels deep (`check_order`
+  calls `_check_fields`, which calls `_check_total` and `_check_id`); a cycle is cut where it
+  closes. The module is resolved against the test file's directory, the repository root and
+  the test roots, and read at the same revision as the test file. A module outside the test
+  paths gets the same credit only if it is **test support**: it imports `pytest`,
+  `unittest` or `hypothesis`, or a segment of its path is `testing`, `test_utils`,
+  `testutils`, `pytest_plugin` or `pytest_plugins`. An ordinary application module
+  (`app/service.py` with a defensive `assert`) is never credited, so a test that calls it
+  gets no check from it;
+- **helper and conftest edits.** When a helper module (a test-path or test-support `.py`
+  file with no tests of its own) or a `conftest.py` changes, both sides are analysed and the
+  names (functions, fixtures) compared. A name that lost credited checks (fewer assertions or
+  strong assertions, more weak, broad, vacuous or swallowed ones, a lost exact check, a new
+  swallowing decorator, a call compared with itself in place of a comparison) or was removed
+  pulls in its dependents; a change that loses none (a comment, a rename, an added check)
+  analyses no dependent. The dependents are the unchanged test files that contain one of those
+  names as a word, and for a helper module also the module's stem, and that import the module
+  (before or after the change). For a helper module these are the test-path files anywhere in
+  the tree, so `tests/support/helpers.py` reaches `tests/unit/test_o.py`. A conftest's scope
+  stays its own directory and below, and it needs no import. They are analysed as if they
+  had changed, so a helper that is neutered weakens every test that relied on it. At most 300
+  files are analysed per check and at most 200 compared; greenproof reads the rest as
+  unchanged. Rules return findings only, so a run that hits the caps carries no report
+  note. Files not in the changeset are identical at both revisions and are read once.
 
 JS/TS, Go, Rust (line level, per test file): count of assertion calls drops (`expect(`,
 `assert.`, `t.Error`/`t.Fatal`/`require.`/`assert.`, `assert!`/`assert_eq!`), or strong
@@ -637,7 +670,9 @@ calls that callable, so the assertion checks the mock.
   patches a callable with the forms above, or by assigning to a module attribute
   (`shop.refund = ...`), fires when a test in its scope calls that callable inside an
   assertion: the fixture's own file (its class, for a class fixture), or for a
-  `conftest.py` every collected test at or below its directory. The patch target is
+  `conftest.py` every collected test at or below its directory. Only files that mention the
+  patched callable's name as a word are read for the scope (the same pre-filter as helper
+  dependents, no alphabetical cut). The patch target is
   resolved with the fixture file's imports and the call with the test file's. Message:
   "autouse fixture <name> patches <target> and the tests in its scope assert on <call>(...)
   (<tests>); they test the mock".

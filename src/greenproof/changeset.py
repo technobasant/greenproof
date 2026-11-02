@@ -45,6 +45,12 @@ class ChangeSet:
     list_base: Callable[[], list[str]] | None = None
     list_cand: Callable[[], list[str]] | None = None
     test_patterns: tuple[str, ...] = ()
+    # Ends the blob reader's git process; call it when the check is done.
+    closer: Callable[[], None] | None = None
+
+    def close(self) -> None:
+        if self.closer is not None:
+            self.closer()
 
     def cand_text(self, path: str) -> str | None:
         """The file's text in the candidate tree, or None when it is not there. A file the change
@@ -169,12 +175,17 @@ def _is_binary(*blobs: bytes | None) -> bool:
 def build_changeset(
     repo: Path, base_sha: str, tree: str, test_patterns: Sequence[str] = ()
 ) -> ChangeSet:
+    """The files that differ between the base and the candidate tree. Blobs are read through one
+    `git cat-file --batch` process that `ChangeSet.close()` ends (it also ends when the
+    changeset is collected)."""
+    blobs = gitops.BlobReader(repo)
+    entries = gitops.diff_name_status(repo, base_sha, tree)
     files: list[ChangedFile] = []
     skipped: list[str] = []
-    for entry in gitops.diff_name_status(repo, base_sha, tree):
+    for entry in entries:
         old_path = entry.old_path or entry.path
-        old = None if entry.status == "A" else gitops.read_blob(repo, base_sha, old_path)
-        new = None if entry.status == "D" else gitops.read_blob(repo, tree, entry.path)
+        old = None if entry.status == "A" else blobs.read(base_sha, old_path)
+        new = None if entry.status == "D" else blobs.read(tree, entry.path)
         if _is_binary(old, new):
             skipped.append(entry.path)
             continue
@@ -191,9 +202,15 @@ def build_changeset(
         )
 
     # Rules read siblings, helpers and importers of the changed files, often the same ones, so
-    # each blob and each tree listing is read from git once per check.
-    def reader(rev: str) -> Callable[[str], bytes | None]:
-        return functools.cache(lambda p: gitops.read_blob(repo, rev, p))
+    # each blob and each tree listing is read from git once per check. The diff lists every path
+    # that differs, so a path it does not list is the same blob at the base and in the candidate
+    # tree: the candidate reader serves it from the base read, and it is read once.
+    differs = {e.path for e in entries} | {e.old_path for e in entries if e.old_path}
+    read_base = functools.cache(lambda p: blobs.read(base_sha, p))
+    read_tree = functools.cache(lambda p: blobs.read(tree, p))
+
+    def read_cand(path: str) -> bytes | None:
+        return read_tree(path) if path in differs else read_base(path)
 
     def lister(rev: str) -> Callable[[], list[str]]:
         @functools.cache
@@ -206,9 +223,10 @@ def build_changeset(
     return ChangeSet(
         files,
         skipped,
-        read_base=reader(base_sha),
-        read_cand=reader(tree),
+        read_base=read_base,
+        read_cand=read_cand,
         list_base=lister(base_sha),
         list_cand=lister(tree),
         test_patterns=tuple(test_patterns),
+        closer=blobs.close,
     )
