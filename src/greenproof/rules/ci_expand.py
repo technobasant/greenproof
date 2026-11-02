@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import posixpath
 import re
+import shlex
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
@@ -19,17 +20,20 @@ from typing import Any, NamedTuple
 
 from greenproof.rules.runner import (
     _MAKE_HEADS,
+    _MAKE_RECIPE,
     _PM,
     _RECIPE_PREFIX,
     _RUN_ALL,
+    _SHELLS,
     _script_lines,
     _script_refs,
     _shadowed,
-    _Target,
+    _Targets,
     _targets,
     _variables,
 )
 
+_MAX_RECIPE = _MAKE_RECIPE  # as the runner rule
 _MAX_PREREQS = 16  # how deep a target's prerequisites are followed
 _VALUE_FLAGS = "CfIjloW"  # short make options whose value follows (`-C dir`, `-j4`)
 _LONG_VALUE = frozenset(
@@ -122,14 +126,17 @@ class Child(NamedTuple):
     ignored: str = ""  # why make ignores the failure of its checks, "" when it does not
 
 
+class MakeUnreadable(Exception):
+    """A Makefile the reader stopped on (a limit of the runner rule's reader); the message says
+    why, and the caller reports that what the step runs was read only up to a point."""
+
+
 @dataclass(frozen=True)
 class _Make:
-    targets: dict[str, _Target]
-    order: tuple[str, ...]
+    targets: _Targets
     ignore_all: bool
     ignore: frozenset[str]
     flags_ignore: bool
-    errexit: bool
 
 
 def _ignores(flags: str) -> bool:
@@ -142,26 +149,42 @@ def _ignores(flags: str) -> bool:
 
 
 @lru_cache(maxsize=64)
-def _makefile(text: str, overrides: tuple[str, ...]) -> _Make:
-    """A Makefile read by the runner rule's reader, with command-line variables
-    (`make test PYTEST=true`) overriding what it assigns."""
+def _makefile(
+    text: str, overrides: tuple[str, ...], env: tuple[tuple[str, str], ...] = ()
+) -> _Make:
+    """A Makefile read by the runner rule's reader, with the environment the step runs make in
+    (`env:` and `NAME=value make`) and the command-line variables (`make test PYTEST=true`)
+    overriding what it assigns, as make takes them. Raises `MakeUnreadable` past the reader's
+    limits."""
     joined = re.sub(r"\\\n[ \t]*", " ", text)
-    if overrides:
-        extra = "".join(f"override {o}\n" for o in overrides)
-        joined = extra + joined + "\n" + extra
-    targets = _targets(joined)
+    targets = _targets(joined, dict(env), overrides)
+    if targets.stopped:
+        raise MakeUnreadable(f"the Makefile could not be read: {targets.stopped}")
     ignore: set[str] = set()
     ignore_all = False
-    errexit = False
     for raw in joined.split("\n"):
         if m := re.match(r"^\.IGNORE\s*:(.*)$", raw):
             names = re.sub(r"#.*$", "", m[1]).split()
             ignore.update(names)
             ignore_all = ignore_all or not names
-        elif m := re.match(r"^\.SHELLFLAGS\s*[:?+]?=\s*(.*)$", raw):
-            errexit = bool(re.search(r"(?:^|\s)-[A-Za-z]*e|errexit", m[1]))
-    flags = _variables(joined).get("MAKEFLAGS", "")
-    return _Make(targets, tuple(targets), ignore_all, frozenset(ignore), _ignores(flags), errexit)
+    flags = _variables(joined, dict(env), overrides).get("MAKEFLAGS", "")
+    return _Make(targets, ignore_all, frozenset(ignore), _ignores(flags))
+
+
+def _make_env(raw: str, defs: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+    """The environment a step runs make in: its merged `env:` and the `NAME=value` words in front
+    of the command (`PYTEST=true make test`)."""
+    env = {k: v for k, v in defs.items() if re.fullmatch(r"[A-Za-z_]\w*", k)}
+    try:
+        words = shlex.split(raw)
+    except ValueError:
+        words = raw.split()
+    for word in words:
+        name, eq, value = word.partition("=")
+        if not eq or not re.fullmatch(r"[A-Za-z_]\w*", name):
+            break
+        env[name] = value
+    return tuple(sorted(env.items()))
 
 
 def _recipe(raw: str) -> tuple[str, bool]:
@@ -244,19 +267,31 @@ def make_children(
         return None
     src = texts[0][0]
     combined = "\n".join(t for _, t in texts)
-    make = _makefile(combined, tuple(overrides))
-    wanted = [g for g in goals if g in make.targets] if goals else list(make.order[:1])
+    make = _makefile(combined, tuple(overrides), _make_env(raw, defs))
+    targets = make.targets
+    if targets.shell is not None:
+        words = targets.shell.split()
+        if "$" in targets.shell:
+            raise MakeUnreadable(f"`SHELL` is `{targets.shell[:40]}`, which cannot be read")
+        if not words or posixpath.basename(words[0]) not in _SHELLS:
+            return []  # the recipe lines are not run as shell commands
+    wanted = [g for g in goals if g in targets] if goals else [targets.default or ""]
+    wanted = [g for g in wanted if g in targets]
     if not wanted:
         return None
-    shadow = _shadowed(combined, make.targets, tree(directory))
+    shadow = _shadowed(targets, tree(directory))
     order: list[str] = []
     seen: set[str] = set()
 
     def walk(target: str, level: int) -> None:
-        if target in seen or target not in make.targets or level > _MAX_PREREQS:
+        if target in seen or target not in targets:
             return
+        if level > _MAX_PREREQS:
+            raise MakeUnreadable(
+                f"the prerequisites of `{wanted[0]}` nest over {_MAX_PREREQS} deep"
+            )
         seen.add(target)
-        for pre in make.targets[target].prereqs:
+        for pre in targets[target].prereqs:
             walk(pre, level + 1)
         order.append(target)
 
@@ -268,17 +303,27 @@ def make_children(
     flags_why = ignore or ("`MAKEFLAGS` with `-i`" if flags else "")
     key = ("make", src, flags_why, *wanted)
     out: list[Child] = []
+    size = 0
     for target in order:
         if target in shadow:
             continue
         why = flags_why or (
             f"`.IGNORE` on `{target}`" if target in make.ignore or make.ignore_all else ""
         )
-        for line in make.targets[target].lines:
-            text, dash = _recipe(line)
-            if text.strip():
-                reason = "a `-` prefix on the recipe line" if dash else why
-                out.append(Child("recipe", src, text, directory, key, make.errexit, reason))
+        recipes = [_recipe(line) for line in targets[target].lines]
+        recipes = [(text, dash) for text, dash in recipes if text.strip()]
+        size += sum(len(text) for text, _ in recipes)
+        if size > _MAX_RECIPE:
+            raise MakeUnreadable(f"the recipes run over {_MAX_RECIPE // 1024} KiB")
+        if targets.oneshell and recipes:
+            # `.ONESHELL`: the lines are one script, and only its last status counts without -e
+            reason = "a `-` prefix on the recipe line" if recipes[0][1] else why
+            text = "\n".join(t for t, _ in recipes)
+            out.append(Child("recipe", src, text, directory, key, targets.errexit, reason))
+            continue
+        for text, dash in recipes:
+            reason = "a `-` prefix on the recipe line" if dash else why
+            out.append(Child("recipe", src, text, directory, key, targets.errexit, reason))
     return out
 
 

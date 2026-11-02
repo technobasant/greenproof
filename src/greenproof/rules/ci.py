@@ -20,7 +20,7 @@ from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import WARN, Finding
 from greenproof.rules import workflow
 from greenproof.rules._common import CODE_SUFFIXES, finding, sev_finding, split_lines
-from greenproof.rules.ci_expand import Child, make_children, pm_children
+from greenproof.rules.ci_expand import Child, MakeUnreadable, make_children, pm_children
 from greenproof.rules.runner import _BaseTests, _tree_names
 from greenproof.rules.shell import (
     NOOP_FLAGS,
@@ -333,7 +333,11 @@ class _Walk:
                     cwd = _join(cwd, target) or cwd
                     cwd = "" if cwd == "." else cwd
                 continue
-            children = make_children(toks, stmt, body.defs, cwd, self.read, self.tree)
+            try:
+                children = make_children(toks, stmt, body.defs, cwd, self.read, self.tree)
+            except MakeUnreadable as e:
+                self.cut(f"`{stmt[:60]}`: {e}")
+                continue
             if children is None:
                 children = pm_children(stmt, toks, cwd, self.read)
             if children is None:

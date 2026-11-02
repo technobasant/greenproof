@@ -927,6 +927,10 @@ def _make_kind(rest: list[str], make_check: Callable[[str], bool | None] | None)
     return None
 
 
+_KIND_MEMO: dict[tuple[object, ...], str | None] = {}
+_KIND_MEMO_MAX = 20000
+
+
 def check_kind(
     text: str,
     *,
@@ -934,6 +938,32 @@ def check_kind(
     scripts: Collection[str] = (),
     make_check: Callable[[str], bool | None] | None = None,
     defs: Mapping[str, str] | None = None,
+) -> str | None:
+    """`_check_kind`, remembered for a statement read again under the same policy and variables
+    (a Makefile's recipe lines and a step's body are asked about once per walk of them)."""
+    if make_check is not None or len(text) > 4096:
+        return _check_kind(text, literals, scripts, make_check, defs)
+    key = (
+        text,
+        tuple(literals),
+        frozenset(scripts),
+        tuple(sorted(defs.items())) if defs else (),
+    )
+    if key in _KIND_MEMO:
+        return _KIND_MEMO[key]
+    kind = _check_kind(text, literals, scripts, make_check, defs)
+    if len(_KIND_MEMO) >= _KIND_MEMO_MAX:
+        _KIND_MEMO.clear()
+    _KIND_MEMO[key] = kind
+    return kind
+
+
+def _check_kind(
+    text: str,
+    literals: Sequence[str],
+    scripts: Collection[str],
+    make_check: Callable[[str], bool | None] | None,
+    defs: Mapping[str, str] | None,
 ) -> str | None:
     """The kind of check a statement runs in command position, None when it is not a check.
 

@@ -458,7 +458,8 @@ def test_a_variable_that_names_another_one_is_followed(tmp_path: Path) -> None:
 def test_a_variable_that_refers_to_itself_does_not_loop(tmp_path: Path) -> None:
     base = "A = $(A) x\ntest:\n\tpytest $(A)\n"
     new = "A = $(A) x\ntest:\n\tpytest -q $(A)\n"
-    assert make_verdict(tmp_path, base, new) == "pass"
+    # make stops on this Makefile ("Recursive variable references itself"); the reader warns
+    assert make_verdict(tmp_path, base, new) == "warn"
 
 
 def test_a_python_variable_refactor_stays_honest(tmp_path: Path) -> None:
