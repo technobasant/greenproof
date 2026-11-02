@@ -25,6 +25,7 @@ or, given the statements it had at the base, as those statements only.
 
 from __future__ import annotations
 
+import functools
 import posixpath
 import re
 import shlex
@@ -783,11 +784,16 @@ def _cmd_name(token: str) -> str:
     return base.lower()
 
 
-def _tokens(statement: str) -> list[str]:
+@functools.lru_cache(maxsize=4096)
+def _split_words(statement: str) -> tuple[str, ...]:
     try:
-        return shlex.split(statement, posix=True)
+        return tuple(shlex.split(statement, posix=True))
     except ValueError:
-        return statement.split()
+        return tuple(statement.split())
+
+
+def _tokens(statement: str) -> list[str]:
+    return list(_split_words(statement))
 
 
 def _skip_opts(toks: list[str], values: Collection[str], positional: int = 0) -> list[str]:
