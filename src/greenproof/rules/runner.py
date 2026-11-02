@@ -480,21 +480,23 @@ def _mypy_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str]:
 def _lint_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str]:
     reasons: list[str] = []
     note = "" if base.lint_table else _ADOPTION
-    if base.ruff_table:
+    if base.ruff_table or cand.ruff_table:
+        # A new ruff table is compared with ruff's defaults, the rules in force without one.
+        soft = "" if base.ruff_table else _ADOPTION
         before = (base.ruff_select, base.ruff_ignore)
         dropped = rc.rules_dropped(before, (cand.ruff_select, cand.ruff_ignore))
         ignored = [c for c in dropped if c in cand.ruff_ignore and c not in base.ruff_ignore]
         if ignored:
-            reasons.append(f"lint ignores added: {', '.join(ignored)}")
+            reasons.append(f"lint ignores added: {', '.join(ignored)}{soft}")
         if others := [c for c in dropped if c not in ignored]:
-            reasons.append(f"ruff `select` narrowed: {', '.join(others)} no longer selected")
+            reasons.append(f"ruff `select` narrowed: {', '.join(others)} no longer selected{soft}")
         added = sorted(
             e
             for e in cand.ruff_per_file - base.ruff_per_file
             if rc.selected_overlap(e.rpartition(":")[2], before)
         )
         if added:
-            reasons.append(f"lint ignores added: {', '.join(added)}")
+            reasons.append(f"lint ignores added: {', '.join(added)}{soft}")
         if [p for p in cand.ruff_exclude if p not in base.ruff_exclude]:
             files = rc.python_files(judge.base())
             hit = rc.ruff_excluded(files, cand.ruff_exclude)

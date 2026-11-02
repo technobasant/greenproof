@@ -1310,6 +1310,7 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
     pending = Counter(world.base_statements)
     autoload = world.base_autoload
     tests = world.tests
+    file_nextest = bool(NEXTEST.search(text))
     for step in wf.steps:
         exp = _expand(world, wf, step, False)
         if exp.stop:
@@ -1349,7 +1350,7 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                 reported.add((at, why))
                 out.append(_block(at, why))
         bodies = _bodies(world, wf, step, False)
-        with_nextest = bool(NEXTEST.search(text)) or any(NEXTEST.search(b.text) for b in bodies)
+        with_nextest = file_nextest or any(NEXTEST.search(b.text) for b in bodies)
         for body in bodies:
             for family, flag, stmt in selection_uses(body.text, retries_ok=True, defs=body.defs):
                 if (family, flag) in base_flags:

@@ -1477,7 +1477,7 @@ def selection_uses(
     return found
 
 
-NEXTEST = re.compile(r"\bcargo\s+(?:\S+\s+)*?nextest\b")
+NEXTEST = re.compile(r"\bcargo[ \t]+(?:\S+[ \t]+)*?nextest\b")
 
 
 _VALUED_NOOP = frozenset({"-DskipTests", "-Dmaven.test.skip"})
