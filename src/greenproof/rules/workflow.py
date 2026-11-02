@@ -10,7 +10,7 @@ aliases, a flow collection that does not close on its line, or anything else it 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from greenproof.rules._common import split_lines
 
@@ -32,6 +32,47 @@ class Step:
     run: str  # the script, "" when the step has no `run:`
     run_line: int  # 1-based file line of the script's first line
     shell: str | None = None  # the step's own `shell:`
+    uses: str | None = None
+    name: str | None = None
+    if_: str | None = None  # the step's `if:`
+    if_line: int = 0
+    coe: str | None = None  # the step's `continue-on-error:`, as written (unquoted)
+    coe_line: int = 0
+    with_: tuple[tuple[str, str], ...] = ()
+    env: tuple[tuple[str, str], ...] = ()
+    stop: int = 0  # 1-based line after the step's last line
+    job_line: int = 0  # 1-based line of the job's key, 0 when it is not under a job
+
+
+@dataclass(frozen=True)
+class Job:
+    name: str
+    line: int  # 1-based line of the job's key
+    stop: int  # 1-based line after the job's last line
+    runners: tuple[str, ...] = ()  # `runs-on:` labels; a `matrix.x` expands to the matrix's values
+    uses: str | None = None  # a reusable workflow the job calls
+    if_: str | None = None
+    if_line: int = 0
+    coe: str | None = None
+    coe_line: int = 0
+    shell: str | None = None  # the job's `defaults.run.shell`
+
+
+@dataclass(frozen=True)
+class Workflow:
+    steps: list[Step]
+    jobs: list[Job]
+    shell: str | None  # the workflow's `defaults.run.shell`
+
+    def job_of(self, step: Step) -> Job | None:
+        return next((j for j in self.jobs if j.line == step.job_line), None)
+
+    def shell_of(self, step: Step) -> str | None:
+        """The shell a step names, or its job's or the workflow's default."""
+        if step.shell:
+            return step.shell
+        job = self.job_of(step)
+        return (job.shell if job else None) or self.shell
 
 
 def _indent(raw: str) -> int:
@@ -55,14 +96,62 @@ def _unquote(value: str) -> str:
     return value
 
 
+def _clean(value: str) -> str:
+    """A one-line scalar: without a trailing comment and quotes."""
+    value = value.strip()
+    if not value.startswith(("'", '"')):
+        value = re.sub(r"\s+#.*$", "", value)
+    return _unquote(value)
+
+
+def _blank(raw: str) -> bool:
+    return not raw.strip() or raw.lstrip().startswith("#")
+
+
+def _block_after(lines: list[str], at: int, stop: int, indent: int) -> list[str]:
+    """The lines under line index `at` that are indented more than `indent`."""
+    out: list[str] = []
+    for k in range(at + 1, stop):
+        raw = lines[k]
+        if not _blank(raw) and _indent(raw) <= indent:
+            break
+        out.append(raw)
+    return out
+
+
 # -- steps -----------------------------------------------------------------------------
+_STEPS_KEY = re.compile(r"^(\s*)steps\s*:\s*(?:&([\w.-]+)\s*)?(?:#.*)?$")
+_STEPS_ALIAS = re.compile(r"^(\s*)steps\s*:\s*\*([\w.-]+)\s*(?:#.*)?$")
+
+
+def parse(text: str) -> Workflow:
+    """The workflow's steps and jobs, read once."""
+    lines = split_lines(text)
+    jobs = _jobs(lines)
+    return Workflow(_steps(lines, jobs), jobs, _workflow_shell(lines))
+
+
 def steps(text: str) -> list[Step]:
     """Every step under a `steps:` key, with its `run:` script."""
-    lines = split_lines(text)
+    return parse(text).steps
+
+
+def _job_line(jobs: list[Job], line: int) -> int:
+    return next((j.line for j in jobs if j.line <= line < j.stop), 0)
+
+
+def _steps(lines: list[str], jobs: list[Job]) -> list[Step]:
     out: list[Step] = []
+    anchored: dict[str, list[Step]] = {}
     i = 0
     while i < len(lines):
-        m = re.match(r"^(\s*)steps\s*:\s*(?:#.*)?$", lines[i])
+        alias = _STEPS_ALIAS.match(lines[i])
+        if alias and alias.group(2) in anchored:
+            job_line = _job_line(jobs, i + 1)
+            out.extend(replace(st, job_line=job_line) for st in anchored[alias.group(2)])
+            i += 1
+            continue
+        m = _STEPS_KEY.match(lines[i])
         i += 1
         if not m:
             continue
@@ -86,19 +175,55 @@ def steps(text: str) -> list[Step]:
                 if ind == item_indent:
                     starts.append(end)
             end += 1
+        found: list[Step] = []
         for n, start in enumerate(starts):
             stop = starts[n + 1] if n + 1 < len(starts) else end
-            out.append(_step(lines, start, stop))
+            found.append(_step(lines, start, stop, _job_line(jobs, start + 1)))
+        out.extend(found)
+        if m.group(2):
+            anchored[m.group(2)] = found
         i = end
     return out
 
 
-def _step(lines: list[str], start: int, stop: int) -> Step:
+def _mapping(
+    lines: list[str], at: int, stop: int, col: int, rest: str
+) -> tuple[tuple[str, str], ...]:
+    """The `key: value` pairs of a `with:` or `env:` mapping whose key is on line index `at`."""
+    rest = rest.strip()
+    if rest.startswith("{"):
+        try:
+            value, _ = _flow(rest)
+        except _Unreadable:
+            return ()
+        if isinstance(value, dict):
+            return tuple((str(k), str(v)) for k, v in value.items())
+        return ()
+    if rest and not rest.startswith("#"):
+        return ()
+    items: list[tuple[str, str]] = []
+    child: int | None = None
+    for k in range(at + 1, stop):
+        raw = lines[k]
+        if _blank(raw):
+            continue
+        ind = _indent(raw)
+        if ind <= col:
+            break
+        child = ind if child is None else child
+        if ind == child and (m := re.match(r"^\s*([^\s:#][^:]*?)\s*:\s*(.*)$", raw)):
+            items.append((_unquote(m.group(1)), _clean(m.group(2))))
+    return tuple(items)
+
+
+def _step(lines: list[str], start: int, stop: int, job_line: int = 0) -> Step:
     first = lines[start]
     marker = re.match(r"^(\s*-\s+)", first)
     col = len(marker.group(1)) if marker else _indent(first) + 2
     run: tuple[str, int] | None = None
     shell: str | None = None
+    fields: dict[str, tuple[str, int]] = {}
+    maps: dict[str, tuple[tuple[str, str], ...]] = {}
     for k in range(start, stop):
         raw = lines[k]
         body = raw[col:] if k == start and marker else raw
@@ -108,38 +233,156 @@ def _step(lines: list[str], start: int, stop: int) -> Step:
             run = _run_value(lines, k, stop, col, m.group(1))
         elif m := re.match(r"^\s*shell\s*:\s*(.+)$", body):
             shell = _unquote(re.sub(r"\s+#.*$", "", m.group(1)))
-    return Step(start + 1, *(run or ("", start + 1)), shell)
+        elif m := re.match(r"^\s*(uses|name|if|continue-on-error)\s*:\s*(.*)$", body):
+            fields.setdefault(m.group(1), (_clean(m.group(2)), k + 1))
+        elif m := re.match(r"^\s*(with|env)\s*:\s*(.*)$", body):
+            maps.setdefault(m.group(1), _mapping(lines, k, stop, col, m.group(2)))
+    return Step(
+        start + 1,
+        *(run or ("", start + 1)),
+        shell,
+        uses=fields.get("uses", (None, 0))[0],
+        name=fields.get("name", (None, 0))[0],
+        if_=fields.get("if", (None, 0))[0],
+        if_line=fields.get("if", ("", 0))[1],
+        coe=fields.get("continue-on-error", (None, 0))[0],
+        coe_line=fields.get("continue-on-error", ("", 0))[1],
+        with_=maps.get("with", ()),
+        env=maps.get("env", ()),
+        stop=stop + 1,
+        job_line=job_line,
+    )
+
+
+# -- jobs ------------------------------------------------------------------------------
+_KEY = re.compile(r"^\s*([\w.-]+)\s*:\s*(.*)$")
+
+
+def _shell_in(block: list[str]) -> str | None:
+    for raw in block:
+        if m := re.match(r"^\s*shell\s*:\s*(.+)$", raw):
+            return _clean(m.group(1))
+    return None
+
+
+def _workflow_shell(lines: list[str]) -> str | None:
+    for k, raw in enumerate(lines):
+        if re.match(r"^defaults\s*:\s*(?:#.*)?$", raw):
+            return _shell_in(_block_after(lines, k, len(lines), 0))
+    return None
+
+
+def _list_items(value: str) -> list[str]:
+    value = value.strip()
+    if value.startswith("["):
+        try:
+            parsed, _ = _flow(value)
+        except _Unreadable:
+            return []
+        return [str(v) for v in parsed] if isinstance(parsed, list) else []
+    return [_clean(value)] if value else []
+
+
+def _matrix_values(block: list[str], key: str) -> list[str]:
+    """Every value the matrix gives `key`: `key: [a, b]`, a block list or `include` rows."""
+    out: list[str] = []
+    for n, raw in enumerate(block):
+        m = re.match(rf"^(\s*)(?:-\s+)?{re.escape(key)}\s*:\s*(.*)$", raw)
+        if not m:
+            continue
+        if m.group(2).strip() and not m.group(2).strip().startswith("#"):
+            out.extend(_list_items(re.sub(r"\s+#.*$", "", m.group(2))))
+            continue
+        for later in block[n + 1 :]:
+            if _blank(later):
+                continue
+            if _indent(later) < len(m.group(1)) or (
+                _indent(later) == len(m.group(1)) and not later.lstrip().startswith("-")
+            ):
+                break
+            if later.lstrip().startswith("-"):
+                out.append(_clean(later.lstrip()[1:]))
+    return out
+
+
+_MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([\w-]+)\s*\}\}")
+
+
+def _runners(value: str, strategy: list[str]) -> tuple[str, ...]:
+    if m := _MATRIX_REF.search(value):
+        return tuple(_matrix_values(strategy, m.group(1)))
+    return (value,) if value else ()
+
+
+def _jobs(lines: list[str]) -> list[Job]:
+    start = next((k for k, raw in enumerate(lines) if re.match(r"^jobs\s*:", raw)), None)
+    if start is None:
+        return []
+    keys: list[tuple[int, str]] = []
+    job_indent: int | None = None
+    end = len(lines)
+    for k in range(start + 1, len(lines)):
+        raw = lines[k]
+        if _blank(raw):
+            continue
+        if _indent(raw) == 0:
+            end = k
+            break
+        job_indent = _indent(raw) if job_indent is None else job_indent
+        if _indent(raw) == job_indent:
+            m = re.match(r"^\s*(\"[^\"]*\"|'[^']*'|[^\s:#][^:]*?)\s*:", raw)
+            keys.append((k, _unquote(m.group(1)) if m else raw.strip()))
+    out: list[Job] = []
+    for n, (k, name) in enumerate(keys):
+        stop = keys[n + 1][0] if n + 1 < len(keys) else end
+        out.append(_job(lines, k, stop, name))
+    return out
+
+
+def _job(lines: list[str], at: int, stop: int, name: str) -> Job:
+    child: int | None = None
+    fields: dict[str, tuple[str, int]] = {}
+    shell: str | None = None
+    strategy: list[str] = []
+    runs_on_block: list[str] = []
+    for k in range(at + 1, stop):
+        raw = lines[k]
+        if _blank(raw):
+            continue
+        child = _indent(raw) if child is None else child
+        if _indent(raw) != child or not (m := _KEY.match(raw)):
+            continue
+        key, value = m.group(1), m.group(2)
+        if key in ("runs-on", "uses", "if", "continue-on-error"):
+            fields.setdefault(key, (_clean(value), k + 1))
+            if key == "runs-on" and not value.strip():
+                runs_on_block = _block_after(lines, k, stop, child)
+        elif key == "defaults":
+            shell = _shell_in(_block_after(lines, k, stop, child))
+        elif key == "strategy":
+            strategy = _block_after(lines, k, stop, child)
+    runs_on = fields.get("runs-on", ("", 0))[0]
+    if runs_on_block:
+        runs_on = " ".join(ln.strip().lstrip("-").strip() for ln in runs_on_block)
+    return Job(
+        name,
+        at + 1,
+        stop + 1,
+        _runners(runs_on, strategy),
+        uses=fields.get("uses", (None, 0))[0],
+        if_=fields.get("if", (None, 0))[0],
+        if_line=fields.get("if", ("", 0))[1],
+        coe=fields.get("continue-on-error", (None, 0))[0],
+        coe_line=fields.get("continue-on-error", ("", 0))[1],
+        shell=shell,
+    )
 
 
 def default_shell(text: str, at: int) -> str | None:
     """`defaults.run.shell` of the job that holds 1-based line `at`, else the workflow's."""
-    lines = split_lines(text)
-    jobs = next((k for k, raw in enumerate(lines) if re.match(r"^jobs\s*:", raw)), None)
-    starts: list[int] = []
-    if jobs is not None:
-        job_indent: int | None = None
-        for k in range(jobs + 1, len(lines)):
-            raw = lines[k]
-            if not raw.strip() or raw.lstrip().startswith("#"):
-                continue
-            if _indent(raw) == 0:
-                break
-            job_indent = _indent(raw) if job_indent is None else job_indent
-            if _indent(raw) == job_indent:
-                starts.append(k)
-    inside = max((k for k in starts if k < at), default=None)
-    found: dict[int | None, str] = {}
-    for k, raw in enumerate(lines):
-        m = re.match(r"^(\s*)defaults\s*:\s*$", raw)
-        if not m:
-            continue
-        for later in lines[k + 1 :]:
-            if later.strip() and not later.lstrip().startswith("#") and _indent(later) <= len(m[1]):
-                break
-            if sm := re.match(r"^\s*shell\s*:\s*(.+)$", later):
-                scope = None if not m[1] else max((j for j in starts if j <= k), default=None)
-                found[scope] = _unquote(re.sub(r"\s+#.*$", "", sm.group(1)))
-    return found.get(inside, found.get(None))
+    wf = parse(text)
+    job = next((j for j in wf.jobs if j.line <= at < j.stop), None)
+    return (job.shell if job else None) or wf.shell
 
 
 def _fold(body: list[str]) -> str:

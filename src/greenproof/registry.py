@@ -148,14 +148,19 @@ _RULES = [
         "ci.tampered",
         BLOCK,
         "A CI workflow change removes or neuters a test or lint step (judged across all "
-        "workflow files), adds continue-on-error: true or if: false, swallows a check's failure "
-        "(|| true, || echo, ; exit 0, set +e), runs a check with --collect-only or "
-        "--passWithNoTests, exits 0 before the first check, adds a selection flag (-k, -m, "
-        "--deselect, -run, -short, -t), narrows the triggers (fewer events, or a paths or "
-        "paths-ignore filter that hides a test or source file), or changes the greenproof "
-        "step itself. Narrowed branch, tag or type filters, a matrix-chosen selection flag, "
-        "continue-on-error with an expression, fewer steps of a kind that still exists, and a "
-        "ref-only version bump of the greenproof action are warnings.",
+        "workflow files, looking through local composite actions, local scripts and launchers "
+        "such as docker compose run or uv run), adds continue-on-error: true or if: false to a "
+        "step that runs a check, swallows a check's failure (|| true, || echo, ; exit 0, "
+        "set +e, or under bash {0}, pwsh and cmd a check whose status is lost), runs a check "
+        "with --collect-only or --passWithNoTests, exits 0 before the first check, adds a "
+        "selection flag (-k, -m, --deselect, -run, -short, -t), narrows the triggers (fewer "
+        "events, or a paths or paths-ignore filter that hides a test or source file), or "
+        "changes the greenproof step, its with: inputs included. The selection-flag, "
+        "collect-only, early exit and set +e checks read GitHub Actions run steps only; "
+        "GitLab CI and CircleCI get the line-level swallow check. Narrowed branch, tag or "
+        "type filters, a matrix-chosen selection flag, continue-on-error with an expression, "
+        "fewer steps of a kind that still exists, a replacement the rule cannot classify, and "
+        "a ref-only version bump of the greenproof action are warnings.",
     ),
     RuleInfo(
         "static.parse_error",

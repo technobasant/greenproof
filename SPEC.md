@@ -207,7 +207,7 @@ covering at least one true positive and one legitimate change that must NOT fire
 | `tests.expected_changed` | warn | a literal in an assertion's expected side changed in a kept test (same number of expected literals), or a modified expected-output data file (5.4), whether or not non-test code changed. With no non-test code change it is the "edit the test to match what the code returns" pattern, which commands and revert cannot see (the suite passes and revert has no source change to undo); the message says which case it is. Legitimate when the old value was wrong or the spec changed, so warn. It also fires when a `@pytest.fixture` function in a `conftest.py` or test file returns or yields a different literal (number, string, tuple, list, dict) than at the base; the message names the fixture and file, and every test using the fixture compares against that value |
 | `suppress.added` | warn | an added line introduces a type/lint/coverage suppression (see 5.5) |
 | `runner.tampered` | block | a change narrows or neuters how checks run: test selection, thresholds, strictness, test scripts, a script or file a policy command runs, a Go `TestMain` that always exits 0 or no longer runs the tests (see 5.6) |
-| `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `if: false`, a swallowed failure in a test or lint step (`|| true`, `|| echo ...`, `; exit 0`, `; true`, an `exit 0` after the check, `set +e` that never reads the status, each only after a check command; under GitHub's default `bash -e`, `; exit 0` and `; true` swallow nothing), `--collect-only` or `--passWithNoTests`, an `exit 0` before the first check, a selection flag on a test command (`-k`, `-m`, `--deselect`, `--ignore`, `-run`, `-short`, `-t`, `--testNamePattern`, `--skip`, `--grep`), a trigger that runs on fewer events or paths (see 5.6), or changes the greenproof step itself. The greenproof step is a line, outside a YAML comment, that runs `greenproof check` (any prefix such as `uvx`, `uv run` or a path, any `@version`) or `uses:` the greenproof action; other mentions (`greenproof --version` in a packaging job) do not count. Only those lines count, and a workflow whose base version has none gaining them is adoption, not a change (a new workflow file included); commenting out or deleting an existing greenproof line still fires. A ref-only version bump of the greenproof action (same inputs) is `warn` |
+| `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `if: false`, a swallowed failure in a test or lint step (`|| true`, `|| echo ...`, `; exit 0`, `; true`, an `exit 0` after the check, `set +e` that never reads the status, each only after a check command; under GitHub's default `bash -e`, `; exit 0` and `; true` swallow nothing), `--collect-only` or `--passWithNoTests`, an `exit 0` before the first check, a selection flag on a test command (`-k`, `-m`, `--deselect`, `--ignore`, `-run`, `-short`, `-t`, `--testNamePattern`, `--skip`, `--grep`), a trigger that runs on fewer events or paths (see 5.6), or changes the greenproof step itself, `with:` inputs included (see 5.6 for what is read where). The greenproof step is a line, outside a YAML comment, that runs `greenproof check` (any prefix such as `uvx`, `uv run` or a path, any `@version`) or `uses:` the greenproof action; other mentions (`greenproof --version` in a packaging job) do not count. Only those lines count, and a workflow whose base version has none gaining them is adoption, not a change (a new workflow file included); commenting out or deleting an existing greenproof line still fires. A ref-only version bump of the greenproof action (same inputs) is `warn` |
 | `static.parse_error` | warn | a changed file in a parsed language (Python, TOML, JSON, INI) does not parse; that file falls back to the line-level checks |
 | `tests.self_mocked` | warn | an added or changed test patches (`monkeypatch.setattr`, `mock.patch`, `jest.mock`, `vi.mock`) the same callable its assertions call, so it tests the mock (5.8) |
 | `code.hardcoded` | warn | non-test code gains a literal table (≥ 8 entries) or an `if x == <literal>` branch whose literal also appears in added lines of a test file changed in this diff (5.8; Python AST only in v0.1) |
@@ -556,20 +556,81 @@ read together, so a change is judged against the whole CI, not one file.
 
 *Steps.* In a GitHub `run:` step (`run: |` and `>`, `>-`, `>+` folded scalars, folded as
 YAML does), a swallow of a check the base step did not have blocks, by the shared detector
-and its definition of a check. A GitHub `run:` step starts with errexit on (`bash -e`), so
-`pytest; exit 0` swallows nothing there, unless the step's `shell:` is a custom string
-holding `{0}` and no `-e` (`bash {0}`) or its shell is not a POSIX shell; GitLab `script:`
-lines are errexit-on too. Also blocked: a selection flag the base step did not have,
-`--co`/`--collect-only` and `--passWithNoTests`, an `exit 0` before the first check,
-`continue-on-error: true`, and `if: false`. `continue-on-error: ${{ ... }}` and a selection
-flag whose value is a `${{ matrix.* }}` expression are `warn`.
+and its definition of a check. Which swallows exist depends on the step's shell, chosen like
+GitHub does: an explicit `shell:`, else the job or workflow `defaults.run.shell`, else bash
+on a Linux or macOS runner and PowerShell on a Windows one (a `runs-on` of `windows-*`, or a
+`${{ matrix.* }}` that resolves to one; a matrix with both kinds is judged under both
+shells, and a finding under either blocks).
+
+- Default bash (and `shell: bash`, `sh`) runs with errexit on, so `pytest; exit 0` and
+  `pytest; true` swallow nothing there. A custom shell string holding `{0}` and no `-e`
+  (`bash {0}`, `sh {0}`) has no errexit: the step's status is the last command's, so `pytest`
+  followed by `true`, on the same line or a later one, swallows the check. Only a swallow the
+  base step did not have blocks.
+- `pwsh`, `powershell` and `cmd` have no errexit either. The status is the last native
+  command's (`$LASTEXITCODE`), so a check that is not the last top-level command and whose
+  status is not propagated is swallowed, and so are `; exit 0`, a trailing `exit 0`,
+  `|| true` and `$LASTEXITCODE = 0` after a check.
+- `shell: python` (and any other interpreter the rule does not model) is not read; the step
+  is skipped rather than guessed at.
+
+The reader looks through launchers and wrappers before it classifies a command: `docker
+compose run`, `docker-compose`, `conda run`, `hatch`, `poetry`, `pdm`, `uv`, `pipenv` and
+`rye run`, `bash -c` and `sh -c` bodies (also scanned for swallows), and interpreter
+variables (`$(PYTHON)`, `${PYTHON}`, `$PYTHON`, `$(VENV)/bin/python`, `.venv/bin/python3`,
+`env/bin/pytest`, `$(BIN)/pytest`); `runner.tampered` shares this reading of Makefiles and
+scripts. `A || B` is not a swallow when B is a check of the same kind with no narrowing flag
+other than the rerun family (`--lf`, `--last-failed`, `--ff`, `--failed-first`, `--sw`,
+`--stepwise`, `--reruns N`), so `pytest || pytest --lf` passes and `pytest || pytest -k
+smoke` blocks.
+
+The next checks apply to GitHub Actions `run:` steps only: a selection flag the base step
+did not have, `--co`/`--collect-only` and `--passWithNoTests`, an `exit 0` before the first
+check, and `set +e` that never reads the status. GitLab CI and CircleCI files get only the
+line-level swallow check (`|| true`, `|| echo`, `; exit 0`, `; true`, with errexit assumed
+on), on added lines.
+
+*Flags.* `continue-on-error: true` and `if: false` on a step or job block, except when the
+step recognisably runs no check: every command is a recognised non-check (`echo`, `true`,
+`:`, `exit 0`, `sleep`, `printf`, `cat`), or the step `uses:` a known auxiliary action
+(`actions/checkout`, `actions/setup-*`, `actions/cache`, `actions/upload-artifact`,
+`actions/download-artifact`, `codecov/codecov-action`, `coverallsapp/github-action`,
+`docker/*`, `peaceiris/actions-gh-pages`, `softprops/action-gh-release`,
+`pypa/gh-action-pypi-publish`). Unknown and local actions and check steps keep blocking. A
+job whose steps include no check is exempt. The flag is also fine when some base workflow
+already had the same step (same normalised `run` body, or the same `uses:` without its ref)
+with `continue-on-error: true`, so moving or splitting a step that was already allowed to
+fail is not new. A quoted or capitalised `"false"`, `'false'` or `False` is false for
+`continue-on-error` (no finding), and `"true"`, `'true'` and `True` are true. For `if:`,
+`false` in any quoting still disables the step and blocks. `continue-on-error: ${{ ... }}`
+and a selection flag whose value is a `${{ matrix.* }}` expression are `warn`.
 
 *Step kinds.* Test and lint steps are counted by kind (pytest, jest, go test, ruff, ...) over
-the `run:` bodies of all workflow files, by the same check test. A kind that vanishes from
-every candidate workflow blocks; fewer steps of a kind that still exists is `warn`. A kind
-that vanishes is also only a `warn` when the candidate tree holds a CI system this rule does
-not read (`.travis.yml`, `azure-pipelines.yml`, `Jenkinsfile`, ...) or a surviving
-`make test`, `npm test` or `tox`/`nox` step that may run it.
+the `run:` bodies of all workflow files, by the same check test. Beyond the usual unit-test
+runners the list covers `playwright test`, `cypress run`, `rspec`, `rake test`/`spec`,
+`phpunit`, `dotnet test`, `mvn test`/`verify`, `gradle test`/`check`, `ctest`, `bats`, `tox`,
+`nox`, `hatch test`, `ng test`, `karma start`, `ava`, `tap`, `node --test`, `deno test`,
+`bun test`, `swift test`, `mix test`, `cargo nextest` and `cargo llvm-cov`, and `gotestsum`.
+A candidate step also counts for the checks it runs through another file: a local composite
+action (`uses: ./path`, read from `action.yml` or `action.yaml` in the candidate tree, its
+`runs.steps[*].run`) and a local script (`./scripts/test.sh`, `bash scripts/test`,
+`sh x.sh`), read one level deep with a 64 KiB cap. Expansion only adds kinds on the
+candidate side; the base is read as written. A kind that vanishes from every candidate
+workflow blocks, unless the step that replaced it is something the rule cannot classify
+(`poe test`, `pre-commit run`, `uses: astral-sh/ruff-action@...`, an unknown action): then
+it is a `warn`. Replacing a check with a recognised non-check (`echo`, `true`, `exit 0`)
+still blocks. Fewer steps of a kind that still exists is `warn`. A kind that vanishes is
+also only a `warn` when the candidate tree holds a CI system this rule does not read
+(`.travis.yml`, `azure-pipelines.yml`, `Jenkinsfile`, ...) or a surviving `make test`,
+`npm test` or `tox`/`nox` step that may run it. A YAML anchor on `steps:` (`steps: &name`
+and `steps: *name`) is read; aliased steps report the line of the anchor.
+
+*The greenproof step.* Greenproof steps are compared across all GitHub workflow files as a
+multiset of signatures: the `uses:` without its ref, `with:`, `if:`, `continue-on-error` and
+`env:`. Moving a step unchanged, or to another file or job, passes. Changing a `with:` input,
+`if:` or `env:` blocks, as does removing the step or deleting the workflow that holds it;
+adding the first greenproof step is adoption. A ref-only bump is `warn`. Non-GitHub files
+compare their greenproof lines per file.
 
 *Triggers.* The `on:` section (scalar, flow or block form) is read; anchors, aliases, an
 unclosed flow collection or anything else unreadable make it unknown, and the rule says
@@ -584,9 +645,12 @@ Excluding documentation or meta files (`mkdocs.yml`, `.vscode/**`, `*.md`) and r
 directory block nothing. An added or narrowed `branches`, `branches-ignore`, `tags`,
 `tags-ignore` or `types` filter is `warn`. Swapping `pull_request` for
 `pull_request_target`, adding events, matrix changes and new jobs are not narrowing.
+Dropping `push` while keeping `pull_request` is narrowing and blocks; so does splitting
+`-m 'not slow'` and `-m slow` into separate steps, because each step carries a selection
+flag (a known limit: the two halves together run everything, and the rule does not add them up).
 
 Other CI files (GitLab, CircleCI, Jenkins and so on) get the line-level swallow check on
-added lines, with errexit assumed on.
+added lines, with errexit assumed on, and none of the GitHub-only checks above.
 
 A linter or type-checker configuration that does not exist at the base (a new
 `[tool.ruff]`/`[tool.ruff.lint]` or `[tool.mypy]` table, a new `ruff.toml`, `.ruff.toml`,

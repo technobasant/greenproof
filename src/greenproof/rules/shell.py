@@ -29,7 +29,7 @@ import posixpath
 import re
 import shlex
 from collections.abc import Callable, Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # What a command-position word is, by the kind of check it runs.
 _SIMPLE_CHECKERS = {
@@ -45,6 +45,10 @@ _SIMPLE_CHECKERS = {
     "rake": "rake",
     "phpunit": "phpunit",
     "ctest": "ctest",
+    "bats": "bats",
+    "ava": "ava",
+    "tap": "tap",
+    "gotestsum": "go test",
     "greenproof": "greenproof",
     "ruff": "ruff",
     "mypy": "mypy",
@@ -267,6 +271,34 @@ _RUN_VALUE_OPTS = frozenset(
 )
 _RUN_TOOLS = {"uv", "poetry", "pipenv", "pdm", "hatch", "rye"}
 _RUNX = {"uvx", "npx", "bunx", "pnpx"}
+# `docker compose run`, `docker exec`, `conda run`, `bundle exec`: launchers that run the command
+# after their own options (and, for a container, its service or image name).
+_DOCKER_VALUES = frozenset(
+    {"-e", "--env", "-v", "--volume", "-u", "--user", "-w", "--workdir", "--entrypoint"}
+    | {"-p", "--publish", "--name", "-l", "--label", "--cap-add", "--cap-drop", "--network"}
+    | {"--net", "--env-file", "--platform", "--mount", "-h", "--hostname", "--add-host", "--pull"}
+    | {"-m", "--memory", "--cpus", "--gpus"}
+)
+_COMPOSE_VALUES = frozenset(
+    {"-f", "--file", "-p", "--project-name", "--profile", "--env-file", "--project-directory"}
+    | {"--ansi", "--parallel", "--progress"}
+)
+_CONDA_VALUES = frozenset({"-n", "--name", "-p", "--prefix", "--cwd"})
+_CONDA = {"conda", "mamba", "micromamba"}
+_SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+_VAR = re.compile(r"^\$(?:\((?P<a>[^()]*)\)|\{(?P<b>[^{}]*)\}|(?P<c>[A-Za-z_]\w*))$")
+
+
+def _cmd_name(token: str) -> str:
+    """A command word as the tool it names: the basename, lowercased, with `$(PYTHON)`,
+    `${PYTHON}` and `$PYTHON` (a Makefile or shell variable) read as `python`."""
+    base = posixpath.basename(token)
+    if m := _VAR.match(base):
+        name = m["a"] or m["b"] or m["c"] or ""
+        if ":-" in name:
+            name = name.partition(":-")[2] or name.partition(":-")[0]
+        base = posixpath.basename(name)
+    return base.lower()
 
 
 def _tokens(statement: str) -> list[str]:
@@ -287,12 +319,21 @@ def _skip_opts(toks: list[str], values: Collection[str], positional: int = 0) ->
     return toks[min(i + positional, len(toks)) :]
 
 
+def _container_command(base: str, rest: list[str]) -> list[str] | None:
+    """The command `docker run|exec IMAGE ...` or `docker compose run|exec SERVICE ...` runs."""
+    if base == "docker-compose" or rest[:1] == ["compose"]:
+        rest = _skip_opts(rest if base == "docker-compose" else rest[1:], _COMPOSE_VALUES)
+    if rest[:1] in (["run"], ["exec"]):
+        return _skip_opts(rest[1:], _DOCKER_VALUES, 1)
+    return None
+
+
 def _strip(tokens: list[str]) -> list[str]:
     """Drop what comes before the command: assignments, `if`/`then`/`!`, and wrappers."""
     toks = list(tokens)
     while toks:
         tok = toks[0]
-        base = posixpath.basename(tok)
+        base = _cmd_name(tok)
         nxt = toks[1] if len(toks) > 1 else ""
         if _ASSIGN.match(tok) or tok in _LEADING:
             toks = toks[1:]
@@ -310,6 +351,14 @@ def _strip(tokens: list[str]) -> list[str]:
             toks = _skip_opts(toks[3:], _RUN_VALUE_OPTS)
         elif base == "pipx" and nxt == "run":
             toks = _skip_opts(toks[2:], _RUN_VALUE_OPTS)
+        elif base in _CONDA and nxt == "run":
+            toks = _skip_opts(toks[2:], _CONDA_VALUES)
+        elif base in ("bundle", "bundler") and nxt == "exec":
+            toks = _skip_opts(toks[2:], frozenset())
+        elif base in ("docker", "docker-compose") and (
+            container := _container_command(base, toks[1:])
+        ):
+            toks = container
         elif base in _RUNX:
             toks = _skip_opts(toks[1:], _RUN_VALUE_OPTS | {"-p", "--package"})
         elif base in _PKG_MANAGERS and nxt in ("exec", "dlx", "x"):
@@ -320,22 +369,44 @@ def _strip(tokens: list[str]) -> list[str]:
 
 
 _PYTHON = re.compile(r"^(?:python[\d.]*|pypy[\d.]*|py)$")
+_CODE_FLAG = re.compile(r"""['"](-[^'"\s]+)['"]""")
 
 
 def _collapse(toks: list[str]) -> list[str]:
-    """`python -m X ...` and `coverage run -m X ...` are `X ...`."""
+    """`python -m X ...` and `coverage run -m X ...` are `X ...`; `python -c "pytest.main(...)"`
+    is `pytest ...`."""
     if not toks:
         return toks
-    base = posixpath.basename(toks[0])
+    base = _cmd_name(toks[0])
     if _PYTHON.match(base):
         j = 1
         while j < len(toks) and toks[j].startswith("-") and toks[j] != "-m":
+            if toks[j] == "-c" and j + 1 < len(toks):
+                code = toks[j + 1]
+                return ["pytest", *_CODE_FLAG.findall(code)] if "pytest.main" in code else toks
             j += 2 if toks[j] in ("-W", "-X") else 1
         if j < len(toks) and toks[j] == "-m":
             return toks[j + 1 :]
     elif base in ("coverage", "coverage3") and toks[1:2] == ["run"] and "-m" in toks:
         return toks[toks.index("-m") + 1 :]
     return toks
+
+
+def _shell_c(toks: list[str]) -> str | None:
+    """The script string of `sh|bash -c "..."` (`-lc`, `-ec`, `-e -c` too), else None."""
+    if not toks or _cmd_name(toks[0]) not in _SHELLS:
+        return None
+    i = 1
+    while i < len(toks) and toks[i][:1] in "-+" and len(toks[i]) > 1:
+        if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", toks[i]):
+            return toks[i + 1] if i + 1 < len(toks) else None
+        i += 2 if toks[i] in ("-o", "+o") else 1
+    return None
+
+
+def shell_c_body(text: str) -> str | None:
+    """The script a `bash -c "..."` statement runs (wrappers like `sudo` allowed), else None."""
+    return _shell_c(_strip(_tokens(text)))
 
 
 def command_tokens(text: str) -> list[str]:
@@ -345,6 +416,9 @@ def command_tokens(text: str) -> list[str]:
     while toks != previous:
         previous = toks
         toks = _strip(_collapse(_strip(toks)))
+        if (body := _shell_c(toks)) is not None:
+            segs = split_segments(body)
+            toks = _tokens(segs[0].text) if segs else []
     return toks
 
 
@@ -371,6 +445,21 @@ def _package_script(rest: list[str]) -> list[str]:
     return _skip_opts(rest, _PKG_VALUE_OPTS)
 
 
+# Commands that are a check only with a given subcommand: `playwright test`, `cypress run`, ...
+_SUB_CHECKERS: dict[str, tuple[frozenset[str], str]] = {
+    "playwright": (frozenset({"test"}), "playwright"),
+    "cypress": (frozenset({"run"}), "cypress"),
+    "karma": (frozenset({"start", "run"}), "karma"),
+    "ng": (frozenset({"test"}), "ng test"),
+    "deno": (frozenset({"test"}), "deno test"),
+    "swift": (frozenset({"test"}), "swift test"),
+    "mix": (frozenset({"test"}), "mix test"),
+    "hatch": (frozenset({"test"}), "pytest"),
+    "rails": (frozenset({"test"}), "rake"),
+}
+_CARGO_TESTS = frozenset({"test", "nextest", "llvm-cov", "tarpaulin"})
+
+
 def classify(toks: list[str], make_check: Callable[[str], bool | None] | None = None) -> str | None:
     """The kind of check a command is (`pytest`, `go test`, `ruff`, ...), None when it is none.
 
@@ -379,18 +468,24 @@ def classify(toks: list[str], make_check: Callable[[str], bool | None] | None = 
     """
     if not toks:
         return None
-    cmd = posixpath.basename(toks[0])
+    cmd = _cmd_name(toks[0])
     rest = toks[1:]
     if "|" in rest:
         rest = rest[: rest.index("|")]
     if cmd in _SIMPLE_CHECKERS:
         return None if _is_info_only(rest) else _SIMPLE_CHECKERS[cmd]
+    if cmd in _SUB_CHECKERS:
+        subs, kind = _SUB_CHECKERS[cmd]
+        words = _skip_opts(rest, frozenset())
+        return kind if words[:1] and words[0] in subs and not _is_info_only(rest) else None
+    if cmd in ("node", "nodejs"):
+        return "node test" if "--test" in rest[:3] else None
     if cmd == "go":
         return "go test" if rest[:1] == ["test"] else None
     if cmd == "cargo":
         rest = [a for a in rest if not a.startswith("+")]
         sub = rest[0] if rest else ""
-        if sub in ("test", "nextest"):
+        if sub in _CARGO_TESTS:
             return "cargo test"
         return "clippy" if sub in ("clippy", "fmt") else None
     if cmd == "dotnet":
@@ -407,9 +502,10 @@ def classify(toks: list[str], make_check: Callable[[str], bool | None] | None = 
             return None
         if m := _PKG_SCRIPT.match(words[0]):
             return "package test" if m["kind"] == "test" else "package lint"
+        name = _cmd_name(words[0])
         return (
             classify(words, make_check)
-            if posixpath.basename(words[0]) in _SIMPLE_CHECKERS
+            if name in _SIMPLE_CHECKERS or name in _SUB_CHECKERS
             else None
         )
     return None
@@ -447,6 +543,12 @@ def check_kind(
             if kind:
                 return kind
         return None
+    if (body := shell_c_body(text)) is not None:  # sh -c "..."
+        for seg in split_segments(body):
+            kind = check_kind(seg.text, literals=literals, scripts=scripts, make_check=make_check)
+            if kind:
+                return kind
+        return None
     toks = command_tokens(text)
     if kind := classify(toks, make_check):
         return kind
@@ -457,6 +559,89 @@ def check_kind(
         if norm in scripts:
             return "policy"
     return None
+
+
+# -- statements that are recognisably not a check ---------------------------------------------
+# Words that run nothing, or only set things up, move files or talk to the network. A step made
+# only of these has no check in it; any other command might be one (`poe test`, `pre-commit run`).
+_NON_CHECK_WORDS = frozenset(
+    {"echo", "printf", "true", "false", ":", "exit", "return", "sleep", "cat", "head", "tail"}
+    | {"tee", "ls", "pwd", "cd", "pushd", "popd", "mkdir", "rmdir", "rm", "cp", "mv", "ln", "touch"}
+    | {"chmod", "chown", "export", "unset", "set", "shopt", "env", "printenv", "which", "type"}
+    | {"test", "[", "[[", "read", "source", ".", "tar", "zip", "unzip", "gzip", "gunzip", "find"}
+    | {"curl", "wget", "git", "gh", "ssh", "scp", "rsync", "date", "uname", "whoami", "id", "wc"}
+    | {"sed", "awk", "grep", "sort", "uniq", "tr", "cut", "xargs", "basename", "dirname", "jq"}
+    | {"apt", "apt-get", "dpkg", "brew", "choco", "winget", "yum", "dnf", "apk", "pacman"}
+    | {"aws", "gcloud", "az", "kubectl", "helm", "terraform", "ansible", "ansible-playbook"}
+    | {"twine", "wrangler", "vercel", "netlify", "firebase", "heroku", "fly", "flyctl", "gpg"}
+    | {"fi", "done", "esac", "else", "for", "case", "select", "in", "then", "do"}
+)
+_NON_CHECK_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "pip": frozenset({"install", "uninstall", "download", "freeze", "list", "show", "config"}),
+    "pip3": frozenset({"install", "uninstall", "download", "freeze", "list", "show", "config"}),
+    "pipx": frozenset({"install", "uninstall", "ensurepath", "upgrade"}),
+    "uv": frozenset({"sync", "pip", "venv", "build", "publish", "lock", "add", "remove", "python"}),
+    "poetry": frozenset({"install", "build", "publish", "config", "lock", "add", "remove"}),
+    "npm": frozenset({"ci", "install", "i", "publish", "pack", "version", "config", "login"}),
+    "pnpm": frozenset({"install", "i", "add", "publish", "config", "store", "setup"}),
+    "yarn": frozenset({"install", "add", "publish", "config", "set", "cache"}),
+    "bun": frozenset({"install", "i", "add", "publish", "pm"}),
+    "cargo": frozenset({"build", "publish", "install", "fetch", "doc", "package", "login"}),
+    "go": frozenset({"build", "mod", "get", "install", "generate", "env", "version"}),
+    "docker": frozenset(
+        {"build", "push", "pull", "login", "logout", "tag", "save", "load", "image", "buildx"}
+        | {"version", "info", "system", "volume", "network", "ps", "logs", "cp", "stop", "rm"}
+        | {"rmi", "kill", "inspect"}
+    ),
+    "make": frozenset(
+        {"build", "clean", "install", "docs", "doc", "deploy", "publish", "release", "dist"}
+        | {"package", "format", "fmt"}
+    ),
+}
+_PKG_BUILD_SCRIPT = re.compile(
+    r"^(?:build|compile|bundle|deploy|publish|release|docs?|clean|prepare|start|dev|format)(?::.*)?$"
+)
+_DEPLOY_SCRIPT = re.compile(
+    r"^(?:deploy|publish|release|upload|notify|announce|tag|changelog|docs?|package|dist|bump"
+    r"|sign|install|setup|bootstrap)[\w.-]*$"
+)
+_PS_CMDLET = re.compile(
+    r"^(?:Write|Set|New|Copy|Remove|Get|Start|Out|Add|Move|Test|Invoke-WebRequest)-?[A-Za-z]*$"
+)
+
+
+def is_non_check(text: str) -> bool:
+    """Whether a statement is recognisably not a check: a command from the list of ones that run
+    no tests (`echo`, `exit 0`, `pip install`, `git`, `docker push`, a `deploy.sh`)."""
+    inner = _group_inner(text)
+    if inner is not None:
+        return all(is_non_check(seg.text) for seg in split_segments(inner))
+    if (body := shell_c_body(text)) is not None:
+        return all(is_non_check(seg.text) for seg in split_segments(body))
+    toks = command_tokens(text)
+    if not toks:
+        return True  # nothing but assignments
+    cmd = _cmd_name(toks[0])
+    if cmd in _NON_CHECK_WORDS or (
+        re.match(r"^[A-Za-z]+-[A-Za-z]+$", toks[0]) and _PS_CMDLET.match(toks[0])
+    ):
+        return True
+    if cmd in _MAKERS and classify(toks) is None:
+        words = [a for a in toks[1:] if not a.startswith("-") and "=" not in a]
+        return bool(words) and all(w in _NON_CHECK_SUBCOMMANDS["make"] for w in words)
+    if cmd in _PKG_MANAGERS:
+        words = _package_script(toks[1:])
+        if words and _PKG_BUILD_SCRIPT.match(words[0]) and classify(toks) is None:
+            return True
+    if (cmd == "docker" and toks[1:2] == ["compose"]) or cmd == "docker-compose":
+        sub = _skip_opts(toks[2:] if cmd == "docker" else toks[1:], _COMPOSE_VALUES)[:1]
+        return bool(sub) and sub[0] in {"build", "pull", "push", "down", "stop", "rm", "logs", "ps"}
+    subs = _NON_CHECK_SUBCOMMANDS.get(cmd)
+    if subs is not None:
+        words = _skip_opts(toks[1:], frozenset())
+        return bool(words) and words[0] in subs and classify(toks) is None
+    stem = posixpath.basename(toks[0]).rpartition(".")[0] or posixpath.basename(toks[0])
+    return ("/" in toks[0] or toks[0].endswith(_SCRIPT_EXT)) and bool(_DEPLOY_SCRIPT.match(stem))
 
 
 # -- scripts a statement runs --------------------------------------------------------------
@@ -472,7 +657,7 @@ def script_of(tokens: list[str]) -> str | None:
     if not toks:
         return None
     tok = toks[0]
-    if _INTERPRETERS.match(tok):
+    if _INTERPRETERS.match(_cmd_name(tok)):
         rest = [t for t in toks[1:] if not t.startswith("-")]
         if toks[1:2] in (["-m"], ["-c"]):
             return None
@@ -503,7 +688,18 @@ _SET_PLUS_E = re.compile(r"^set\s+(?:\+[A-Za-z]*e[A-Za-z]*|\+o\s+errexit)(?:\s|$
 _SET_MINUS_E = re.compile(r"^set\s+(?:-[A-Za-z]*e[A-Za-z]*|-o\s+errexit)(?:\s|$)")
 _STATUS_READ = re.compile(
     r"\$\?|\$\{\?|PIPESTATUS|\bexit\s+[\"']?\$|\breturn\s+[\"']?\$|\bif\b|\bwhile\b"
-    r"|\|\|\s*(?:exit|return|false|\{|\()|\bwait\b"
+    r"|\|\|\s*(?:exit|return|false|\{|\()|\bwait\b|\$LASTEXITCODE\b(?!\s*=(?!=))"
+)
+# PowerShell: `$LASTEXITCODE = 0` throws away a native command's status; a cmdlet (`Write-Host`,
+# `echo`, `cd`, `$x = 1`) does not touch it.
+_RESET_STATUS = re.compile(r"^\$LASTEXITCODE\s*=\s*0\s*$", re.IGNORECASE)
+_CMDLET = re.compile(
+    r"^(?:[A-Za-z]+-[A-Za-z]+|echo|cd|ls|dir|cat|type|sleep|pwd|cls|clear|\$\w+\s*=)(?:\s|$)",
+    re.IGNORECASE,
+)
+# What `A || B` may retry with: flags that rerun the failures of the run `A` made.
+RERUN_FLAGS = frozenset(
+    {"--lf", "--last-failed", "--ff", "--failed-first", "--sw", "--stepwise", "--reruns"}
 )
 _CONDITION = re.compile(r"^(?:if|elif|while|until)\b|^\[|^test\b")
 _KEYWORD = re.compile(r"^(?P<kw>then|else|do)\b\s*(?P<rest>.*)$", re.DOTALL)
@@ -578,7 +774,7 @@ def early_exit(script: str) -> bool:
     return False
 
 
-def find_swallows(
+def _flat_swallows(
     script: str,
     extra: Sequence[str] = (),
     *,
@@ -589,6 +785,8 @@ def find_swallows(
     make_check: Callable[[str], bool | None] | None = None,
     base_segments: Collection[str] | None = None,
     known: bool | None = None,
+    strict_status: bool = False,
+    powershell: bool = False,
 ) -> list[Swallow]:
     """The places where `script` can fail a check and still exit 0 (see the module docstring).
 
@@ -597,14 +795,18 @@ def find_swallows(
     check as all check, or, with `base_segments`, as those statements only. `errexit` is whether
     the shell starts with `set -e` (a GitHub Actions step); `early` also reports an `exit 0`
     that comes before a check. `known` overrides whether the script holds a recognised check
-    (a Makefile recipe is judged as a whole, a line at a time).
+    (a Makefile recipe is judged as a whole, a line at a time). `strict_status` is for a shell
+    whose exit status is its last command's (`bash {0}`, `sh {0}`, PowerShell, cmd): a check
+    followed by another command, with its status neither read nor chained to the end, is swallowed
+    (kind `noerr`). `powershell` makes cmdlets and `$x = ...` leave the status alone.
+    A retry, `check || check --lf`, is not a swallow (see `RERUN_FLAGS`).
     """
     segs = split_segments(script)
     literals = [e for e in extra if len(e) >= 6]
-    is_check = [
-        check_kind(s.text, literals=literals, scripts=scripts, make_check=make_check) is not None
-        for s in segs
+    kinds = [
+        check_kind(s.text, literals=literals, scripts=scripts, make_check=make_check) for s in segs
     ]
+    is_check = [k is not None for k in kinds]
     has_check = any(is_check) if known is None else known
 
     def check(i: int) -> bool:
@@ -640,6 +842,7 @@ def find_swallows(
             out.append(Swallow(seg.line, kind, _short(seg.text), reason))
 
     state_errexit = errexit
+    unguarded = [False] * len(segs)
     last_ok = -1  # the last check that could fail with nothing turning that into a failure
     last_read = -1  # the last statement before the current one that reads a status
     first_exit: Seg | None = None
@@ -654,13 +857,17 @@ def find_swallows(
                 if segs[k].sep != "&&":
                     break
                 rhs.append(segs[k].text)
-            if any(check(j) for j in chain_members[chain_of[i]] if j < i) and not any(
-                _is_failing_exit(r) for r in rhs
+            before = [j for j in chain_members[chain_of[i]] if j < i and check(j)]
+            if (
+                before
+                and not any(_is_failing_exit(r) for r in rhs)
+                and not _is_retry(text, kinds[before[-1]], literals, scripts, make_check)
             ):
                 add(seg, "or", f"a failure is swallowed by `|| {_short(text)}`")
-        elif _is_zero_exit(text) and top[i]:
+        elif (_is_zero_exit(text) or _RESET_STATUS.match(text)) and top[i]:
             if last_ok >= 0 and last_ok >= last_read:
-                add(seg, "exit0", "`exit 0` after the checks ran, whatever their result")
+                what = text if _RESET_STATUS.match(text) else "exit 0"
+                add(seg, "exit0", f"`{what}` after the checks ran, whatever their result")
         elif text in ("true", ":") and seg.sep == ";" and chain_of[i] > 0:
             nxt_sep = segs[i + 1].sep if i + 1 < len(segs) else "\n"
             before = chain_members[chain_of[i] - 1]
@@ -688,8 +895,117 @@ def find_swallows(
             add(first_exit, "early", "`exit 0` comes before the checks, so none of them runs")
         if check(i) and not _is_zero_exit(text) and not (state_errexit or chain_guard[chain_of[i]]):
             last_ok = i
+            unguarded[i] = True
         if reads[i]:
             last_read = i
+    if strict_status:
+        depth = _block_depth(segs)
+        for i, seg in enumerate(segs):
+            if not (check(i) and unguarded[i]) or depth[i] or reads[i]:
+                continue
+            members = chain_members[chain_of[i]]
+            if any(segs[j].sep != "&&" for j in members if j > i):
+                continue  # a `||` after it: judged above
+            after = range(members[-1] + 1, len(segs))
+            if not after or next_read[i + 1] >= 0:
+                continue
+            if powershell and all(_CMDLET.match(segs[j].text) for j in after):
+                continue
+            nxt = segs[after[0]]
+            if (nxt.line, "true") in seen or (nxt.line, "exit0") in seen:
+                continue
+            label = kinds[i] or "check"
+            out.append(
+                Swallow(
+                    seg.line,
+                    "noerr",
+                    label,
+                    f"the {label} command `{_short(seg.text)}` is followed by more commands and"
+                    " this shell's exit status is the last command's",
+                )
+            )
+    return out
+
+
+def find_swallows(
+    script: str,
+    extra: Sequence[str] = (),
+    *,
+    opaque: bool = True,
+    errexit: bool = False,
+    early: bool = False,
+    scripts: Collection[str] = (),
+    make_check: Callable[[str], bool | None] | None = None,
+    base_segments: Collection[str] | None = None,
+    known: bool | None = None,
+    strict_status: bool = False,
+    powershell: bool = False,
+) -> list[Swallow]:
+    """The places where `script` can fail a check and still exit 0 (see `_flat_swallows`), also
+    inside the body of a `sh -c` or `bash -c` statement, which is a shell of its own."""
+    out = _flat_swallows(
+        script,
+        extra,
+        opaque=opaque,
+        errexit=errexit,
+        early=early,
+        scripts=scripts,
+        make_check=make_check,
+        base_segments=base_segments,
+        known=known,
+        strict_status=strict_status,
+        powershell=powershell,
+    )
+    for seg in split_segments(script):
+        body = shell_c_body(seg.text)
+        if body is None:
+            continue
+        out.extend(
+            replace(w, line=seg.line + w.line - 1)
+            for w in _flat_swallows(
+                body,
+                extra,
+                opaque=False,
+                errexit=False,
+                scripts=scripts,
+                make_check=make_check,
+                strict_status=True,
+            )
+        )
+    return out
+
+
+def _is_retry(
+    text: str,
+    kind: str | None,
+    literals: Sequence[str],
+    scripts: Collection[str],
+    make_check: Callable[[str], bool | None] | None,
+) -> bool:
+    """Whether `text`, the right side of `A || ...`, reruns a check of A's kind unnarrowed (only
+    the rerun-the-failures flags): the failure of A is then not swallowed."""
+    if kind is None or kind == "policy":
+        return False
+    if check_kind(text, literals=literals, scripts=scripts, make_check=make_check) != kind:
+        return False
+    return all(flag in RERUN_FLAGS for _, flag, _ in selection_uses(text))
+
+
+def _block_depth(segs: Sequence[Seg]) -> list[int]:
+    """For each segment: how many `if`/`case`/`for`/`while` blocks it is inside."""
+    depth = 0
+    out: list[int] = []
+    for seg in segs:
+        text = seg.text
+        kw = _KEYWORD.match(text)
+        if kw:
+            text = kw["rest"]
+        word = _first_word(text)
+        if word in ("fi", "esac", "done") and depth:
+            depth -= 1
+        out.append(depth)
+        if word in ("if", "case", "for", "while", "until"):
+            depth += 1
     return out
 
 
@@ -707,19 +1023,21 @@ def _flag_name(token: str, flags: frozenset[str]) -> str | None:
 
 
 def _is_tox(token: str) -> bool:
-    return posixpath.basename(token) in ("tox", "nox")
+    return _cmd_name(token) in ("tox", "nox")
 
 
 def _runner_end(family: str, tokens: list[str]) -> int | None:
     """The index just after the family's runner word, or None when the command is not it."""
     if not tokens:
         return None
-    head = posixpath.basename(tokens[0])
+    head = _cmd_name(tokens[0])
     if family == "pytest":
         return 1 if head in ("pytest", "py.test") else None
     if family == "mocha":
         return 1 if head == "mocha" else None
     if family == "go":
+        if head == "gotestsum":
+            return 1
         return 2 if head == "go" and tokens[1:2] == ["test"] else None
     if family == "cargo":
         rest = [t for t in tokens[1:] if not t.startswith("+")]
@@ -737,10 +1055,24 @@ def _runner_end(family: str, tokens: list[str]) -> int | None:
     return None
 
 
-def selection_uses(command: str) -> list[tuple[str, str, str]]:
-    """`(runner family, flag, the statement)` for each narrowing flag a runner is run with."""
+def selection_uses(command: str, *, retries_ok: bool = False) -> list[tuple[str, str, str]]:
+    """`(runner family, flag, the statement)` for each narrowing flag a runner is run with.
+
+    With `retries_ok`, the rerun-the-failures flags (`--lf`) do not count on the right side of
+    `check || check --lf`: that reruns what the first run failed.
+    """
     found: list[tuple[str, str, str]] = []
+    chain: list[str] = []  # the kinds of check on the current `&&` / `||` chain
     for seg in split_segments(command):
+        if (body := shell_c_body(seg.text)) is not None:
+            found.extend(selection_uses(body, retries_ok=retries_ok))
+            continue
+        if seg.sep not in ("&&", "||"):
+            chain = []
+        kind = check_kind(seg.text)
+        retry = retries_ok and seg.sep == "||" and kind is not None and kind in chain
+        if kind is not None:
+            chain.append(kind)
         tokens = command_tokens(seg.text)
         if "|" in tokens:
             tokens = tokens[: tokens.index("|")]
@@ -748,14 +1080,16 @@ def selection_uses(command: str) -> list[tuple[str, str, str]]:
             start = _runner_end(family, tokens)
             if start is not None:
                 found.extend(
-                    (family, n, seg.text) for t in tokens[start:] if (n := _flag_name(t, flags))
+                    (family, n, seg.text)
+                    for t in tokens[start:]
+                    if (n := _flag_name(t, flags)) and not (retry and n in RERUN_FLAGS)
                 )
         if "--" in tokens and tokens and _is_tox(tokens[0]):
             pytest_flags = _ALL_FLAGS["pytest"]
             found.extend(
                 ("pytest", n, seg.text)
                 for t in tokens[tokens.index("--") + 1 :]
-                if (n := _flag_name(t, pytest_flags))
+                if (n := _flag_name(t, pytest_flags)) and not (retry and n in RERUN_FLAGS)
             )
     return found
 
