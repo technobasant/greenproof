@@ -40,6 +40,7 @@ from greenproof.rules.shell import (
     shell_c_body,
     split_segments,
 )
+from greenproof.rules.tasks import Opaque, Reader, task_reader
 
 _HINT = "Restore the original configuration; fix the code or the test instead of the check."
 _ADOPTION = " (a new linter or type-checker configuration: adoption, not a loosening)"
@@ -1114,6 +1115,7 @@ def neutering_reason(
     cwds: Sequence[str] = ("",),
     recipe: bool = False,
     exports: tuple[Mapping[str, str], Mapping[str, str]] | None = None,
+    tasks: tuple[Reader, Reader] | None = None,
 ) -> str | None:
     """Whether a command (a script or recipe) was emptied, no-opped, narrowed or shortened.
 
@@ -1126,7 +1128,10 @@ def neutering_reason(
     towards "fewer steps": a cleanup line or a `pretest` split off is not a lost check. A kind of
     check the base ran and the candidate no longer does (`jest` became `eslint`) is a reason, with
     `expanders` reading `npm run x` or `make x` into the body they run. `exports` are the flag
-    variables (`PYTEST_ADDOPTS`, `GOFLAGS`) the base and the candidate Makefile export.
+    variables (`PYTEST_ADDOPTS`, `GOFLAGS`) the base and the candidate Makefile export. `tasks`
+    read `concurrently`, `turbo run x`, `nx run-many -t x` and `lerna run x` of each tree into the
+    commands they run (see tasks.py); one that cannot be read stays as it is, and the candidate
+    running fewer steps then is a warning.
     """
     base_c = [ln.strip() for ln in base_lines if ln.strip()]
     cand_c = [ln.strip() for ln in cand_lines if ln.strip()]
@@ -1139,6 +1144,13 @@ def neutering_reason(
     cand_e = _with_exports(cand_c, script, exports[1] if exports else None)
     if base_c == cand_c and base_e == cand_e:
         return None
+    unread = False
+    narrow_base, narrow_cand = _statements(base_e, script), _statements(cand_e, script)
+    if tasks is not None:
+        base_c, _ = _read_tasks(base_c, tasks[0])
+        cand_c, unread = _read_tasks(cand_c, tasks[1])
+        base_e = _with_exports(base_c, script, exports[0] if exports else None)
+        cand_e = _with_exports(cand_c, script, exports[1] if exports else None)
     if (
         cand_c
         and all(_NOOP.match(ln) for ln in cand_c)
@@ -1155,8 +1167,8 @@ def neutering_reason(
     if flag := _new_selection_flag(base_e, cand_e):
         return f"it now passes {flag}"
     if narrowed := narrowed_selection(
-        _statements(base_e, script),
-        _statements(cand_e, script),
+        narrow_base,
+        narrow_cand,
         files=tests.selectable() if tests is not None else None,
     ):
         return f"it now selects fewer paths ({narrowed})"
@@ -1176,6 +1188,8 @@ def neutering_reason(
     if not script and _check_steps(cand_c, ctx, known[1], base_texts, side[1]) < _check_steps(
         base_c, ctx, known[0], None, side[0]
     ):
+        if unread:
+            return _Warn(_UNREAD_TASKS_WHY)
         return "it runs fewer steps than before"
     if _autoload_sets(_statements(cand_c, script)) > _autoload_sets(_statements(base_c, script)):
         return _Warn(_AUTOLOAD_WHY)
@@ -1184,6 +1198,35 @@ def neutering_reason(
     ):
         return _Warn(_UNREADABLE_WHY)
     return None
+
+
+_UNREAD_TASKS_WHY = (
+    "it runs a task runner whose commands cannot be read here (a package filter, or a workspace"
+    " the tree does not declare): check that it still runs the tests"
+)
+
+
+def _read_tasks(lines: list[str], read: Reader) -> tuple[list[str], bool]:
+    """The lines with each task runner statement replaced by the commands it runs; whether one
+    stayed as it was because it could not be read. A command that is itself a task runner (a
+    package whose `test` runs `turbo run test`) is not read again: it is unread."""
+    out: list[str] = []
+    unread = False
+    for line in lines:
+        built = ""
+        grew = False
+        for seg in split_segments(line):
+            got = read(seg.text)
+            if isinstance(got, Opaque):
+                unread = True
+                got = None
+            elif got is not None:
+                grew = True
+                unread = unread or any(read(cmd) is not None for cmd in got)
+            body = seg.text if got is None else " && ".join(got) if got else "true"
+            built = f"{built} {seg.sep} {body}" if built else body
+        out.append(built if grew else line)
+    return out, unread
 
 
 Expander = Callable[[str], "list[str] | None"]
@@ -1842,8 +1885,23 @@ def _script_expander(scripts: Mapping[str, Any]) -> Expander:
     return expand
 
 
+def _task_readers(changes: ChangeSet | None, path: str) -> tuple[Reader, Reader] | None:
+    """Readers of task runner statements for the package.json at `path`, in each tree."""
+    if changes is None:
+        return None
+    root = posixpath.dirname(path)
+    cand_paths = changes.list_cand or changes.cand_paths
+    return (
+        task_reader(root, changes.base_text, changes.list_base),
+        task_reader(root, changes.cand_text, cand_paths),
+    )
+
+
 def _package_reasons(
-    f: ChangedFile, commands: Mapping[str, str], tests: _BaseTests | None = None
+    f: ChangedFile,
+    commands: Mapping[str, str],
+    tests: _BaseTests | None = None,
+    changes: ChangeSet | None = None,
 ) -> list[tuple[int | None, str]]:
     base = json.loads(f.old_text) if f.old_text else {}
     cand = json.loads(f.new_text or "{}")
@@ -1852,6 +1910,7 @@ def _package_reasons(
     out: list[tuple[int | None, str]] = []
     extra = list(commands.values())
     cwds = (posixpath.dirname(f.path),)
+    tasks = _task_readers(changes, f.path)
     seeds = _script_names(commands)
     # The scripts a policy command runs at the base, and in the candidate: a `test` pointed at a
     # new alias runs the alias's body, which is read as a new script.
@@ -1880,6 +1939,7 @@ def _package_reasons(
                 expanders=(_script_expander(old_scripts), _script_expander(new_scripts)),
                 tests=tests,
                 cwds=cwds,
+                tasks=tasks,
             ):
                 out.append((line, _carry(why, f"package.json script `{name}` changed and {why}")))
         elif name in after and isinstance(new, str) and new != old and new not in old_bodies:
@@ -3037,7 +3097,7 @@ def _file_reasons(
     new = f.new_text or ""
     found: list[tuple[int | None, str]]
     if name == "package.json":
-        found = _package_reasons(f, commands, tests)
+        found = _package_reasons(f, commands, tests, changes)
         found.extend(_jest_reasons(f, True))
         if found and not _reaches_package(changes, f.path, commands):
             return [(line, _Warn(why)) for line, why in found]

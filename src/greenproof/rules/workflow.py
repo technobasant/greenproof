@@ -64,6 +64,7 @@ class Job:
     shell: str | None = None  # the job's `defaults.run.shell`
     env: tuple[tuple[str, str], ...] = ()
     working_directory: str | None = None  # the job's `defaults.run.working-directory`
+    strategy: tuple[str, ...] = ()  # the lines under the job's `strategy:`
 
 
 @dataclass(frozen=True)
@@ -494,7 +495,53 @@ def _job(lines: list[str], at: int, stop: int, name: str) -> Job:
         shell=shell,
         env=env,
         working_directory=directory,
+        strategy=tuple(strategy),
     )
+
+
+def matrix_axis(job: Job, key: str) -> list[str] | None:
+    """The values of the job's matrix axis `key`, as written: the axis list, plus the `include`
+    rows that give it, minus the values an `exclude` row names. None when the matrix is not
+    one this reader follows (`fromJSON(...)`, an expression for the axis, no such axis)."""
+    block = list(job.strategy)
+    matrix = next((n for n, raw in enumerate(block) if re.match(r"^\s*matrix\s*:", raw)), None)
+    if matrix is None:
+        return None
+    base = _indent(block[matrix])
+    rows: list[str] = []
+    for raw in block[matrix + 1 :]:
+        if not _blank(raw) and _indent(raw) <= base:
+            break
+        rows.append(raw)
+    if not rows or any("fromJSON" in raw or "fromJson" in raw for raw in rows):
+        return None
+    top = min((_indent(r) for r in rows if not _blank(r)), default=0)
+    sections: dict[str, list[str]] = {}
+    current = ""
+    for raw in rows:
+        if _blank(raw):
+            continue
+        m = re.match(r"^\s*([\w-]+)\s*:", raw)
+        if m and _indent(raw) == top:
+            current = m.group(1)
+            sections[current] = [raw]
+        elif current:
+            sections[current].append(raw)
+    if key not in sections or key in ("include", "exclude"):
+        return None
+    first = re.sub(rf"^\s*{re.escape(key)}\s*:", "", sections[key][0]).strip()
+    if first.startswith("${{"):
+        return None
+    values = _matrix_values(sections[key], key)
+    for row in sections.get("include", [])[1:]:
+        m = re.match(rf"^\s*(?:-\s+)?{re.escape(key)}\s*:\s*(.+?)\s*$", row)
+        if m:
+            values.append(_clean(m.group(1)))
+    for row in sections.get("exclude", [])[1:]:
+        m = re.match(rf"^\s*(?:-\s+)?{re.escape(key)}\s*:\s*(.+?)\s*$", row)
+        if m and _clean(m.group(1)) in values:
+            values.remove(_clean(m.group(1)))
+    return values
 
 
 def default_shell(text: str, at: int) -> str | None:

@@ -1872,10 +1872,14 @@ def _js_runner(tokens: list[str]) -> tuple[str, int] | None:
     return None if start is None else ("jest", start)
 
 
+_EXPRESSION = re.compile(r"\$\{\{.*?\}\}")  # `${{ matrix.x }}` is one word once substituted
+
+
 def _invocations(commands: Sequence[str], defs: Mapping[str, str] | None) -> dict[str, list[_Run]]:
     """Per runner family, each run of it in `commands`, with its positional words."""
     found: dict[str, list[_Run]] = {}
     for command in commands:
+        command = _EXPRESSION.sub(lambda m: re.sub(r"\s+", "", m[0]), command)
         for _, tokens, _sep in _calls(command, defs):
             if not tokens:
                 continue

@@ -1299,6 +1299,41 @@ def _line_of(lines: list[str], start: int, stop: int, needle: str) -> int:
     return start
 
 
+_SHARD = re.compile(
+    r"--shard(?:=|\s+)(\$\{\{\s*matrix\.([\w-]+)\s*\}\}|\d+)\s*/\s*(\$\{\{\s*matrix\.([\w-]+)\s*\}\}|\d+)"
+)
+
+
+def _shard_verdict(stmt: str, job: workflow.Job | None) -> str | None:
+    """`--shard=${{ matrix.shard }}/N` is the whole suite when the job's matrix runs every shard
+    1..N: "" says it does, a reason says a shard is missing, None that the matrix cannot be read
+    (the caller then warns, as for any matrix value)."""
+    m = _SHARD.search(stmt)
+    if m is None or job is None:
+        return None
+    axis, total, total_axis = m.group(2), m.group(3), m.group(4)
+    if axis is None:
+        return None  # a literal shard of a matrix total: one shard only
+    ran = workflow.matrix_axis(job, axis)
+    count: int | None = int(total) if total_axis is None else None
+    if total_axis is not None:
+        sizes = workflow.matrix_axis(job, total_axis)
+        if sizes is not None and len(sizes) == 1 and sizes[0].isdigit():
+            count = int(sizes[0])
+    if ran is None or count is None or not all(v.isdigit() for v in ran):
+        return None
+    missing = sorted(set(range(1, count + 1)) - {int(v) for v in ran})
+    extra = sorted({int(v) for v in ran} - set(range(1, count + 1)))
+    if missing or extra:
+        what = (
+            f"shard {', '.join(map(str, missing))} of {count} is never run"
+            if missing
+            else (f"shards {', '.join(map(str, extra))} are outside 1..{count}")
+        )
+        return f"the matrix of a `--shard` step does not run every shard: {what}"
+    return ""
+
+
 def _github_step_reasons(text: str, world: _World) -> list[Reason]:
     out: list[Reason] = []
     lines = split_lines(text)
@@ -1351,6 +1386,13 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
             for family, flag, stmt in selection_uses(body.text, retries_ok=True, defs=body.defs):
                 if (family, flag) in base_flags:
                     continue
+                if flag == "--shard" and _MATRIX.search(stmt):
+                    verdict = _shard_verdict(stmt, wf.job_of(step))
+                    if verdict == "":
+                        continue
+                    if verdict is not None:
+                        out.append(_block(step.line, verdict))
+                        continue
                 noop = any(flag in flags for flags in NOOP_FLAGS.values())
                 if not noop and not world.base_has_tests:
                     continue
@@ -1496,6 +1538,10 @@ def _reasons(f: ChangedFile, world: _World) -> list[Reason]:
         if cand_c[kind] >= base_c[kind] or total_cand[kind] >= total_base[kind]:
             continue
         if total_cand[kind] == 0:
+            if kind in _DELEGATING and any(
+                n and k not in _DELEGATING and k not in _NOT_TESTS for k, n in total_cand.items()
+            ):
+                continue  # `npm test` became `npx jest --shard=...`: the runner behind it is run
             renamed = kind == "make test" and world.hands_off  # `make test` -> `make richtest`
             if (
                 renamed
