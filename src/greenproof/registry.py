@@ -63,9 +63,12 @@ _RULES = [
         "conftest scope. The test no longer runs, so it can no longer fail. On a brand-new "
         "test an unconditional skip or xfail is only a warning, and a conditional one "
         "(skipif with a condition, importorskip) does not fire: neither hides existing "
-        "verification. In Go, a `//go:build` or `// +build` constraint added or changed above "
-        "the package clause of an existing `_test.go` file counts: `go test ./...` no longer "
-        "compiles it. A constraint on a brand-new test file does not fire.",
+        "verification. In Go, a `//go:build` or `// +build` constraint added above "
+        "the package clause of an existing `_test.go` file that had none blocks: `go test ./...` "
+        "no longer compiles it. A constraint that differs from one the file already had is a "
+        "warning. Adding `//go:build` over unchanged `// +build` lines (gofmt's migration) or "
+        "dropping `// +build` lines under an unchanged `//go:build` gives nothing, and neither "
+        "does a constraint on a brand-new test file.",
     ),
     RuleInfo(
         "tests.focused",
@@ -80,13 +83,19 @@ _RULES = [
         "assertion replaced by a weaker one, a wider tolerance, fewer parametrize cases, an "
         "assertion made vacuous (`assert True`, `assert [x]`, `... or True`, `x == x`, "
         "`f(x) == f(x)`) or unreachable (after an unconditional return or raise, or under "
-        "`if False`; in JS, Go and Rust a bare `return` at the top level of a test, or an "
-        "`if false`, `if (false)` or `... && false` block), an exact check loosened to a wide "
-        "`pytest.approx`/`math.isclose`/`assertAlmostEqual` tolerance, or an assertion wrapped "
+        "`if False`; in JS, Go and Rust a bare `return` at the top level of a test, a one-line "
+        "`if (true) return;`, `if true { return }` or `if (x || true) return;` there, or an "
+        "`if false`, `if (false)` or `... && false` block; a `return` that is the body of a "
+        "brace-less `if`, `else`, `for` or `while` is conditional and does not count), an exact "
+        "check loosened to a wide `pytest.approx`/`math.isclose`/`assertAlmostEqual` tolerance, "
+        "or an assertion wrapped "
         "in a try/except or a swallowing decorator that swallows the failure. In JS, Go and "
-        "Rust, comparing an expression with itself (`expect(X).toBe(X)`, `assert.Equal(t, X, "
-        "X)`, `assert_eq!(X, X)`, `if X != X`) is vacuous, and rows removed from an `it.each`, "
-        "`test.each` or `describe.each` table count as fewer cases. In Python a later def, del "
+        "Rust, comparing a call-free expression with itself (`expect(X).toBe(X)`, "
+        "`assert.Equal(t, X, X)`, `assert_eq!(X, X)`) is vacuous; an operand with a call "
+        "(`expect(f(s)).toBe(f(s))`, a determinism or memoization check) and Go's `got != got` "
+        "NaN check are not. Rows removed from an `it.each`, "
+        "`test.each` or `describe.each` table count as fewer cases; a table with a spread "
+        "(`[...rows, [3, 4, 7]]`) is not a literal and is not counted. In Python a later def, del "
         "or rebinding of a test name shadows the earlier test, which Python never collects. A "
         "helper that checks counts as one check per call (Python: helpers imported from other "
         "test modules too; JS: same file; Go: same directory), so a helper or conftest that "
@@ -104,7 +113,10 @@ _RULES = [
         "comes from the requirement, not from what the code returns. A modified expected-output "
         "data file (.json, .yaml, .yml, .txt, .csv, .snap, .golden, .out, .expected, .html, "
         ".xml) under a test path or a fixture directory (testdata, fixtures, golden, "
-        "__snapshots__) is reported the same way, once per file.",
+        "__snapshots__), modified or renamed with changed content, is reported the same way, "
+        "once per file. Dependency, container and tool configuration there (requirements*.txt, "
+        "constraints*.txt, *compose*.yml/.yaml, Dockerfile*, .pre-commit*, codecov.yml, .env*) "
+        "is not expected output.",
     ),
     RuleInfo(
         "suppress.added",
