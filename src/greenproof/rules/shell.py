@@ -2077,6 +2077,7 @@ def _pins(family: str, run: _Run, word: str, tf: TestFiles) -> bool:
     than an area (a directory, a package, a glob): an area keeps covering the tests added to it,
     a hand-picked one covers today's files by coincidence, so selecting every file through it is
     still a narrowing."""
+    shaped = "/" in word.removeprefix("./").strip("/") or (word.endswith("/") and len(word) > 1)
     word = word.removeprefix("./").rstrip("/")
     if family == "go" or word in ("", ".") or any(c in word for c in "*?[{"):
         return False
@@ -2086,6 +2087,10 @@ def _pins(family: str, run: _Run, word: str, tf: TestFiles) -> bool:
         return bool(sep) or any(f == path or f.endswith("/" + path) for f in files)
     if family == "mocha" or run.flavor == "node":
         return any(f == word or f.endswith("/" + word) for f in files)
+    if any(f == word or f.endswith("/" + word) for f in files):
+        return True
+    if shaped:
+        return False  # a path-shaped regex (`(test|e2e)/`, `^src/`) names an area
     return not any(f.startswith(word + "/") or f"/{word}/" in f for f in files)
 
 
