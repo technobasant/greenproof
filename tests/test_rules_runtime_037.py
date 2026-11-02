@@ -319,3 +319,63 @@ def test_a_cd_before_a_write_is_followed_across_statements(tmp_path, run_line: s
 )
 def test_a_write_in_another_directory_passes(tmp_path, run_line: str) -> None:
     assert verdict(run(tmp_path, "pytest", {}, {WF: wf_with(run_line)})) == "pass"
+
+
+# ---- R4: a write that creates a file the runner loads ----------------------------------------
+
+
+def no_conftest() -> _BaseTests:
+    return index([p for p in PATHS if not p.endswith("conftest.py")] + ["tests/sub/test_c.py"])
+
+
+@pytest.mark.parametrize(
+    "statement, cwd",
+    [
+        (
+            "printf 'import pytest\\npytest.skip(allow_module_level=True)\\n' > tests/conftest.py",
+            "",
+        ),
+        ("echo x > conftest.py", "tests"),
+        ("cp pytest.ini.dist pytest.ini", ""),
+        ("cp ci/conftest.py tests/", ""),
+        ("cp conftest.py.in tests/conftest.py", ""),
+        ("echo x | tee jest.config.js", ""),
+        ("echo x >> pyproject.toml", ""),
+        ("sed -i 's/a/b/' tox.ini", ""),
+        ("ln -s ../conftest.py tests/conftest.py", ""),
+        ("mv conftest.new conftest.py", ""),
+        ("echo x > tests/test_new.py", ""),
+        ("echo x > tests/unit/b_test.py", ""),
+        ("echo x > tests/sub/shop.spec.ts", ""),
+        ("python -c \"open('tests/test_new.py','w').write('')\"", ""),
+        ("cd tests && echo x > conftest.py", ""),
+    ],
+)
+def test_a_write_that_creates_a_runner_file_warns(statement: str, cwd: str) -> None:
+    got = no_conftest().removes(statement, cwd)
+    assert got is not None
+    assert got.how == "writes"
+    reason = removal_reason(statement, got)
+    assert type(reason).__name__ == "_Warn"
+    assert "cannot see its contents" in reason
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "echo x > tests/output/log.txt",
+        "echo x | tee tests/output.log",
+        "echo '{}' > tests/fixtures/data.json",
+        "echo x > build/conftest.py",
+        "echo x > dist/pytest.ini",
+        "echo x > node_modules/pkg/jest.config.js",
+        "echo x > .tox/py/tox.ini",
+        "echo x > coverage/test_report.py",
+        "echo x > /tmp/pytest.ini",
+        "cp pytest.ini.dist build/",
+        "echo x > src/test_helper_data.txt",
+        "echo x > src/test_new.py",
+    ],
+)
+def test_a_write_the_runner_never_loads_stays_quiet(statement: str) -> None:
+    assert no_conftest().removes(statement, "") is None
