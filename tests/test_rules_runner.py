@@ -54,7 +54,7 @@ def test_each_selection_flag_fires(tmp_path: Path) -> None:
             "-k 'not slow'",
             "--ignore=tests/slow",
             "--ignore-glob=*_slow.py",
-            "-p no:randomly",
+            "-p no:doctest",
             "-m 'not slow'",
         )
     ):
