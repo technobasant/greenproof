@@ -142,7 +142,9 @@ _RULES = [
         "`; exit 0` after a test, lint or type-check command, and scripts or files a policy "
         "command runs, one level deep), a conftest or plugin hook that can rewrite outcomes or "
         "collection, a Go TestMain that always exits 0 or never runs the tests (a conditional "
-        "exit is a warning), or os._exit / sys.exit(0) added to a test file.",
+        "exit is a warning), or os._exit / sys.exit(0) added to a test file. Fewer steps count "
+        "checks only, selection flags belong to their tool, `-p no:<plugin>` is judged by the "
+        "plugin, and a nested package.json that no policy command reaches is a warning.",
     ),
     RuleInfo(
         "ci.tampered",
