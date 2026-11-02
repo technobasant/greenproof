@@ -33,7 +33,7 @@ from greenproof.rules.tests_python import (
     lost_helpers,
     marker_display,
 )
-from greenproof.rules.tests_tables import match_rows
+from greenproof.rules.tests_tables import MAX_MATCH, fits, match_rows
 
 _RUST_TEST_ATTR = re.compile(r"#\[\s*(?:\w+::)*(?:test|rstest|test_case)\b")
 
@@ -807,46 +807,73 @@ def _unit_count(u: Unit) -> int:
     return 1
 
 
-def _fold_into_tables(s: _Side, names: list[Unit], partner: dict[int, Unit]) -> dict[int, Unit]:
+def _not_credited(unit: Unit, reason: str) -> str:
+    return f"the table-driven test {unit.name} was not credited as a fold: {reason}"
+
+
+def _fold_into_tables(
+    s: _Side, names: list[Unit], partner: dict[int, Unit]
+) -> tuple[dict[int, Unit], str]:
     """Removed JS, Go or Rust tests (by id) accounted for by a row of a table-driven test of the
-    same file, the way pytest parametrize folds tests: the table runs, a row of its own carries
-    the removed test's literals (the numbers and strings its body passes and expects, never its
-    name), and the file's total of tests and rows did not fall. All or nothing: when one removed
-    test has no row of its own, none is accounted for. A row a paired test already had at the
-    base is not available, and a plain test that became the table needs a row for itself."""
+    same file, the way pytest parametrize folds tests: the table runs (every wrapper live, no row
+    skipped), a row of its own carries the removed test's literals (the numbers and strings its
+    body passes and expects, never its name), an assertion of the table's body reads the
+    parameters that carry them, and the file's total of tests and rows did not fall. All or
+    nothing: when one removed test has no row of its own, none is accounted for. A row a paired
+    test already had at the base is not available, and a plain test that became the table needs
+    a row for itself. The text says why a table was not credited, when one was not."""
     if s.base is None or s.cand is None or not names:
-        return {}
+        return {}, ""
     if any(u.engine not in ("js", "go", "rust") for u in names):
-        return {}
+        return {}, ""
+    # a table that carries the removed tests' values but is not credited: the first reason
+    why = ""
+    wanted = [Counter(u.literals) for u in names]
+    for c in s.cand.units:
+        t = c.table
+        if t is None or t.runs or not t.why or len(t.rows) * len(wanted) > MAX_MATCH:
+            continue
+        body = Counter(c.literals)
+        if any(fits(need, Counter(row), body) for need in wanted for row in t.rows):
+            why = _not_credited(c, t.why)
+            break
     if sum(map(_unit_count, s.base.units)) > sum(map(_unit_count, s.cand.units)):
-        return {}
-    pool: list[tuple[Unit, Counter[str], Counter[str]]] = []
+        return {}, why
+    pool: list[tuple[Unit, Counter[str], Counter[str], int]] = []
     needs: list[Counter[str]] = []
     for c in s.cand.units:
         t = c.table
         if t is None or not t.runs or (c.asserts == 0 and not t.implicit):
             continue
-        rows = list(zip(t.rows, t.forms, strict=True))
+        rows = list(enumerate(zip(t.rows, t.forms, strict=True)))
         b = partner.get(id(c))
         if b is not None and b.table is not None:
             spent = Counter(b.table.forms)
             fresh = []
-            for row, form in rows:
+            for i, (row, form) in rows:
                 if spent[form] > 0:
                     spent[form] -= 1
                 else:
-                    fresh.append((row, form))
+                    fresh.append((i, (row, form)))
             rows = fresh
         elif b is not None and b.literals:
             needs.append(Counter(b.literals))
-        pool.extend((c, Counter(row), Counter(c.literals)) for row, _ in rows)
+        pool.extend((c, Counter(row), Counter(c.literals), i) for i, (row, _) in rows)
     if not pool:
-        return {}
+        return {}, why
     needs.extend(Counter(u.literals) for u in names)
-    hit = match_rows(needs, [(row, body) for _, row, body in pool])
+    hit = match_rows(needs, [(row, body) for _, row, body, _ in pool])
     if hit is None:
-        return {}
-    return {id(u): pool[j][0] for u, j in zip(names, hit[len(needs) - len(names) :], strict=True)}
+        return {}, why
+    for need, j in zip(needs, hit, strict=True):
+        unit, _, body, index = pool[j]
+        table = unit.table
+        gap = table.unasserted(index, need - body) if table is not None else ""
+        if gap:
+            return {}, _not_credited(unit, gap)
+    return {
+        id(u): pool[j][0] for u, j in zip(names, hit[len(needs) - len(names) :], strict=True)
+    }, ""
 
 
 def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]:
@@ -878,9 +905,10 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
                 )
             continue
         added = added_by_path.get(path, [])
-        folded_into = _fold_into_tables(s, names, partner)
+        folded_into, not_credited = _fold_into_tables(s, names, partner)
         for removed in (u for u in names if id(u) in folded_into):
             table = folded_into[id(removed)]
+            limit = f" ({table.table.note})" if table.table is not None and table.table.note else ""
             out.append(
                 sev_finding(
                     "tests.replaced",
@@ -888,7 +916,7 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
                     path,
                     table.line,
                     f"test {removed.name} was removed and folded into table-driven test "
-                    f"{table.name}: a row of its own carries the same values",
+                    f"{table.name}: a row of its own carries the same values{limit}",
                     "Keep the original test; add new tests alongside it, not in its place.",
                 )
             )
@@ -942,7 +970,8 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
                     path,
                     line,
                     what
-                    + (" (a rewrite: same subjects, at least as many checks)" if rewrite else ""),
+                    + (" (a rewrite: same subjects, at least as many checks)" if rewrite else "")
+                    + (f" ({not_credited})" if not_credited else ""),
                     "Keep the original test; add new tests alongside it, not in its place.",
                 )
             )
@@ -952,7 +981,8 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
                     "tests.removed",
                     path,
                     None,
-                    f"test {removed.name} was removed and nothing replaced it",
+                    f"test {removed.name} was removed and nothing replaced it"
+                    + (f" ({not_credited})" if not_credited else ""),
                     "Restore the test, or say which requirement made it obsolete.",
                 )
             )

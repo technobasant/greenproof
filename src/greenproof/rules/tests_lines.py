@@ -688,6 +688,7 @@ class _Desc:
     rows: tuple[str, ...] | None = None
     cb: tuple[int, int] = (0, 0)
     live: bool = True
+    why: str = ""  # what makes a block not live (`.skip`, `xdescribe`, `.todo`, `.failing`)
 
 
 @dataclass
@@ -702,6 +703,20 @@ class _Each:
     rows: tuple[str, ...] | None
     cb: tuple[int, int]
     live: bool
+    why: str = ""
+
+
+_JS_OFF = re.compile(r"\.(skip|todo|failing)\b")
+
+
+def _js_off(head: str) -> str:
+    """What makes a `describe`/`it`/`test` call not live (its tests do not pass for real), else
+    "": an `x` prefix, `.skip`, `.todo`, and `.failing` (which passes only when the test fails)."""
+    m = re.match(r"\s*(\w+)", head)
+    if m is not None and m.group(1).startswith("x"):
+        return m.group(1)
+    off = _JS_OFF.search(head)
+    return f".{off.group(1)}" if off else ""
 
 
 def _parse_each(src: _Src, i: int, m: re.Match[str]) -> _Each | None:
@@ -761,7 +776,8 @@ def _parse_each(src: _Src, i: int, m: re.Match[str]) -> _Each | None:
     )
     # The callback is the second argument; a skipped or todo table does not run.
     cb_start = p + 1 + len(args[0]) + 1
-    live = not (m.group(1).startswith("x") or re.search(r"\.(?:skip|todo)\b", m.group(0)))
+    tag = _js_off(m.group(0))
+    marked = f"the table is marked {tag}" if tag else ""
     return _Each(
         m.group(1).endswith("describe"),
         src.line_of(c2),
@@ -772,7 +788,8 @@ def _parse_each(src: _Src, i: int, m: re.Match[str]) -> _Each | None:
         forms,
         raw,
         (cb_start, c2),
-        bool(live),
+        not tag,
+        marked,
     )
 
 
@@ -839,16 +856,20 @@ def _find_spans(
                                 each.rows,
                                 each.cb,
                                 each.live,
+                                each.why,
                             )
                         )
                     else:
                         cases, forms = _each_parts(enc, each)
                         titles = [d.title for d in enc] + [each.title]
+                        off = each.why or next((d.why for d in enc if not d.live), "")
                         table, lits = js_table(
                             src,
                             None if any(d.each for d in enc) else each.rows,
                             each.cb,
-                            each.live,
+                            not off,
+                            None,
+                            off,
                         )
                         spans.append(
                             _Span(
@@ -867,7 +888,11 @@ def _find_spans(
                 continue
             dm = _JS_DESCRIBE.match(line)
             if dm:
-                describes.append(_Desc(i, _brace_end(masked, i), dm.group(2)))
+                tag = _js_off(line[: dm.start(1)])
+                why = f"an enclosing describe is marked {tag}" if tag else ""
+                describes.append(
+                    _Desc(i, _brace_end(masked, i), dm.group(2), live=not tag, why=why)
+                )
             um = _JS_UNIT.match(line)
             if um:
                 end = _brace_end(masked, i)
@@ -879,7 +904,13 @@ def _find_spans(
                 if src is not None and len(sources) == 1 and sources[0].rows is not None:
                     d = sources[0]
                     reads = (src.starts[i], src.starts[end] + len(code[end]))
-                    table = js_table(src, d.rows, d.cb, d.live, reads)[0]
+                    tag = _js_off(line[: um.start(1)])
+                    off = (
+                        f"the test inside the describe.each table is marked {tag}"
+                        if tag
+                        else next((e.why for e in enc if not e.live), "")
+                    )
+                    table = js_table(src, d.rows, d.cb, not off, reads, off)[0]
                 spans.append(
                     _Span(
                         i,
