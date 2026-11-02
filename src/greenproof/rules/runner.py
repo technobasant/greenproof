@@ -26,6 +26,7 @@ from greenproof.rules._common import finding, split_lines, warn_finding
 from greenproof.rules.collect import DEFAULT_CLASSES, DEFAULT_FILES, DEFAULT_FUNCTIONS
 from greenproof.rules.shell import (
     SELECT_FLAGS,
+    TestFiles,
     _group_inner,
     check_kind,
     command_env,
@@ -584,6 +585,21 @@ class _BaseTests:
         self._sorted: list[str] = []
         self._by_name: dict[str, list[str]] = {}
         self._budget = _MATCH_BUDGET
+        self._selectable: TestFiles | None = None
+
+    def selectable(self) -> TestFiles:
+        """The test files of the base tree, for judging what a runner's arguments still select."""
+        if self._selectable is None:
+            self._build()
+            changes = self._changes
+            names = changes.list_base() if changes.list_base is not None else []
+            mocharc = any(posixpath.basename(n).startswith(".mocharc") for n in names)
+            mocharc = mocharc or '"mocha"' in (changes.base_text("package.json") or "")
+            module = re.search(r"^module\s+(\S+)", changes.base_text("go.mod") or "", re.M)
+            self._selectable = TestFiles(
+                sorted(self.files), module[1].strip('"') if module else "", mocharc
+            )
+        return self._selectable
 
     def _build(self) -> None:
         if self._built:
@@ -1138,7 +1154,11 @@ def neutering_reason(
         return f"it now passes {added[0]}"
     if flag := _new_selection_flag(base_e, cand_e):
         return f"it now passes {flag}"
-    if narrowed := narrowed_selection(_statements(base_e, script), _statements(cand_e, script)):
+    if narrowed := narrowed_selection(
+        _statements(base_e, script),
+        _statements(cand_e, script),
+        files=tests.selectable() if tests is not None else None,
+    ):
         return f"it now selects fewer paths ({narrowed})"
     if tests is not None and (
         gone := _removed_tests(base_c, cand_c, tests, cwds, recipe=recipe and not script)

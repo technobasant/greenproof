@@ -1676,9 +1676,10 @@ def _selection_reasons(world: _World, path: str) -> list[tuple[str, int | None, 
         return []
     defs = {**base_defs, **cand_defs}
     out: list[tuple[str, int | None, str, bool]] = []
-    if why := narrowed_selection(base_cmds, cand_cmds, defs):
+    files = world.tests.selectable() if world.tests is not None else None
+    if why := narrowed_selection(base_cmds, cand_cmds, defs, files):
         out.append((path, None, f"the tests run on a narrower selection: {why}", False))
-    if why := selection_changed_warning(base_cmds, cand_cmds, defs):
+    if why := selection_changed_warning(base_cmds, cand_cmds, defs, files):
         out.append((path, None, why, True))
     return out
 
