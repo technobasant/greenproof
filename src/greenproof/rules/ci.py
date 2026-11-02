@@ -22,6 +22,7 @@ from greenproof.rules import workflow
 from greenproof.rules._common import CODE_SUFFIXES, finding, sev_finding, split_lines
 from greenproof.rules.ci_expand import (
     Child,
+    MakeUnreadable,
     make_children,
     nox_children,
     pm_children,
@@ -500,7 +501,11 @@ class _Walk:
             toks = command_tokens(stmt, body.defs)
             if not toks:
                 continue
-            children = make_children(toks, stmt, body.defs, cwd, self.read, self.tree)
+            try:
+                children = make_children(toks, stmt, body.defs, cwd, self.read, self.tree)
+            except MakeUnreadable as e:
+                self.cut(f"`{stmt[:60]}`: {e}")
+                continue
             if children is None:
                 children = pm_children(stmt, toks, cwd, self.read)
             if children is None:

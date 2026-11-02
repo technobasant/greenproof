@@ -13,8 +13,8 @@ import posixpath
 import re
 import shlex
 from bisect import bisect_left
-from collections import Counter
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections import ChainMap, Counter
+from collections.abc import Callable, Collection, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from typing import Any
@@ -2809,24 +2809,105 @@ class _Target:
     prereqs: list[str] = field(default_factory=list)
 
 
+class _Unreadable(Exception):
+    """The Makefile is past what the reader will spend on it (the message says which limit)."""
+
+
+class _Vars(dict[str, str]):
+    """The variables of a Makefile; `stopped` says why reading them stopped short, "" when it
+    did not."""
+
+    stopped = ""
+
+
+class _Targets(dict[str, _Target]):
+    """The rules of a Makefile, and what else it says about how they run: `phony` (the names
+    `.PHONY:` lists), `oneshell` (`.ONESHELL:`), `errexit` (`.SHELLFLAGS` has `-e`), `pipefail`
+    (`SHELL` is bash and `.SHELLFLAGS` has `-o pipefail`), `shell` (the last value `SHELL` was
+    given, None when it never was), `default` (the target `make` builds with no goal named) and
+    `stopped` (why the Makefile could not be read, "" when it could; the rules are empty then).
+    `cut` is set when following prerequisites ran into a limit."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.phony: set[str] = set()
+        self.oneshell = False
+        self.errexit = False
+        self.pipefail = False
+        self.shell: str | None = None
+        self.default: str | None = None
+        self.stopped = ""
+        self.cut = ""
+
+
 _RULE = re.compile(r"^([A-Za-z_][\w.-]*)\s*(?:[^=:\n]*)?:(?![=:])(.*)$")
 _DEFINE = re.compile(r"^\s*define\s")
+_DEFINE_HEAD = re.compile(
+    r"^(?:(?:export|override)\s+)*define\s+([A-Za-z_.][\w.-]*)\s*(::=|:=|\?=|\+=|=)?\s*$"
+)
 _ENDEF = re.compile(r"^\s*endef\b")
-_ASSIGN = re.compile(r"^(?:(?:export|override)\s+)*([A-Za-z_][\w.-]*)\s*(::=|:=|\?=|\+=|=)\s*(.*)$")
+_ASSIGN = re.compile(
+    r"^((?:(?:export|override)\s+)*)([A-Za-z_.][\w.-]*)\s*(::=|:=|\?=|\+=|=)\s*(.*)$"
+)
+_TARGET_VAR = re.compile(
+    r"^([^\s:=#][^:=#]*?)\s*:(?![=:])\s*((?:(?:override|export|private)\s+)*)"
+    r"([A-Za-z_][\w.-]*)\s*(::=|:=|\?=|\+=|=)\s*(.*)$"
+)
+_CLI_ASSIGN = re.compile(r"^([A-Za-z_][\w.-]*)\s*(::=|:=|\?=|\+=|=)(.*)$")
 _VAR_REF = re.compile(r"(?<!\$)\$[({]([A-Za-z_][\w.]*)[)}]")
 _MAX_DEPTH = 4
-_MAX_VAR_DEPTH = 6
+_MAX_VAR_DEPTH = 16
+_MAX_PREREQS = 16  # how deep a target's prerequisites are followed
+_MAKE_VALUE = 64 * 1024  # bytes of one expanded value or recipe line (ci.py reads no more per file)
+_MAKE_TOTAL = 1024 * 1024  # bytes of expanded values and recipe lines in one Makefile
+_MAKE_STEPS = 50_000  # variable references expanded in one Makefile
+_MAKE_RECIPE = 256 * 1024  # bytes of recipe one target and its prerequisites run
+_SHELLS = frozenset(
+    {"sh", "bash", "dash", "zsh", "ksh", "ksh93", "mksh", "pdksh", "ash", "busybox", "rbash"}
+    | {"fish", "csh", "tcsh"}
+)
 
 
-def _expand_vars(text: str, variables: Mapping[str, str], depth: int = 0) -> str:
-    """`$(NAME)` and `${NAME}` replaced by what the Makefile assigns NAME, recursively (to a depth
-    limit). A name the Makefile does not define, or a function call, is left as it is."""
-    if depth >= _MAX_VAR_DEPTH or "$" not in text:
+class _Budget:
+    """What reading one Makefile may spend on expanding variables; spending past a limit raises
+    `_Unreadable`, so a Makefile whose variables double (`V2 = $(V1)$(V1)`) cannot make the
+    reader's work or memory grow with anything but the file's size."""
+
+    def __init__(self) -> None:
+        self.steps = 0
+        self.total = 0
+
+    def spend(self, text: str) -> None:
+        self.steps += 1
+        self.total += len(text)
+        if len(text) > _MAKE_VALUE:
+            raise _Unreadable(f"a value or recipe line is over {_MAKE_VALUE // 1024} KiB")
+        if self.steps > _MAKE_STEPS:
+            raise _Unreadable(f"it expands more than {_MAKE_STEPS} variable references")
+        if self.total > _MAKE_TOTAL:
+            raise _Unreadable(f"its expanded text is over {_MAKE_TOTAL // 1024} KiB")
+
+
+def _expand_vars(
+    text: str, variables: Mapping[str, str], depth: int = 0, budget: _Budget | None = None
+) -> str:
+    """`$(NAME)` and `${NAME}` replaced by what the Makefile assigns NAME, recursively. A name the
+    Makefile does not define, or a function call, is left as it is. Raises `_Unreadable` when
+    variables nest deeper than `_MAX_VAR_DEPTH` or the expansion outgrows `budget`."""
+    if budget is not None:
+        budget.spend(text)
+    if "$" not in text:
         return text
+    if depth >= _MAX_VAR_DEPTH:
+        raise _Unreadable(f"its variables nest more than {_MAX_VAR_DEPTH} levels deep")
 
     def value(m: re.Match[str]) -> str:
         found = variables.get(m[1])
-        return m[0] if found is None else _expand_vars(found, variables, depth + 1)
+        if found is None:
+            return m[0]
+        if len(found) > _MAKE_VALUE:
+            raise _Unreadable(f"the value of `{m[1]}` is over {_MAKE_VALUE // 1024} KiB")
+        return _expand_vars(found, variables, depth + 1, budget)
 
     return _VAR_REF.sub(value, text)
 
@@ -2836,83 +2917,290 @@ def _joined(text: str) -> list[str]:
     return split_lines(re.sub(r"\\\n[ \t]*", " ", text))
 
 
-def _variables(text: str | None) -> dict[str, str]:
-    """The variables a Makefile assigns at the top level (`=`, `:=`, `::=`, `?=`, `+=`), by the
-    order of the file: a later `=` wins, `?=` keeps an earlier value, `+=` appends."""
-    out: dict[str, str] = {}
-    in_define = 0
-    for raw in _joined(text or ""):
-        if _DEFINE.match(raw):
-            in_define += 1
-            continue
-        if in_define:
-            in_define -= 1 if _ENDEF.match(raw) else 0
-            continue
-        m = _ASSIGN.match(raw) if not raw.startswith((" ", "\t")) else None
-        if m is None:
-            continue
-        name, op, value = m[1], m[2], re.sub(r"\s+#.*$", "", m[3]).strip()
+def _variables(
+    text: str | None, env: Mapping[str, str] | None = None, cli: Sequence[str] = ()
+) -> _Vars:
+    """The variables a Makefile assigns at the top level (`=`, `:=`, `::=`, `?=`, `+=`, and
+    `define ... endef`), by the order of the file: a later `=` wins, `?=` keeps an earlier value,
+    `+=` appends. `env` is the environment make runs in: its variables are defined before the
+    file is read, so `?=` leaves them alone and a plain assignment in the file replaces them (but
+    not `SHELL`, which make never takes from the environment). `cli` are the `NAME=value` words
+    of the command line, which beat every assignment in the file but an `override` one."""
+    out = _Vars()
+    budget = _Budget()
+    locked: set[str] = set()
+    for name, value in (env or {}).items():
+        if name != "SHELL" and re.fullmatch(r"[A-Za-z_]\w*", name):
+            out[name] = value
+    define: str | None = None
+    define_op, define_override, nested = "=", False, 0
+    body: list[str] = []
+
+    def assign(name: str, op: str, value: str, override: bool) -> None:
+        if name in locked and not override:
+            return
         if op in (":=", "::="):
-            out[name] = _expand_vars(value, out)
+            out[name] = _expand_vars(value, out, 0, budget)
         elif op == "?=":
             out.setdefault(name, value)
         elif op == "+=" and name in out:
             out[name] = f"{out[name]} {value}".strip()
         else:
             out[name] = value
+
+    try:
+        for word in cli:
+            if m := _CLI_ASSIGN.match(word):
+                assign(m[1], m[2], m[3], True)
+                locked.add(m[1])
+        for raw in _joined(text or ""):
+            if define is not None:
+                if _ENDEF.match(raw):
+                    if nested:
+                        nested -= 1
+                    else:
+                        assign(define, define_op, "\n".join(body), define_override)
+                        define = None
+                        continue
+                nested += 1 if _DEFINE.match(raw) else 0
+                body.append(raw)
+                continue
+            if _DEFINE.match(raw):
+                head = _DEFINE_HEAD.match(raw.strip())
+                define = head[1] if head else "\0"
+                define_op = (head[2] if head else None) or "="
+                define_override = raw.lstrip().startswith("override")
+                body, nested = [], 0
+                continue
+            m = _ASSIGN.match(raw) if not raw.startswith((" ", "\t")) else None
+            if m is None:
+                continue
+            value = re.sub(r"\s+#.*$", "", m[4]).strip()
+            assign(m[2], m[3], value, "override" in m[1])
+        if define is not None:
+            assign(define, define_op, "\n".join(body), define_override)
+    except _Unreadable as e:
+        out.stopped = str(e)
+    out.pop("\0", None)
     return out
 
 
-def _phony(text: str | None) -> set[str]:
-    names: set[str] = set()
-    for raw in _joined(text or ""):
-        m = re.match(r"^\.PHONY\s*:(.*)$", raw)
-        if m:
-            names.update(re.sub(r"#.*$", "", m[1]).split())
-    return names
+def _phony_names(rest: str, variables: Mapping[str, str], budget: _Budget) -> set[str]:
+    return set(_expand_vars(re.sub(r"#.*$", "", rest), variables, 0, budget).split())
 
 
-def _targets(text: str | None) -> dict[str, _Target]:
+_FOR_LOOP = re.compile(r"\bfor\s+(\w+)\s+in\s+([^;]*?)\s*;\s*do\b\s*(.*?)\s*;?\s*\bdone\b")
+_NESTED_LOOP = re.compile(r"\b(?:for|while|until|select|case)\b")
+_KEEPS_FAILURE = re.compile(r"\|\|\s*(?:exit(?!\s+0\b)|return(?!\s+0\b)|\{[^}]*\bexit\s+(?!0\b))")
+_ERREXIT = re.compile(r"\bset\s+-[A-Za-z]*e|-o\s+errexit")
+_NOT_LITERAL = re.compile(r"[$`*?\[\]{}~]")
+
+
+def _unroll(line: str, errexit: bool) -> str:
+    """A recipe line with its shell `for` loops written out: the body once per item of a literal
+    list, the loop variable replaced by the item, so the checks in it are read as the checks they
+    are. A loop over several items runs every one, but only the last one's status is the loop's;
+    unless the body leaves on the first failure (`|| exit 1`, `|| exit $$?`), the line has
+    `set -e`, or the Makefile's `.SHELLFLAGS` has `-e`, the failures before it are lost, and each
+    such body is written with a `|| true` after it, which the swallow checks then read. A list
+    that cannot be read (`$(DIRS)`, a glob) is one copy of the body, taken as several items."""
+    if "for" not in line:
+        return line
+
+    def loop(m: re.Match[str]) -> str:
+        var, listing, body = m[1], m[2], m[3]
+        if _NESTED_LOOP.search(body):
+            return m[0]
+        items = [w.strip("'\"") for w in listing.split()]
+        literal = not any(_NOT_LITERAL.search(w) for w in items)
+        before, after = line[: m.start()], line[m.end() :]
+        keeps = (
+            errexit
+            or bool(_ERREXIT.search(before))
+            or bool(_KEEPS_FAILURE.search(body))
+            or bool(re.search(r"\|\|\s*\w+=", body) and re.search(r"\bexit\s+\$\$\{?\w+", after))
+        )
+        if not literal:
+            bodies = [body]
+        elif not items:
+            return ":"
+        else:
+            pattern = re.compile(rf"\$\$(?:{re.escape(var)}\b|\{{{re.escape(var)}\}})")
+            bodies = [pattern.sub(lambda _m, w=w: w, body) for w in items]
+        parts = [b.strip().rstrip(";").strip() for b in bodies]
+        last = len(parts) - 1 if literal else -1
+        return "; ".join(p if keeps or i == last else f"{p} || true" for i, p in enumerate(parts))
+
+    return _FOR_LOOP.sub(loop, line)
+
+
+def _split_recipe(raw: str, expanded: str, errexit: bool) -> list[str]:
+    """The recipe lines an expanded recipe line stands for: a `define` macro put in a recipe is
+    several lines, each run by a shell of its own and each with the line's `@`/`-`/`+` prefix."""
+    prefix = _RECIPE_PREFIX.match(raw)
+    head = prefix[0] if prefix else ""
+    out: list[str] = []
+    for i, piece in enumerate(expanded.split("\n")):
+        piece = piece.strip()
+        if piece:
+            text = piece if i == 0 or _RECIPE_PREFIX.match(piece) else head + piece
+            out.append(_unroll(text, errexit))
+    return out
+
+
+def _overlays(
+    variables: MutableMapping[str, str],
+    rules: Mapping[str, _Target],
+    scoped: Sequence[tuple[str, str, str, str, bool]],
+    cli: Collection[str],
+    budget: _Budget,
+) -> dict[str, dict[str, str]]:
+    """The target-specific variable values (`test: ARGS := -k add`, `%.o: CFLAGS = -g`) each target
+    runs with: its own, then those of the targets it is a prerequisite of. A command-line
+    assignment beats them unless they are `override`."""
+    own: dict[str, list[tuple[str, str, str, bool]]] = {}
+    for pattern, name, op, value, override in scoped:
+        regex = re.escape(pattern).replace("%", ".*")
+        for target in rules:
+            if re.fullmatch(regex, target):
+                own.setdefault(target, []).append((name, op, value, override))
+    scopes: dict[str, list[tuple[str, str, str, bool]]] = {t: list(a) for t, a in own.items()}
+    for root, assignments in own.items():
+        queue, seen = list(rules[root].prereqs), {root}
+        while queue:
+            node = queue.pop(0)
+            if node in seen or node not in rules:
+                continue
+            seen.add(node)
+            defined = {a[0] for a in scopes.get(node, ())}
+            scopes.setdefault(node, []).extend(a for a in assignments if a[0] not in defined)
+            queue.extend(rules[node].prereqs)
+    out: dict[str, dict[str, str]] = {}
+    for target, assignments in scopes.items():
+        view: dict[str, str] = {}
+        merged = ChainMap(view, variables)
+        for name, op, value, override in assignments:
+            if name in cli and not override:
+                continue
+            if op in (":=", "::="):
+                view[name] = _expand_vars(value, merged, 0, budget)
+            elif op == "?=":
+                if name not in merged:
+                    view[name] = value
+            elif op == "+=" and name in merged:
+                view[name] = f"{merged[name]} {value}".strip()
+            else:
+                view[name] = value
+        out[target] = view
+    return out
+
+
+def _targets(
+    text: str | None, env: Mapping[str, str] | None = None, cli: Sequence[str] = ()
+) -> _Targets:
     """Every rule of a Makefile with its recipe lines and prerequisites, the Makefile's own
-    variables expanded in both. A `define ... endef` body is a macro, not a recipe, and is
-    skipped."""
-    found: dict[str, _Target] = {}
-    current: _Target | None = None
-    in_define = 0
-    variables = _variables(text)
-    for raw in split_lines(text or ""):
-        if _DEFINE.match(raw):
-            in_define += 1
-            continue
-        if in_define:
-            in_define -= 1 if _ENDEF.match(raw) else 0
-            continue
-        m = _RULE.match(raw)
-        if m and not raw.startswith((" ", "\t")):
-            head, _, inline = _expand_vars(m.group(2), variables).partition(";")
-            current = _Target(
-                prereqs=[
-                    t for t in re.sub(r"#.*$", "", head).split() if re.fullmatch(r"[\w.-]+", t)
-                ]
-            )
-            found[m.group(1)] = current
-            if inline.strip():
-                current.lines.append(inline.strip())
-        elif current is not None and raw.startswith((" ", "\t")) and raw.strip():
-            current.lines.append(_expand_vars(raw.strip(), variables))
-        elif current is not None and raw.strip() and not raw.startswith(("#", ".")):
-            current = None
+    variables expanded in both (and the environment's, `env`, and the command line's, `cli`; see
+    `_variables`). A `define ... endef` body is a macro, not a recipe, and is skipped, but is
+    read where a recipe line uses it; a recipe line's `for` loops are written out (`_unroll`);
+    target-specific variables apply to a target's recipe and its prerequisites'. The result's
+    `stopped` is set, and it has no rules, when the Makefile outgrows the reader's limits."""
+    found = _Targets()
+    variables = _variables(text, env, cli)
+    if variables.stopped:
+        found.stopped = variables.stopped
+        return found
+    budget = _Budget()
+    try:
+        _read_rules(text or "", variables, cli, budget, found)
+    except _Unreadable as e:
+        found.clear()
+        found.stopped = str(e)
     return found
 
 
-def _shadowed(text: str | None, targets: Mapping[str, _Target], tree: Collection[str]) -> set[str]:
+def _read_rules(
+    text: str, variables: _Vars, cli: Sequence[str], budget: _Budget, found: _Targets
+) -> None:
+    flags = variables.get(".SHELLFLAGS", "")
+    found.errexit = bool(re.search(r"(?:^|\s)-[A-Za-z]*e|errexit", flags))
+    shell = variables.get("SHELL")
+    found.shell = None if shell is None else _expand_vars(shell, variables, 0, budget).strip()
+    # a recipe runs under `/bin/sh -c`: its pipelines keep the last stage's status unless SHELL
+    # is bash and `.SHELLFLAGS` adds `-o pipefail`
+    found.pipefail = "bash" in (found.shell or "") and bool(
+        re.search(r"(?:^|\s)-[A-Za-z]*o\s+pipefail", flags)
+    )
+    raw: dict[str, list[str]] = {}
+    scoped: list[tuple[str, str, str, str, bool]] = []
+    current: str | None = None
+    in_define = 0
+    replace = False
+    first: str | None = None
+    explicit: str | None = None
+    for line in _joined(text):
+        if _DEFINE.match(line):
+            in_define += 1
+            continue
+        if in_define:
+            in_define -= 1 if _ENDEF.match(line) else 0
+            continue
+        indented = line.startswith((" ", "\t"))
+        if not indented and (m := re.match(r"^\.PHONY\s*:(.*)$", line)):
+            found.phony |= _phony_names(m[1], variables, budget)
+        elif not indented and re.match(r"^\.ONESHELL\s*:", line):
+            found.oneshell = True
+        elif not indented and (m := _ASSIGN.match(line)):
+            if m[2] == ".DEFAULT_GOAL":
+                goal = _expand_vars(re.sub(r"\s+#.*$", "", m[4]), variables, 0, budget).split()
+                explicit = goal[0] if goal else None
+                first = None if not goal else first
+            current = None
+        elif not indented and (m := _TARGET_VAR.match(line)):
+            value = re.sub(r"\s+#.*$", "", m[5]).strip()
+            for pattern in _expand_vars(m[1], variables, 0, budget).split():
+                scoped.append((pattern, m[3], m[4], value, "override" in m[2]))
+        elif not indented and (m := _RULE.match(line)):
+            head, _, inline = _expand_vars(m[2], variables, 0, budget).partition(";")
+            prereqs = [t for t in re.sub(r"#.*$", "", head).split() if re.fullmatch(r"[\w.-]+", t)]
+            name = m[1]
+            current = name
+            first = first if first is not None or name.startswith(".") else name
+            earlier = found.get(name)
+            found[name] = _Target(prereqs=(earlier.prereqs if earlier else []) + prereqs)
+            body = [inline.strip()] if inline.strip() else []
+            # a later rule with a recipe replaces the earlier one; one with none only adds
+            # prerequisites
+            replace = earlier is not None
+            if body or earlier is None:
+                raw[name] = body
+                replace = False
+        elif current is not None and indented and line.strip():
+            if replace:
+                raw[current], replace = [], False
+            raw[current].append(line.strip())
+        elif current is not None and line.strip() and not line.startswith(("#", ".")):
+            current = None
+    found.default = explicit if explicit is not None else first
+    overlays = _overlays(
+        variables, found, scoped, {m[1] for w in cli if (m := _CLI_ASSIGN.match(w))}, budget
+    )
+    for name, lines in raw.items():
+        view: Mapping[str, str] = (
+            ChainMap(overlays[name], variables) if name in overlays else variables
+        )
+        for ln in lines:
+            found[name].lines.extend(
+                _split_recipe(ln, _expand_vars(ln, view, 0, budget), found.errexit)
+            )
+
+
+def _shadowed(targets: _Targets, tree: Collection[str]) -> set[str]:
     """The targets whose recipe make never runs: not `.PHONY`, not forced, and a file or directory
     of the same name exists beside the Makefile, so make takes the target as up to date."""
-    phony = _phony(text)
     return {
         name
         for name, target in targets.items()
-        if name in tree and name not in phony and "FORCE" not in target.prereqs
+        if name in tree and name not in targets.phony and "FORCE" not in target.prereqs
     }
 
 
@@ -2926,25 +3214,52 @@ def _tree_names(changes: ChangeSet, directory: str, base: bool) -> set[str]:
     }
 
 
-def _effective(
+def _chain(
     targets: Mapping[str, _Target], name: str, shadow: Collection[str] = ()
-) -> list[str]:
-    """A target's recipe lines followed by those of its prerequisites in the same Makefile. A
-    target in `shadow` runs nothing (its prerequisites still run)."""
-    lines: list[str] = []
+) -> list[_Target]:
+    """The rules whose recipes run for `make name`, prerequisites first, in order. A target in
+    `shadow` runs nothing (its prerequisites still run). Prerequisites nested deeper than
+    `_MAX_PREREQS` are not followed, and `targets.cut` says so."""
+    nodes: list[_Target] = []
     seen: set[str] = set()
 
     def walk(target: str, level: int) -> None:
         node = targets.get(target)
-        if node is None or target in seen or level > _MAX_DEPTH:
+        if node is None or target in seen:
+            return
+        if level > _MAX_PREREQS:
+            if isinstance(targets, _Targets):
+                targets.cut = targets.cut or (
+                    f"the prerequisites of `{name}` nest more than {_MAX_PREREQS} levels deep"
+                )
             return
         seen.add(target)
         for pre in node.prereqs:
             walk(pre, level + 1)
         if target not in shadow:
-            lines.extend(node.lines)
+            nodes.append(node)
 
     walk(name, 0)
+    return nodes
+
+
+def _effective(
+    targets: Mapping[str, _Target], name: str, shadow: Collection[str] = ()
+) -> list[str]:
+    """A target's recipe lines followed by those of its prerequisites in the same Makefile. A
+    target in `shadow` runs nothing (its prerequisites still run). Past `_MAKE_RECIPE` bytes the
+    rest is left out, and `targets.cut` says so."""
+    lines: list[str] = []
+    size = 0
+    for node in _chain(targets, name, shadow):
+        size += sum(len(ln) for ln in node.lines)
+        if size > _MAKE_RECIPE:
+            if isinstance(targets, _Targets):
+                targets.cut = targets.cut or (
+                    f"`{name}` and its prerequisites run over {_MAKE_RECIPE // 1024} KiB of recipe"
+                )
+            break
+        lines.extend(node.lines)
     return lines
 
 
@@ -2990,8 +3305,55 @@ def _make_expander(targets: Mapping[str, _Target], shadow: Collection[str] = ())
 
 _SHADOW_WHY = (
     "its recipe never runs: a file or directory of the same name exists and the target is not "
-    "in .PHONY"
+    "in .PHONY (`.PHONY += name` assigns a variable; it does not declare)"
 )
+
+
+_BARE_MAKE = re.compile(r"\b(?:make|gmake)\b([^;&|]*)")
+
+
+def _goals(commands: Mapping[str, str]) -> tuple[set[str], bool]:
+    """The target names the policy commands pass to make or just, and whether one of them runs
+    `make` with no target (it builds the default goal)."""
+    names: set[str] = set()
+    bare = False
+    for cmd in commands.values():
+        m = re.search(r"\b(?:make|just)\b(.*)", cmd)
+        if m:
+            names.update(t for t in re.findall(r"[\w.-]+", m.group(1)) if not t.startswith("-"))
+        if m := _BARE_MAKE.search(cmd):
+            words = m.group(1).split()
+            bare = bare or not [w for w in words if not w.startswith("-") and "=" not in w]
+    return names, bare
+
+
+def _shell_reason(old: _Targets, new: _Targets) -> str | None:
+    """`SHELL` set to something that does not run the recipe lines as shell commands
+    (`/bin/true`), or to something that cannot be read."""
+    value = new.shell
+    if value is None or value == old.shell:
+        return None
+    if "$" in value:
+        return _Warn(f"SHELL is set to `{value[:40]}`, which cannot be read: check it is a shell")
+    words = value.split()
+    if not words or posixpath.basename(words[0]) not in _SHELLS:
+        return f"SHELL is now `{value[:40]}`, which does not run the recipe lines as shell commands"
+    return None
+
+
+def _oneshell_reason(old: _Targets, new: _Targets, name: str, ctx: _Ctx) -> str | None:
+    """`.ONESHELL` without `-e` in `.SHELLFLAGS` newly puts a target's recipe lines in one shell
+    script, in which a failing check followed by another line does not fail the target."""
+    if not new.oneshell or new.errexit or (old.oneshell and not old.errexit):
+        return None
+    for node in _chain(new, name):
+        for line in node.lines[:-1]:
+            if any(ctx.is_check(st) for st in _statements([line], False)):
+                return (
+                    "`.ONESHELL` runs its recipe lines as one script, and only the last line's "
+                    "exit status counts without `-e` in `.SHELLFLAGS`"
+                )
+    return None
 
 
 def _make_reasons(
@@ -3000,30 +3362,41 @@ def _make_reasons(
     changes: ChangeSet | None = None,
     tests: _BaseTests | None = None,
 ) -> list[tuple[int | None, str]]:
-    names: set[str] = set()
-    for cmd in commands.values():
-        m = re.search(r"\b(?:make|just)\b(.*)", cmd)
-        if m:
-            names.update(t for t in re.findall(r"[\w.-]+", m.group(1)) if not t.startswith("-"))
+    names, bare = _goals(commands)
     old, new = _targets(f.old_text), _targets(f.new_text)
+    if new.stopped and (names or bare):
+        return [
+            (
+                None,
+                _Warn(
+                    f"{posixpath.basename(f.path)} could not be read ({new.stopped}): the reader "
+                    "stopped, so what its targets run was not compared"
+                ),
+            )
+        ]
     extra = list(commands.values())
     old_shadow: set[str] = set()
     new_shadow: set[str] = set()
     if changes is not None and posixpath.basename(f.path).lower() in ("makefile", "gnumakefile"):
         directory = posixpath.dirname(f.path)
-        old_shadow = _shadowed(f.old_text, old, _tree_names(changes, directory, True))
-        new_shadow = _shadowed(f.new_text, new, _tree_names(changes, directory, False))
+        old_shadow = _shadowed(old, _tree_names(changes, directory, True))
+        new_shadow = _shadowed(new, _tree_names(changes, directory, False))
     resolve = _make_resolver(new, extra, new_shadow)
     exported = (_make_exports(f.old_text), _make_exports(f.new_text))
     out: list[tuple[int | None, str]] = []
-    for name in sorted(names):
-        if name not in old:
+    # (what to call it, the target at the base, the target in the candidate)
+    goals = [(name, name, name) for name in sorted(names)]
+    if bare and old.default and not (old.default == new.default and old.default in names):
+        goals.append((new.default or old.default, old.default, new.default or ""))
+    ctx = _Ctx(extra, resolve)
+    for name, old_name, new_name in goals:
+        if old_name not in old:
             continue
-        if name not in new:
+        if new_name not in new:
             out.append((None, f"target `{name}` was removed from {posixpath.basename(f.path)}"))
             continue
-        base_lines = _effective(old, name, old_shadow)
-        cand_lines = _effective(new, name, new_shadow)
+        base_lines = _effective(old, old_name, old_shadow)
+        cand_lines = _effective(new, new_name, new_shadow)
         why = neutering_reason(
             base_lines,
             cand_lines,
@@ -3035,15 +3408,30 @@ def _make_reasons(
             recipe=True,
             exports=exported,
         )
-        if why and not cand_lines and _effective(new, name):
+        if why and not cand_lines and _effective(new, new_name):
             why = _SHADOW_WHY
+        why = why or _oneshell_reason(old, new, new_name, ctx)
         if why:
             out.append(
                 (
-                    _first_line_with(f.new_text or "", f"{name}:"),
+                    _first_line_with(f.new_text or "", f"{new_name}:"),
                     _carry(why, f"target `{name}` changed and {why}"),
                 )
             )
+    if names or bare:
+        if why := _shell_reason(old, new):
+            at = _first_line_with(f.new_text or "", "SHELL")
+            out.append((at, _carry(why, f"{why}")))
+        if new.cut:
+            out = [
+                (
+                    None,
+                    _Warn(
+                        f"{posixpath.basename(f.path)} was read only up to a point ({new.cut}): "
+                        "what its targets run was not fully compared"
+                    ),
+                )
+            ]
     if (
         names
         and _makefile_sets_autoload_off(f.new_text)
