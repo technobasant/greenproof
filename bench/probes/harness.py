@@ -36,6 +36,7 @@ SPECS = [
     "spec_runner6.py",
     "spec_runtime7.py",
     "spec_sh7.py",
+    "spec_tables7.py",
 ]
 VERDICT = {0: "pass", 1: "BLOCK", 2: "cmd-fail", 3: "smoke", 4: "usage", 5: "internal"}
 

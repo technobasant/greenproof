@@ -33,8 +33,9 @@ from greenproof.rules.tests_python import (
     lost_helpers,
     marker_display,
 )
+from greenproof.rules.tests_tables import match_rows
 
-_RUST_TEST_ATTR = re.compile(r"#\[\s*(?:\w+::)*test\b")
+_RUST_TEST_ATTR = re.compile(r"#\[\s*(?:\w+::)*(?:test|rstest|test_case)\b")
 
 
 def analyse(
@@ -796,8 +797,61 @@ def _absorbing(pairing: _Pairing, path: str) -> list[tuple[Unit, Unit]]:
     return found
 
 
+def _unit_count(u: Unit) -> int:
+    """How many tests a unit stands for: the rows of a table that runs, the parametrize or
+    `each` cases when the rows are not literal, else one."""
+    if u.table is not None and u.table.runs:
+        return len(u.table.rows)
+    if u.table is None and u.param_cases:
+        return u.param_cases
+    return 1
+
+
+def _fold_into_tables(s: _Side, names: list[Unit], partner: dict[int, Unit]) -> dict[int, Unit]:
+    """Removed JS, Go or Rust tests (by id) accounted for by a row of a table-driven test of the
+    same file, the way pytest parametrize folds tests: the table runs, a row of its own carries
+    the removed test's literals (the numbers and strings its body passes and expects, never its
+    name), and the file's total of tests and rows did not fall. All or nothing: when one removed
+    test has no row of its own, none is accounted for. A row a paired test already had at the
+    base is not available, and a plain test that became the table needs a row for itself."""
+    if s.base is None or s.cand is None or not names:
+        return {}
+    if any(u.engine not in ("js", "go", "rust") for u in names):
+        return {}
+    if sum(map(_unit_count, s.base.units)) > sum(map(_unit_count, s.cand.units)):
+        return {}
+    pool: list[tuple[Unit, Counter[str], Counter[str]]] = []
+    needs: list[Counter[str]] = []
+    for c in s.cand.units:
+        t = c.table
+        if t is None or not t.runs or (c.asserts == 0 and not t.implicit):
+            continue
+        rows = list(zip(t.rows, t.forms, strict=True))
+        b = partner.get(id(c))
+        if b is not None and b.table is not None:
+            spent = Counter(b.table.forms)
+            fresh = []
+            for row, form in rows:
+                if spent[form] > 0:
+                    spent[form] -= 1
+                else:
+                    fresh.append((row, form))
+            rows = fresh
+        elif b is not None and b.literals:
+            needs.append(Counter(b.literals))
+        pool.extend((c, Counter(row), Counter(c.literals)) for row, _ in rows)
+    if not pool:
+        return {}
+    needs.extend(Counter(u.literals) for u in names)
+    hit = match_rows(needs, [(row, body) for _, row, body in pool])
+    if hit is None:
+        return {}
+    return {id(u): pool[j][0] for u, j in zip(names, hit[len(needs) - len(names) :], strict=True)}
+
+
 def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]:
     out: list[Finding] = []
+    partner = {id(c): b for b, c in pairing.pairs}
     lost = {id(u) for u in pairing.left_base}
     added_by_path: dict[str, list[Unit]] = {}
     for u in pairing.left_cand:
@@ -824,6 +878,23 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
                 )
             continue
         added = added_by_path.get(path, [])
+        folded_into = _fold_into_tables(s, names, partner)
+        for removed in (u for u in names if id(u) in folded_into):
+            table = folded_into[id(removed)]
+            out.append(
+                sev_finding(
+                    "tests.replaced",
+                    WARN,
+                    path,
+                    table.line,
+                    f"test {removed.name} was removed and folded into table-driven test "
+                    f"{table.name}: a row of its own carries the same values",
+                    "Keep the original test; add new tests alongside it, not in its place.",
+                )
+            )
+        names = [u for u in names if id(u) not in folded_into]
+        used = {id(u) for u in folded_into.values()}
+        added = [u for u in added if id(u) not in used]
         absorbing = _absorbing(pairing, path) if names else []
         if added or absorbing:
             # No counted check at the base (type-only test, "does not throw" smoke test):

@@ -14,7 +14,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from greenproof.rules._common import digest, split_lines
-from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
+from greenproof.rules.tests_model import FileAnalysis, Marker, Table, Unit
+from greenproof.rules.tests_tables import go_unit, js_table, rust_unit, tokens
 
 _NUM = r"-?\d+(?:\.\d+)?"
 # A Rust char literal (`'}'`, `'"'`, `'\n'`): masked like a string so its bracket or quote is not
@@ -113,7 +114,7 @@ _EXPECTED: dict[str, re.Pattern[str]] = {
 _JS_UNIT = re.compile(r"^\s*(?:it|test|xit|fit|xtest)(?:\.\w+)*\s*\(\s*(['\"`])(.*?)\1")
 _JS_DESCRIBE = re.compile(r"^\s*(?:describe|xdescribe|fdescribe)(?:\.\w+)*\s*\(\s*(['\"`])(.*?)\1")
 _GO_UNIT = re.compile(r"^func\s+(Test\w*|Fuzz\w*)\s*\(")
-_RUST_ATTR = re.compile(r"^\s*#\[\s*(?:\w+::)*test\b")
+_RUST_ATTR = re.compile(r"^\s*#\[\s*(?:\w+::)*(?:test|rstest|test_case)\b")
 _RUST_FN = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)")
 _PY_DEF = re.compile(r"^(\s*)(?:async\s+)?def\s+(test\w*)\s*\(")
 _PY_CLASS = re.compile(r"^(\s*)class\s+(\w+)")
@@ -252,6 +253,11 @@ class _Span:
     # JS/TS table rows (`it.each`, or an enclosing `describe.each`): count and exact row forms.
     cases: int | None = None
     forms: tuple[str, ...] = ()
+    # The literal table this test runs and the literals of its own body (JS/TS, Go, Rust).
+    table: Table | None = None
+    literals: tuple[str, ...] | None = None
+    # Rust: the line of the `fn` (the span starts at the first test attribute).
+    fn_line: int = -1
 
 
 _QUOTES = {"js": "\"'`", "go": "\"'`", "rust": '"', "python-lines": "\"'"}
@@ -678,6 +684,10 @@ class _Desc:
     each: bool = False
     cases: int | None = None
     forms: tuple[str, ...] = ()
+    # `describe.each`: raw rows (None when not literal), callback range, whether it is skipped.
+    rows: tuple[str, ...] | None = None
+    cb: tuple[int, int] = (0, 0)
+    live: bool = True
 
 
 @dataclass
@@ -689,6 +699,9 @@ class _Each:
     title_cols: tuple[int, int] | None
     cases: int | None
     forms: tuple[str, ...]
+    rows: tuple[str, ...] | None
+    cb: tuple[int, int]
+    live: bool
 
 
 def _parse_each(src: _Src, i: int, m: re.Match[str]) -> _Each | None:
@@ -700,6 +713,7 @@ def _parse_each(src: _Src, i: int, m: re.Match[str]) -> _Each | None:
         p += 1
     cases: int | None = None
     forms: tuple[str, ...] = ()
+    raw: tuple[str, ...] | None = None
     if p >= len(s):
         return None
     if s[p] == "`":
@@ -709,6 +723,7 @@ def _parse_each(src: _Src, i: int, m: re.Match[str]) -> _Each | None:
         rows = [r.strip() for r in t[p + 1 : q].split("\n") if r.strip()]
         forms = tuple(_norm(r) for r in rows[1:])
         cases = len(forms)
+        raw = tuple(rows[1:])
         p = q + 1
     elif s[p] == "(":
         c = src.close(p)
@@ -722,6 +737,7 @@ def _parse_each(src: _Src, i: int, m: re.Match[str]) -> _Each | None:
             if not any(e.lstrip().startswith("...") for e in elems):  # a spread: not a literal
                 cases = len(elems)
                 forms = tuple(_norm(e) for e in elems)
+                raw = tuple(elems)
         p = c + 1
     else:
         return None
@@ -743,8 +759,20 @@ def _parse_each(src: _Src, i: int, m: re.Match[str]) -> _Each | None:
         if "\n" in tm.group(2)
         else (off - src.starts[line], off - src.starts[line] + len(tm.group(2)))
     )
+    # The callback is the second argument; a skipped or todo table does not run.
+    cb_start = p + 1 + len(args[0]) + 1
+    live = not (m.group(1).startswith("x") or re.search(r"\.(?:skip|todo)\b", m.group(0)))
     return _Each(
-        m.group(1).endswith("describe"), src.line_of(c2), tm.group(2), line, cols, cases, forms
+        m.group(1).endswith("describe"),
+        src.line_of(c2),
+        tm.group(2),
+        line,
+        cols,
+        cases,
+        forms,
+        raw,
+        (cb_start, c2),
+        bool(live),
     )
 
 
@@ -761,6 +789,25 @@ def _each_parts(enclosing: list[_Desc], own: _Each | None) -> tuple[int | None, 
         total *= c or 0
         forms.extend(f)
     return total, tuple(forms)
+
+
+def _rust_fn_line(src: _Src, code: list[str], i: int) -> int | None:
+    """The line of the `fn` that the attributes starting on line `i` belong to, however many
+    attributes (`#[case(..)]` rows of a table) sit between: the first thing after them."""
+    s = src.shadow
+    p = src.starts[i]
+    while True:
+        p = len(s) - len(s[p:].lstrip())
+        if not s.startswith("#[", p):
+            break
+        close = src.close(p + 1)
+        if close < 0:
+            return None
+        p = close + 1
+    if p >= len(s):
+        return None
+    j = src.line_of(p)
+    return j if _RUST_FN.match(code[j]) else None
 
 
 def _find_spans(
@@ -782,11 +829,27 @@ def _find_spans(
                     enc = [d for d in describes if d.start < i <= d.end]
                     if each.describe:
                         describes.append(
-                            _Desc(i, each.end, each.title, True, each.cases, each.forms)
+                            _Desc(
+                                i,
+                                each.end,
+                                each.title,
+                                True,
+                                each.cases,
+                                each.forms,
+                                each.rows,
+                                each.cb,
+                                each.live,
+                            )
                         )
                     else:
                         cases, forms = _each_parts(enc, each)
                         titles = [d.title for d in enc] + [each.title]
+                        table, lits = js_table(
+                            src,
+                            None if any(d.each for d in enc) else each.rows,
+                            each.cb,
+                            each.live,
+                        )
                         spans.append(
                             _Span(
                                 i,
@@ -796,6 +859,8 @@ def _find_spans(
                                 each.title_cols,
                                 cases,
                                 forms,
+                                table,
+                                lits,
                             )
                         )
                 i += 1
@@ -809,8 +874,23 @@ def _find_spans(
                 enc = [d for d in describes if d.start < i <= d.end]
                 titles = [d.title for d in enc] + [um.group(2)]
                 cases, forms = _each_parts(enc, None)
+                table = None
+                sources = [d for d in enc if d.each]
+                if src is not None and len(sources) == 1 and sources[0].rows is not None:
+                    d = sources[0]
+                    reads = (src.starts[i], src.starts[end] + len(code[end]))
+                    table = js_table(src, d.rows, d.cb, d.live, reads)[0]
                 spans.append(
-                    _Span(i, end, " > ".join(titles), i, (um.start(2), um.end(2)), cases, forms)
+                    _Span(
+                        i,
+                        end,
+                        " > ".join(titles),
+                        i,
+                        (um.start(2), um.end(2)),
+                        cases,
+                        forms,
+                        table,
+                    )
                 )
         elif lang == "go":
             gm = _GO_UNIT.match(line)
@@ -819,14 +899,18 @@ def _find_spans(
                 spans.append(_Span(i, end, gm.group(1), i, (gm.start(1), gm.end(1))))
         elif lang == "rust":
             if _RUST_ATTR.match(line):
-                j = i + 1
-                while j < len(raw) and j < i + 8 and not _RUST_FN.match(code[j]):
-                    j += 1
-                if j < len(raw) and j < i + 8:
+                j = _rust_fn_line(src, code, i) if src is not None else None
+                if j is None:
+                    j = i + 1
+                    while j < len(raw) and j < i + 8 and not _RUST_FN.match(code[j]):
+                        j += 1
+                    if j >= len(raw) or j >= i + 8:
+                        j = None
+                if j is not None:
                     fm = _RUST_FN.match(code[j])
                     assert fm is not None
                     end = _brace_end(masked, j)
-                    spans.append(_Span(i, end, fm.group(1), j, (fm.start(1), fm.end(1))))
+                    spans.append(_Span(i, end, fm.group(1), j, (fm.start(1), fm.end(1)), fn_line=j))
                     i = max(i + 1, spans[-1].end + 1)
                     continue
         else:
@@ -1166,6 +1250,16 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
             param_cases=span.cases,
             param_forms=list(span.forms),
         )
+        unit.table = span.table
+        if span.literals is not None:
+            unit.literals = span.literals
+        elif lang == "js":
+            unit.literals = tokens(_hash_text(code, span), "js")
+        if src is not None and lang == "go":
+            lo, hi = src.starts[span.start], src.starts[span.end] + len(code[span.end])
+            unit.table, unit.literals = go_unit(src, lo, hi)
+        elif src is not None and lang == "rust" and span.fn_line >= 0:
+            unit.table, unit.literals = rust_unit(src, span.start, span.fn_line)
         unit.self_calls = selfeq.calls
         unit.compared = selfeq.compared
         live: list[str] = []
@@ -1194,6 +1288,8 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
                 unit.vacuous_line = unit.vacuous_line or k + 1
             if counted > 0:
                 unit.assertion_forms.extend([digest("".join(code[k].split()))] * counted)
+        if unit.table is not None and unit.table.implicit and unit.asserts == 0:
+            unit.asserts = 1  # a `test_case` row checks its `=>` value
         body_masked = "\n".join(live)
         if lang == "js":
             unit.strong = len(_JS_STRONG.findall(body_masked))
