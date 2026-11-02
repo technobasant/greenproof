@@ -11,7 +11,7 @@ from __future__ import annotations
 import posixpath
 import re
 from collections import Counter
-from collections.abc import Callable, Generator, Iterator, Mapping
+from collections.abc import Callable, Collection, Generator, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import NamedTuple
@@ -398,16 +398,16 @@ _SELF_EXPR = re.compile(rf"{_SELF_PWD}|{_SELF}")
 _SELF_ASSIGN = re.compile(rf"^(?P<v>[A-Za-z_]\w*)=\"?(?:{_SELF_PWD}|{_SELF})\"?$")
 
 
-def _self_dir(stmt: str, body: _Body, cwd: str, here: set[str]) -> str:
-    """`stmt` with the directory of the running script, `$(dirname "$0")` or `${BASH_SOURCE%/*}`
-    (or a variable `HERE="$(cd "$(dirname "$0")" && pwd)"` holds), written as a path from `cwd`.
-    Only for a script that is read from a file."""
-    if body.kind != "script" or not body.src:
+def _self_dir(stmt: str, src: str, cwd: str, here: set[str]) -> str:
+    """`stmt` with the directory of the running script `src`, `$(dirname "$0")` or
+    `${BASH_SOURCE%/*}` (or a variable `HERE="$(cd "$(dirname "$0")" && pwd)"` holds), written as
+    a path from `cwd`. Only for a script that is read from a file: `src` is "" for any other."""
+    if not src:
         return stmt
     if m := _SELF_ASSIGN.match(stmt.strip()):
         here.add(m["v"])
         return stmt
-    where = posixpath.relpath(posixpath.dirname(body.src) or ".", cwd or ".")
+    where = posixpath.relpath(posixpath.dirname(src) or ".", cwd or ".")
     stmt = _SELF_EXPR.sub(where, stmt)
     for var in here:
         stmt = re.sub(rf"\$(?:\{{{var}\}}|{var}\b)", where, stmt)
@@ -420,6 +420,17 @@ def _literal_args(toks: list[str], script: str) -> tuple[str, ...] | None:
         return None
     args = tuple(toks[toks.index(script) + 1 :])
     return None if any(c in a for a in args for c in "$`*?[") else args
+
+
+_PICKS = frozenset(
+    {"-w", "-ws", "--workspace", "--workspaces", "-F", "--filter", "-r", "--recursive"}
+)
+
+
+def _selects_package(toks: list[str]) -> bool:
+    """Whether a package manager command picks a workspace package (`-w web`, `--filter x`,
+    `yarn workspace x`) rather than the package.json of its own directory."""
+    return any(t.partition("=")[0] in _PICKS for t in toks) or toks[1:2] == ["workspace"]
 
 
 @dataclass
@@ -461,19 +472,24 @@ class _Walk:
     def tree(self, directory: str) -> set[str]:
         return _tree_names(self.world.changes, directory, self.base)
 
-    def render(self, text: str, cwd: str, scope: Scope) -> tuple[str, str]:
+    def render(self, text: str, cwd: str, scope: Scope, src: str = "") -> tuple[str, str]:
         """A script read with its functions (those of the files it sources too) and arguments:
         what runs whatever a `case` word is, and what may run. Why reading stopped short is
         noted."""
-        self.load(text, cwd, scope, 0, set())
+        self.load(text, cwd, scope, 0, set(), src)
         common, arms = expand_script(text, scope)
         for why in scope.cuts:
             self.cut(why)
         return common, arms if arms != common else ""
 
-    def load(self, text: str, cwd: str, scope: Scope, depth: int, seen: set[str]) -> None:
-        """The functions of the files `text` sources, added to `scope`."""
+    def load(
+        self, text: str, cwd: str, scope: Scope, depth: int, seen: set[str], src: str = ""
+    ) -> None:
+        """The functions of the files `text` sources, added to `scope`. `src` is the file `text`
+        is read from: a path through its own directory is read from there."""
+        here: set[str] = set()
         for stmt, at in _leaves(text, {}, cwd):
+            stmt = _self_dir(stmt, src, at, here)
             toks = command_tokens(stmt)
             if toks[:1] not in (["."], ["source"]) or len(toks) < 2 or "$" in toks[1]:
                 continue
@@ -492,12 +508,12 @@ class _Walk:
             if depth + 1 > _MAX_DEPTH:
                 self.cut(f"`{path}` is {_MAX_DEPTH} levels below the step")
             else:
-                self.load(lib, at, scope, depth + 1, seen)
+                self.load(lib, at, scope, depth + 1, seen, path)
 
     def descend(self, body: _Body, depth: int) -> None:
         here: set[str] = set()  # variables holding the directory of the script itself
         for stmt, cwd in _leaves(body.text, body.defs, body.cwd):
-            stmt = _self_dir(stmt, body, cwd, here)
+            stmt = _self_dir(stmt, body.src if body.kind == "script" else "", cwd, here)
             toks = command_tokens(stmt, body.defs)
             if not toks:
                 continue
@@ -520,12 +536,21 @@ class _Walk:
     def group(self, body: _Body, stmt: str, children: list[Child], depth: int) -> None:
         """The recipe lines or package.json scripts a statement runs."""
         world = self.world
-        known = not children or any(
-            check_kind(seg.text, literals=world.literals, scripts=world.scripts, defs=body.defs)
-            for child in children
-            for seg in split_segments(child.text)
+        segs = [seg for child in children for seg in split_segments(child.text)]
+        known = (
+            not children
+            or any(
+                check_kind(s.text, literals=world.literals, scripts=world.scripts, defs=body.defs)
+                for s in segs
+            )
+            or (
+                # a workspace selection (`npm test -w web`) names another package than the one
+                # read: its commands are not the ones that run
+                not _selects_package(command_tokens(stmt, body.defs))
+                and all(is_non_check(s.text, body.defs) for s in segs)
+            )
         )
-        if known:  # a target that holds nothing the rule recognises stays opaque
+        if known:  # a target whose commands are not all ones the rule can place stays opaque
             self.expanded.add(stmt)
         if not children:
             return
@@ -595,7 +620,7 @@ class _Walk:
                 return
             modes = [mode]
         scope = body.scope if sourced and body.scope is not None else Scope(args=args)
-        common, arms = self.render(text, cwd, scope)
+        common, arms = self.render(text, cwd, scope, path)
         sub = _Body(
             common,
             self.line,
@@ -1428,8 +1453,8 @@ def _filter_warnings(
     event: str, was: dict[str, list[str]], now: dict[str, list[str]], pr_open: bool = False
 ) -> list[str]:
     """What a filter that is new or wider than at the base takes away from `event`. `pr_open`: a
-    `branches` filter newly under `push` costs nothing the tests ran on, since `pull_request`
-    still runs them on every branch."""
+    `branches` or `branches-ignore` filter newly under `push` costs nothing the tests ran on,
+    since `pull_request` still runs them on every branch."""
     out: list[str] = []
     for key in _POSITIVE_FILTERS:
         if key not in now:
@@ -1444,7 +1469,7 @@ def _filter_warnings(
         if key not in now:
             continue
         added = [p for p in now[key] if p not in was.get(key, [])]
-        if added:
+        if added and not (pr_open and event == "push" and key == "branches-ignore" not in was):
             out.append(f"`{key}` under `{event}` now also excludes {', '.join(added)}")
     return out
 
@@ -1478,6 +1503,188 @@ def _covered(world: _World, path: str, event: str, needed: set[str]) -> bool:
     return False
 
 
+# -- an `if:` that keeps pull requests out -----------------------------------------------------
+_EXPR = re.compile(r"^\$\{\{(.*)\}\}$", re.DOTALL)
+_EVENT_NAME = re.compile(
+    r"^(?:github\.event_name\s*(==|!=)\s*'([^']*)'|'([^']*)'\s*(==|!=)\s*github\.event_name)$"
+)
+_REF_IS = re.compile(r"^github\.(?:ref|ref_name)\s*(==|!=)\s*'([^']*)'$")
+_REF_STARTS = re.compile(
+    r"^(!?)startsWith\(\s*github\.ref\s*,\s*'(refs/(?:heads|tags)/[^']*)'\s*\)$"
+)
+
+
+def _split_top(expr: str, op: str) -> list[str]:
+    """`expr` cut at each `op` outside parentheses and quotes."""
+    parts: list[str] = []
+    depth = 0
+    quote = ""
+    start = 0
+    i = 0
+    while i < len(expr):
+        c = expr[i]
+        if quote:
+            quote = "" if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif depth == 0 and expr.startswith(op, i):
+            parts.append(expr[start:i])
+            start = i + len(op)
+            i += len(op) - 1
+        i += 1
+    parts.append(expr[start:])
+    return parts
+
+
+def _wrapped(text: str) -> bool:
+    """Whether one pair of parentheses encloses all of `text`."""
+    if not (text.startswith("(") and text.endswith(")")):
+        return False
+    return _balanced(text[1:-1])
+
+
+def _balanced(text: str) -> bool:
+    depth = 0
+    for c in text:
+        depth += (c == "(") - (c == ")")
+        if depth < 0:
+            return False
+    return depth == 0
+
+
+def _if_on(value: str, event: str) -> bool | None:
+    """Whether an `if:` holds on an `event` run: False for `github.event_name == 'push'` on a
+    pull request, True for `!= 'pull_request'` on one; `github.ref` and `github.ref_name`
+    conditions are False on `pull_request` (a pull request's ref is `refs/pull/N/merge`) and
+    unknown on any other event. None for anything the reading cannot tell."""
+    text = " ".join(value.split())
+    if len(text) > 1 and text[0] == text[-1] and text[0] in "'\"" and text[0] not in text[1:-1]:
+        text = text[1:-1].strip()
+    if m := _EXPR.match(text):
+        text = m[1].strip()
+    if _wrapped(text):
+        return _if_on(text[1:-1], event)
+    ors = _split_top(text, "||")
+    if len(ors) > 1:
+        got = [_if_on(p, event) for p in ors]
+        return True if True in got else False if all(g is False for g in got) else None
+    ands = _split_top(text, "&&")
+    if len(ands) > 1:
+        got = [_if_on(p, event) for p in ands]
+        return False if False in got else True if all(g is True for g in got) else None
+    text = text.strip()
+    if text in ("true", "'true'"):
+        return True
+    if text in ("false", "'false'"):
+        return False
+    if m := _EVENT_NAME.match(text):
+        op = m[1] or m[4]
+        name = m[2] if m[1] else m[3]
+        return (event == name) == (op == "==")
+    if event != "pull_request":
+        return None
+    if m := _REF_IS.match(text):
+        return m[1] == "!="
+    if m := _REF_STARTS.match(text):
+        return m[1] == "!"
+    return None
+
+
+def _if_key(value: str | None) -> str:
+    return " ".join((value or "").split())
+
+
+def _pr_losses(
+    world: _World, f: ChangedFile, base_path: str, events: Collection[str]
+) -> list[Reason]:
+    """Blocks for a job or step that runs a check and carries an `if:` new or changed since the
+    base that is false on `pull_request`: pull requests no longer run the check, whatever the
+    `on:` section says. It is not a loss when another job of the workflow, or another workflow,
+    still runs that kind of check on pull requests; when no event of the workflow satisfies the
+    `if:`, the check never runs."""
+    text = world.cand.get(f.path)
+    if text is None or not _GITHUB.match(f.path):
+        return []
+    wf = _wf(text)
+    base_text = world.base.get(base_path)
+    base_wf = _wf(base_text) if base_text is not None and _GITHUB.match(base_path) else None
+    was_jobs = {j.name: _if_key(j.if_) for j in base_wf.jobs} if base_wf else {}
+    was_steps = (
+        {
+            (j.name if (j := base_wf.job_of(s)) else "", _sig(s), _if_key(s.if_))
+            for s in base_wf.steps
+        }
+        if base_wf
+        else set()
+    )
+    kinds: dict[int, set[str]] = {}
+    for step in wf.steps:
+        kinds[step.line] = {
+            k
+            for body, defs in _unit_texts(world, wf, step)
+            for seg in split_segments(body)
+            if (
+                k := check_kind(seg.text, literals=world.literals, scripts=world.scripts, defs=defs)
+            )
+            and k not in _NOT_TESTS
+        }
+    covered: set[str] = set()
+    skipped: list[tuple[int, str, str, set[str]]] = []  # line, what, the `if:`, kinds
+    for step in wf.steps:
+        job = wf.job_of(step)
+        if job is None or not kinds[step.line] or _disabled(step):
+            continue
+        conds = [
+            (
+                job.if_,
+                job.if_line,
+                f"job `{job.name}`",
+                was_jobs.get(job.name) is None or was_jobs[job.name] != _if_key(job.if_),
+            )
+        ]
+        conds.append(
+            (
+                step.if_,
+                step.if_line,
+                f"step at line {step.line}",
+                (job.name, _sig(step), _if_key(step.if_)) not in was_steps,
+            )
+        )
+        bad = [
+            (c, n, what)
+            for c, n, what, new in conds
+            if c and new and _if_on(c, "pull_request") is False
+        ]
+        if bad:
+            c, n, what = bad[0]
+            skipped.append((n or step.line, what, c, kinds[step.line]))
+        elif not any(c and _if_on(c, "pull_request") is False for c, _, _, _ in conds):
+            covered |= kinds[step.line]
+    out: list[Reason] = []
+    for line, what, cond, got in skipped:
+        lost = got - covered
+        if not lost:
+            continue
+        if events and all(_if_on(cond, e) is False for e in events):
+            why = (
+                f"the {what} runs only when `{_if_key(cond)}`, which none of the workflow's"
+                " triggers satisfy: its tests never run"
+            )
+        elif not any(_covered(world, f.path, "pull_request", {k}) for k in lost):
+            why = (
+                f"the {what} now has `if: {_if_key(cond)}`, which is false on pull requests: the"
+                f" {', '.join(sorted(lost))} step no longer runs on `pull_request`"
+            )
+        else:
+            continue
+        out.append(_block(line, why))
+    return out
+
+
 def _trigger_reasons(
     world: _World, f: ChangedFile, base_path: str
 ) -> tuple[list[Reason], list[Reason]]:
@@ -1490,6 +1697,10 @@ def _trigger_reasons(
     needed = _test_kinds(world.base_kinds.get(base_path, Counter()))
     blocks: list[Reason] = []
     warns: list[Reason] = []
+    losses: list[Reason] = []
+    if needed and "pull_request" in base_t and "pull_request" in cand_t:
+        losses = _pr_losses(world, f, base_path, cand_t)
+        blocks.extend(losses)
     if needed:
         for event in _CORE_EVENTS:
             if event not in base_t or event in cand_t:
@@ -1520,7 +1731,7 @@ def _trigger_reasons(
         now = cand_t.get(event)
         if now is not None:
             pr = cand_t.get("pull_request")
-            open_pr = "pull_request" in base_t and pr is not None and not pr
+            open_pr = "pull_request" in base_t and pr is not None and not pr and not losses
             warns.extend(_warn(line, why) for why in _filter_warnings(event, was, now, open_pr))
     return blocks, warns
 
@@ -1617,13 +1828,16 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                         "unless named with `-p`: check what they were doing)",
                     )
                 )
-            for stmt, where in _leaf_dirs(body.text, body.defs, body.cwd):
+            here: set[str] = set()  # variables holding the directory of the script itself
+            src = body.src if body.kind == "script" else ""
+            for stmt, cwd, where in _walk_leaves(body.text, body.defs, (body.cwd, _Dir(body.cwd))):
+                path_stmt = _self_dir(stmt, src, cwd, here)
                 if pending[stmt] > 0:
                     pending[stmt] -= 1
                     continue
                 if tests is None:
                     continue
-                gone, _ = tests.scan(stmt, where)
+                gone, _ = tests.scan(path_stmt, where)
                 if gone is not None:
                     why = removal_reason(stmt[:80], gone)
                     if (at, why) not in reported:
