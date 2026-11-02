@@ -476,6 +476,64 @@ _FIND_UNFILTERED = frozenset(
 _MATCH_BUDGET = 400_000  # glob-against-path tests per check; past it a glob counts as a match
 
 
+class _Hit(str):
+    """A test path a statement touches, and how: it `removes` it, `rewrites` it, or `appends to`
+    it (appending cannot take a test away, but a module-level `pytest.skip` can be added)."""
+
+    how: str = "removes"
+
+    def __new__(cls, path: str, how: str = "removes") -> _Hit:
+        hit = super().__new__(cls, path)
+        hit.how = how
+        return hit
+
+
+# -- tests rewritten at run time ----------------------------------------------------------
+_WRITERS = frozenset({"truncate", "shred", "sponge"})
+_COPIERS = frozenset({"cp", "install", "ln", "rsync", "ditto"})
+_REDIRECT = re.compile(
+    r"^(?P<pre>[^<>=\s-][^<>=\s]*?)?(?P<fd>\d*|&)(?P<op>>>?)\|?(?P<to>[^>&|(\s].*)?$"
+)
+_INPLACE = {
+    "sed": re.compile(r"^(?:--in-place\b.*|-[nrEsz]*i.*)$"),
+    "perl": re.compile(r"^-[nplaswWtTuU0]*i.*$"),
+}
+_COPY_VALUED = frozenset(
+    {"-t", "--target-directory", "-S", "--suffix", "-m", "--mode", "-o", "--owner", "-g", "--group"}
+)
+_RSYNC_VALUED = frozenset(
+    {"-e", "--rsh", "--exclude", "--include", "--exclude-from", "--include-from", "-f", "--filter"}
+    | {"--port", "--chmod", "--backup-dir", "--files-from", "--link-dest", "--partial-dir"}
+)
+_GIT_VALUED = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
+_LIT = r"""(?:"(?P<d>[^"]+)"|'(?P<s>[^']+)')"""
+# Calls in the code of `python -c` and its kin that write the file named by a literal: the file
+# is the first argument, or the second for a copy. The last pair appends.
+_WRITING_CALLS = (
+    (
+        re.compile(rf"\bopen\s*\(\s*{_LIT}\s*,\s*(?:mode\s*=\s*)?[\"'][^\"'a]*[wx+][^\"']*[\"']"),
+        False,
+    ),
+    (re.compile(rf"\bopen\s*\(\s*{_LIT}\s*,\s*(?:mode\s*=\s*)?[\"']a[^\"']*[\"']"), True),
+    (re.compile(rf"\bPath\s*\(\s*{_LIT}\s*\)\s*\.\s*write_(?:text|bytes)\b"), False),
+    (
+        re.compile(
+            rf"\b(?:shutil\s*\.\s*copy\w*|fs\w*\s*\.\s*copyFile\w*)\s*\(\s*[^,()]+,\s*{_LIT}"
+        ),
+        False,
+    ),
+    (
+        re.compile(
+            r"\b(?:os\s*\.\s*truncate|fs\w*\s*\.\s*(?:writeFile\w*|truncate\w*|createWriteStream)"
+            rf"|File\s*\.\s*(?:write|binwrite|truncate))\s*\(\s*{_LIT}"
+        ),
+        False,
+    ),
+    (re.compile(rf"\bfs\w*\s*\.\s*appendFile\w*\s*\(\s*{_LIT}"), True),
+)
+_REVS_KEPT = frozenset({"HEAD", "@", "-"})
+
+
 def _glob_regex(pattern: str) -> re.Pattern[str]:
     """A shell glob as a regex: `*` and `?` stay inside a path segment, `**` crosses them,
     `[...]` is a class and `{a,b}` an alternation (not nested)."""
@@ -527,6 +585,65 @@ def _operands(args: Sequence[str], valued: Collection[str] = ()) -> list[str]:
         elif done or not arg.startswith("-") or arg == "-":
             out.append(arg)
     return out
+
+
+_XARGS_VALUED = frozenset(
+    {"-n", "-I", "-L", "-P", "-s", "-d", "-E", "-a", "--max-args", "--delimiter"}
+)
+_MODE_CLAUSE = re.compile(r"([ugoa]*)([-+=])([rwxXst]*)")
+_HOW = {
+    "removes": "removes tests",
+    "rewrites": "rewrites tests",
+    "appends to": "appends to tests",
+    "copies into": "copies into the tests' directory",
+}
+
+
+def _xargs(stage: Sequence[str]) -> list[str]:
+    """The command an `xargs ...` stage runs: its options (a valued one with its value) dropped."""
+    words = list(stage[1:])
+    i = 0
+    while i < len(words) and words[i].startswith("-") and words[i] != "--":
+        i += 2 if words[i] in _XARGS_VALUED else 1
+    return words[i + (words[i : i + 1] == ["--"]) :]
+
+
+def _hides_mode(mode: str) -> bool:
+    """Whether a `chmod` mode takes the owner's read permission away (`000`, `a-r`, `u=w`)."""
+    if re.fullmatch(r"[0-7]{3,4}", mode):
+        return int(mode[-3]) & 4 == 0
+    clauses = _MODE_CLAUSE.findall(mode.replace(",", " ").replace(" ", "")) if mode else []
+    if not clauses or "".join("".join(c) for c in clauses) != mode.replace(",", ""):
+        return False
+    return any(
+        ("u" in who or "a" in who or not who)
+        and ((op == "-" and "r" in perm) or (op == "=" and "r" not in perm))
+        for who, op, perm in clauses
+    )
+
+
+def _in_place_how(cmd: Sequence[str], *, exec_: bool = False) -> str | None:
+    """How a command acts on the files it is given when it changes them in place: `truncate`,
+    `shred`, `sed -i`, `perl -i`, `tee`, `chmod` that makes them unreadable rewrite them, `mv`
+    takes them away. None for any other command. Under `find -exec` (`exec_`) a copy counts when
+    the file is its destination."""
+    if not cmd:
+        return None
+    head, rest = posixpath.basename(cmd[0]), list(cmd[1:])
+    if head in _WRITERS:
+        return "rewrites"
+    if head == "tee":
+        return "appends to" if any(a in ("-a", "--append") for a in rest) else "rewrites"
+    if head in _INPLACE and any(_INPLACE[head].match(a) for a in rest if a.startswith("-")):
+        return "rewrites"
+    if head == "chmod":
+        words = _operands(rest)
+        return "rewrites" if words and _hides_mode(words[0]) else None
+    if head == "mv" or cmd[:2] == ["git", "mv"]:
+        return "removes" if "{}" in cmd or not exec_ else None
+    if exec_ and head in _COPIERS and cmd[-1] == "{}":
+        return "rewrites"
+    return None
 
 
 @dataclass(frozen=True)
@@ -745,6 +862,9 @@ class _BaseTests:
 
     # -- what a command removes -------------------------------------------------------
     def _removes(self, toks: list[str], where: _Dir) -> str | None:
+        return self._takes(toks, where) or self._rewrites(toks, where)
+
+    def _takes(self, toks: list[str], where: _Dir) -> str | None:
         if "|" in toks:
             left, right = toks[: toks.index("|")], toks[toks.index("|") + 1 :]
             piped = [posixpath.basename(t) for t in right[:6]]
@@ -752,6 +872,12 @@ class _BaseTests:
             if left[:1] == ["find"] and piped[:1] == ["xargs"] and at is not None:
                 recursive = _recursive_removal(right[at:])
                 return self._found([*left[1:], "-delete"], where, recursive=recursive)
+            if (
+                left[:1] == ["find"]
+                and piped[:1] == ["xargs"]
+                and (how := _in_place_how(_xargs(right)))
+            ):
+                return self._found([*left[1:], "-delete"], where, how=how)
             toks = left
         if not toks:
             return None
@@ -766,6 +892,176 @@ class _BaseTests:
             return self._found(rest, where)
         if _INTERPRETER.match(head):
             return self._one_liner(rest, where)
+        return None
+
+    # -- what a command rewrites ------------------------------------------------------
+    def _rewrites(self, toks: list[str], where: _Dir) -> str | None:
+        """The base test file a command overwrites (`> f`, `truncate`, `sed -i`, `cp`, `rsync
+        --delete`, `git checkout REV -- tests`, a `python -c` that opens it for writing) or
+        appends to (a `>>`, `tee -a`: it cannot take a test away, but can add a module-level
+        `pytest.skip`); a directory a copy lands in whose files it may overwrite."""
+        stage: list[str] = []
+        for tok in [*toks, "|"]:
+            if tok != "|" and not (tok.startswith("|") and len(tok) > 1):
+                stage.append(tok)
+                continue
+            if hit := self._stage_rewrites(stage, where):
+                return hit
+            stage = [tok[1:]] if tok != "|" else []
+        return None
+
+    def _stage_rewrites(self, stage: list[str], where: _Dir) -> str | None:
+        for i, tok in enumerate(stage):
+            if ">" not in tok or " " in tok or not (m := _REDIRECT.match(tok)):
+                continue
+            target = m["to"] or (stage[i + 1] if i + 1 < len(stage) else "")
+            if target and self._near(target, where, True):
+                return _Hit(target, "appends to" if m["op"] == ">>" else "rewrites")
+        if not stage:
+            return None
+        head, rest = posixpath.basename(stage[0]), stage[1:]
+        if (how := _in_place_how(stage)) and how != "removes":
+            words = self._in_place_files(head, rest)
+            dirs_ok = head == "chmod"
+            if hit := next((w for w in words if self._near(w, where, not dirs_ok)), None):
+                return _Hit(hit, how)
+        if head == "dd":
+            of = next((a[3:] for a in rest if a.startswith("of=")), "")
+            return _Hit(of, "rewrites") if of and self._near(of, where, True) else None
+        if head == "patch":
+            hit = next(
+                (w for w in _operands(rest, {"-p", "-i", "-d"}) if self._near(w, where, True)), None
+            )
+            return _Hit(hit, "rewrites") if hit else None
+        if head in _COPIERS:
+            return self._copied(head, rest, where)
+        if head == "git":
+            return self._restored(rest, where)
+        if _INTERPRETER.match(head):
+            return self._writing_code(rest, where)
+        return None
+
+    @staticmethod
+    def _in_place_files(head: str, rest: Sequence[str]) -> list[str]:
+        """The files an in-place command acts on, its script and options left out."""
+        if head == "chmod":
+            return _operands(rest)[1:]
+        if head in ("truncate", "shred"):
+            return _operands(rest, {"-s", "--size", "-r", "--reference", "-n", "--iterations"})
+        if head == "sed":
+            words = _operands(rest, {"-e", "-f", "--expression", "--file", "-l"})
+            given = any(a in ("-e", "-f") or a.startswith(("--expression", "--file")) for a in rest)
+            return words if given else words[1:]
+        if head == "perl":  # `-e CODE` and `-pie CODE` take their code as the next word
+            out: list[str] = []
+            skip = False
+            for arg in rest:
+                if skip:
+                    skip = False
+                elif arg.startswith("-") and arg != "--":
+                    skip = arg[1:].endswith(("e", "E")) and not arg.startswith("--")
+                else:
+                    out.append(arg)
+            return out
+        return _operands(rest)
+
+    def _copied(self, head: str, args: Sequence[str], where: _Dir) -> str | None:
+        """`cp`, `install`, `ln -f`, `rsync`: the destination is a test file, or a directory
+        holding tests that a source of the same name lands on (`rsync --delete` into one removes
+        what the source lacks; a source that is a directory's contents or a glob lands on names
+        that cannot be told, a `copies into` warning)."""
+        flags = (
+            [a for a in args[: args.index("--")] if a.startswith("-")]
+            if "--" in args
+            else [a for a in args if a.startswith("-")]
+        )
+        short = "".join(f[1:] for f in flags if not f.startswith("--"))
+        if head == "ln" and "--force" not in flags and "f" not in short:
+            return None
+        if head == "cp" and ("--no-clobber" in flags or "n" in short):
+            return None
+        words = _operands(args, _RSYNC_VALUED if head == "rsync" else _COPY_VALUED)
+        into = next(
+            (a.split("=", 1)[1] for a in args if a.startswith("--target-directory=")),
+            next((args[i + 1] for i, a in enumerate(args[:-1]) if a == "-t"), None),
+        )
+        sources, dest = (words, into) if into else (words[:-1], words[-1] if len(words) > 1 else "")
+        if not dest or not sources:
+            return None
+        if self._near(dest, where, True):
+            return _Hit(dest, "rewrites")
+        if not self._near(dest, where):  # a directory that holds no test
+            return None
+        if head == "rsync" and any(f.startswith("--del") for f in flags):
+            return _Hit(dest, "rewrites")
+        recursive = bool({"--recursive", "--archive"} & set(flags)) or bool(set("rRa") & set(short))
+        for src in sources:
+            name = posixpath.basename(src.rstrip("/"))
+            if (
+                src.endswith("/")
+                or name in ("", ".", "..")
+                or _GLOB_CHARS & set(name)
+                or "$" in name
+            ):
+                return _Hit(dest, "copies into")
+            if self._near(f"{dest.rstrip('/')}/{name}", where, not recursive):
+                return _Hit(f"{dest.rstrip('/')}/{name}", "rewrites")
+        return None
+
+    def _restored(self, args: Sequence[str], where: _Dir) -> str | None:
+        """`git checkout REV -- tests`, `git restore --source=REV tests` and `git stash push --
+        tests` put tests back to another revision or set them aside; from `HEAD` or the index
+        (`git checkout -- tests`, `git restore tests`) they leave a clean tree as it is."""
+        words = list(args)
+        i = 0
+        while i < len(words) and words[i].startswith("-"):
+            i += 2 if words[i] in _GIT_VALUED else 1
+        if i >= len(words):
+            return None
+        sub, rest = words[i], words[i + 1 :]
+        if "--" in rest:
+            before, after = rest[: rest.index("--")], rest[rest.index("--") + 1 :]
+        else:
+            before, after = (
+                [a for a in rest if a.startswith("-")],
+                [a for a in rest if not a.startswith("-")],
+            )
+        if sub == "checkout":
+            if any(a in ("-b", "-B", "--orphan") for a in before):
+                return None
+            names = [a for a in before if not a.startswith("-")]
+            if "--" not in rest and len(after) > 1:
+                names, after = after[:1], after[1:]
+            rev = names[0] if names else None
+            paths = after
+            if rev is None or rev in _REVS_KEPT:
+                return None
+        elif sub == "restore":
+            source = next((a.split("=", 1)[1] for a in before if a.startswith("--source=")), None)
+            source = source or next(
+                (rest[k + 1] for k, a in enumerate(rest[:-1]) if a in ("-s", "--source")), None
+            )
+            if source is None or source in _REVS_KEPT:
+                return None
+            paths = [a for a in after if a != source]
+        elif sub in ("stash", "push", "save"):
+            paths = after
+        else:
+            return None
+        hit = next((w for w in paths if self._near(w, where)), None)
+        return _Hit(hit, "rewrites") if hit else None
+
+    def _writing_code(self, args: Sequence[str], where: _Dir) -> str | None:
+        """`python -c`, `node -e`, `ruby -e`: code that opens a test file for writing, copies
+        over it or truncates it (`open('tests/test_a.py', 'w')`)."""
+        for i, arg in enumerate(args[:-1]):
+            if not _CODE_FLAG.match(arg):
+                continue
+            for pattern, appends in _WRITING_CALLS:
+                for m in pattern.finditer(args[i + 1]):
+                    word = m["d"] or m["s"]
+                    if self._near(word, where, True):
+                        return _Hit(word, "appends to" if appends else "rewrites")
         return None
 
     def _one_liner(self, args: Sequence[str], where: _Dir) -> str | None:
@@ -800,7 +1096,9 @@ class _BaseTests:
             return [] if top is None else [top]
         return self._suffixed(root)
 
-    def _found(self, args: Sequence[str], where: _Dir, recursive: bool = False) -> str | None:
+    def _found(
+        self, args: Sequence[str], where: _Dir, recursive: bool = False, how: str = "removes"
+    ) -> str | None:
         """`find ROOT ... -delete`, `-exec rm`, or `| xargs rm`: a root that holds base tests the
         name, type and depth filters do not rule out. `-delete` removes files (and empty
         directories), `rm -r` and its kin whole directories, a plain `rm` files. A negation,
@@ -826,6 +1124,9 @@ class _BaseTests:
                     deletes, recursive = True, recursive or _recursive_removal(cmd[1:])
                 elif cmd and posixpath.basename(cmd[0]) in _REMOVERS:
                     deletes, recursive = True, recursive or _recursive_removal(cmd)
+                elif writes := _in_place_how(cmd, exec_=True):
+                    deletes = True
+                    how = how if "-delete" in expr else writes
         if not deletes:
             return None
         names = [expr[j + 1] for j, t in enumerate(expr[:-1]) if t in ("-name", "-iname")]
@@ -857,7 +1158,7 @@ class _BaseTests:
                     if folded:
                         name = name.lower()
                     if all(fnmatchcase(name, n.lower() if folded else n) for n in names):
-                        return root
+                        return _Hit(root, how)
         return None
 
 
@@ -1045,6 +1346,14 @@ def _make_exports(text: str | None) -> dict[str, str]:
     return out
 
 
+def removal_reason(statement: str, found: str) -> str:
+    """Why a statement that touches the base test path `found` is a finding: it removes it,
+    rewrites it, or appends to it (a warning: nothing is taken away)."""
+    how = getattr(found, "how", "removes")
+    why = f"it now {_HOW[how]} (`{statement}` {how} `{found}`, which holds the project's tests)"
+    return _Warn(why) if how in ("appends to", "copies into") else why
+
+
 def _removed_tests(
     base: Sequence[str],
     cand: Sequence[str],
@@ -1068,6 +1377,7 @@ def _removed_tests(
             for step in tests.steps(_RECIPE_PREFIX.sub("", ln, count=1), _Dir(start))
         ]
 
+    warned: str | None = None
     for start in cwds:
         seen = Counter(placed(base, start))
         for statement, where in placed(cand, start):
@@ -1076,11 +1386,11 @@ def _removed_tests(
                 continue
             found, _ = tests.scan(statement, where)
             if found is not None:
-                return (
-                    f"it now removes tests (`{statement}` removes `{found}`,"
-                    " which holds the project's tests)"
-                )
-    return None
+                why = removal_reason(statement, found)
+                if not isinstance(why, _Warn):
+                    return why
+                warned = warned or why
+    return warned
 
 
 def neutering_reason(
@@ -1140,10 +1450,11 @@ def neutering_reason(
         return f"it now passes {flag}"
     if narrowed := narrowed_selection(_statements(base_e, script), _statements(cand_e, script)):
         return f"it now selects fewer paths ({narrowed})"
-    if tests is not None and (
-        gone := _removed_tests(base_c, cand_c, tests, cwds, recipe=recipe and not script)
-    ):
-        return gone
+    gone = None
+    if tests is not None:
+        gone = _removed_tests(base_c, cand_c, tests, cwds, recipe=recipe and not script)
+        if gone and not isinstance(gone, _Warn):
+            return gone
     if swallowed := _new_swallow(base_c, cand_c, script, ctx, known, base_texts):
         return f"a failure is now swallowed (`{swallowed}`)"
     if script and early_exit("\n".join(cand_c)) and not early_exit("\n".join(base_c)):
@@ -1157,6 +1468,8 @@ def neutering_reason(
         base_c, ctx, known[0], None, side[0]
     ):
         return "it runs fewer steps than before"
+    if gone:
+        return gone
     if _autoload_sets(_statements(cand_c, script)) > _autoload_sets(_statements(base_c, script)):
         return _Warn(_AUTOLOAD_WHY)
     if _unreadable_sets(_statements(cand_c, script)) > _unreadable_sets(

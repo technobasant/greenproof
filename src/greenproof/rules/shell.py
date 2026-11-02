@@ -30,6 +30,7 @@ import re
 import shlex
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
+from functools import lru_cache
 
 # What a command-position word is, by the kind of check it runs.
 _SIMPLE_CHECKERS = {
@@ -343,6 +344,7 @@ _SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 _VAR = re.compile(r"^\$(?:\((?P<a>[^()]*)\)|\{(?P<b>[^{}]*)\}|(?P<c>[A-Za-z_]\w*))$")
 
 
+@lru_cache(maxsize=4096)
 def _cmd_name(token: str) -> str:
     """A command word as the tool it names: the basename, lowercased, with `$(PYTHON)`,
     `${PYTHON}` and `$PYTHON` (a Makefile or shell variable) read as `python`."""
@@ -355,12 +357,19 @@ def _cmd_name(token: str) -> str:
     return base.lower()
 
 
-def _tokens(statement: str) -> list[str]:
+@lru_cache(maxsize=8192)
+def _split_cached(statement: str) -> tuple[str, ...]:
     try:
         words = shlex.split(statement, posix=True)
     except ValueError:
-        return statement.split()
-    return _join_substitutions(words)
+        return tuple(statement.split())
+    return tuple(_join_substitutions(words))
+
+
+def _tokens(statement: str) -> list[str]:
+    """The words of a statement. A script that repeats a statement (a long `&&` chain) splits it
+    once; each caller gets a list of its own."""
+    return list(_split_cached(statement))
 
 
 def _join_substitutions(words: list[str]) -> list[str]:
