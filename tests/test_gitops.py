@@ -132,6 +132,63 @@ def test_base_is_head_on_the_default_branch(repo: Repo) -> None:
     assert base.sha == repo.head()
 
 
+def _clone_on_default(tmp_path: Path) -> tuple[Repo, str]:
+    """A clone of a repo whose default branch `main` tracks origin/main; (clone, pushed sha)."""
+    upstream = make_repo(tmp_path / "upstream")
+    pushed = upstream.head()
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(upstream.path), str(clone)], check=True)
+    work = Repo(clone)
+    work.git("config", "user.name", "Test")
+    work.git("config", "user.email", "t@example.com")
+    return work, pushed
+
+
+def test_base_on_the_default_branch_includes_unpushed_commits(tmp_path: Path) -> None:
+    work, pushed = _clone_on_default(tmp_path)
+    work.write("a.py", "a = 1\n")
+    work.commit("committed, not pushed")
+    base = gitops.resolve_base(work.path, None, {})
+    assert (base.ref, base.sha, base.note) == ("origin/main", pushed, "")
+
+
+def test_base_on_the_default_branch_is_head_when_everything_is_pushed(tmp_path: Path) -> None:
+    work, pushed = _clone_on_default(tmp_path)  # what CI sees on a push to main
+    base = gitops.resolve_base(work.path, None, {})
+    assert (base.ref, base.sha) == ("origin/main", pushed) and base.sha == work.head()
+
+
+def test_base_on_the_default_branch_ahead_and_behind_is_the_fork_point(tmp_path: Path) -> None:
+    work, pushed = _clone_on_default(tmp_path)
+    work.write("a.py", "a = 1\n")
+    work.commit("local")
+    other = Repo(tmp_path / "upstream")
+    other.write("b.py", "b = 1\n")
+    other.commit("remote advanced")
+    work.git("fetch", "-q", "origin")
+    assert gitops.resolve_base(work.path, None, {}).sha == pushed
+
+
+def test_base_on_the_default_branch_without_an_upstream_notes_the_limit(repo: Repo) -> None:
+    base = gitops.resolve_base(repo.path, None, {})
+    assert (base.ref, base.sha) == ("HEAD", repo.head())
+    assert "no upstream" in base.note and "--base REF" in base.note
+
+
+def test_base_on_the_default_branch_with_a_dangling_upstream_is_head(tmp_path: Path) -> None:
+    work, _ = _clone_on_default(tmp_path)
+    work.git("config", "branch.main.merge", "refs/heads/gone")
+    base = gitops.resolve_base(work.path, None, {})
+    assert base.ref == "HEAD" and "no upstream" in base.note
+
+
+def test_base_explicit_still_beats_the_upstream(tmp_path: Path) -> None:
+    work, pushed = _clone_on_default(tmp_path)
+    work.write("a.py", "a = 1\n")
+    second = work.commit("committed, not pushed")
+    assert gitops.resolve_base(work.path, second, {}).sha == second
+
+
 def test_base_is_merge_base_on_a_feature_branch(repo: Repo) -> None:
     fork_point = repo.head()
     repo.git("checkout", "-q", "-b", "feature")

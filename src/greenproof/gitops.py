@@ -33,6 +33,7 @@ _FETCH_HINT = (
 class Base:
     ref: str
     sha: str
+    note: str = ""  # a line for the report when the base choice limits what is checked
 
 
 @dataclass(frozen=True)
@@ -320,11 +321,32 @@ def resolve_base(repo: Path, explicit: str | None, env: Mapping[str, str]) -> Ba
         )
     head = head_sha(repo)
     if current_branch(repo) == default.removeprefix("origin/"):
-        return Base("HEAD", head)
+        return _default_branch_base(repo, head)
     proc = git(repo, "merge-base", "HEAD", default, check=False)
     if proc.returncode != 0 or not _out(proc):
         raise UsageError(f"no merge base between HEAD and {default}. {_FETCH_HINT}")
     return Base(default, _out(proc))
+
+
+NO_UPSTREAM_NOTE = (
+    "on the default branch with no upstream: only uncommitted changes are checked; "
+    "pass --base REF to include commits"
+)
+
+
+def _default_branch_base(repo: Path, head: str) -> Base:
+    """On the default branch: the fork point from its upstream, else HEAD (uncommitted only).
+
+    The upstream is what the branch will be pushed to, so commits not yet pushed are part of
+    the change under test. When HEAD equals the upstream (CI on a push) the base is HEAD.
+    """
+    name = git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False)
+    upstream = _out(name) if name.returncode == 0 else ""
+    if upstream and rev_parse_commit(repo, upstream):
+        proc = git(repo, "merge-base", "HEAD", upstream, check=False)
+        if proc.returncode == 0 and _out(proc):
+            return Base(upstream, _out(proc))
+    return Base("HEAD", head, NO_UPSTREAM_NOTE)
 
 
 def diff_name_status(repo: Path, base_sha: str, tree: str) -> list[DiffEntry]:

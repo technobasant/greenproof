@@ -114,7 +114,10 @@ def nothing_to_verify_report(opts: CheckOptions, candidate: Candidate) -> Report
         base=candidate.base,
         tree=candidate.tree,
         dirty=candidate.tree != gitops.head_tree(candidate.repo),
-        notes=["nothing to verify: the candidate tree equals the base tree"],
+        notes=[
+            "nothing to verify: the candidate tree equals the base tree",
+            *([candidate.base.note] if candidate.base.note else []),
+        ],
     )
     return report.finish()
 
@@ -160,6 +163,8 @@ def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
         policy_source=loaded.source,
         policy_sha256=loaded.sha256,
     )
+    if base.note:
+        report.notes.append(base.note)
     if readonly:
         report.notes.append(READONLY_NOTE)
 
