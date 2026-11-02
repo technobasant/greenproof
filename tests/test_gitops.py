@@ -183,7 +183,7 @@ def test_base_on_the_default_branch_with_a_dangling_upstream_is_head(tmp_path: P
 
 
 def test_base_explicit_still_beats_the_upstream(tmp_path: Path) -> None:
-    work, pushed = _clone_on_default(tmp_path)
+    work, _pushed = _clone_on_default(tmp_path)
     work.write("a.py", "a = 1\n")
     second = work.commit("committed, not pushed")
     assert gitops.resolve_base(work.path, second, {}).sha == second

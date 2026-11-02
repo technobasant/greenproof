@@ -212,5 +212,5 @@ def test_default_branch_without_upstream_notes_that_only_uncommitted_changes_cou
     math_repo: Repo, run, tmp_path: Path
 ) -> None:
     math_repo.write("app.py", "def total():\n    return 100  # edited\n")
-    code, _, data = check(run, math_repo, tmp_path)
+    _, _, data = check(run, math_repo, tmp_path)
     assert any("no upstream" in n and "--base REF" in n for n in data["notes"])

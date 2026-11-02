@@ -340,7 +340,9 @@ def _default_branch_base(repo: Path, head: str) -> Base:
     The upstream is what the branch will be pushed to, so commits not yet pushed are part of
     the change under test. When HEAD equals the upstream (CI on a push) the base is HEAD.
     """
-    name = git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False)
+    name = git(
+        repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False
+    )
     upstream = _out(name) if name.returncode == 0 else ""
     if upstream and rev_parse_commit(repo, upstream):
         proc = git(repo, "merge-base", "HEAD", upstream, check=False)
