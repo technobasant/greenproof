@@ -140,7 +140,9 @@ class Seg:
 @dataclass(frozen=True)
 class Swallow:
     line: int
-    kind: str  # "or", "exit0", "true", "set+e", "early", "noerr", "bg", "trap", "dropped"
+    kind: (
+        str  # "or", "exit0", "true", "set+e", "early", "noerr", "andlist", "bg", "trap", "dropped"
+    )
     text: str
     reason: str
 
@@ -1184,23 +1186,49 @@ def _syntax_only(toks: list[str]) -> bool:
     return False
 
 
-def _shell_c(toks: list[str]) -> str | None:
-    """The script string of `sh|bash -c "..."` (`-lc`, `-ec`, `-e -c` too), else None."""
+def _shell_c_parts(toks: list[str]) -> tuple[str, bool, bool] | None:
+    """The script string of `sh|bash -c "..."` (`-lc`, `-ec`, `-e -c`, `-eo pipefail -c` too),
+    with whether the options before it turn on errexit and pipefail; else None."""
     if not toks or _cmd_name(toks[0]) not in _SHELLS:
         return None
     if _syntax_only(toks):
         return None
+    errexit = pipefail = False
     i = 1
     while i < len(toks) and toks[i][:1] in "-+" and len(toks[i]) > 1:
-        if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", toks[i]):
-            return toks[i + 1] if i + 1 < len(toks) else None
-        i += 2 if toks[i] in ("-o", "+o") else 1
+        tok = toks[i]
+        if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", tok):
+            if i + 1 >= len(toks):
+                return None
+            return toks[i + 1], errexit or "e" in tok, pipefail
+        if re.fullmatch(r"[-+][A-Za-z]+", tok):
+            on = tok[0] == "-"
+            errexit = on if "e" in tok else errexit
+            if tok.endswith("o"):  # `-o NAME`, also the last letter of `-eo NAME`
+                name = toks[i + 1] if i + 1 < len(toks) else ""
+                errexit = on if name == "errexit" else errexit
+                pipefail = on if name == "pipefail" else pipefail
+                i += 1
+        i += 1
     return None
+
+
+def _shell_c(toks: list[str]) -> str | None:
+    """The script string of `sh|bash -c "..."`, else None."""
+    parts = _shell_c_parts(toks)
+    return parts[0] if parts else None
 
 
 def shell_c_body(text: str, defs: Mapping[str, str] | None = None) -> str | None:
     """The script a `bash -c "..."` statement runs (wrappers like `sudo` allowed), else None."""
     return _shell_c(_strip(_tokens(text), defs))
+
+
+def shell_c_shell(
+    text: str, defs: Mapping[str, str] | None = None
+) -> tuple[str, bool, bool] | None:
+    """`shell_c_body` with whether the shell it starts has errexit and pipefail on."""
+    return _shell_c_parts(_strip(_tokens(text), defs))
 
 
 def _command(text: str, defs: Mapping[str, str] | None, env: EnvUse) -> list[str]:
@@ -1780,6 +1808,7 @@ def _flat_swallows(
     state_errexit = errexit
     state_pipefail = pipefail
     unguarded = [False] * len(segs)
+    under_e = [False] * len(segs)  # a check statement that runs with errexit on
     last_ok = -1  # the last check that could fail with nothing turning that into a failure
     last_read = -1  # the last statement before the current one that reads a status
     first_exit: Seg | None = None
@@ -1876,13 +1905,31 @@ def _flat_swallows(
         elif early and first_exit is not None and not exit_reported and check(i):
             exit_reported = True
             add(first_exit, "early", "`exit 0` comes before the checks, so none of them runs")
+        under_e[i] = state_errexit
         if check(i) and not _is_zero_exit(text) and not (state_errexit or chain_guard[chain_of[i]]):
             last_ok = i
             unguarded[i] = True
         if reads[i]:
             last_read = i
+    depth = _block_depth(segs)
+    for i, seg in enumerate(segs):
+        if (
+            check(i)
+            and under_e[i]
+            and _and_list_swallowed(segs, i, depth, chain_members[chain_of[i]])
+            and not chain_guard[chain_of[i]]
+        ):
+            label = kinds[i] or "check"
+            out.append(
+                Swallow(
+                    seg.line,
+                    "andlist",
+                    label,
+                    f"the {label} command `{_short(seg.text)}` is not the last command of its"
+                    " `&&` list, so `set -e` does not stop on its failure and more commands follow",
+                )
+            )
     if strict_status:
-        depth = _block_depth(segs)
         for i, seg in enumerate(segs):
             if not (check(i) and unguarded[i]) or depth[i] or reads[i]:
                 continue
@@ -1910,19 +1957,132 @@ def _flat_swallows(
     return out
 
 
+_LIST_HEAD = re.compile(r"^(?:if|elif|while|until)\b")
+_LAST_STATUS = re.compile(r"\$\?|\$\{\?|PIPESTATUS")
+
+
+def _and_list_swallowed(segs: Sequence[Seg], i: int, depth: list[int], members: list[int]) -> bool:
+    """Whether `segs[i]`, a check under `set -e`, is in an `&&` list but not its last command
+    (errexit does not stop on a failure there) and a statement of the same block follows the list
+    whose status read is not `$?`: the failure is then dropped. The condition of an `if` or
+    `while` is read by it, and a list that ends `|| exit 1` is judged by the `||` rule."""
+    if i == members[-1] or _LIST_HEAD.match(segs[members[0]].text):
+        return False
+    if any(segs[j].sep != "&&" for j in members if j > i):
+        return False
+    level = depth[i]  # the block the walk is in; its `else` and `elif` branches are not reached
+    skipping = False
+    for k in range(members[-1] + 1, len(segs)):
+        text = segs[k].text
+        kw = _KEYWORD.match(text)
+        word = _first_word(kw["rest"] if kw else text)
+        if depth[k] < level:
+            level, skipping = depth[k], False
+        elif level and depth[k] == level and (word == "elif" or (kw and kw["kw"] == "else")):
+            skipping = True
+        if skipping or word in ("fi", "done", "esac"):
+            continue
+        return not (_LAST_STATUS.search(text) or _is_failing_exit(kw["rest"] if kw else text))
+    return False
+
+
 _RC_SET = re.compile(r"^(?P<v>[A-Za-z_]\w*)=(?:\$\?|\"\$\?\"|\$\{\?\})$")
 _RC_NONZERO = re.compile(r"^(?P<v>[A-Za-z_]\w*)=\"?[1-9]\d*\"?$")
 
 
+def _rc_operand(var: str) -> str:
+    """A pattern for the ways a script reads `$var`: `$v`, `${v}`, `${v:-0}`, `${v-0}` and
+    `$((v))`, optionally quoted."""
+    v = re.escape(var)
+    return rf"\"?(?:\${v}\b|\$\{{{v}(?::?-[^}}]*)?\}}|\$\(\(\s*{v}\s*\)\))\"?"
+
+
+def _rc_test(text: str, var: str) -> str | None:
+    """`nonzero` for a test that holds when `$var` is not 0 (`[ "$rc" -ne 0 ]`, `[[ $rc != 0 ]]`,
+    `test $rc -gt 0`), `zero` for one that holds when it is, None for any other test."""
+    m = re.fullmatch(
+        rf"(?:\[\[?|test)\s+{_rc_operand(var)}\s+(?P<op>-ne|-gt|!=|-eq|==|=)\s+\"?0\"?"
+        r"(?:\s*\]\]?)?",
+        _KEYWORD.sub(r"\g<rest>", text.strip()),
+    )
+    if not m:
+        return None
+    return "zero" if m["op"] in ("-eq", "==", "=") else "nonzero"
+
+
+def _rc_exits(text: str, var: str, last: bool = False) -> bool:
+    """Whether `text` ends the script with a failure: `exit` of `$var` (with or without a
+    default), `exit N` for a literal N that is not 0, and `false` when nothing runs after it."""
+    t = _KEYWORD.sub(r"\g<rest>", text.strip())
+    if re.fullmatch(rf"exit\s+{_rc_operand(var)}", t):
+        return True
+    m = _EXIT.match(t)
+    if m and m["word"] == "exit" and m["code"] is not None:
+        return re.fullmatch(r"[1-9]\d*", _unquote(m["code"])) is not None
+    return last and t == "false"
+
+
+def _rc_branches(
+    segs: Sequence[Seg], j: int, depth: list[int]
+) -> tuple[list[str], list[str]] | None:
+    """The statements that always run in the `then` and the `else` branch of the `if` at
+    `segs[j]`, each branch's own level only; None for an `if` with `elif`, or one that does not
+    close."""
+    branches: tuple[list[str], list[str]] = ([], [])
+    cur = 0
+    for k in range(j + 1, len(segs)):
+        text = segs[k].text
+        kw = _KEYWORD.match(text)
+        word = _first_word(kw["rest"] if kw else text)
+        if word == "fi" and depth[k] == depth[j]:
+            return branches
+        if depth[k] != depth[j] + 1:
+            continue
+        if word == "elif":
+            return None
+        if kw and kw["kw"] in ("then", "else"):
+            cur = 0 if kw["kw"] == "then" else 1
+            text = kw["rest"]
+        elif segs[k].sep not in ("", ";", "\n"):
+            continue  # after `&&` or `||`: conditional
+        if text.strip():
+            branches[cur].append(text)
+    return None
+
+
 def _rc_kept(segs: Sequence[Seg], i: int, var: str) -> bool:
-    """Whether the script, after `segs[i]` saved a status in `$var`, goes on to `exit $var` at
-    its top level with no later statement assigning `var` in between."""
+    """Whether the script, after `segs[i]` saved a status in `$var`, ends non-zero when `$var`
+    is: `exit $var` (also `exit ${var:-0}`, `exit $((var))`) at its top level or last in a
+    top-level `{ ...; }` group, a top-level `if [ "$var" -ne 0 ]; then exit "$var"; fi` (or `exit
+    1`), or `[ "$var" -eq 0 ] || exit "$var"`, with no later statement assigning `var` in
+    between. A test that cannot be read does not count."""
     top = _top_level(segs)
-    exit_rc = re.compile(rf"^exit\s+\"?\$\{{?{re.escape(var)}\}}?\"?$")
+    depth = _block_depth(segs)
     reset = re.compile(rf"^{re.escape(var)}=")
     for j in range(i + 1, len(segs)):
-        if top[j] and exit_rc.match(segs[j].text.strip()):
-            return True
+        text = segs[j].text.strip()
+        if top[j]:
+            if re.fullmatch(rf"exit\s+{_rc_operand(var)}", text):
+                return True
+            inner = group_inner(text) if text.startswith("{") else None
+            tail = split_segments(inner.strip(" ;")) if inner else []
+            if tail and re.fullmatch(rf"exit\s+{_rc_operand(var)}", tail[-1].text.strip()):
+                return True
+            joined = j + 1 < len(segs) and segs[j + 1].sep in ("&&", "||")
+            if joined and (pol := _rc_test(text, var)):
+                want = "nonzero" if segs[j + 1].sep == "&&" else "zero"
+                if pol == want and _rc_exits(segs[j + 1].text, var, j + 2 == len(segs)):
+                    return True
+            elif _first_word(text) == "if" and not joined and (pol := _rc_test(text[2:], var)):
+                if (branches := _rc_branches(segs, j, depth)) is not None:
+                    fi = next(
+                        k
+                        for k in range(j + 1, len(segs))
+                        if segs[k].text == "fi" and depth[k] == depth[j]
+                    )
+                    for stmt in branches[0 if pol == "nonzero" else 1]:
+                        if _rc_exits(stmt, var, fi == len(segs) - 1):
+                            return True
         if segs[j].sep in ("", ";", "\n") and reset.match(_KEYWORD.sub(r"\g<rest>", segs[j].text)):
             return False
     return False
@@ -2032,21 +2192,23 @@ def find_swallows(
         scope=scope,
     )
     for seg in split_segments(script, scope, all_arms=True):
-        body = shell_c_body(seg.text, defs)
-        if body is None:
+        inner = shell_c_shell(seg.text, defs)
+        if inner is None:
             continue
+        body, errexit_c, pipefail_c = inner
         out.extend(
             replace(w, line=seg.line + w.line - 1)
             for w in _flat_swallows(
                 body,
                 extra,
                 opaque=False,
-                errexit=False,
+                errexit=errexit_c,
                 early=True,
                 scripts=scripts,
                 make_check=make_check,
-                strict_status=True,
+                strict_status=not errexit_c,
                 defs=defs,
+                pipefail=pipefail_c,
             )
         )
     return out
