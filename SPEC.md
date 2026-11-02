@@ -586,7 +586,22 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `--disable-plugin-autoload`: `VAR=1 pytest`, `env VAR=1 pytest`, `export VAR=1` in a script
   or recipe, or in a Makefile or justfile `export VAR = 1` (also `VAR = 1` with `export VAR`,
   `.EXPORT_ALL_VARIABLES:`, `set export` or a target-specific `export`); an empty value, `env
-  -u` and an assignment the base already had say nothing, and a CI `env:` is `ci.tampered`'s. A nested `package.json` is a `warn`, not
+  -u` and an assignment the base already had say nothing, and a CI `env:` is `ci.tampered`'s.
+  Two variables hand a runner flags and are read as them: `PYTEST_ADDOPTS` (to `pytest`) and
+  `GOFLAGS` (to `go test`). An assignment in front of the command (`PYTEST_ADDOPTS='-k fast'
+  pytest`, `env X=...`, `cross-env X=...`, `dotenv -v X=...`) is spliced in after the runner,
+  and the selection-flag and path judgment above then applies to it, so `-k fast` blocks and
+  `-q` or `-mod=mod` passes. An `export` in a script or recipe, and a Makefile or justfile
+  `export VAR = ...` (or `VAR = ...` with `export VAR`), apply to the commands after them in
+  the same body until an `unset`. An env file a dotenv-style wrapper on a policy command loads
+  (`dotenv -e F`, `dotenv -f F run`, `dotenvx run -f F`, `env-cmd -f F`, `op run --env-file F`;
+  `.env` when it names none, and a wrapper that names none is taken to load any `.env*` file
+  that changed) that gains one of the two variables (or the autoload variable) is judged as
+  if its assignment stood in front of the command. A value greenproof cannot read (`$(...)`,
+  backticks, `${VAR}`) that is new or changed is a `warn`. A missing env file is no finding:
+  an env file is read only when it is in the repo. Environment variables considered and not
+  read: `JEST_*`, `NODE_OPTIONS`, `RUSTFLAGS`, `CI`, `PYTEST_PLUGINS`, `PYTEST_CURRENT_TEST`,
+  `COVERAGE_*`, and a CI `env:` block (`ci.tampered`). A nested `package.json` is a `warn`, not
   a block, only when it is known that no policy command reaches it: every policy command is a
   plain root package-manager run (`npm test`, `pnpm run x`, `yarn test`, `bun test`) with no
   workspace, filter, prefix or directory option, and the root scripts it reaches contain no
@@ -609,7 +624,12 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   prefix on a line blocks only when the line is a check (`-rm -rf build` is fine);
 - a swallowed failure in any of those scripts or recipes, found by the shared shell reader.
   A *check* is a statement whose command, in command position (after environment
-  assignments and wrappers such as `uv run`, `python -m`, `npx`, `time`, `sudo`), is a known
+  assignments and wrappers such as `uv run`, `python -m`, `npx`, `time`, `sudo`, and the
+  env and coverage wrappers `cross-env`, `cross-env-shell` (its tail is a shell string),
+  `env-cmd`, `dotenv` (dotenv-cli), `dotenv run`, `dotenvx run`, `doppler run`, `op run`,
+  `infisical run`, `nyc` and `c8`, whose options are skipped, a value-taking one with its
+  value: `nyc --reporter lcov jest` is `jest`, and a word after the options that is no runner
+  makes it no check, so `echo -- pytest` and `cross-env CI=1 echo jest` are not), is a known
   test runner, linter, type checker, or a policy command; a runner name that is only an
   argument (`pip install pytest-xdist`, `grep pytest`, `echo pytest`), `--version` and
   `--help`, and `make` with `-C` or `-f` are not checks. A swallow blocks only on a check:
