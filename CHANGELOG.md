@@ -15,6 +15,22 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   section as the notes and the built files attached.
 - Link references at the end of the CHANGELOG for each version and for `[Unreleased]`.
 
+### Changed
+
+- `ci.tampered` and `runner.tampered` block only when a change weakened what checks the code.
+  A swallow (`|| true`, `; exit 0`, `set +e`) counts only after a test, lint or type-check
+  command, so `rm -rf build || true` and `pip install x || true` are fine; GitHub `run:` steps
+  are read as `bash -e`; folded `>` scalars and heredoc bodies are read as YAML and the shell
+  do. CI is judged across all workflow files: splitting a workflow into a reusable one passes,
+  `paths` and `paths-ignore` are evaluated against the tree (excluding docs or meta files
+  passes), and branch, tag and type filters warn. New blocks: `--collect-only`,
+  `--passWithNoTests`, and `exit 0` before the first check in a CI step.
+- A Go `TestMain` is read by its declared parameter name, and a conditional `os.Exit(0)` is a
+  warning. Makefile recipes follow prerequisites and skip `define` blocks, and `run-s`,
+  `run-p` and `npm-run-all` are the same steps as chained `npm run`.
+- When the upstream exists but shares no history with HEAD (a shallow clone), the base is an
+  error with the `fetch-depth: 0` hint instead of a silent fall back to `HEAD`.
+
 ## [0.2.0] - 2026-11-02
 
 ### Added

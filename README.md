@@ -144,8 +144,11 @@ verdict: fail (exit 1)
    on a GitHub pull request, the merge base with the pull request's base branch; the
    revision recorded by `greenproof session-start` for this worktree; the merge base with
    the default branch (`origin/HEAD`'s target, else `main`, else `master`). If HEAD is the
-   default branch, only uncommitted changes are compared. A base it cannot resolve, such
-   as in a shallow clone, is exit 4 with the fix (`fetch-depth: 0`).
+   default branch, the base is the merge base with its upstream, so commits not yet pushed
+   are checked along with uncommitted changes; with no upstream, or when HEAD equals it,
+   only uncommitted changes are checked (the report says so; pass `--base REF` to include
+   commits). A base it cannot resolve, such as an upstream with no shared history in a
+   shallow clone, is exit 4 with the fix (`fetch-depth: 0`).
 3. **Policy from the base.** It reads `.greenproof.toml` with `git show <base>:.greenproof.toml`.
    The commands, test globs and rule severities for the run all come from there. If the
    candidate's policy differs from the base's (compared as parsed TOML, so comment and
@@ -217,8 +220,8 @@ example `"tests.expected_changed" = "off"`.
 | `tests.weakened` | block | a test checks less than before: fewer assertions, a weaker assertion, a wider tolerance, fewer parametrize cases, a vacuous or unreachable assertion, or one wrapped in a swallowing `try/except` |
 | `tests.expected_changed` | warn | the expected value in an assertion changed, with or without a code change (a test edited to match what the code returns) |
 | `suppress.added` | warn | an added line introduces a type, lint or coverage suppression |
-| `runner.tampered` | block | a change narrows or neuters how checks run: test selection, coverage thresholds, linter or type-checker strictness, test scripts, a conftest hook that rewrites outcomes |
-| `ci.tampered` | block | a CI workflow change removes or neuters a test or lint step, adds `continue-on-error`, `\|\| true` or `if: false`, or changes or removes the greenproof step (adding the first one is fine); a ref-only bump of the greenproof action is `warn` |
+| `runner.tampered` | block | a change narrows or neuters how checks run: test selection, coverage thresholds, linter or type-checker strictness, test scripts, a conftest hook that rewrites outcomes. A swallowed failure (`\|\| true`, `; exit 0`, `set +e`) blocks only when it follows a test, lint or type-check command: `rm -rf build \|\| true` is not one. A Go `TestMain` that always exits 0 is a block, a conditional exit is a `warn` |
+| `ci.tampered` | block | a CI workflow change removes or neuters a test or lint step (judged across all workflow files, so splitting one into a reusable workflow is fine), swallows a check's failure, adds `continue-on-error: true`, `if: false`, `--collect-only` or `--passWithNoTests`, an `exit 0` before the first check, or a selection flag, runs on fewer events, or hides a test or source file behind a `paths` or `paths-ignore` filter; or changes or removes the greenproof step (adding the first one is fine). Narrowed `branches`/`tags`/`types` filters, a selection flag chosen by `${{ matrix.* }}`, `continue-on-error: ${{ ... }}`, and fewer steps of a kind that still exists are `warn`, as is a ref-only bump of the greenproof action |
 | `static.parse_error` | warn | a changed Python, TOML, JSON or INI file does not parse, so line-level checks are used for it |
 | `tests.self_mocked` | warn | a test patches the same callable its assertions call, so it tests the mock |
 | `code.hardcoded` | warn | non-test code gains a literal lookup table or an equality branch on a literal that also appears in a test changed in the same diff (Python only) |
