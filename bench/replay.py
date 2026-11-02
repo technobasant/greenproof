@@ -1,11 +1,15 @@
 """Replay greenproof over a repository's history (SPEC section 12).
 
-    python bench/replay.py REPO [--n 200] [--out PATH.tsv] [--details]
+    python bench/replay.py REPO [--n 200] [--select tests|runner] [--command CMD]
+                           [--out PATH.tsv] [--details]
 
-For each of the last N first-parent, non-merge commits whose diff touches a test file, check
-out the parent in a temporary clone, commit a policy with empty commands as the base, set the
-index and worktree to the commit's tree, and run `greenproof check --checks static`. The
-original repository is only read: everything happens in a clone under the temp directory.
+For each of the last N first-parent, non-merge commits whose diff touches a test file (with
+`--select runner`: a CI workflow, a test-runner config or a shell script), check out the parent
+in a temporary clone, commit a policy as the base, set the index and worktree to the commit's
+tree, and run `greenproof check --checks static`. The policy has no commands unless `--command`
+names the test command, which lets the runner rules see the files that command runs; static
+checks never run it. The original repository is only read: everything happens in a clone under
+the temp directory.
 
 TSV columns: short sha, exit code, sorted `rule(severity)` list, check duration in ms,
 subject (70 characters). `--details` also writes, per blocked commit, every block finding.
@@ -18,18 +22,51 @@ import argparse
 import json
 import math
 import os
+import posixpath
+import re
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from greenproof.changeset import is_test_path
 
 POLICY = "version = 1\n"
+
+_CI_FILE = re.compile(
+    r"^(?:\.github/workflows/[^/]+\.ya?ml|\.gitlab-ci\.ya?ml|\.circleci/config\.ya?ml)$"
+)
+_RUNNER_NAMES = {
+    "package.json",
+    "Makefile",
+    "makefile",
+    "GNUmakefile",
+    "justfile",
+    "Justfile",
+    "noxfile.py",
+    "pyproject.toml",
+    "ruff.toml",
+    ".ruff.toml",
+    "pytest.ini",
+    "tox.ini",
+    "setup.cfg",
+    ".coveragerc",
+    "mypy.ini",
+    ".flake8",
+}
+
+
+def touches_runner(path: str) -> bool:
+    """A CI workflow, a file the runner rules read, or a shell script."""
+    name = posixpath.basename(path)
+    return bool(_CI_FILE.match(path)) or name in _RUNNER_NAMES or name.endswith((".sh", ".bash"))
+
+
 LAUNCH = "import sys; from greenproof.cli import main; sys.exit(main(sys.argv[1:]))"
 
 
@@ -67,10 +104,12 @@ def git(repo: Path, *args: str, check: bool = True) -> str:
     return proc.stdout
 
 
-def test_touching_commits(clone: Path, n: int) -> list[tuple[str, str]]:
-    """The last `n` first-parent, non-merge commits with a test file in their diff, newest
-    first, as (sha, subject). Renames are listed as a delete plus an add, so a test moved to a
-    path that is not a test still counts."""
+def touching_commits(
+    clone: Path, n: int, touches: Callable[[str], bool] = is_test_path
+) -> list[tuple[str, str]]:
+    """The last `n` first-parent, non-merge commits with a path in their diff that `touches`
+    accepts (default: a test file), newest first, as (sha, subject). Renames are listed as a
+    delete plus an add, so a test moved to a path that is not a test still counts."""
     out = git(
         clone,
         "-c",
@@ -94,24 +133,24 @@ def test_touching_commits(clone: Path, n: int) -> list[tuple[str, str]]:
             sha, _, subject = line[2:].partition("\t")
             head, touched = (sha, subject), False
         elif line and not touched:
-            touched = is_test_path(line)
+            touched = touches(line)
     if head and touched and len(commits) < n:
         commits.append(head)
     return commits
 
 
-def run_one(clone: Path, sha: str, work: Path) -> dict[str, Any]:
+def run_one(clone: Path, sha: str, work: Path, policy_text: str = POLICY) -> dict[str, Any]:
     parents = git(clone, "rev-list", "--parents", "-n", "1", sha).split()[1:]
     if not parents:
         return {"skipped": "root commit"}
     git(clone, "checkout", "-q", "-f", "--detach", parents[0])
     git(clone, "clean", "-fdxq")
     policy = clone / ".greenproof.toml"
-    policy.write_text(POLICY)
+    policy.write_text(policy_text)
     git(clone, "add", "-f", ".greenproof.toml")
     git(clone, "commit", "-q", "--allow-empty", "-m", "base")
     git(clone, "read-tree", "-u", "--reset", sha)
-    policy.write_text(POLICY)
+    policy.write_text(policy_text)
     report = work / "report.json"
     report.unlink(missing_ok=True)
     start = time.monotonic()
@@ -165,6 +204,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo", type=Path)
     parser.add_argument("--n", type=int, default=200)
+    parser.add_argument(
+        "--select",
+        choices=("tests", "runner"),
+        default="tests",
+        help="commits touching test files (default) or CI, runner config and shell scripts",
+    )
+    parser.add_argument(
+        "--command",
+        default="",
+        help="the base policy's [commands] test, so the runner rules see the files it runs",
+    )
     parser.add_argument("--out", type=Path, help="write the TSV here (default: stdout)")
     parser.add_argument("--details", action="store_true", help="also write PATH-details.txt")
     args = parser.parse_args(argv)
@@ -194,9 +244,13 @@ def main(argv: list[str] | None = None) -> int:
             check=True,
             capture_output=True,
         )
-        commits = test_touching_commits(clone, args.n)
+        policy_text = POLICY + (
+            f"\n[commands]\ntest = {json.dumps(args.command)}\n" if args.command else ""
+        )
+        touches = touches_runner if args.select == "runner" else is_test_path
+        commits = touching_commits(clone, args.n, touches)
         for index, (sha, subject) in enumerate(commits, 1):
-            result = run_one(clone, sha, work)
+            result = run_one(clone, sha, work, policy_text)
             if "skipped" in result:
                 continue
             scanned += 1

@@ -159,3 +159,44 @@ def test_replay_scans_test_commits_and_leaves_the_source_alone(tmp_path: Path) -
     assert "tests.weakened tests/test_shop.py:" in details
     assert repo.head() == head
     assert repo.git("status", "--porcelain") == status
+
+
+def test_replay_runner_mode_scans_runner_commits_with_the_given_command(tmp_path: Path) -> None:
+    makefile = "test:\n\tpytest -q\n"
+    repo = init_repo(tmp_path / "history")
+    repo.write("src/shop.py", "def refund(x):\n    return x - 1\n")
+    repo.write("tests/test_shop.py", BASE_TEST)
+    repo.write("Makefile", makefile)
+    repo.commit("base")
+    repo.write("Makefile", makefile.replace("\tpytest -q\n", "\t-pytest -q\n"))
+    repo.commit("ignore test failures")
+    repo.write("tests/test_shop.py", BASE_TEST.replace("== 99", "== 99 or True"))
+    repo.commit("loosen the check")
+    repo.write("Makefile", makefile + "\ndocs:\n\tmkdocs build\n")
+    repo.commit("add a docs target")
+
+    out = tmp_path / "replay.tsv"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPLAY),
+            str(repo.path),
+            "--select",
+            "runner",
+            "--command",
+            "make test",
+            "--out",
+            str(out),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    rows = [line.split("\t") for line in out.read_text().splitlines()]
+    # the test-only commit is not selected; the docs target is not run by `make test`
+    assert [(r[1], r[2], r[4]) for r in rows] == [
+        ("0", "-", "add a docs target"),
+        ("1", "runner.tampered(block)", "ignore test failures"),
+    ]

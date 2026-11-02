@@ -1406,10 +1406,13 @@ greenproof and use the dev dependencies; it never needs network access.
 - A test in `tests/` runs `bench/run.py` on all cases (marked slow if it exceeds 60 s with
   xdist) so the benchmark cannot rot.
 
-**Replay harness** `bench/replay.py REPO [--n 200] [--out PATH.tsv] [--details]`: on a
-temporary clone of REPO (never the original), for each of the last N first-parent,
-non-merge commits whose diff touches a file greenproof classifies as a test: check out the
-parent, commit a policy with empty commands as the base, set index and worktree to the
+**Replay harness** `bench/replay.py REPO [--n 200] [--select tests|runner] [--command CMD]
+[--out PATH.tsv] [--details]`: on a temporary clone of REPO (never the original), for each of
+the last N first-parent, non-merge commits whose diff touches a file greenproof classifies as
+a test (with `--select runner`: a CI workflow, a test-runner or tool config, a `package.json`,
+a Makefile or justfile, or a shell script): check out the parent, commit a policy as the base
+(no commands, or `[commands] test = CMD` with `--command`, so the runner rules see the files
+the command runs; static checks never run it), set index and worktree to the
 commit's tree with `git read-tree -u --reset <sha>`, rewrite the same policy file (so the
 base and candidate policies are equal), and run `greenproof check --checks static --base
 HEAD --no-cache --json`. TSV columns: short sha, exit code, sorted `rule(severity)` list,
