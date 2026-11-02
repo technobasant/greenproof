@@ -3,7 +3,8 @@
 PyYAML is not a dependency, so this is a small indentation reader for the two shapes the CI
 rule needs: `run:` scripts (single-line, `|` and `>` blocks) and the `on:` section (a scalar,
 a flow list or map, or a block mapping or list). Anything it cannot read yields None and the
-rule that wanted it says nothing rather than guessing.
+rule that wanted it says nothing rather than guessing: `triggers()` is None for anchors and
+aliases, a flow collection that does not close on its line, or anything else it cannot read.
 """
 
 from __future__ import annotations
@@ -13,7 +14,15 @@ from dataclasses import dataclass
 
 from greenproof.rules._common import split_lines
 
-FILTER_KEYS = ("paths", "paths-ignore", "branches-ignore")
+FILTER_KEYS = (
+    "paths",
+    "paths-ignore",
+    "branches",
+    "branches-ignore",
+    "tags",
+    "tags-ignore",
+    "types",
+)
 Triggers = dict[str, dict[str, list[str]]]
 
 
@@ -22,6 +31,7 @@ class Step:
     line: int  # 1-based line of the step's `- `
     run: str  # the script, "" when the step has no `run:`
     run_line: int  # 1-based file line of the script's first line
+    shell: str | None = None  # the step's own `shell:`
 
 
 def _indent(raw: str) -> int:
@@ -87,12 +97,71 @@ def _step(lines: list[str], start: int, stop: int) -> Step:
     first = lines[start]
     marker = re.match(r"^(\s*-\s+)", first)
     col = len(marker.group(1)) if marker else _indent(first) + 2
+    run: tuple[str, int] | None = None
+    shell: str | None = None
     for k in range(start, stop):
         raw = lines[k]
         body = raw[col:] if k == start and marker else raw
-        if (k == start or _indent(raw) == col) and (m := re.match(r"^\s*run\s*:\s*(.*)$", body)):
-            return Step(start + 1, *_run_value(lines, k, stop, col, m.group(1)))
-    return Step(start + 1, "", start + 1)
+        if k != start and _indent(raw) != col:
+            continue
+        if run is None and (m := re.match(r"^\s*run\s*:\s*(.*)$", body)):
+            run = _run_value(lines, k, stop, col, m.group(1))
+        elif m := re.match(r"^\s*shell\s*:\s*(.+)$", body):
+            shell = _unquote(re.sub(r"\s+#.*$", "", m.group(1)))
+    return Step(start + 1, *(run or ("", start + 1)), shell)
+
+
+def default_shell(text: str, at: int) -> str | None:
+    """`defaults.run.shell` of the job that holds 1-based line `at`, else the workflow's."""
+    lines = split_lines(text)
+    jobs = next((k for k, raw in enumerate(lines) if re.match(r"^jobs\s*:", raw)), None)
+    starts: list[int] = []
+    if jobs is not None:
+        job_indent: int | None = None
+        for k in range(jobs + 1, len(lines)):
+            raw = lines[k]
+            if not raw.strip() or raw.lstrip().startswith("#"):
+                continue
+            if _indent(raw) == 0:
+                break
+            job_indent = _indent(raw) if job_indent is None else job_indent
+            if _indent(raw) == job_indent:
+                starts.append(k)
+    inside = max((k for k in starts if k < at), default=None)
+    found: dict[int | None, str] = {}
+    for k, raw in enumerate(lines):
+        m = re.match(r"^(\s*)defaults\s*:\s*$", raw)
+        if not m:
+            continue
+        for later in lines[k + 1 :]:
+            if later.strip() and not later.lstrip().startswith("#") and _indent(later) <= len(m[1]):
+                break
+            if sm := re.match(r"^\s*shell\s*:\s*(.+)$", later):
+                scope = None if not m[1] else max((j for j in starts if j <= k), default=None)
+                found[scope] = _unquote(re.sub(r"\s+#.*$", "", sm.group(1)))
+    return found.get(inside, found.get(None))
+
+
+def _fold(body: list[str]) -> str:
+    """A folded scalar (`>`): lines join with a space; blank lines and more-indented lines keep
+    their breaks, as YAML folds them."""
+    out: list[str] = []
+    previous: str | None = None
+    blanks = 0
+    for b in body:
+        if not b.strip():
+            blanks += 1
+            continue
+        if previous is None:
+            out.append(b)
+        else:
+            plain = not b[0].isspace() and not previous[0].isspace()
+            if blanks:
+                out.append("\n" * (blanks if plain else blanks + 1) + b)
+            else:
+                out.append((" " if plain else "\n") + b)
+        previous, blanks = b, 0
+    return "".join(out)
 
 
 def _run_value(lines: list[str], at: int, stop: int, col: int, value: str) -> tuple[str, int]:
@@ -109,6 +178,8 @@ def _run_value(lines: list[str], at: int, stop: int, col: int, value: str) -> tu
         while body and not body[-1].strip():
             body.pop()
         pad = min((_indent(b) for b in body if b.strip()), default=0)
+        if value[0] == ">":
+            return _fold([b[pad:] for b in body]), at + 2
         return "\n".join(b[pad:] for b in body), at + 2
     parts = [_unquote(value)]
     k = at + 1
@@ -119,6 +190,10 @@ def _run_value(lines: list[str], at: int, stop: int, col: int, value: str) -> tu
 
 
 # -- triggers --------------------------------------------------------------------------
+class _Unreadable(Exception):
+    """The `on:` section uses YAML this reader does not follow."""
+
+
 def _flow(text: str, i: int = 0) -> tuple[object, int]:
     """A flow scalar, `[...]` or `{...}` starting at `text[i]`; the value and the next index."""
     n = len(text)
@@ -135,7 +210,7 @@ def _flow(text: str, i: int = 0) -> tuple[object, int]:
             value, j = _flow(text, i)
             i = j if j > i else i + 1
             items.append(value)
-        return items, i
+        raise _Unreadable("flow list not closed")
     if i < n and text[i] == "{":
         mapping: dict[str, object] = {}
         i += 1
@@ -152,7 +227,7 @@ def _flow(text: str, i: int = 0) -> tuple[object, int]:
             if i < n and text[i] == ":":
                 item, i = _flow(text, i + 1)
             mapping[key] = item
-        return mapping, i
+        raise _Unreadable("flow map not closed")
     return _flow_scalar(text, i, ",]}")
 
 
@@ -170,6 +245,8 @@ def _flow_scalar(text: str, i: int, stops: str) -> tuple[str, int]:
 
 def _value(text: str) -> object:
     text = re.sub(r"\s+#.*$", "", text.strip())
+    if text[:1] in ("&", "*", "!", "|", ">"):
+        raise _Unreadable("anchor, alias, tag or block scalar")
     if text[:1] in ("[", "{"):
         return _flow(text)[0]
     return _unquote(text)
@@ -186,7 +263,9 @@ def _block(items: list[tuple[int, str]], pos: int) -> tuple[object, int]:
         return seq, pos
     mapping: dict[str, object] = {}
     while pos < len(items) and items[pos][0] == indent and not items[pos][1].startswith("-"):
-        key, _, rest = items[pos][1].partition(":")
+        key, colon, rest = items[pos][1].partition(":")
+        if not colon or key.strip() == "<<":
+            raise _Unreadable("not a key")
         pos += 1
         rest = rest.strip()
         if rest and not rest.startswith("#"):
@@ -211,7 +290,9 @@ def _strings(value: object) -> list[str]:
 def triggers(text: str) -> tuple[Triggers, int] | None:
     """The workflow's events with their path and branch filters, and the line of `on:`.
 
-    An absent `on:` is an empty set of events; None means the section could not be read.
+    An absent `on:` is an empty set of events; None means the section could not be read
+    reliably (an anchor or alias, a flow collection that does not close on its line, or
+    anything else this reader does not follow), and a rule that wanted it says nothing.
     """
     lines = _content_lines(text)
     for n, (number, indent, content) in enumerate(lines):
@@ -221,14 +302,22 @@ def triggers(text: str) -> tuple[Triggers, int] | None:
         rest = m.group(1).strip()
         raw: object
         if rest and not rest.startswith("#"):
-            raw = _value(rest)
+            try:
+                raw = _value(rest)
+            except _Unreadable:
+                return None
         else:
             body = [(ind, c) for _, ind, c in lines[n + 1 :]]
             end = next((k for k, (ind, _) in enumerate(body) if ind == 0), len(body))
             body = body[:end]
             if not body:
                 return {}, number
-            raw = _block(body, 0)[0]
+            try:
+                raw, used = _block(body, 0)
+            except _Unreadable:
+                return None
+            if used < len(body):
+                return None
         return _to_triggers(raw), number
     return {}, 1
 
