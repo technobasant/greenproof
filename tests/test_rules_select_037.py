@@ -84,8 +84,13 @@ def test_a_pytest_node_id_selects_only_part_of_its_file(tmp_path: Path) -> None:
 
 def test_pytest_from_a_subdirectory_is_read_from_there(tmp_path: Path) -> None:
     files = {"backend/tests/test_a.py": PY}
+    assert (
+        run_make(tmp_path, "cd backend && pytest tests", "cd backend && pytest -q tests", files)
+        == "pass"
+    )
+    # one test file that is every test file is still a hand-picked list
     cand = "cd backend && pytest tests/test_a.py"
-    assert run_make(tmp_path, "cd backend && pytest tests", cand, files) == "pass"
+    assert run_make(tmp_path / "p", "cd backend && pytest tests", cand, files) == "block"
 
 
 GO = {
