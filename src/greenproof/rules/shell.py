@@ -2052,6 +2052,23 @@ def _node_or_mocha(word: str, files: Sequence[str], recursive: bool) -> set[str]
     return out
 
 
+def _pins(family: str, run: _Run, word: str, tf: TestFiles) -> bool:
+    """Whether a positional word hand-picks tests (a name filter, a test file, a node id) rather
+    than an area (a directory, a package, a glob): an area keeps covering the tests added to it,
+    a hand-picked one covers today's files by coincidence, so selecting every file through it is
+    still a narrowing."""
+    word = word.removeprefix("./").rstrip("/")
+    if family == "go" or word in ("", ".") or any(c in word for c in "*?[{"):
+        return False
+    files = [f for f in tf.paths if (_FAMILY_FILES.get(family) or (lambda _: False))(f)]
+    if family == "pytest":
+        path, sep, _ = word.partition("::")
+        return bool(sep) or any(f == path or f.endswith("/" + path) for f in files)
+    if family == "mocha" or run.flavor == "node":
+        return any(f == word or f.endswith("/" + word) for f in files)
+    return not any(f.startswith(word + "/") or f"/{word}/" in f for f in files)
+
+
 def _all_default(family: str, run: _Run, files: Sequence[str], tf: TestFiles) -> set[str]:
     """What a run with no positional words selects: everything, but a mocha run reads
     `./test/*.js` (below it with `--recursive`) unless a config file may say otherwise."""
@@ -2141,7 +2158,10 @@ def narrowed_selection(
             if lost:
                 now = _listing([w for r in cand[family] for w in r.words])
                 return f"{family} ran `{lost[0]}` before and now runs only {now or 'other paths'}"
-            continue
+            if files is None or not any(
+                _pins(family, r, w, files) for r in cand[family] for w in r.words
+            ):
+                continue
         base_words = [w for run in base[family] for w in run.words]
         cand_runs = [run.words for run in cand[family]]
         if family == "go":
