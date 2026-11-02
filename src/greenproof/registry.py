@@ -63,7 +63,9 @@ _RULES = [
         "conftest scope. The test no longer runs, so it can no longer fail. On a brand-new "
         "test an unconditional skip or xfail is only a warning, and a conditional one "
         "(skipif with a condition, importorskip) does not fire: neither hides existing "
-        "verification.",
+        "verification. In Go, a `//go:build` or `// +build` constraint added or changed above "
+        "the package clause of an existing `_test.go` file counts: `go test ./...` no longer "
+        "compiles it. A constraint on a brand-new test file does not fire.",
     ),
     RuleInfo(
         "tests.focused",
@@ -77,8 +79,14 @@ _RULES = [
         "A test present on both sides checks less than before: fewer assertions, a strong "
         "assertion replaced by a weaker one, a wider tolerance, fewer parametrize cases, an "
         "assertion made vacuous (`assert True`, `... or True`, `x == x`) or unreachable (after "
-        "an unconditional return or raise, or under `if False`), or an assertion wrapped in a "
-        "try/except that swallows the failure. Replacing a comparison with its own operand "
+        "an unconditional return or raise, or under `if False`; in JS, Go and Rust a bare "
+        "`return` at the top level of a test, or an `if false`, `if (false)` or `... && false` "
+        "block), or an assertion wrapped in a try/except that swallows the failure. In JS, Go "
+        "and Rust, comparing an expression with itself (`expect(X).toBe(X)`, `assert.Equal(t, "
+        "X, X)`, `assert_eq!(X, X)`, `if X != X`) is vacuous, and rows removed from an "
+        "`it.each`, `test.each` or `describe.each` table count as fewer cases. A helper that "
+        "checks counts as one check per call (JS: same file; Go: same directory), so a helper "
+        "that loses its checks weakens its callers. Replacing a comparison with its own operand "
         "(`assert f() == 1` to `assert f()`) blocks; replacing it with a different expression "
         "is a warning, because that is often a legitimate refactor.",
     ),
@@ -87,7 +95,10 @@ _RULES = [
         WARN,
         "The expected value in an assertion changed, whether or not non-test code changed. That is "
         "legitimate when the specification changed, so it is a warning: confirm the new value "
-        "comes from the requirement, not from what the code returns.",
+        "comes from the requirement, not from what the code returns. A modified expected-output "
+        "data file (.json, .yaml, .yml, .txt, .csv, .snap, .golden, .out, .expected, .html, "
+        ".xml) under a test path or a fixture directory (testdata, fixtures, golden, "
+        "__snapshots__) is reported the same way, once per file.",
     ),
     RuleInfo(
         "suppress.added",
