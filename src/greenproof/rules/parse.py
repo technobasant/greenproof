@@ -17,7 +17,16 @@ from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import Finding
 from greenproof.rules._common import warn_finding
 
-_INI_NAMES = {"pytest.ini", "tox.ini", "setup.cfg", ".coveragerc", "mypy.ini", ".flake8"}
+_INI_NAMES = {
+    "pytest.ini",
+    ".pytest.ini",
+    "tox.ini",
+    "setup.cfg",
+    ".coveragerc",
+    "mypy.ini",
+    ".mypy.ini",
+    ".flake8",
+}
 _LENIENT_JSON = ("tsconfig", "jsconfig")
 
 

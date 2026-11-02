@@ -38,6 +38,7 @@ from greenproof.rules.runner import (
     removal_reason,
 )
 from greenproof.rules.shell import (
+    NEXTEST,
     NOOP_FLAGS,
     Scope,
     check_kind,
@@ -1580,6 +1581,7 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
     autoload = world.base_autoload
     tests = world.tests
     unreadable = set(world.base_env_unreadable)
+    file_nextest = bool(NEXTEST.search(text))
     for step in wf.steps:
         for name, value in sorted(_unreadable_env(wf.defs_of(step)) - unreadable):
             unreadable.add((name, value))
@@ -1628,7 +1630,9 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
             elif (at, why) not in reported:
                 reported.add((at, why))
                 out.append(_block(at, why))
-        for body in _bodies(world, wf, step, False):
+        bodies = _bodies(world, wf, step, False)
+        with_nextest = file_nextest or any(NEXTEST.search(b.text) for b in bodies)
+        for body in bodies:
             for family, flag, stmt in selection_uses(body.text, retries_ok=True, defs=body.defs):
                 if (family, flag) in base_flags:
                     continue
@@ -1639,6 +1643,8 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                     if verdict is not None:
                         out.append(_block(step.line, verdict))
                         continue
+                if flag == "--doc" and with_nextest:
+                    continue  # nextest in another step: `cargo test --doc` completes it
                 noop = any(flag in flags for flags in NOOP_FLAGS.values())
                 if not noop and not world.base_has_tests:
                     continue

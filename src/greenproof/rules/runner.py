@@ -12,7 +12,6 @@ import json
 import posixpath
 import re
 import shlex
-import tomllib
 from bisect import bisect_left
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
@@ -22,9 +21,12 @@ from typing import Any
 
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import Finding
+from greenproof.rules import runner_config as rc
 from greenproof.rules._common import finding, split_lines, warn_finding
 from greenproof.rules.collect import DEFAULT_CLASSES, DEFAULT_FILES, DEFAULT_FUNCTIONS
 from greenproof.rules.shell import (
+    NEXTEST,
+    NOOP_FLAGS,
     SELECT_FLAGS,
     TestFiles,
     _group_inner,
@@ -45,7 +47,6 @@ from greenproof.rules.tasks import Opaque, Reader, task_reader
 _HINT = "Restore the original configuration; fix the code or the test instead of the check."
 _ADOPTION = " (a new linter or type-checker configuration: adoption, not a loosening)"
 _SELECT_FLAGS = set(SELECT_FLAGS["pytest"])
-_INI_NAMES = {"pytest.ini", "tox.ini", "setup.cfg", ".coveragerc", "mypy.ini", ".flake8"}
 _NOOP = re.compile(r"^(?:@?-?\s*)?(?:true|:|exit\s+0|echo\b.*)\s*$")
 # Flags that narrow a run, by tool: `-k` selects tests only for pytest, and `-t` is a name pattern
 # for jest and vitest but mocha's timeout. A tool not listed here (a policy script, `ng`, `node
@@ -62,8 +63,8 @@ _LONG_NARROW = frozenset(
     }
 )
 _TOOL_NARROW: dict[str, frozenset[str]] = {
-    "pytest": _LONG_NARROW | SELECT_FLAGS["pytest"],
-    "jest": _LONG_NARROW | SELECT_FLAGS["js"] | {"--passWithNoTests"},
+    "pytest": _LONG_NARROW | SELECT_FLAGS["pytest"] | NOOP_FLAGS["pytest"],
+    "jest": _LONG_NARROW | SELECT_FLAGS["js"] | (NOOP_FLAGS["js"] - {"--testFailureExitCode"}),
     "mocha": _LONG_NARROW | SELECT_FLAGS["mocha"] | {"-f", "--fgrep", "--only"},
     "none": frozenset(),
 }
@@ -83,18 +84,30 @@ _PM_VALUE_OPTS = {"--prefix", "--workspace", "-w", "--filter", "-F", "--cwd", "-
 
 @dataclass
 class _Settings:
+    """What the tools read in one directory of one revision (see `_build`)."""
+
     select: Counter[str] = field(default_factory=Counter)  # narrowing pytest options
+    noop: Counter[str] = field(default_factory=Counter)  # `--setup-plan` and the like in addopts
     plugins_off: Counter[str] = field(default_factory=Counter)  # `-p no:X` in addopts
     autoload_off: bool = False  # `--disable-plugin-autoload` in addopts
     error_filter: bool = False  # warnings are errors: `filterwarnings = error`, `-W error`
     testpaths: set[str] = field(default_factory=set)
-    cov_fail_under: float | None = None
+    cov_fail_under: float | None = None  # `--cov-fail-under` in addopts
+    cov_cfg_fail_under: float | None = None  # the coverage configuration's `fail_under`
+    cov_omit: list[str] = field(default_factory=list)
+    cov_exclude: list[str] = field(default_factory=list)  # exclude_lines and exclude_also
     mypy_strict: bool | None = None
     mypy_ignore_errors: int = 0
     mypy_disabled: set[str] = field(default_factory=set)
-    lint_ignores: set[str] = field(default_factory=set)
-    # Whether the file holds a linter / type-checker table at all (SPEC 5.6 adoption).
+    mypy_exclude: list[str] = field(default_factory=list)
+    lint_ignores: set[str] = field(default_factory=set)  # flake8's
+    ruff_select: list[str] = field(default_factory=lambda: list(rc.RUFF_DEFAULT_SELECT))
+    ruff_ignore: list[str] = field(default_factory=list)
+    ruff_per_file: set[str] = field(default_factory=set)
+    ruff_exclude: list[str] = field(default_factory=lambda: list(rc.RUFF_DEFAULT_EXCLUDE))
+    # Whether the directory holds a linter / type-checker table at all (SPEC 5.6 adoption).
     lint_table: bool = False
+    ruff_table: bool = False
     mypy_table: bool = False
     collection: dict[str, list[str]] = field(default_factory=dict)  # python_files etc.
 
@@ -131,7 +144,9 @@ def _addopts(settings: _Settings, value: Any) -> None:
     while i < len(tokens):
         tok = tokens[i]
         flag, eq, rest = tok.partition("=")
-        if flag in _SELECT_FLAGS and eq:
+        if tok in NOOP_FLAGS["pytest"]:
+            settings.noop[tok] += 1
+        elif flag in _SELECT_FLAGS and eq:
             settings.select[f"{flag} {rest}"] += 1
         elif flag in _SELECT_FLAGS and i + 1 < len(tokens):
             settings.select[f"{flag} {tokens[i + 1]}"] += 1
@@ -184,98 +199,111 @@ def _per_file(value: Any) -> set[str]:
     return out
 
 
-def _ruff_section(settings: _Settings, table: Mapping[str, Any]) -> None:
-    for key in ("ignore", "extend-ignore"):
-        settings.lint_ignores.update(_as_list(table.get(key)))
-    for key in ("per-file-ignores", "extend-per-file-ignores"):
-        settings.lint_ignores.update(_per_file(table.get(key)))
+def _regexes(value: Any) -> list[str]:
+    """A coverage list of regexes: one per line (or list item); a comma belongs to the regex."""
+    if isinstance(value, str):
+        return [ln.strip() for ln in value.splitlines() if ln.strip()]
+    return [str(v) for v in value] if isinstance(value, list) else []
 
 
-def _from_pyproject(data: Mapping[str, Any]) -> _Settings:
-    s = _Settings()
-    tool = data.get("tool", {})
-    pytest_opts = tool.get("pytest", {}).get("ini_options", {})
-    _addopts(s, pytest_opts.get("addopts"))
-    _filters(s, pytest_opts.get("filterwarnings"))
-    s.testpaths.update(_as_list(pytest_opts.get("testpaths")))
-    _collection(s, pytest_opts)
-    cov = tool.get("coverage", {}).get("report", {})
-    s.cov_fail_under = (
-        s.cov_fail_under
-        if _number(cov.get("fail_under")) is None
-        else _number(cov.get("fail_under"))
+def _globs(value: Any) -> list[str]:
+    """A coverage list of file patterns: separated by newlines or commas."""
+    if isinstance(value, str):
+        return [p.strip() for p in re.split(r"[\n,]", value) if p.strip()]
+    return [str(v) for v in value] if isinstance(value, list) else []
+
+
+def _pick(top: Mapping[str, Any], lint: Mapping[str, Any], key: str) -> Any:
+    """A ruff lint option: the `lint` table's, else the deprecated top-level one."""
+    return lint[key] if key in lint else top.get(key)
+
+
+def _into_pytest(tree: rc.Tree, s: _Settings) -> str | None:
+    name, options = rc.pytest_options(tree)
+    _addopts(s, options.get("addopts"))
+    _filters(s, options.get("filterwarnings"))
+    s.testpaths.update(_as_list(options.get("testpaths")))
+    _collection(s, options)
+    return name
+
+
+def _into_coverage(tree: rc.Tree, s: _Settings) -> str | None:
+    name, run, report = rc.coverage_tables(tree)
+    s.cov_cfg_fail_under = _number(report.get("fail_under"))
+    s.cov_omit = [*_globs(run.get("omit")), *_globs(report.get("omit"))]
+    s.cov_exclude = [*_regexes(report.get("exclude_lines")), *_regexes(report.get("exclude_also"))]
+    return name
+
+
+def _into_mypy(tree: rc.Tree, s: _Settings) -> str | None:
+    name, table, overrides = rc.mypy_tables(tree)
+    s.mypy_table = name is not None
+    s.mypy_strict = _boolean(table.get("strict"))
+    s.mypy_ignore_errors = int(_boolean(table.get("ignore_errors")) is True)
+    s.mypy_disabled.update(_as_list(table.get("disable_error_code")))
+    for ov in overrides:
+        s.mypy_ignore_errors += int(_boolean(ov.get("ignore_errors")) is True)
+        s.mypy_disabled.update(_as_list(ov.get("disable_error_code")))
+    exclude = table.get("exclude")
+    s.mypy_exclude = [exclude] if isinstance(exclude, str) else _as_list(exclude)
+    return name
+
+
+def _into_ruff(tree: rc.Tree, s: _Settings) -> str | None:
+    name, top, lint = rc.ruff_tables(tree)
+    if name is None:
+        return None
+    s.ruff_table = s.lint_table = True
+    select = _pick(top, lint, "select")
+    if select is not None:
+        s.ruff_select = _as_list(select)
+    s.ruff_select += _as_list(_pick(top, lint, "extend-select"))
+    s.ruff_ignore = _as_list(_pick(top, lint, "ignore")) + _as_list(
+        _pick(top, lint, "extend-ignore")
     )
-    mypy = tool.get("mypy", {})
-    s.mypy_table = "mypy" in tool
-    s.mypy_strict = _boolean(mypy.get("strict"))
-    s.mypy_ignore_errors = int(_boolean(mypy.get("ignore_errors")) is True)
-    s.mypy_disabled.update(_as_list(mypy.get("disable_error_code")))
-    overrides = mypy.get("overrides", [])
-    for ov in overrides if isinstance(overrides, list) else []:
-        if isinstance(ov, dict):
-            s.mypy_ignore_errors += int(_boolean(ov.get("ignore_errors")) is True)
-            s.mypy_disabled.update(_as_list(ov.get("disable_error_code")))
-    ruff = tool.get("ruff", {})
-    s.lint_table = "ruff" in tool
-    if isinstance(ruff, dict):
-        _ruff_section(s, ruff)
-        lint = ruff.get("lint", {})
-        if isinstance(lint, dict):
-            _ruff_section(s, lint)
-    return s
+    s.ruff_per_file = _per_file(_pick(top, lint, "per-file-ignores")) | _per_file(
+        _pick(top, lint, "extend-per-file-ignores")
+    )
+    if top.get("exclude") is not None:
+        s.ruff_exclude = _as_list(top.get("exclude"))
+    s.ruff_exclude += _as_list(top.get("extend-exclude")) + _as_list(lint.get("exclude"))
+    return name
 
 
-def _from_ruff_toml(data: Mapping[str, Any]) -> _Settings:
-    s = _Settings(lint_table=True)
-    _ruff_section(s, data)
-    lint = data.get("lint", {})
-    if isinstance(lint, dict):
-        _ruff_section(s, lint)
-    return s
+def _into_flake8(tree: rc.Tree, s: _Settings) -> str | None:
+    name, options = rc.flake8_table(tree)
+    if name is None:
+        return None
+    s.lint_table = True
+    for key in ("ignore", "extend-ignore"):
+        s.lint_ignores.update(_as_list(options.get(key)))
+    s.lint_ignores.update(_per_file(options.get("per-file-ignores")))
+    return name
 
 
-def _from_ini(parser: configparser.ConfigParser) -> _Settings:
-    s = _Settings()
-    for name in ("pytest", "tool:pytest"):
-        if parser.has_section(name):
-            _addopts(s, parser.get(name, "addopts", fallback=None))
-            _filters(s, parser.get(name, "filterwarnings", fallback=None))
-            s.testpaths.update(_as_list(parser.get(name, "testpaths", fallback="")))
-            _collection(s, dict(parser.items(name)))
-    for name in ("coverage:report", "report"):
-        if parser.has_section(name):
-            s.cov_fail_under = _number(parser.get(name, "fail_under", fallback=None))
-    s.mypy_table = parser.has_section("mypy")
-    if parser.has_section("mypy"):
-        s.mypy_strict = _boolean(parser.get("mypy", "strict", fallback=None))
-        s.mypy_ignore_errors = int(
-            _boolean(parser.get("mypy", "ignore_errors", fallback=None)) is True
-        )
-        s.mypy_disabled.update(_as_list(parser.get("mypy", "disable_error_code", fallback="")))
-    for section in parser.sections():
-        if section.startswith("mypy-") and _boolean(
-            parser.get(section, "ignore_errors", fallback=None)
-        ):
-            s.mypy_ignore_errors += 1
-    s.lint_table = parser.has_section("flake8")
-    if parser.has_section("flake8"):
-        for key in ("ignore", "extend-ignore"):
-            s.lint_ignores.update(_as_list(parser.get("flake8", key, fallback="")))
-        s.lint_ignores.update(_per_file(parser.get("flake8", "per-file-ignores", fallback="")))
-    return s
+_EXTRACTORS: dict[str, Callable[[rc.Tree, _Settings], str | None]] = {
+    "pytest": _into_pytest,
+    "coverage": _into_coverage,
+    "mypy": _into_mypy,
+    "ruff": _into_ruff,
+    "flake8": _into_flake8,
+}
 
 
-def _parse_settings(name: str, text: str) -> _Settings | None:
-    """None when the file is not one of the structured config files."""
-    if name == "pyproject.toml":
-        return _from_pyproject(tomllib.loads(text))
-    if name in ("ruff.toml", ".ruff.toml"):
-        return _from_ruff_toml(tomllib.loads(text))
-    if name in _INI_NAMES:
-        parser = configparser.ConfigParser(interpolation=None, strict=False)
-        parser.read_string(text)
-        return _from_ini(parser)
-    return None
+def _build(tree: rc.Tree) -> tuple[_Settings, dict[str, str | None], dict[str, str]]:
+    """The effective settings of a directory, which file each tool read, and the tools whose
+    configuration did not parse (with the file)."""
+    settings = _Settings()
+    where: dict[str, str | None] = {}
+    broken: dict[str, str] = {}
+    for tool, extract in _EXTRACTORS.items():
+        try:
+            where[tool] = extract(tree, settings)
+        except rc.Broken as exc:
+            where[tool], broken[tool] = None, exc.name
+        except (ValueError, TypeError, AttributeError):  # e.g. an addopts that does not split
+            where[tool], broken[tool] = None, where.get(tool) or tool
+    return settings, where, broken
 
 
 def _collection_reasons(base: _Settings, cand: _Settings) -> list[str]:
@@ -334,43 +362,232 @@ def _plugin_reasons(base: _Settings | None, cand: _Settings) -> list[str]:
     return out
 
 
-def _setting_reasons(base: _Settings | None, cand: _Settings) -> list[str]:
+class _Judge:
+    """The base tree's files under one directory, for judging an exclusion against them."""
+
+    def __init__(self, changes: ChangeSet, root: str) -> None:
+        self.changes = changes
+        self.root = root
+        self.truncated = False
+        self._paths: list[str] | None = None
+
+    def base(self) -> list[str]:
+        if self._paths is None:
+            if self.changes.list_base is not None:
+                names = self.changes.list_base()
+            else:
+                names = [f.old_path or f.path for f in self.changes.files if f.old_content]
+            prefix = f"{self.root}/" if self.root else ""
+            under = [n[len(prefix) :] for n in names if n.startswith(prefix)]
+            self.truncated = len(under) > rc.MAX_FILES
+            self._paths = under[: rc.MAX_FILES]
+        return self._paths
+
+    def source(self) -> list[str]:
+        """Python files that are not tests: what a coverage gate measures."""
+        return [
+            p for p in rc.python_files(self.base()) if not self.changes.is_test(f"{self.root}/{p}")
+        ]
+
+
+def _gate(s: _Settings) -> float | None:
+    found = [n for n in (s.cov_fail_under, s.cov_cfg_fail_under) if n is not None]
+    return max(found) if found else None
+
+
+def _pytest_reasons(base: _Settings, cand: _Settings) -> list[str]:
     reasons: list[str] = []
-    before = base.select if base else Counter()
-    for item, count in (cand.select - before).items():
+    for item, count in (cand.select - base.select).items():
         reasons.append(f"pytest option `{item}` added" + (f" (x{count})" if count > 1 else ""))
+    for flag, count in (cand.noop - base.noop).items():
+        reasons.append(
+            f"pytest option `{flag}` added (the run then passes without running a test)"
+            + (f" (x{count})" if count > 1 else "")
+        )
     reasons.extend(_plugin_reasons(base, cand))
-    if base is None:
-        return reasons
     if (
         base.testpaths
         and (gone := base.testpaths - cand.testpaths)
+        and cand.testpaths
         and cand.testpaths != base.testpaths
     ):
         reasons.append(f"testpaths narrowed: {', '.join(sorted(gone))} removed")
-    if (
-        base.cov_fail_under is not None
-        and cand.cov_fail_under is not None
-        and cand.cov_fail_under < base.cov_fail_under
-    ):
-        reasons.append(
-            f"coverage fail_under lowered from {base.cov_fail_under:g} to {cand.cov_fail_under:g}"
-        )
-    if base.cov_fail_under is not None and cand.cov_fail_under is None:
-        reasons.append("coverage fail_under removed")
     reasons.extend(_collection_reasons(base, cand))
-    # A table absent at the base is adoption or a migration: nothing stricter was loosened.
-    mypy_note = "" if base.mypy_table else _ADOPTION
-    lint_note = "" if base.lint_table else _ADOPTION
-    if base.mypy_strict is not False and cand.mypy_strict is False:
-        reasons.append("mypy strict switched off" + mypy_note)
-    if cand.mypy_ignore_errors > base.mypy_ignore_errors:
-        reasons.append("mypy ignore_errors enabled" + mypy_note)
-    if added := cand.mypy_disabled - base.mypy_disabled:
-        reasons.append(f"mypy disable_error_code added: {', '.join(sorted(added))}{mypy_note}")
-    if added := cand.lint_ignores - base.lint_ignores:
-        reasons.append(f"lint ignores added: {', '.join(sorted(added))}{lint_note}")
     return reasons
+
+
+def _coverage_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str]:
+    reasons: list[str] = []
+    before, after = _gate(base), _gate(cand)
+    if before is not None and after is not None and after < before:
+        reasons.append(f"coverage fail_under lowered from {before:g} to {after:g}")
+    if before is not None and after is None:
+        reasons.append("coverage fail_under removed")
+    if [p for p in cand.cov_omit if p not in base.cov_omit]:
+        hits = [
+            p
+            for p in judge.source()
+            if rc.omitted(p, cand.cov_omit) and not rc.omitted(p, base.cov_omit)
+        ]
+        if hits:
+            why = f"coverage `omit` now leaves out {rc.hit_text(hits, 'source files')}"
+            reasons.append(why if before is not None else _Warn(why + " (no gate in the config)"))
+    for pattern in rc.broad_exclusions(p for p in cand.cov_exclude if p not in base.cov_exclude):
+        reasons.append(
+            f"coverage exclusion `{pattern}` matches ordinary code: it hides lines from coverage"
+        )
+    return reasons
+
+
+def _exclusion_reasons(
+    option: str,
+    new: Sequence[str],
+    hits: set[str],
+    bad: Sequence[str],
+    before: set[str],
+) -> list[str]:
+    out: list[str] = []
+    if lost := sorted(hits - before):
+        out.append(f"{option} now leaves out {rc.hit_text(lost, 'files the gate was checking')}")
+    out.extend(
+        _Warn(f"{option} `{p}` is not a valid regex: its effect was not checked") for p in bad
+    )
+    return out
+
+
+def _mypy_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str]:
+    reasons: list[str] = []
+    note = "" if base.mypy_table else _ADOPTION
+    if (base.mypy_strict is True and cand.mypy_strict is not True) or (
+        base.mypy_strict is not False and cand.mypy_strict is False
+    ):
+        reasons.append("mypy strict switched off" + note)
+    if cand.mypy_ignore_errors > base.mypy_ignore_errors:
+        reasons.append("mypy ignore_errors enabled" + note)
+    if added := cand.mypy_disabled - base.mypy_disabled:
+        reasons.append(f"mypy disable_error_code added: {', '.join(sorted(added))}{note}")
+    if [p for p in cand.mypy_exclude if p not in base.mypy_exclude]:
+        files = rc.python_files(judge.base())
+        hit, bad = rc.mypy_excluded(files, cand.mypy_exclude)
+        reasons.extend(
+            _exclusion_reasons(
+                "mypy `exclude`",
+                cand.mypy_exclude,
+                hit,
+                bad,
+                rc.mypy_excluded(files, base.mypy_exclude)[0],
+            )
+        )
+    return reasons
+
+
+def _lint_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str]:
+    reasons: list[str] = []
+    note = "" if base.lint_table else _ADOPTION
+    if base.ruff_table or cand.ruff_table:
+        # A new ruff table is compared with ruff's defaults, the rules in force without one.
+        soft = "" if base.ruff_table else _ADOPTION
+        before = (base.ruff_select, base.ruff_ignore)
+        dropped = rc.rules_dropped(before, (cand.ruff_select, cand.ruff_ignore))
+        ignored = [c for c in dropped if c in cand.ruff_ignore and c not in base.ruff_ignore]
+        if ignored:
+            reasons.append(f"lint ignores added: {', '.join(ignored)}{soft}")
+        if others := [c for c in dropped if c not in ignored]:
+            reasons.append(f"ruff `select` narrowed: {', '.join(others)} no longer selected{soft}")
+        added = sorted(
+            e
+            for e in cand.ruff_per_file - base.ruff_per_file
+            if rc.selected_overlap(e.rpartition(":")[2], before)
+        )
+        if added:
+            reasons.append(f"lint ignores added: {', '.join(added)}{soft}")
+        if [p for p in cand.ruff_exclude if p not in base.ruff_exclude]:
+            files = rc.python_files(judge.base())
+            hit = rc.ruff_excluded(files, cand.ruff_exclude)
+            reasons.extend(
+                _exclusion_reasons(
+                    "ruff `exclude`",
+                    cand.ruff_exclude,
+                    hit,
+                    [],
+                    rc.ruff_excluded(files, base.ruff_exclude),
+                )
+            )
+    if added_flake := cand.lint_ignores - base.lint_ignores:
+        reasons.append(f"lint ignores added: {', '.join(sorted(added_flake))}{note}")
+    return reasons
+
+
+_TOOL_GROUPS = ("pytest", "coverage", "mypy", "lint")
+
+
+def _setting_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[tuple[str, str]]:
+    """`(tool, reason)` for what the candidate's effective configuration loosened."""
+    out = [("pytest", r) for r in _pytest_reasons(base, cand)]
+    out += [("coverage", r) for r in _coverage_reasons(base, cand, judge)]
+    out += [("mypy", r) for r in _mypy_reasons(base, cand, judge)]
+    out += [("lint", r) for r in _lint_reasons(base, cand, judge)]
+    return out
+
+
+def _config_dirs(changes: ChangeSet) -> list[str]:
+    roots: set[str] = set()
+    for f in changes.files:
+        for path in (f.path, f.old_path):
+            if path and posixpath.basename(path) in rc.CONFIG_NAMES:
+                roots.add(posixpath.dirname(path))
+    return sorted(roots)
+
+
+def _config_findings(changes: ChangeSet) -> list[Finding]:
+    """The tool configuration of each directory with a changed config file, compared as the
+    tools read it (one source each, by precedence) before and after the change."""
+    out: list[Finding] = []
+    changed = {f.path for f in changes.files} | {f.old_path for f in changes.files if f.old_path}
+    for root in _config_dirs(changes):
+
+        def join(name: str, root: str = root) -> str:
+            return posixpath.join(root, name)
+
+        base, base_where, base_broken = _build(rc.Tree(changes.base_text, root))
+        cand, cand_where, cand_broken = _build(rc.Tree(changes.cand_text, root))
+        # a file that does not parse is reported by static.parse_error; it is not judged here
+        skip = set(base_broken) | set(cand_broken)
+        if "pytest" in skip:
+            skip.add("coverage")
+        if {"ruff", "flake8"} & skip:
+            skip.add("lint")
+        judge = _Judge(changes, root)
+        for tool, why in _setting_reasons(base, cand, judge):
+            if tool in skip:
+                continue
+            winners = {"lint": cand_where["ruff"] or cand_where["flake8"]}
+            old_winners = {"lint": base_where["ruff"] or base_where["flake8"]}
+            name = winners.get(tool, cand_where.get(tool))
+            old_name = old_winners.get(tool, base_where.get(tool))
+            quiet = name is not None and changes.base_text(join(name)) is None
+            if why.endswith(_ADOPTION) and quiet:
+                continue
+            at = next(
+                (n for n in (name, old_name) if n is not None and join(n) in changed),
+                next((n for n in rc.CONFIG_NAMES if join(n) in changed), "pyproject.toml"),
+            )
+            text = changes.cand_text(join(at)) or changes.base_text(join(at)) or ""
+            line = _first_line_with(text, _anchor(why))
+            make = warn_finding if why.endswith(_ADOPTION) or isinstance(why, _Warn) else finding
+            out.append(make("runner.tampered", join(at), line, f"{join(at)}: {why}", _HINT))
+        if judge.truncated:
+            out.append(
+                warn_finding(
+                    "runner.tampered",
+                    root or ".",
+                    None,
+                    f"{root or '.'}: more than {rc.MAX_FILES} files at the base; "
+                    "excludes were judged against the first ones only",
+                    _HINT,
+                )
+            )
+    return out
 
 
 # -- line helpers -------------------------------------------------------------------------
@@ -1764,9 +1981,10 @@ def _dash_reason(
 
 def _new_selection_flag(base: list[str], cand: list[str]) -> str | None:
     before = {f for ln in base for f in selection_flags(ln)}
+    nextest = any(NEXTEST.search(ln) for ln in cand)  # which runs no doctest: `--doc` completes it
     for ln in cand:
         for family_flag in selection_flags(ln):
-            if family_flag not in before:
+            if family_flag not in before and not (nextest and family_flag[1] == "--doc"):
                 return family_flag[1]
     return None
 
@@ -2428,16 +2646,87 @@ def _thresholds(text: str) -> dict[str, float]:
     return out
 
 
-def _jest_reasons(f: ChangedFile, is_package: bool) -> list[tuple[int | None, str]]:
+def _without_block(text: str, key: str) -> str:
+    """`text` with the `key: {...}` block taken out (coverage settings are not test selection)."""
+    block = _bracket_block(text, key)
+    return text if block is None else text.replace(block, "", 1)
+
+
+def _selected_tests(patterns: Sequence[str], tests: Sequence[str]) -> tuple[set[str], bool]:
+    hit, complete = rc.glob_paths(patterns, tests)
+    return hit, complete
+
+
+def _jest_selection(
+    old: str,
+    new: str,
+    key: str,
+    tests: Sequence[str],
+    base_known: bool,
+) -> tuple[list[str], list[str]]:
+    """What a `testMatch`/`include` list in `new` stops running, among the base tests, against
+    the list in `old` (or all tests when `old` has none); and what could not be read."""
+    now = _strings(_bracket_block(new, key))
+    if not now:
+        return [], []
+    before = _strings(_bracket_block(old, key))
+    if not base_known:
+        return ([f"`{key}` narrowed"] if now - before else []), []
+    ran = set(tests) if not before else _selected_tests(sorted(before), tests)[0]
+    hit, complete = _selected_tests(sorted(now), tests)
+    if not complete:
+        return [], [f"`{key}` uses a pattern greenproof cannot read; its effect was not checked"]
+    lost = sorted(ran - hit)
+    return ([f"`{key}` no longer runs {rc.hit_text(lost, 'tests')}"] if lost else []), []
+
+
+def _jest_reasons(
+    f: ChangedFile, is_package: bool, changes: ChangeSet
+) -> list[tuple[int | None, str]]:
+    """Loosenings of a jest or vitest configuration, judged against the test files of the base
+    tree: an exclusion that matches no test the base ran is housekeeping."""
     old, new = f.old_text or "", f.new_text or ""
     out: list[tuple[int | None, str]] = []
-    keys = ["testPathIgnorePatterns"] + ([] if is_package else ["exclude"])
+    judge = _Judge(changes, posixpath.dirname(f.path))
+    base_known = changes.list_base is not None
+    tests = [p for p in rc.js_files(judge.base()) if changes.is_test(posixpath.join(judge.root, p))]
+    keys = ["testPathIgnorePatterns", "exclude"]
     for key in keys:
-        added = _strings(_bracket_block(new, key)) - _strings(_bracket_block(old, key))
-        if added:
-            out.append(
-                (_first_line_with(new, key), f"`{key}` now excludes {', '.join(sorted(added))}")
-            )
+        text_old, text_new = (
+            (_without_block(old, "coverage"), _without_block(new, "coverage"))
+            if key == "exclude"
+            else (old, new)
+        )
+        if key == "exclude" and is_package:
+            continue
+        before_p = _strings(_bracket_block(text_old, key))
+        added = _strings(_bracket_block(text_new, key)) - before_p
+        if not added:
+            continue
+        line = _first_line_with(new, key)
+        if not base_known:
+            out.append((line, f"`{key}` now excludes {', '.join(sorted(added))}"))
+            continue
+        if key == "testPathIgnorePatterns":
+            hit, bad = rc.regex_paths(sorted(added), tests)
+            was, _ = rc.regex_paths(sorted(before_p), tests)
+        else:
+            hit, complete = _selected_tests(sorted(added), tests)
+            bad = [] if complete else sorted(added)
+            was, _ = _selected_tests(sorted(before_p), tests)
+        if lost := sorted(hit - was):
+            out.append((line, f"`{key}` now excludes {rc.hit_text(lost, 'tests that ran')}"))
+        out.extend(
+            (line, _Warn(f"`{key}` pattern `{p}` could not be read: its effect was not checked"))
+            for p in bad
+        )
+    for key in ("testMatch", "include"):
+        if key == "include" and is_package:
+            continue
+        reasons, unread = _jest_selection(old, new, key, tests, base_known)
+        line = _first_line_with(new, key)
+        out.extend((line, r) for r in reasons)
+        out.extend((line, _Warn(r)) for r in unread)
     flag = re.compile(r"passWithNoTests[\"']?\s*:\s*true")
     if flag.search(new) and not flag.search(old):
         out.append((_first_line_with(new, "passWithNoTests"), "`passWithNoTests` enabled"))
@@ -2449,6 +2738,66 @@ def _jest_reasons(f: ChangedFile, is_package: bool) -> list[tuple[int | None, st
                     _first_line_with(new, key.split(".")[1]),
                     f"coverage threshold {key.split('.')[1]} lowered "
                     f"from {before[key]:g} to {value:g}",
+                )
+            )
+    return out
+
+
+_MOCHA_SWITCHES = ("grep", "fgrep", "invert", "dry-run", "dryRun")
+_NYC_GATES = ("lines", "statements", "branches", "functions")
+
+
+def _flat_values(text: str, keys: Sequence[str]) -> dict[str, str]:
+    """`key: value` / `"key": value` / `key = value` for the given keys, the value as written."""
+    out: dict[str, str] = {}
+    for key in keys:
+        m = re.search(rf"[\"']?{re.escape(key)}[\"']?\s*[:=]\s*([^,\n}}]+)", text)
+        if m:
+            out[key] = m[1].strip().strip("\"'")
+    return out
+
+
+def _package_tool_reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
+    """The `mocha` and `nyc` blocks of a package.json."""
+    out: list[tuple[int | None, str]] = []
+    for key, read in (("mocha", _mocha_reasons), ("nyc", _nyc_reasons)):
+        old = _bracket_block(f.old_text or "", key) or ""
+        new = _bracket_block(f.new_text or "", key) or ""
+        if new:
+            out.extend((_first_line_with(f.new_text or "", key), why) for _, why in read(old, new))
+    return out
+
+
+def _mocha_reasons(old: str, new: str) -> list[tuple[int | None, str]]:
+    """Switches that make mocha run fewer tests (or none) than its configuration did."""
+    before, after = _flat_values(old, _MOCHA_SWITCHES), _flat_values(new, _MOCHA_SWITCHES)
+    out: list[tuple[int | None, str]] = []
+    for key, value in after.items():
+        if value.lower() in ("false", "null", "") or before.get(key) == value:
+            continue
+        out.append((_first_line_with(new, key), f"mocha option `{key}` set: it narrows the run"))
+    return out
+
+
+def _nyc_reasons(old: str, new: str) -> list[tuple[int | None, str]]:
+    """nyc's coverage gate switched off or lowered."""
+    before = _flat_values(old, ("check-coverage", *_NYC_GATES))
+    after = _flat_values(new, ("check-coverage", *_NYC_GATES))
+    out: list[tuple[int | None, str]] = []
+    if before.get("check-coverage", "").lower() == "true" and (
+        after.get("check-coverage", "").lower() == "false"
+    ):
+        out.append((_first_line_with(new, "check-coverage"), "nyc `check-coverage` switched off"))
+    for key in _NYC_GATES:
+        try:
+            was, now = float(before[key]), float(after[key])
+        except (KeyError, ValueError):
+            continue
+        if now < was:
+            out.append(
+                (
+                    _first_line_with(new, key),
+                    f"nyc `{key}` threshold lowered from {was:g} to {now:g}",
                 )
             )
     return out
@@ -2903,6 +3252,7 @@ def _pytest_arguments(name: str, text: str) -> list[list[str]]:
             pass
     found: list[list[str]] = []
     for raw in split_lines(re.sub(r"\\\n\s*", " ", text)):
+        raw = re.sub(r"\{posargs:([^{}]*)\}", r"\1", raw)  # tox: the default when none are given
         found.extend(_after_pytest(_split_words(re.sub(r"^\s*[A-Za-z_][\w:]*\s*=\s*", "", raw))))
     return found
 
@@ -3469,6 +3819,7 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
         for line, why in reasons:
             make = warn_finding if why.endswith(_ADOPTION) or isinstance(why, _Warn) else finding
             out.append(make("runner.tampered", f.path, line, f"{f.path}: {why}", _HINT))
+    out.extend(_config_findings(changes))
     workspace_files = [
         f.path for f in changes.files if f.path in ("pnpm-workspace.yaml", "package.json")
     ]
@@ -3486,39 +3837,32 @@ def _file_reasons(
     changes: ChangeSet,
     tests: _BaseTests | None = None,
 ) -> list[tuple[int | None, str]]:
-    new = f.new_text or ""
     found: list[tuple[int | None, str]]
     if name == "package.json":
         found = _package_reasons(f, commands, tests, changes)
-        found.extend(_jest_reasons(f, True))
+        found.extend(_jest_reasons(f, True, changes))
+        found.extend(_package_tool_reasons(f))
         if found and not _reaches_package(changes, f.path, commands):
             return [(line, _Warn(why)) for line, why in found]
         return found
     if re.match(r"^tsconfig.*\.json$", name):
         return _tsconfig_reasons(f)
     if re.match(r"^(?:jest|vitest)\.config\.\w+$", name):
-        return _jest_reasons(f, False)
+        return _jest_reasons(f, False, changes)
     if name in ("Makefile", "makefile", "GNUmakefile", "justfile", "Justfile"):
         return _make_reasons(f, commands, changes, tests)
     if name == "noxfile.py":
         return _noxfile_reasons(f)
+    if re.match(r"^\.mocharc(\.\w+)?$", name):
+        return _mocha_reasons(f.old_text or "", f.new_text or "")
+    if re.match(r"^(\.nycrc(\.\w+)?|nyc\.config\.\w+)$", name):
+        return _nyc_reasons(f.old_text or "", f.new_text or "")
     if name.endswith("_test.go"):
         return _go_reasons(f)
     if _ENV_FILE.match(name):
         return _envfile_reasons(f, name, commands, changes)
-    settings = None
-    if name == "pyproject.toml" or name in ("ruff.toml", ".ruff.toml") or name in _INI_NAMES:
-        old = _parse_settings(name, f.old_text) if f.old_text is not None else None
-        settings = _parse_settings(name, new)
-        found = []
-        if settings is not None:
-            why_list = _setting_reasons(old, settings)
-            if f.status == "A":
-                why_list = [w for w in why_list if w.startswith(("pytest option", "pytest coll"))]
-            found = [(_first_line_with(new, _anchor(why)), why) for why in why_list]
-        if name == "tox.ini":
-            found.extend(_noxfile_reasons(f))
-        return found
+    if name == "tox.ini":
+        return _noxfile_reasons(f)
     return []
 
 

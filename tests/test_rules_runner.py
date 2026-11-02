@@ -23,8 +23,17 @@ ignore = ["E501"]
 """
 
 
-def edit(tmp_path: Path, path: str, old: str, new: str, commands: dict[str, str] | None = None):
+def edit(
+    tmp_path: Path,
+    path: str,
+    old: str,
+    new: str,
+    commands: dict[str, str] | None = None,
+    files: dict[str, str] | None = None,
+):
     repo = init_repo(tmp_path / "r")
+    for name, text in (files or {}).items():
+        repo.write(name, text)
     repo.write(path, old)
     repo.commit("base")
     repo.write(path, new)
@@ -115,7 +124,7 @@ def test_ruff_ignores_added_fire_and_section_move_is_clean(tmp_path: Path) -> No
     more = PYPROJECT.replace('ignore = ["E501"]', 'ignore = ["E501", "F401"]')
     found = pyproject(tmp_path / "a", PYPROJECT, more)
     assert rule_ids(found) == ["runner.tampered"] and "F401" in found[0].message
-    per_file = PYPROJECT + '\n[tool.ruff.lint.per-file-ignores]\n"tests/*" = ["S101"]\n'
+    per_file = PYPROJECT + '\n[tool.ruff.lint.per-file-ignores]\n"tests/*" = ["F401"]\n'
     assert rule_ids(pyproject(tmp_path / "b", PYPROJECT, per_file)) == ["runner.tampered"]
     moved = PYPROJECT.replace(
         "[tool.ruff.lint]\nselect", "[tool.ruff]\nline-length = 100\n\n[tool.ruff.lint]\nselect"
@@ -248,8 +257,10 @@ def test_jest_config_changes_fire(tmp_path: Path) -> None:
         "  coverageThreshold: { global: { branches: 80, lines: 90 } },\n};\n"
     )
     ignored = old.replace("['/node_modules/']", "['/node_modules/', '/tests/api/']")
-    found = edit(tmp_path / "a", "jest.config.js", old, ignored)
-    assert rule_ids(found) == ["runner.tampered"] and "/tests/api/" in found[0].message
+    found = edit(
+        tmp_path / "a", "jest.config.js", old, ignored, files={"tests/api/users.test.js": "t\n"}
+    )
+    assert rule_ids(found) == ["runner.tampered"] and "tests/api" in found[0].message
     lowered = old.replace("branches: 80", "branches: 10")
     assert rule_ids(edit(tmp_path / "b", "jest.config.js", old, lowered)) == ["runner.tampered"]
     assert rule_ids(
@@ -269,7 +280,10 @@ def test_vitest_exclude_fires(tmp_path: Path) -> None:
         "coverage: { thresholds: { lines: 80 } } } };\n"
     )
     new = old.replace("['node_modules']", "['node_modules', 'src/**/*.spec.ts']")
-    assert rule_ids(edit(tmp_path / "a", "vitest.config.ts", old, new)) == ["runner.tampered"]
+    spec = {"src/a/b.spec.ts": "t\n"}
+    assert rule_ids(edit(tmp_path / "a", "vitest.config.ts", old, new, files=spec)) == [
+        "runner.tampered"
+    ]
     assert rule_ids(
         edit(tmp_path / "b", "vitest.config.ts", old, old.replace("lines: 80", "lines: 5"))
     ) == ["runner.tampered"]
@@ -377,11 +391,11 @@ BARE = '[project]\nname = "x"\n'
 
 
 def test_new_ruff_table_with_ignores_only_warns(tmp_path: Path) -> None:
-    adopted = BARE + '\n[tool.ruff]\nselect = ["E"]\nignore = ["B904", "B028"]\n'
+    adopted = BARE + '\n[tool.ruff]\nselect = ["E", "F"]\nignore = ["F401", "F841"]\n'
     found = pyproject(tmp_path / "a", BARE, adopted)
     assert rule_ids(found) == ["runner.tampered"] and found[0].severity == "warn"
-    assert "B904" in found[0].message
-    per_file = BARE + '\n[tool.ruff.lint.per-file-ignores]\n"tests/*" = ["S101"]\n'
+    assert "F401" in found[0].message
+    per_file = BARE + '\n[tool.ruff.lint.per-file-ignores]\n"tests/*" = ["F401"]\n'
     found = pyproject(tmp_path / "b", BARE, per_file)
     assert rule_ids(found) == ["runner.tampered"] and found[0].severity == "warn"
 
@@ -394,14 +408,14 @@ def test_new_mypy_table_loosening_only_warns(tmp_path: Path) -> None:
 
 
 def test_ignores_added_to_an_existing_ruff_table_still_block(tmp_path: Path) -> None:
-    base = BARE + '\n[tool.ruff]\nselect = ["E"]\n'
+    base = BARE + '\n[tool.ruff]\nselect = ["E", "B"]\n'
     found = pyproject(tmp_path / "a", base, base + 'ignore = ["B904"]\n')
     assert rule_ids(found) == ["runner.tampered"] and found[0].severity == "block"
     # An existing mypy table does not make a new ruff table an old one, and vice versa.
     mixed = BARE + "\n[tool.mypy]\nstrict = true\n"
-    new = mixed + '\n[tool.ruff]\nignore = ["E501"]\n'
+    new = mixed + '\n[tool.ruff]\nignore = ["F401"]\n'
     assert {f.severity for f in pyproject(tmp_path / "b", mixed, new)} == {"warn"}
-    loosened = mixed.replace("true", "false") + '\n[tool.ruff]\nignore = ["E501"]\n'
+    loosened = mixed.replace("true", "false") + '\n[tool.ruff]\nignore = ["F401"]\n'
     severities = sorted(f.severity for f in pyproject(tmp_path / "c", mixed, loosened))
     assert severities == ["block", "warn"]
 
