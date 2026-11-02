@@ -2087,6 +2087,18 @@ def selected_test_files(family: str, runs: Sequence[_Run], tf: TestFiles | None)
     return out
 
 
+def covered_test_files(
+    commands: Sequence[str], files: TestFiles | None, defs: Mapping[str, str] | None = None
+) -> dict[str, set[str] | None]:
+    """Per runner family the commands run, the base test files they select (None when that
+    cannot be told). The entry point for a rule that asks "which tests does this run cover",
+    with `TestFiles` from the base tree (`_BaseTests.selectable()`)."""
+    return {
+        family: selected_test_files(family, runs, files)
+        for family, runs in _invocations(commands, defs).items()
+    }
+
+
 def _lost_files(
     family: str, base: Sequence[_Run], cand: Sequence[_Run], tf: TestFiles | None
 ) -> list[str] | None:
