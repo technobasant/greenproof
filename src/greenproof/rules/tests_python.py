@@ -129,9 +129,18 @@ def _has_call(node: ast.AST) -> bool:
 _Same = Callable[[ast.AST, ast.AST], bool]
 
 
+def _empty_display(node: ast.AST) -> bool:
+    """A `[]`, `()`, `{}` display with nothing in it: falsy."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return not node.elts
+    return isinstance(node, ast.Dict) and not node.keys
+
+
 def _always_false(node: ast.AST, same: _Same | None = None) -> bool:
     if isinstance(node, ast.Constant):
         return not node.value
+    if _empty_display(node):
+        return True
     return (
         isinstance(node, ast.UnaryOp)
         and isinstance(node.op, ast.Not)
@@ -139,14 +148,27 @@ def _always_false(node: ast.AST, same: _Same | None = None) -> bool:
     )
 
 
+def _truthy_display(node: ast.AST) -> bool:
+    """A display with at least one element that is not a `*unpack` (which may be empty)."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any(not isinstance(e, ast.Starred) for e in node.elts)
+    return isinstance(node, ast.Dict) and any(k is not None for k in node.keys)
+
+
 def _always_true(node: ast.AST, same: _Same | None = None) -> bool:
-    """A condition that cannot fail: a truthy constant, `x or True`, `x == x`, a non-empty tuple.
+    """A condition that cannot fail: a truthy constant, `x or True`, `x == x`, a non-empty
+    display (the classic `assert (x, "msg")`), a non-empty f-string, `not []`.
     `same` decides whether two sides are the same expression (default: `_same`)."""
     same = same or _same
     if isinstance(node, ast.Constant):
         return bool(node.value) and node.value is not Ellipsis
-    if isinstance(node, ast.Tuple):
-        return bool(node.elts)
+    if _truthy_display(node):
+        return True
+    if isinstance(node, ast.JoinedStr):
+        return any(
+            isinstance(v, ast.Constant) and isinstance(v.value, str) and v.value
+            for v in node.values
+        )
     if isinstance(node, ast.BoolOp):
         parts = [_always_true(v, same) for v in node.values]
         return any(parts) if isinstance(node.op, ast.Or) else all(parts)
@@ -159,15 +181,54 @@ def _always_true(node: ast.AST, same: _Same | None = None) -> bool:
     return False
 
 
+# Calls that give a different answer each time: `next(it) == next(it)` is not a tautology.
+_IMPURE_TAILS = frozenset(
+    {
+        "next",
+        "pop",
+        "popleft",
+        "popitem",
+        "readline",
+        "recv",
+        "random",
+        "randint",
+        "randrange",
+        "choice",
+        "getrandbits",
+        "uuid1",
+        "uuid4",
+        "time",
+        "time_ns",
+        "now",
+        "monotonic",
+        "perf_counter",
+        "get_nowait",
+    }
+)
+
+
+def _stateful(node: ast.AST) -> bool:
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr)):
+            return True
+        if isinstance(n, ast.Call):
+            func = n.func
+            tail = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            if tail in _IMPURE_TAILS:
+                return True
+    return False
+
+
 def _same(a: ast.AST, b: ast.AST) -> bool:
-    """The same side-effect-free expression on both sides (calls are not assumed pure)."""
-    return not _has_call(a) and ast.dump(a) == ast.dump(b)
+    """The same expression on both sides, so comparing it with itself checks nothing. Calls count
+    as the same call written twice (`f(1) == f(1)`), except calls that are stateful by nature."""
+    return ast.dump(a) == ast.dump(b) and not _stateful(a)
 
 
 def _vacuous_call(tail: str, node: ast.Call, same: _Same | None = None) -> bool:
     if tail == "assertTrue":
         return bool(node.args) and _always_true(node.args[0], same)
-    if tail in _EQUAL_METHODS and len(node.args) >= 2:
+    if (tail in _EQUAL_METHODS or tail == "assertIs") and len(node.args) >= 2:
         return (same or _same)(node.args[0], node.args[1])
     return False
 
@@ -565,6 +626,9 @@ class _Stats(ast.NodeVisitor):
             set()
         )  # targets of a bare truthiness (or `is not None`) check
         self.first_line = 0
+        # (subject shape, expected number) -> (tightest band, subject source) over the exact and
+        # tolerant numeric comparisons of the body (SPEC 5.4, exact checks loosened).
+        self.numeric: dict[tuple[str, float], tuple[float, str]] = {}
 
     def _same_at(self, line: int) -> _Same:
         """`_same`, also after inlining the locals assigned once before `line`. An expression with
@@ -641,6 +705,12 @@ class _Stats(ast.NodeVisitor):
             if test.args:
                 self._loosen(test.args[0], src)
         else:
+            if (
+                isinstance(test, ast.Call)
+                and not negated
+                and dotted(test.func).rsplit(".", 1)[-1] == "isclose"
+            ):
+                self._isclose(test)
             self._loosen(test, src)
 
     def _compare(self, left: ast.expr, op: ast.cmpop, right: ast.expr, src: str, neg: bool) -> None:
@@ -652,11 +722,88 @@ class _Stats(ast.NodeVisitor):
             return
         if exact:
             self._pinned_check((left, right))
+            if isinstance(op, ast.Eq) and not neg:
+                self._numeric_pair(left, right)
         for side in (left, right):
             if exact:
                 self._exact(side, src)
             else:
                 self._loosen(side, src)
+
+    # -- numeric tolerance bands ---------------------------------------------------------
+    def _band(self, node: ast.expr) -> tuple[float, float] | None:
+        """(expected, band) of a numeric literal (band 0) or `approx(<literal>, rel=, abs=)`;
+        None for anything else, or when a tolerance is not a literal."""
+        node = self.consts.inline(node)  # type: ignore[assignment]
+        expected = _number(node)
+        if expected is not None:
+            return expected, 0.0
+        if not (
+            isinstance(node, ast.Call)
+            and dotted(node.func).rsplit(".", 1)[-1] == "approx"
+            and len(node.args) == 1
+        ):
+            return None
+        expected = _number(node.args[0])
+        if expected is None:
+            return None
+        tol: dict[str, float] = {}
+        for kw in node.keywords:
+            if kw.arg not in {"rel", "abs"}:
+                continue
+            value = _number(self.consts.inline(kw.value))
+            if value is None:
+                return None
+            tol[kw.arg] = value
+        rel = tol.get("rel", 0.0 if "abs" in tol else 1e-6)
+        return expected, max(rel * abs(expected), tol.get("abs", 1e-12))
+
+    def _note_numeric(self, subject: ast.expr, expected: float, band: float) -> None:
+        if self.consts.is_const(subject):
+            return
+        key = (self._opshape(subject), expected)
+        have = self.numeric.get(key)
+        if have is None or band < have[0]:
+            self.numeric[key] = (band, ast.unparse(self.consts.inline(subject)))
+
+    def _numeric_pair(self, left: ast.expr, right: ast.expr, band: float | None = None) -> None:
+        """`left == right` where one side is a numeric literal or approx of one. `band` overrides
+        the tolerance for a call that carries its own (assertAlmostEqual, math.isclose)."""
+        a, b = self._band(left), self._band(right)
+        if (a is None) == (b is None):
+            return
+        expected, own = a or b or (0.0, 0.0)
+        self._note_numeric(
+            right if a is not None else left, expected, own if band is None else band
+        )
+
+    def _almost_band(self, node: ast.Call) -> float | None:
+        """The band an assertAlmostEqual call allows: `delta`, else half of 10**-places."""
+        places: float | None = 7.0
+        if len(node.args) >= 3:
+            places = _number(node.args[2])
+        for kw in node.keywords:
+            if kw.arg == "delta":
+                return _number(kw.value)
+            if kw.arg == "places":
+                places = _number(kw.value)
+        return None if places is None else 0.5 * 10.0 ** (-places)
+
+    def _isclose(self, node: ast.Call) -> None:
+        tol: dict[str, float] = {}
+        for kw in node.keywords:
+            if kw.arg in {"rel_tol", "abs_tol"}:
+                value = _number(kw.value)
+                if value is None:
+                    return
+                tol[kw.arg] = value
+        if len(node.args) < 2:
+            return
+        for lit, other in ((node.args[1], node.args[0]), (node.args[0], node.args[1])):
+            if (n := _number(self.consts.inline(lit))) is not None:
+                band = max(tol.get("rel_tol", 1e-9) * abs(n), tol.get("abs_tol", 0.0))
+                self._note_numeric(other, n, band)
+                return
 
     # -- assertions ---------------------------------------------------------------------
     def _counted(self, node: ast.AST) -> None:
@@ -704,6 +851,9 @@ class _Stats(ast.NodeVisitor):
             # A bare truthiness check on a call is weak; type checks pin a concrete fact.
             if dotted(test.func) in {"isinstance", "issubclass"}:
                 self.strong += 1
+            elif dotted(test.func).rsplit(".", 1)[-1] == "isclose" and len(test.args) >= 2:
+                self.strong += 1  # a comparison with a tolerance, like `== approx(...)`
+                self.strong_operands.update(self._opshape(a) for a in test.args[:2])
             else:
                 self.weak += 1
                 self.weak_operands.add(self._opshape(test))
@@ -775,6 +925,10 @@ class _Stats(ast.NodeVisitor):
     def _method_checks(self, tail: str, node: ast.Call) -> None:
         src = ast.unparse(node)
         args = node.args
+        if tail in _EQUAL_METHODS and len(args) >= 2:
+            band = self._almost_band(node) if tail in _ALMOST else None
+            if band is not None or tail not in _ALMOST:
+                self._numeric_pair(args[0], args[1], band)
         if tail in _EXACT_METHODS:
             if tail == "assertIsNone":
                 self.pinned += 1  # `is None`: pinned to the constant None
@@ -1013,6 +1167,7 @@ def _unit(
         exact_subjects=stats.exact,
         loose_targets=stats.loose,
         pinned=stats.pinned,
+        numeric_bands=stats.numeric,
         strong_operands=stats.strong_operands,
         weak_operands=stats.weak_operands,
         classes=classes,

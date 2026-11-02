@@ -46,6 +46,9 @@ class Unit:
     pinned: int = 0
     # Python only: forms of assertions that are loose checks only (no exact check inside).
     loose_forms: list[str] = field(default_factory=list)
+    # Python only: (subject shape, expected number) -> (tightest tolerance band, subject source)
+    # over the body's comparisons to a numeric literal; exact is band 0 (SPEC 5.4).
+    numeric_bands: dict[tuple[str, float], tuple[float, str]] = field(default_factory=dict)
     strong_operands: set[str] = field(default_factory=set)
     weak_operands: set[str] = field(default_factory=set)
     # Collection facts: enclosing classes, whether one is a TestCase, `__test__ = False`.

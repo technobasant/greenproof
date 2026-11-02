@@ -168,6 +168,31 @@ def _loosened(b: Unit, c: Unit) -> list[tuple[str, str]]:
     ]
 
 
+def _band_floor(expected: float) -> float:
+    """The smallest tolerance that counts as loosening an exact numeric check: 1% of the
+    expected value, or 0.01 when it is 0 (SPEC 5.4)."""
+    return 0.01 * abs(expected) if expected else 0.01
+
+
+def _loosened_numeric(b: Unit, c: Unit) -> list[_Reason]:
+    """An exact (or default-`approx`) comparison to a number at the base that the candidate makes
+    with an explicit tolerance of 1% of the expected value or more."""
+    out: list[_Reason] = []
+    for (shape, expected), (band, src) in c.numeric_bands.items():
+        floor = _band_floor(expected)
+        before = b.numeric_bands.get((shape, expected))
+        if before is not None and before[0] < floor <= band:
+            out.append(
+                (
+                    f"exact check on `{src}` against {expected:g} loosened to a tolerance "
+                    f"of {band:g} (1% of the expected value or more)",
+                    c.line,
+                    BLOCK,
+                )
+            )
+    return out
+
+
 def _only_loose_dropped(b: Unit, c: Unit, added: _Added) -> bool:
     """SPEC 5.4: every base assertion that is gone is a loose check, and every subject of an
     exact check at the base is still the subject of one in the candidate. Beyond the spec text
@@ -215,6 +240,8 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
         )
     loosened = _loosened(b, c) if b.engine == "python" else []
     out.extend((f"exact check on `{x}` loosened to `{src}`", c.line, BLOCK) for x, src in loosened)
+    if b.engine == "python":
+        out.extend(_loosened_numeric(b, c))
     if c.strong < b.strong and c.weak > b.weak and not loosened:
         # Cutting a comparison to a truthiness check on its own operand is a plain weakening
         # (an exact check loosened is reported above); a different expression is often a
