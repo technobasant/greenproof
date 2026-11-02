@@ -358,3 +358,232 @@ def test_a_parameter_shadowing_a_module_list_is_unreadable(tmp_path: Path) -> No
         NOX,
     )
     assert verdict(found) == "warn"
+
+
+# ---- G5: Makefile variables are expanded before a recipe line is read --------------------------
+
+
+def make_verdict(tmp_path: Path, base: str, new: str, extra: dict[str, str] | None = None) -> str:
+    return verdict(scene(tmp_path, {"Makefile": base, **(extra or {})}, {"Makefile": new}, MAKE))
+
+
+@pytest.mark.parametrize("op", ["=", ":=", "::=", "?="])
+def test_a_variable_reassigned_to_true_blocks(tmp_path: Path, op: str) -> None:
+    base = f"PYTEST {op} pytest\ntest:\n\t$(PYTEST) -q\n"
+    new = f"PYTEST {op} true\ntest:\n\t$(PYTEST) -q\n"
+    assert make_verdict(tmp_path, base, new) == "block"
+
+
+def test_a_variable_defined_after_the_first_assignment_wins(tmp_path: Path) -> None:
+    base = "PYTEST = pytest\ntest:\n\t$(PYTEST) -q\n"
+    new = "PYTEST = pytest\nPYTEST = true\ntest:\n\t$(PYTEST) -q\n"
+    assert make_verdict(tmp_path, base, new) == "block"
+
+
+def test_a_conditional_assignment_does_not_override(tmp_path: Path) -> None:
+    base = "PYTEST = pytest\ntest:\n\t$(PYTEST) -q\n"
+    new = "PYTEST = pytest\nPYTEST ?= true\ntest:\n\t${PYTEST} -q\n"
+    assert make_verdict(tmp_path, base, new) == "pass"
+
+
+def test_an_appended_variable_is_read(tmp_path: Path) -> None:
+    base = "ARGS = -q\ntest:\n\tpytest $(ARGS)\n"
+    new = "ARGS = -q\nARGS += -k add\ntest:\n\tpytest $(ARGS)\n"
+    assert make_verdict(tmp_path, base, new) == "block"
+
+
+def test_a_variable_that_names_another_one_is_followed(tmp_path: Path) -> None:
+    base = "RUN = $(TOOL)\nTOOL = pytest\ntest:\n\t$(RUN) -q\n"
+    new = "RUN = $(TOOL)\nTOOL = echo\ntest:\n\t$(RUN) -q\n"
+    assert make_verdict(tmp_path, base, new) == "block"
+
+
+def test_a_variable_that_refers_to_itself_does_not_loop(tmp_path: Path) -> None:
+    base = "A = $(A) x\ntest:\n\tpytest $(A)\n"
+    new = "A = $(A) x\ntest:\n\tpytest -q $(A)\n"
+    assert make_verdict(tmp_path, base, new) == "pass"
+
+
+def test_a_python_variable_refactor_stays_honest(tmp_path: Path) -> None:
+    base = "test:\n\trm -rf .pytest_cache\n\tpython3 -m pytest -q\n"
+    new = "PYTHON ?= python3\ntest:\n\t$(PYTHON) -m pytest -q\n"
+    assert make_verdict(tmp_path, base, new) == "pass"
+
+
+def test_an_undefined_variable_is_left_as_written(tmp_path: Path) -> None:
+    base = "test:\n\t$(PY) -m pytest -q\n"
+    new = "test:\n\t$(PY) -m pytest -q tests\n"
+    assert make_verdict(tmp_path, base, new) == "pass"
+
+
+def test_a_variable_with_a_policy_value_stays_the_check(tmp_path: Path) -> None:
+    base = "PYTHON ?= python3\ntest:\n\t$(PYTHON) -m pytest -q\n"
+    new = "PYTHON ?= python3\ntest:\n\t$(PYTHON) -m pytest -q --maxfail=3\n"
+    assert make_verdict(tmp_path, base, new) == "pass"
+
+
+# ---- G6: a check replaced by a check of another kind ------------------------------------------
+
+
+def pkg_verdict(tmp_path: Path, base: dict[str, str], new: dict[str, str]) -> str:
+    found = scene(tmp_path, {"package.json": pkg(base)}, {"package.json": pkg(new)}, NPM_TEST)
+    return verdict(found)
+
+
+def test_a_test_script_replaced_by_a_linter_blocks(tmp_path: Path) -> None:
+    assert pkg_verdict(tmp_path, {"test": "jest"}, {"test": "eslint ."}) == "block"
+
+
+def test_a_test_script_replaced_by_a_script_that_lints_blocks(tmp_path: Path) -> None:
+    base = {"test": "jest", "lint": "eslint ."}
+    new = {"test": "npm run lint", "lint": "eslint ."}
+    assert pkg_verdict(tmp_path, base, new) == "block"
+
+
+def test_a_test_recipe_replaced_by_a_type_check_blocks(tmp_path: Path) -> None:
+    assert make_verdict(tmp_path, "test:\n\tpytest -q\n", "test:\n\tmypy src\n") == "block"
+
+
+def test_a_test_runner_swapped_for_its_family_passes(tmp_path: Path) -> None:
+    assert pkg_verdict(tmp_path, {"test": "jest"}, {"test": "vitest run"}) == "pass"
+
+
+def test_a_check_moved_into_another_script_passes(tmp_path: Path) -> None:
+    base = {"test": "jest --ci"}
+    new = {"test": "npm run unit", "unit": "jest --ci"}
+    assert pkg_verdict(tmp_path, base, new) == "pass"
+
+
+def test_checks_reordered_pass(tmp_path: Path) -> None:
+    base = {"test": "jest && eslint ."}
+    new = {"test": "eslint . && jest"}
+    assert pkg_verdict(tmp_path, base, new) == "pass"
+
+
+def test_a_recipe_that_calls_another_target_passes(tmp_path: Path) -> None:
+    base = "test:\n\tpytest -q\n\truff check .\n"
+    new = "test: unit lint\n\nunit:\n\tpytest -q\n\nlint:\n\truff check .\n"
+    assert make_verdict(tmp_path, base, new) == "pass"
+
+
+def test_a_candidate_with_an_unknown_script_is_not_judged_by_kind(tmp_path: Path) -> None:
+    base = "test:\n\tpytest -q\n"
+    new = "test:\n\t./run-tests.sh\n\truff check .\n"
+    assert make_verdict(tmp_path, base, new, {"run-tests.sh": "pytest\n"}) == "pass"
+
+
+# ---- G7: the same tool is the same step only with the same subcommand -------------------------
+
+
+def known(*texts: str):
+    from greenproof.rules.runner import _Known
+
+    return _Known(list(texts))
+
+
+@pytest.mark.parametrize(
+    ("base", "cand", "same"),
+    [
+        ("ng test", "ng lint", False),
+        ("ng test", "ng --version", False),
+        ("ng test", "ng e2e", False),
+        ("ng test", "ng test --no-watch", True),
+        ("ng test --watch=false", "ng test --browsers=ChromeHeadless", True),
+        ('prettier "src/**" --check', "prettier . --check", True),
+        ("eslint src", "eslint .", True),
+        ("ng build", "ng build --prod", True),
+    ],
+)
+def test_known_statements_match_by_subcommand(base: str, cand: str, same: bool) -> None:
+    assert (cand in known(base)) is same
+
+
+def test_ng_test_replaced_by_ng_lint_blocks(tmp_path: Path) -> None:
+    found = scene(
+        tmp_path,
+        {"package.json": pkg({"test": "ng test"})},
+        {"package.json": pkg({"test": "ng lint"})},
+        NPM_TEST,
+    )
+    assert verdict(found) == "block"
+
+
+def test_ng_test_with_more_flags_passes(tmp_path: Path) -> None:
+    base = {"test": "ng test"}
+    new = {"test": "ng test --no-watch --browsers=ChromeHeadless"}
+    assert pkg_verdict(tmp_path, base, new) == "pass"
+
+
+# ---- G8: a target named like an existing path does not run -------------------------------------
+
+TESTS_DIR = {"tests/test_a.py": "def test_a(): pass\n"}
+
+
+def test_a_recipe_moved_to_a_target_named_like_a_directory_blocks(tmp_path: Path) -> None:
+    new = "test: tests\n\ntests:\n\tpytest -q\n"
+    assert make_verdict(tmp_path, "test:\n\tpytest -q\n", new, TESTS_DIR) == "block"
+
+
+def test_the_same_target_declared_phony_passes(tmp_path: Path) -> None:
+    new = ".PHONY: tests\ntest: tests\n\ntests:\n\tpytest -q\n"
+    assert make_verdict(tmp_path, "test:\n\tpytest -q\n", new, TESTS_DIR) == "pass"
+
+
+def test_phony_continued_over_lines_passes(tmp_path: Path) -> None:
+    new = ".PHONY: lint \\\n    tests\ntest: tests\n\ntests:\n\tpytest -q\n"
+    assert make_verdict(tmp_path, "test:\n\tpytest -q\n", new, TESTS_DIR) == "pass"
+
+
+def test_a_forced_target_passes(tmp_path: Path) -> None:
+    new = "test: tests\n\ntests: FORCE\n\tpytest -q\n\nFORCE:\n"
+    assert make_verdict(tmp_path, "test:\n\tpytest -q\n", new, TESTS_DIR) == "pass"
+
+
+def test_a_target_with_no_such_path_passes(tmp_path: Path) -> None:
+    new = "test: unit\n\nunit:\n\tpytest -q\n"
+    assert make_verdict(tmp_path, "test:\n\tpytest -q\n", new, TESTS_DIR) == "pass"
+
+
+def test_a_prerequisite_that_is_a_path_does_not_hide_the_recipe(tmp_path: Path) -> None:
+    new = "test: tests\n\tpytest -q\n"
+    assert make_verdict(tmp_path, "test:\n\tpytest -q\n", new, TESTS_DIR) == "pass"
+
+
+def test_a_shadowed_target_that_was_already_shadowed_at_the_base_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    base = "test: tests\n\ntests:\n\tpytest -q\n"
+    assert make_verdict(tmp_path, base, base + "# note\n", TESTS_DIR) == "pass"
+
+
+def test_a_directory_added_over_the_test_target_blocks(tmp_path: Path) -> None:
+    found = scene(
+        tmp_path,
+        {"Makefile": "test:\n\tpytest -q\n"},
+        {"test/README": "x\n"},
+        MAKE,
+    )
+    assert found == []  # the Makefile is untouched: nothing to compare
+
+
+# ---- G9: turning off plugin autoload is worth a look ------------------------------------------
+
+AUTOLOAD = '[tool.pytest.ini_options]\naddopts = "-q --disable-plugin-autoload"\n'
+PLAIN = '[tool.pytest.ini_options]\naddopts = "-q"\n'
+
+
+def test_disabling_plugin_autoload_warns(tmp_path: Path) -> None:
+    found = scene(tmp_path, {"pyproject.toml": PLAIN}, {"pyproject.toml": AUTOLOAD}, NOX)
+    assert verdict(found) == "warn"
+    assert "--disable-plugin-autoload" in found[0].message
+
+
+def test_plugin_autoload_already_off_at_the_base_passes(tmp_path: Path) -> None:
+    changed = AUTOLOAD + "\n[tool.other]\nx = 1\n"
+    found = scene(tmp_path, {"pyproject.toml": AUTOLOAD}, {"pyproject.toml": changed}, NOX)
+    assert verdict(found) == "pass"
+
+
+def test_enabling_plugin_autoload_again_passes(tmp_path: Path) -> None:
+    found = scene(tmp_path, {"pyproject.toml": AUTOLOAD}, {"pyproject.toml": PLAIN}, NOX)
+    assert verdict(found) == "pass"

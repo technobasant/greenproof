@@ -29,6 +29,7 @@ from greenproof.rules.shell import (
     command_tokens,
     early_exit,
     find_swallows,
+    is_non_check,
     scripts_in,
     selection_flags,
     split_segments,
@@ -77,6 +78,7 @@ _PM_VALUE_OPTS = {"--prefix", "--workspace", "-w", "--filter", "-F", "--cwd", "-
 class _Settings:
     select: Counter[str] = field(default_factory=Counter)  # narrowing pytest options
     plugins_off: Counter[str] = field(default_factory=Counter)  # `-p no:X` in addopts
+    autoload_off: bool = False  # `--disable-plugin-autoload` in addopts
     error_filter: bool = False  # warnings are errors: `filterwarnings = error`, `-W error`
     testpaths: set[str] = field(default_factory=set)
     cov_fail_under: float | None = None
@@ -134,6 +136,8 @@ def _addopts(settings: _Settings, value: Any) -> None:
             i += 1
         elif tok.startswith("-pno:"):
             settings.plugins_off[tok[5:]] += 1
+        elif tok == "--disable-plugin-autoload":
+            settings.autoload_off = True
         elif tok == "-W" and i + 1 < len(tokens) and tokens[i + 1].startswith("error"):
             settings.error_filter = True
             i += 1
@@ -313,6 +317,13 @@ def _plugin_reasons(base: _Settings | None, cand: _Settings) -> list[str]:
             out.append(f"{option} (warnings are errors in this configuration, and now are not)")
         else:
             out.append(_Warn(f"{option} (it turns off a plugin: check what it was doing)"))
+    if cand.autoload_off and not (base and base.autoload_off):
+        out.append(
+            _Warn(
+                "pytest option `--disable-plugin-autoload` added (no installed plugin loads "
+                "unless named with `-p`: check what they were doing)"
+            )
+        )
     return out
 
 
@@ -430,6 +441,16 @@ class _Ctx:
             self.script_check(name) for name in _script_refs(statement, self.names)
         )
 
+    def kind(self, statement: str) -> str | None:
+        """The kind of check a statement is (`pytest`, `eslint`, ...), None when it is none."""
+        for text in (statement, _unwrap(statement)):
+            kind = check_kind(
+                text, literals=self.literals, scripts=self.scripts, make_check=self.make_check
+            )
+            if kind is not None:
+                return kind
+        return None
+
     def has_check(self, lines: Sequence[str], script: bool) -> bool:
         return any(self.is_check(st) for st in _statements(lines, script))
 
@@ -444,6 +465,7 @@ def neutering_reason(
     script_check: Callable[[str], bool] | None = None,
     base_pool: Sequence[str] = (),
     names: tuple[Collection[str], Collection[str]] | None = None,
+    expanders: tuple[Expander, Expander] | None = None,
 ) -> str | None:
     """Whether a command (a script or recipe) was emptied, no-opped, narrowed or shortened.
 
@@ -453,7 +475,9 @@ def neutering_reason(
     package.json script does. A statement counts as a check only when its command is one; with no
     recognised check at all, every statement the base had does (`base_pool` adds statements the
     base ran from elsewhere, for a script that is new). Only the steps that are checks count
-    towards "fewer steps": a cleanup line or a `pretest` split off is not a lost check.
+    towards "fewer steps": a cleanup line or a `pretest` split off is not a lost check. A kind of
+    check the base ran and the candidate no longer does (`jest` became `eslint`) is a reason, with
+    `expanders` reading `npm run x` or `make x` into the body they run.
     """
     base_c = [ln.strip() for ln in base_lines if ln.strip()]
     cand_c = [ln.strip() for ln in cand_lines if ln.strip()]
@@ -485,11 +509,74 @@ def neutering_reason(
         return "it now exits 0 before its checks run"
     if not script and (why := _dash_reason(base_c, cand_c, ctx, known[1], base_texts)):
         return why
+    if not script and (lost := _lost_kind(base_c, cand_c, ctx, expanders)):
+        return f"it no longer runs {lost}"
     side = names or ((), ())
     if not script and _check_steps(cand_c, ctx, known[1], base_texts, side[1]) < _check_steps(
         base_c, ctx, known[0], None, side[0]
     ):
         return "it runs fewer steps than before"
+    return None
+
+
+Expander = Callable[[str], "list[str] | None"]
+_LINT_KINDS = frozenset({"ruff", "mypy", "flake8", "pylint", "eslint", "clippy", "package lint"})
+# Kinds that wrap another command: they stand for whatever test runner is behind them.
+_WRAPPER_KINDS = frozenset({"make test", "package test", "tox/nox"})
+
+
+def _kinds(
+    lines: Sequence[str], ctx: _Ctx, expand: Expander | None, depth: int = 0
+) -> tuple[Counter[str], bool]:
+    """The kinds of check a recipe or script runs, with `npm run x` and `make x` read into their
+    bodies; and whether a statement is one the rule cannot classify (it might run any check)."""
+    found: Counter[str] = Counter()
+    opaque = False
+    for st in _statements(lines, False):
+        body = expand(st) if expand is not None and depth < _MAX_DEPTH else None
+        if body is not None:
+            inner, inner_opaque = _kinds(body, ctx, expand, depth + 1)
+            found.update(inner)
+            opaque = opaque or inner_opaque
+            continue
+        kind = ctx.kind(st)
+        if kind == "policy":
+            continue
+        if kind is not None:
+            found[kind] += 1
+        elif not (_housekeeping(st) or is_non_check(st)):
+            opaque = True
+    return found, opaque
+
+
+def _category(kind: str) -> str:
+    return "lint" if kind in _LINT_KINDS else kind
+
+
+def _lost_kind(
+    base: Sequence[str],
+    cand: Sequence[str],
+    ctx: _Ctx,
+    expanders: tuple[Expander, Expander] | None,
+) -> str | None:
+    """A kind of check the base ran that the candidate no longer does. Only judged when every
+    statement of the candidate is classified (an unknown script might run it) and it runs some
+    check; the lint kinds are one category, a wrapper (`make test`) stands for any test runner."""
+    before, _ = _kinds(base, ctx, expanders[0] if expanders else None)
+    after, opaque = _kinds(cand, ctx, expanders[1] if expanders else None)
+    if opaque or not after:
+        return None
+    present = {_category(k) for k in after}
+    for kind in sorted(before):
+        category = _category(kind)
+        if category in present:
+            continue
+        others = present - {"lint"}
+        if kind in _WRAPPER_KINDS and others:
+            continue
+        if category != "lint" and present & _WRAPPER_KINDS:
+            continue
+        return f"`{kind}`"
     return None
 
 
@@ -632,10 +719,24 @@ _GENERIC_HEADS = frozenset(
 )
 
 
+# The word after a tool's name that says what it does: `ng test` and `ng lint` are two steps.
+_SUBCOMMANDS = frozenset(
+    {"test", "lint", "check", "build", "run", "e2e", "typecheck", "format", "verify", "ci"}
+    | {"coverage", "spec", "unit", "integration", "serve", "start", "watch"}
+)
+
+
+def _subcommand(words: Sequence[str]) -> str | None:
+    """The first argument that is not a flag, when it is one of the `_SUBCOMMANDS`."""
+    first = next((w for w in words[1:] if not w.startswith("-")), None)
+    return first if first in _SUBCOMMANDS else None
+
+
 class _Known(Collection[str]):
     """The statements of the base. A candidate statement is one of them when it extends one or is
     one it extends (`ng test` became `ng test --no-watch`), or runs the same tool with other
-    arguments (`prettier "src/**" --check` became `prettier . --check`): the same step, edited."""
+    arguments (`prettier "src/**" --check` became `prettier . --check`): the same step, edited. A
+    tool's subcommand is part of the step: `ng test` becoming `ng lint` is another one."""
 
     def __init__(self, texts: Sequence[str]) -> None:
         self.texts = {t for t in texts if not _housekeeping(t)}
@@ -648,7 +749,11 @@ class _Known(Collection[str]):
         return bool(words) and any(
             b[: len(words)] == words
             or words[: len(b)] == b
-            or (b[0] == words[0] and words[0] not in _GENERIC_HEADS)
+            or (
+                b[0] == words[0]
+                and words[0] not in _GENERIC_HEADS
+                and _subcommand(b) == _subcommand(words)
+            )
             for b in self._words
         )
 
@@ -1045,6 +1150,18 @@ def _script_resolver(
     return resolve
 
 
+def _script_expander(scripts: Mapping[str, Any]) -> Expander:
+    """`npm run x` read into the bodies of script x of this package.json."""
+
+    def expand(statement: str) -> list[str] | None:
+        refs = [r for r in _script_refs(statement, scripts) if r in scripts]
+        if not refs:
+            return None
+        return [ln for r in refs for ln in _script_lines(scripts, r)]
+
+    return expand
+
+
 def _package_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int | None, str]]:
     base = json.loads(f.old_text) if f.old_text else {}
     cand = json.loads(f.new_text or "{}")
@@ -1077,6 +1194,7 @@ def _package_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[
                 script_check=resolve,
                 base_pool=pool,
                 names=(old_scripts.keys(), new_scripts.keys()),
+                expanders=(_script_expander(old_scripts), _script_expander(new_scripts)),
             ):
                 out.append((line, f"package.json script `{name}` changed and {why}"))
         elif name in after and isinstance(new, str) and new != old and new not in old_bodies:
@@ -1201,15 +1319,74 @@ class _Target:
 _RULE = re.compile(r"^([A-Za-z_][\w.-]*)\s*(?:[^=:\n]*)?:(?![=:])(.*)$")
 _DEFINE = re.compile(r"^\s*define\s")
 _ENDEF = re.compile(r"^\s*endef\b")
+_ASSIGN = re.compile(r"^(?:(?:export|override)\s+)*([A-Za-z_][\w.-]*)\s*(::=|:=|\?=|\+=|=)\s*(.*)$")
+_VAR_REF = re.compile(r"(?<!\$)\$[({]([A-Za-z_][\w.]*)[)}]")
 _MAX_DEPTH = 4
+_MAX_VAR_DEPTH = 6
+
+
+def _expand_vars(text: str, variables: Mapping[str, str], depth: int = 0) -> str:
+    """`$(NAME)` and `${NAME}` replaced by what the Makefile assigns NAME, recursively (to a depth
+    limit). A name the Makefile does not define, or a function call, is left as it is."""
+    if depth >= _MAX_VAR_DEPTH or "$" not in text:
+        return text
+
+    def value(m: re.Match[str]) -> str:
+        found = variables.get(m[1])
+        return m[0] if found is None else _expand_vars(found, variables, depth + 1)
+
+    return _VAR_REF.sub(value, text)
+
+
+def _joined(text: str) -> list[str]:
+    """The lines of a Makefile with backslash continuations folded into one line."""
+    return split_lines(re.sub(r"\\\n[ \t]*", " ", text))
+
+
+def _variables(text: str | None) -> dict[str, str]:
+    """The variables a Makefile assigns at the top level (`=`, `:=`, `::=`, `?=`, `+=`), by the
+    order of the file: a later `=` wins, `?=` keeps an earlier value, `+=` appends."""
+    out: dict[str, str] = {}
+    in_define = 0
+    for raw in _joined(text or ""):
+        if _DEFINE.match(raw):
+            in_define += 1
+            continue
+        if in_define:
+            in_define -= 1 if _ENDEF.match(raw) else 0
+            continue
+        m = _ASSIGN.match(raw) if not raw.startswith((" ", "\t")) else None
+        if m is None:
+            continue
+        name, op, value = m[1], m[2], re.sub(r"\s+#.*$", "", m[3]).strip()
+        if op in (":=", "::="):
+            out[name] = _expand_vars(value, out)
+        elif op == "?=":
+            out.setdefault(name, value)
+        elif op == "+=" and name in out:
+            out[name] = f"{out[name]} {value}".strip()
+        else:
+            out[name] = value
+    return out
+
+
+def _phony(text: str | None) -> set[str]:
+    names: set[str] = set()
+    for raw in _joined(text or ""):
+        m = re.match(r"^\.PHONY\s*:(.*)$", raw)
+        if m:
+            names.update(re.sub(r"#.*$", "", m[1]).split())
+    return names
 
 
 def _targets(text: str | None) -> dict[str, _Target]:
-    """Every rule of a Makefile with its recipe lines and prerequisites. A `define ... endef`
-    body is a macro, not a recipe, and is skipped."""
+    """Every rule of a Makefile with its recipe lines and prerequisites, the Makefile's own
+    variables expanded in both. A `define ... endef` body is a macro, not a recipe, and is
+    skipped."""
     found: dict[str, _Target] = {}
     current: _Target | None = None
     in_define = 0
+    variables = _variables(text)
     for raw in split_lines(text or ""):
         if _DEFINE.match(raw):
             in_define += 1
@@ -1219,7 +1396,7 @@ def _targets(text: str | None) -> dict[str, _Target]:
             continue
         m = _RULE.match(raw)
         if m and not raw.startswith((" ", "\t")):
-            head, _, inline = m.group(2).partition(";")
+            head, _, inline = _expand_vars(m.group(2), variables).partition(";")
             current = _Target(
                 prereqs=[
                     t for t in re.sub(r"#.*$", "", head).split() if re.fullmatch(r"[\w.-]+", t)
@@ -1229,14 +1406,38 @@ def _targets(text: str | None) -> dict[str, _Target]:
             if inline.strip():
                 current.lines.append(inline.strip())
         elif current is not None and raw.startswith((" ", "\t")) and raw.strip():
-            current.lines.append(raw.strip())
+            current.lines.append(_expand_vars(raw.strip(), variables))
         elif current is not None and raw.strip() and not raw.startswith(("#", ".")):
             current = None
     return found
 
 
-def _effective(targets: Mapping[str, _Target], name: str, depth: int = 0) -> list[str]:
-    """A target's recipe lines followed by those of its prerequisites in the same Makefile."""
+def _shadowed(text: str | None, targets: Mapping[str, _Target], tree: Collection[str]) -> set[str]:
+    """The targets whose recipe make never runs: not `.PHONY`, not forced, and a file or directory
+    of the same name exists beside the Makefile, so make takes the target as up to date."""
+    phony = _phony(text)
+    return {
+        name
+        for name, target in targets.items()
+        if name in tree and name not in phony and "FORCE" not in target.prereqs
+    }
+
+
+def _tree_names(changes: ChangeSet, directory: str, base: bool) -> set[str]:
+    """The names of the files and directories directly inside `directory`, at the base or in the
+    candidate tree; empty when the tree cannot be listed (no target is then taken as shadowed)."""
+    lister = changes.listing(base)
+    prefix = f"{directory}/" if directory else ""
+    return {
+        p[len(prefix) :].split("/")[0] for p in (lister() if lister else ()) if p.startswith(prefix)
+    }
+
+
+def _effective(
+    targets: Mapping[str, _Target], name: str, shadow: Collection[str] = ()
+) -> list[str]:
+    """A target's recipe lines followed by those of its prerequisites in the same Makefile. A
+    target in `shadow` runs nothing (its prerequisites still run)."""
     lines: list[str] = []
     seen: set[str] = set()
 
@@ -1247,13 +1448,16 @@ def _effective(targets: Mapping[str, _Target], name: str, depth: int = 0) -> lis
         seen.add(target)
         for pre in node.prereqs:
             walk(pre, level + 1)
-        lines.extend(node.lines)
+        if target not in shadow:
+            lines.extend(node.lines)
 
-    walk(name, depth)
+    walk(name, 0)
     return lines
 
 
-def _make_resolver(targets: Mapping[str, _Target], extra: Sequence[str]) -> MakeCheck:
+def _make_resolver(
+    targets: Mapping[str, _Target], extra: Sequence[str], shadow: Collection[str] = ()
+) -> MakeCheck:
     """Whether target X of this Makefile holds a check; None when there is no such target."""
     memo: dict[str, bool | None] = {}
 
@@ -1263,13 +1467,43 @@ def _make_resolver(targets: Mapping[str, _Target], extra: Sequence[str]) -> Make
         if target not in memo:
             memo[target] = False  # a cycle through this target adds nothing
             ctx = _Ctx(extra, resolve)
-            memo[target] = ctx.has_check(_effective(targets, target), False)
+            memo[target] = ctx.has_check(_effective(targets, target, shadow), False)
         return memo[target]
 
     return resolve
 
 
-def _make_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int | None, str]]:
+_MAKE_HEADS = frozenset({"make", "gmake", "$(MAKE)", "${MAKE}", "$MAKE"})
+_MAKE_FILE_OPTS = ("-C", "-f", "--directory", "--file", "--makefile")
+
+
+def _make_expander(targets: Mapping[str, _Target], shadow: Collection[str] = ()) -> Expander:
+    """`make x` read into the recipe lines of target x of this Makefile (None for anything else,
+    including a `make -C dir` that runs another Makefile)."""
+
+    def expand(statement: str) -> list[str] | None:
+        toks = command_tokens(statement)
+        if not toks or posixpath.basename(toks[0]) not in _MAKE_HEADS:
+            return None
+        if any(t.startswith(_MAKE_FILE_OPTS) for t in toks[1:]):
+            return None
+        names = [t for t in toks[1:] if not t.startswith("-") and "=" not in t and t in targets]
+        if not names:
+            return None
+        return [ln for n in names for ln in _effective(targets, n, shadow)]
+
+    return expand
+
+
+_SHADOW_WHY = (
+    "its recipe never runs: a file or directory of the same name exists and the target is not "
+    "in .PHONY"
+)
+
+
+def _make_reasons(
+    f: ChangedFile, commands: Mapping[str, str], changes: ChangeSet | None = None
+) -> list[tuple[int | None, str]]:
     names: set[str] = set()
     for cmd in commands.values():
         m = re.search(r"\b(?:make|just)\b(.*)", cmd)
@@ -1277,7 +1511,13 @@ def _make_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int
             names.update(t for t in re.findall(r"[\w.-]+", m.group(1)) if not t.startswith("-"))
     old, new = _targets(f.old_text), _targets(f.new_text)
     extra = list(commands.values())
-    resolve = _make_resolver(new, extra)
+    old_shadow: set[str] = set()
+    new_shadow: set[str] = set()
+    if changes is not None and posixpath.basename(f.path).lower() in ("makefile", "gnumakefile"):
+        directory = posixpath.dirname(f.path)
+        old_shadow = _shadowed(f.old_text, old, _tree_names(changes, directory, True))
+        new_shadow = _shadowed(f.new_text, new, _tree_names(changes, directory, False))
+    resolve = _make_resolver(new, extra, new_shadow)
     out: list[tuple[int | None, str]] = []
     for name in sorted(names):
         if name not in old:
@@ -1285,11 +1525,18 @@ def _make_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int
         if name not in new:
             out.append((None, f"target `{name}` was removed from {posixpath.basename(f.path)}"))
             continue
-        base_lines, cand_lines = old[name].lines, new[name].lines
-        if old[name].prereqs or new[name].prereqs:  # a recipe can move into its prerequisites
-            base_lines = _effective(old, name)
-            cand_lines = _effective(new, name)
-        if why := neutering_reason(base_lines, cand_lines, extra=extra, make_check=resolve):
+        base_lines = _effective(old, name, old_shadow)
+        cand_lines = _effective(new, name, new_shadow)
+        why = neutering_reason(
+            base_lines,
+            cand_lines,
+            extra=extra,
+            make_check=resolve,
+            expanders=(_make_expander(old, old_shadow), _make_expander(new, new_shadow)),
+        )
+        if why and not cand_lines and _effective(new, name):
+            why = _SHADOW_WHY
+        if why:
             out.append(
                 (
                     _first_line_with(f.new_text or "", f"{name}:"),
@@ -2020,7 +2267,7 @@ def _file_reasons(
     if re.match(r"^(?:jest|vitest)\.config\.\w+$", name):
         return _jest_reasons(f, False)
     if name in ("Makefile", "makefile", "GNUmakefile", "justfile", "Justfile"):
-        return _make_reasons(f, commands)
+        return _make_reasons(f, commands, changes)
     if name == "noxfile.py":
         return _noxfile_reasons(f)
     if name.endswith("_test.go"):
