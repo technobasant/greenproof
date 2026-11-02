@@ -1493,10 +1493,29 @@ _PATH_LIKE = re.compile(r"/|::|\.py$|_spec\.rb$")
 _RUNNER_WORDS = {"vitest": frozenset({"run", "watch", "dev", "related"})}
 
 
+def _join_expressions(args: list[str]) -> list[str]:
+    """`${{ matrix.x }}` split on its spaces back into one word."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if "${{" in tok and "}}" not in tok.split("${{", 1)[1]:
+            j = i
+            while j + 1 < len(args) and "}}" not in args[j]:
+                j += 1
+            out.append(" ".join(args[i : j + 1]))
+            i = j + 1
+        else:
+            out.append(tok)
+            i += 1
+    return out
+
+
 def _positionals(family: str, args: list[str]) -> list[str]:
     """The paths and names among a runner's arguments: flags, their values and numbers dropped."""
     values = _VALUE_FLAGS.get(family, frozenset())
     optional = _OPTIONAL_VALUE.get(family, frozenset())
+    args = _join_expressions(args)
     out: list[str] = []
     i = 0
     while i < len(args):
