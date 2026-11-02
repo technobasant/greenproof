@@ -591,7 +591,30 @@ _XARGS_VALUED = frozenset(
     {"-n", "-I", "-L", "-P", "-s", "-d", "-E", "-a", "--max-args", "--delimiter"}
 )
 _MODE_CLAUSE = re.compile(r"([ugoa]*)([-+=])([rwxXst]*)")
+# -- files the runners load that a run-time write can create ------------------------------
+_RUNNER_FILE = re.compile(
+    r"^(?:conftest\.py|\.?pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml|\.coveragerc|go\.mod"
+    r"|Cargo\.toml|\.nycrc.*|\.mocharc\..+|(?:jest|vitest|vite|playwright|babel)\.config\..+"
+    r"|karma\.conf\..+)$"
+)
+_TEST_NAME = re.compile(r"^(?:test_.+\.py|.+_test\.py|.+_test\.go|.+\.(?:test|spec)\.[A-Za-z]+)$")
+_OUTPUT_DIRS = frozenset(
+    {
+        "build",
+        "dist",
+        "node_modules",
+        ".tox",
+        "coverage",
+        "htmlcov",
+        ".nyc_output",
+        "target",
+        ".venv",
+        "venv",
+        ".git",
+    }
+)
 _HOW = {
+    "writes": "writes a file the test runner loads",
     "removes": "removes tests",
     "rewrites": "rewrites tests",
     "appends to": "appends to tests",
@@ -915,8 +938,8 @@ class _BaseTests:
             if ">" not in tok or " " in tok or not (m := _REDIRECT.match(tok)):
                 continue
             target = m["to"] or (stage[i + 1] if i + 1 < len(stage) else "")
-            if target and self._near(target, where, True):
-                return _Hit(target, "appends to" if m["op"] == ">>" else "rewrites")
+            if target and (wrote := self._written(target, where, m["op"] == ">>")):
+                return wrote
         if not stage:
             return None
         head, rest = posixpath.basename(stage[0]), stage[1:]
@@ -925,14 +948,16 @@ class _BaseTests:
             dirs_ok = head == "chmod"
             if hit := next((w for w in words if self._near(w, where, not dirs_ok)), None):
                 return _Hit(hit, how)
+            if not dirs_ok and (made := next((w for w in words if self._loaded(w, where)), None)):
+                return _Hit(made, "writes")
         if head == "dd":
             of = next((a[3:] for a in rest if a.startswith("of=")), "")
-            return _Hit(of, "rewrites") if of and self._near(of, where, True) else None
+            return self._written(of, where) if of else None
         if head == "patch":
-            hit = next(
-                (w for w in _operands(rest, {"-p", "-i", "-d"}) if self._near(w, where, True)), None
-            )
-            return _Hit(hit, "rewrites") if hit else None
+            for w in _operands(rest, {"-p", "-i", "-d"}):
+                if found := self._written(w, where):
+                    return found
+            return None
         if head in _COPIERS:
             return self._copied(head, rest, where)
         if head == "git":
@@ -940,6 +965,40 @@ class _BaseTests:
         if _INTERPRETER.match(head):
             return self._writing_code(rest, where)
         return None
+
+    def _written(self, word: str, where: _Dir, appends: bool = False) -> _Hit | None:
+        """A file a statement writes: a base test file (`rewrites`, or `appends to`), or one the
+        runner loads that the statement may create (`writes`)."""
+        if self._near(word, where, True):
+            return _Hit(word, "appends to" if appends else "rewrites")
+        return _Hit(word, "writes") if self._loaded(word, where) else None
+
+    def _loaded(self, word: str, where: _Dir) -> bool:
+        """Whether a file a statement writes is one the test runner loads: a config or collection
+        hook by name (`conftest.py`, `pytest.ini`, `jest.config.js`, ...), or a test-named file
+        that is not in the base, in a directory under a base test path. Output directories
+        (`build/`, `dist/`, `node_modules/`, `.tox/`, coverage) are left out."""
+        if word.startswith(("/", "~")):
+            return False
+        path = None if where.path is None else self._resolve(word, where.path)
+        parts = (path or _CWD_PREFIX.sub("", word)).split("/")
+        if _OUTPUT_DIRS & set(parts):
+            return False
+        name = parts[-1]
+        if _RUNNER_FILE.match(name):
+            return True
+        if not _TEST_NAME.match(name) or self._near(word, where, True):
+            return False  # not test-named, or a base test: that is a rewrite, not a new file
+        folder = "/".join(parts[:-1])
+        while folder not in ("", ".", ".."):
+            if path is not None:
+                self._build()
+                if folder in self.dirs:
+                    return True
+            elif any(p != "." for p in self._suffixed(folder)):
+                return True
+            folder = posixpath.dirname(folder)
+        return False
 
     @staticmethod
     def _in_place_files(head: str, rest: Sequence[str]) -> list[str]:
@@ -976,10 +1035,9 @@ class _BaseTests:
             else [a for a in args if a.startswith("-")]
         )
         short = "".join(f[1:] for f in flags if not f.startswith("--"))
-        if head == "ln" and "--force" not in flags and "f" not in short:
-            return None
-        if head == "cp" and ("--no-clobber" in flags or "n" in short):
-            return None
+        keeps = (head == "ln" and "--force" not in flags and "f" not in short) or (
+            head == "cp" and ("--no-clobber" in flags or "n" in short)
+        )  # such a copy cannot overwrite a file, but can still create one
         words = _operands(args, _RSYNC_VALUED if head == "rsync" else _COPY_VALUED)
         into = next(
             (a.split("=", 1)[1] for a in args if a.startswith("--target-directory=")),
@@ -987,6 +1045,14 @@ class _BaseTests:
         )
         sources, dest = (words, into) if into else (words[:-1], words[-1] if len(words) > 1 else "")
         if not dest or not sources:
+            return None
+        if self._loaded(dest, where):
+            return _Hit(dest, "writes")
+        if dest.endswith("/") or dest in (".", ".."):
+            landed = [f"{dest.rstrip('/')}/{posixpath.basename(s.rstrip('/'))}" for s in sources]
+            if hit := next((w for w in landed if self._loaded(w, where)), None):
+                return _Hit(hit, "writes")
+        if keeps:
             return None
         if self._near(dest, where, True):
             return _Hit(dest, "rewrites")
@@ -1060,8 +1126,8 @@ class _BaseTests:
             for pattern, appends in _WRITING_CALLS:
                 for m in pattern.finditer(args[i + 1]):
                     word = m["d"] or m["s"]
-                    if self._near(word, where, True):
-                        return _Hit(word, "appends to" if appends else "rewrites")
+                    if hit := self._written(word, where, appends):
+                        return hit
         return None
 
     def _one_liner(self, args: Sequence[str], where: _Dir) -> str | None:
@@ -1086,7 +1152,13 @@ class _BaseTests:
         if hit := next((w for w in sources if self._near(w, where)), None):
             return hit
         # `mv new.py tests/test_a.py` writes over a test file
-        return words[-1] if words and not to_dir and self._near(words[-1], where, True) else None
+        if words and not to_dir and self._near(words[-1], where, True):
+            return words[-1]
+        return (
+            _Hit(words[-1], "writes")
+            if words and not to_dir and self._loaded(words[-1], where)
+            else None
+        )
 
     def _tops(self, root: str, where: _Dir) -> list[str]:
         """The directories (or files) a `find` root names: one when the shell's directory is
@@ -1350,6 +1422,11 @@ def removal_reason(statement: str, found: str) -> str:
     """Why a statement that touches the base test path `found` is a finding: it removes it,
     rewrites it, or appends to it (a warning: nothing is taken away)."""
     how = getattr(found, "how", "removes")
+    if how == "writes":
+        return _Warn(
+            f"it now writes `{found}` (`{statement}`), a file the test runner loads: greenproof "
+            "cannot see its contents at run time, and it may skip or add tests"
+        )
     why = f"it now {_HOW[how]} (`{statement}` {how} `{found}`, which holds the project's tests)"
     return _Warn(why) if how in ("appends to", "copies into") else why
 
