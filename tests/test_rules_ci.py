@@ -220,3 +220,206 @@ def test_check_invocation_with_a_path_or_version_counts(tmp_path: Path) -> None:
         base = NO_GP + f"      - run: {run_line}\n"
         found = adopted(tmp_path / str(i), base, base.replace(run_line, run_line + " --x"))
         assert rule_ids(found) == ["ci.tampered"], run_line
+
+
+# ---- swallowed failures, narrowed runs and narrowed triggers in a test step -------------
+
+
+def ci_only(findings):
+    """The ci.tampered findings: set +e and || true also draw the warn-level suppress.added."""
+    return [f for f in findings if f.rule == "ci.tampered"]
+
+
+def test_failure_swallowing_in_a_test_step_fires(tmp_path: Path) -> None:
+    for i, tail in enumerate(
+        ("|| echo ok", "|| true", "|| :", "|| exit 0", "; exit 0", "; true", "; :")
+    ):
+        found = changed(
+            tmp_path / str(i), WORKFLOW.replace("run: pytest -q", f"run: pytest -q {tail}")
+        )
+        assert len(ci_only(found)) == 1, tail
+        assert ci_only(found)[0].line == WORKFLOW.splitlines().index("        run: pytest -q") + 1
+
+
+def test_set_plus_e_without_reading_the_status_fires(tmp_path: Path) -> None:
+    body = "run: |\n          set +e\n          pytest -q\n          exit 0"
+    found = changed(tmp_path, WORKFLOW.replace("run: pytest -q", body))
+    assert "ci.tampered" in rule_ids(found)
+    assert any("set +e" in f.message for f in found)
+    assert any(f.line == 15 for f in found if "set +e" in f.message)
+
+
+def test_a_failing_fallback_and_the_honest_set_plus_e_pattern_are_clean(tmp_path: Path) -> None:
+    assert (
+        changed(tmp_path / "a", WORKFLOW.replace("run: pytest -q", "run: pytest -q || exit 1"))
+        == []
+    )
+    assert (
+        changed(
+            tmp_path / "b",
+            WORKFLOW.replace("run: pytest -q", "run: pytest -q || { echo failed; exit 3; }"),
+        )
+        == []
+    )
+    honest = (
+        "run: |\n          set +e\n          pytest -q\n          code=$?\n"
+        "          set -e\n          exit $code"
+    )
+    assert ci_only(changed(tmp_path / "c", WORKFLOW.replace("run: pytest -q", honest))) == []
+
+
+def test_a_fallback_outside_a_test_step_is_clean(tmp_path: Path) -> None:
+    new = WORKFLOW.replace(
+        "      - name: Lint\n",
+        "      - name: Install\n        run: pip install -e . || pip install .\n"
+        "      - name: Lint\n",
+    )
+    assert changed(tmp_path / "a", new) == []
+    cleanup = WORKFLOW.replace(
+        "run: pytest -q", "run: |\n          rm -rf .cache || true\n          pytest -q"
+    )
+    assert ci_only(changed(tmp_path / "b", cleanup)) == []
+
+
+def test_swallowing_a_lint_step_fires(tmp_path: Path) -> None:
+    found = changed(tmp_path, WORKFLOW.replace("run: ruff check .", "run: ruff check . || true"))
+    assert [f.rule for f in ci_only(found)] == ["ci.tampered"]
+
+
+def test_a_swallow_already_at_base_is_not_new(tmp_path: Path) -> None:
+    base = WORKFLOW.replace("run: ruff check .", "run: ruff check . || true")
+    assert adopted(tmp_path, base, base.replace("actions/checkout@v4", "actions/checkout@v5")) == []
+
+
+def test_a_selection_flag_added_to_a_runner_fires(tmp_path: Path) -> None:
+    for i, args in enumerate(("-k total", "-m smoke", "--deselect tests/test_a.py::t", "--lf")):
+        found = changed(
+            tmp_path / str(i), WORKFLOW.replace("pytest -q", f"python -m pytest -q {args}")
+        )
+        assert rule_ids(found) == ["ci.tampered"], args
+        assert "fewer tests" in found[0].message
+
+
+def test_selection_flags_for_other_runners_fire(tmp_path: Path) -> None:
+    base = "name: ci\non: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: {cmd}\n"
+    cases = [
+        ("go test ./...", "go test ./... -run TestA"),
+        ("go test ./...", "go test -short ./..."),
+        ("npx jest", "npx jest -t adds"),
+        ("npm test", "npm test -- --testPathIgnorePatterns=slow"),
+        ("cargo test", "cargo test -- --skip slow"),
+        ("npx mocha", "npx mocha --grep fast"),
+    ]
+    for i, (was, now) in enumerate(cases):
+        found = adopted(tmp_path / str(i), base.format(cmd=was), base.format(cmd=now))
+        assert rule_ids(found) == ["ci.tampered"], now
+    assert (
+        adopted(
+            tmp_path / "ok",
+            base.format(cmd="pytest -m smoke"),
+            base.format(cmd="pytest -m smoke -q"),
+        )
+        == []
+    )
+
+
+def test_an_existing_flag_is_not_new(tmp_path: Path) -> None:
+    base = WORKFLOW.replace("pytest -q", "pytest -q -k 'not slow'")
+    assert adopted(tmp_path, base, base.replace("not slow", "not slow and not net")) == []
+
+
+TRIGGERED = """\
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest -q
+"""
+
+
+def test_triggers_that_lose_the_tests_fire(tmp_path: Path) -> None:
+    cases = {
+        "dispatch": "on: [workflow_dispatch]",
+        "drop-push": "on:\n  pull_request:",
+        "scalar": "on: workflow_dispatch",
+        "flow-map": "on: {workflow_dispatch: {}}",
+        "block-list": "on:\n  - workflow_dispatch",
+        "drop-pr": "on:\n  push:\n    branches: [main]",
+    }
+    for name, on in cases.items():
+        new = TRIGGERED.replace("on:\n  push:\n    branches: [main]\n  pull_request:", on)
+        assert "ci.tampered" in rule_ids(adopted(tmp_path / name, TRIGGERED, new)), name
+
+
+def test_scalar_and_flow_triggers_narrowed_by_a_filter_fire(tmp_path: Path) -> None:
+    flow = TRIGGERED.replace(
+        "on:\n  push:\n    branches: [main]\n  pull_request:", "on: [push, pull_request]"
+    )
+    for i, narrowed in enumerate(
+        (
+            "on:\n  push:\n  pull_request:\n    paths: ['docs/**']",
+            "on:\n  push:\n  pull_request:\n    paths-ignore: ['src/**']",
+            "on:\n  push:\n    branches-ignore: ['**']\n  pull_request:",
+        )
+    ):
+        new = TRIGGERED.replace("on:\n  push:\n    branches: [main]\n  pull_request:", narrowed)
+        assert "ci.tampered" in rule_ids(adopted(tmp_path / str(i), flow, new)), narrowed
+    scalar = flow.replace("[push, pull_request]", "push")
+    new = scalar.replace("on: push", "on:\n  push:\n    paths: ['src/**']")
+    assert "ci.tampered" in rule_ids(adopted(tmp_path / "scalar", scalar, new))
+
+
+def test_changed_path_lists_fire_in_the_right_direction(tmp_path: Path) -> None:
+    base = TRIGGERED.replace(
+        "  pull_request:\n", "  pull_request:\n    paths:\n      - 'src/**'\n      - 'lib/**'\n"
+    )
+    fewer = base.replace("      - 'lib/**'\n", "")
+    more = base.replace("      - 'lib/**'\n", "      - 'lib/**'\n      - 'pkg/**'\n")
+    assert "ci.tampered" in rule_ids(adopted(tmp_path / "fewer", base, fewer))
+    assert adopted(tmp_path / "more", base, more) == []
+    ignored = TRIGGERED.replace(
+        "  pull_request:\n", "  pull_request:\n    paths-ignore:\n      - 'docs/**'\n"
+    )
+    wider = ignored.replace("      - 'docs/**'\n", "      - 'docs/**'\n      - 'src/**'\n")
+    found = adopted(tmp_path / "ignore", ignored, wider)
+    assert rule_ids(found) == ["ci.tampered"] and "src/**" in found[0].message
+
+
+def test_trigger_changes_that_keep_the_tests_running_are_clean(tmp_path: Path) -> None:
+    more_events = TRIGGERED.replace(
+        "  pull_request:\n",
+        "  pull_request:\n  workflow_dispatch:\n  schedule:\n    - cron: '0 3 * * *'\n",
+    )
+    assert adopted(tmp_path / "events", TRIGGERED, more_events) == []
+    swapped = TRIGGERED.replace("  pull_request:\n", "  pull_request_target:\n")
+    assert "push" not in "".join(f.message for f in adopted(tmp_path / "swap", TRIGGERED, swapped))
+    matrix = TRIGGERED.replace(
+        "    runs-on: ubuntu-latest\n",
+        "    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n"
+        "        python: ['3.11', '3.12', '3.13']\n",
+    )
+    assert adopted(tmp_path / "matrix", TRIGGERED, matrix) == []
+    job = TRIGGERED + "  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: mkdocs build\n"
+    assert adopted(tmp_path / "job", TRIGGERED, job) == []
+
+
+def test_filters_on_a_workflow_without_a_test_step_are_clean(tmp_path: Path) -> None:
+    docs = (
+        "name: docs\non: [push]\njobs:\n  d:\n    runs-on: x\n"
+        "    steps:\n      - run: mkdocs build\n"
+    )
+    new = docs.replace("on: [push]", "on:\n  push:\n    paths: ['docs/**']")
+    assert adopted(tmp_path, docs, new) == []
+
+
+def test_other_ci_files_keep_the_line_based_swallow_check(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "r")
+    repo.write(".gitlab-ci.yml", "test:\n  script:\n    - pytest -q\n")
+    repo.commit("base")
+    repo.write(".gitlab-ci.yml", "test:\n  script:\n    - pytest -q || echo ok\n")
+    assert rule_ids(static_findings(repo)) == ["ci.tampered"]
