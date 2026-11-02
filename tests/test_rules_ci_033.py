@@ -22,7 +22,7 @@ def with_job(extra: str, on: str = "[push, pull_request]") -> str:
     return f"name: ci\non: {on}\njobs:\n{extra}"
 
 
-def tests_job(name: str = "test", body: str = "      - run: python -m pytest -q\n") -> str:
+def _tests_job(name: str = "test", body: str = "      - run: python -m pytest -q\n") -> str:
     return f"  {name}:\n    runs-on: ubuntu-latest\n    steps:\n{body}"
 
 
@@ -109,20 +109,20 @@ def test_a_retry_is_only_the_failed_first_flags(
 
 # ---- F3: a check kind that vanished downgrades to a warn only in the same job --------------------
 
-DOUBLE = tests_job(body=("      - run: python -m pytest -q\n      - run: ruff check .\n"))
+DOUBLE = _tests_job(body=("      - run: python -m pytest -q\n      - run: ruff check .\n"))
 
 
 def test_a_new_unknown_step_in_the_same_job_warns(tmp_path: Path) -> None:
     base = with_job(DOUBLE)
-    new = with_job(tests_job(body="      - run: poe test\n      - run: ruff check .\n"))
+    new = with_job(_tests_job(body="      - run: poe test\n      - run: ruff check .\n"))
     assert verdict(scene(tmp_path, {PATH: base}, {PATH: new})) == "warn"
 
 
 def test_a_new_unknown_step_in_another_job_blocks(tmp_path: Path) -> None:
     base = with_job(DOUBLE)
     new = with_job(
-        tests_job(body="      - run: ruff check .\n")
-        + tests_job("other", "      - run: poe test\n")
+        _tests_job(body="      - run: ruff check .\n")
+        + _tests_job("other", "      - run: poe test\n")
     )
     assert verdict(scene(tmp_path, {PATH: base}, {PATH: new})) == "block"
 
@@ -130,19 +130,21 @@ def test_a_new_unknown_step_in_another_job_blocks(tmp_path: Path) -> None:
 def test_an_unknown_step_that_is_disabled_blocks(tmp_path: Path) -> None:
     base = with_job(DOUBLE)
     body = "      - run: poe test\n        if: false\n      - run: ruff check .\n"
-    assert verdict(scene(tmp_path, {PATH: base}, {PATH: with_job(tests_job(body=body))})) == "block"
+    assert (
+        verdict(scene(tmp_path, {PATH: base}, {PATH: with_job(_tests_job(body=body))})) == "block"
+    )
 
 
 def test_an_unknown_step_that_is_a_missing_script_blocks(tmp_path: Path) -> None:
     base = with_job(DOUBLE)
-    new = with_job(tests_job(body="      - run: ./ci/gone.sh\n      - run: ruff check .\n"))
+    new = with_job(_tests_job(body="      - run: ./ci/gone.sh\n      - run: ruff check .\n"))
     assert verdict(scene(tmp_path, {PATH: base}, {PATH: new})) == "block"
 
 
 def test_an_unknown_step_in_a_workflow_nobody_runs_blocks(tmp_path: Path) -> None:
-    manual = with_job(tests_job(body="      - run: poe test\n"), on="workflow_dispatch")
+    manual = with_job(_tests_job(body="      - run: poe test\n"), on="workflow_dispatch")
     base = with_job(DOUBLE)
-    new = with_job(tests_job(body="      - run: ruff check .\n"))
+    new = with_job(_tests_job(body="      - run: ruff check .\n"))
     found = scene(
         tmp_path,
         {PATH: base},
@@ -156,8 +158,8 @@ def test_an_unknown_step_in_a_workflow_nobody_runs_blocks(tmp_path: Path) -> Non
 
 def test_a_flag_moved_into_a_reusable_workflow_with_the_step_passes(tmp_path: Path) -> None:
     flagged = "      - run: python -m pytest -q\n        continue-on-error: true\n"
-    base = with_job(tests_job(body=flagged))
-    reusable = "name: t\non: workflow_call\njobs:\n" + tests_job(body=flagged)
+    base = with_job(_tests_job(body=flagged))
+    reusable = "name: t\non: workflow_call\njobs:\n" + _tests_job(body=flagged)
     new = with_job("  test:\n    uses: ./.github/workflows/t.yml\n")
     found = scene(tmp_path, {PATH: base}, {PATH: new, ".github/workflows/t.yml": reusable})
     assert verdict(found) != "block"
@@ -165,7 +167,7 @@ def test_a_flag_moved_into_a_reusable_workflow_with_the_step_passes(tmp_path: Pa
 
 def test_a_flag_that_appears_in_another_workflow_blocks(tmp_path: Path) -> None:
     flagged = "      - run: python -m pytest -q\n        continue-on-error: true\n"
-    second = "name: t\non: [push]\njobs:\n" + tests_job(body=flagged)
+    second = "name: t\non: [push]\njobs:\n" + _tests_job(body=flagged)
     found = scene(tmp_path, {PATH: CI}, {".github/workflows/t.yml": second, PATH: CI})
     assert verdict(found) == "block"
 
@@ -173,14 +175,14 @@ def test_a_flag_that_appears_in_another_workflow_blocks(tmp_path: Path) -> None:
 def test_a_new_flag_on_a_job_in_another_file_blocks(tmp_path: Path) -> None:
     job = "  test:\n    continue-on-error: true\n    runs-on: ubuntu-latest\n    steps:\n"
     moved = with_job(job + "      - run: python -m pytest -q\n")
-    base = with_job(tests_job())
+    base = with_job(_tests_job())
     found = scene(tmp_path, {PATH: base}, {PATH: base, ".github/workflows/b.yml": moved})
     assert verdict(found) == "block"
 
 
 def test_a_false_if_added_in_another_file_blocks(tmp_path: Path) -> None:
     body = "      - run: python -m pytest -q\n        if: false\n"
-    moved = with_job(tests_job(body=body))
+    moved = with_job(_tests_job(body=body))
     found = scene(tmp_path, {PATH: CI}, {PATH: CI, ".github/workflows/b.yml": moved})
     assert verdict(found) == "block"
 
@@ -391,9 +393,9 @@ def test_a_selection_narrowed_in_a_script_blocks(tmp_path: Path) -> None:
 
 
 def test_a_selection_narrowed_in_another_workflow_blocks(tmp_path: Path) -> None:
-    other = with_job(tests_job("other", "      - run: pytest tests/test_one.py\n"))
-    base = with_job(tests_job(body="      - run: pytest\n"))
-    new_main = with_job(tests_job(body="      - run: pytest tests/test_one.py\n"))
+    other = with_job(_tests_job("other", "      - run: pytest tests/test_one.py\n"))
+    base = with_job(_tests_job(body="      - run: pytest\n"))
+    new_main = with_job(_tests_job(body="      - run: pytest tests/test_one.py\n"))
     found = scene(tmp_path, {PATH: base}, {PATH: new_main, ".github/workflows/o.yml": other})
     assert verdict(found) == "block"
 
