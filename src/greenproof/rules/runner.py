@@ -682,23 +682,248 @@ def _is_pattern(name: str) -> bool:
     return (len(name) > 2 and name[0] == "/" and name[-1] == "/") or any(c in name for c in "*?")
 
 
+# A script-name pattern is matched by a small automaton, never by `re`: the pattern comes from the
+# candidate, and `/^(a+)+$/` would hang a backtracking engine. The safe subset is literal text,
+# `^`, `$`, `.`, character classes, `*`, `+` and `?` on a single atom, and `|` between literals
+# (one group of them at most). Anything else is "unknown", and unknown matches every script.
+_MAX_PATTERN = 200
+_MAX_BRANCHES = 64
+_Atom = tuple[str, str]  # ("lit", char) | ("any", "") | ("cls", "^a-z:" style body)
+_Item = tuple[_Atom, str]  # the atom and its quantifier: "", "*", "?"
+
+
+@dataclass(frozen=True)
+class _Pattern:
+    branches: tuple[tuple[_Item, ...], ...]
+    start: bool  # anchored with ^
+    end: bool  # anchored with $
+
+
+def _class_atom(body: str) -> _Atom | None:
+    """A character class body (between the brackets) as an atom, None when it is not plain."""
+    negate = body.startswith("^")
+    chars = body[1:] if negate else body
+    if not chars or "[" in chars:
+        return None
+    out: list[str] = []
+    i = 0
+    while i < len(chars):
+        c = chars[i]
+        if c == "\\":
+            if i + 1 >= len(chars) or chars[i + 1].isalnum():
+                return None
+            out.append(chars[i + 1])
+            i += 2
+        elif i + 2 < len(chars) and chars[i + 1] == "-":
+            lo, hi = c, chars[i + 2]
+            if lo > hi:
+                return None
+            out.append(f"{lo}-{hi}")
+            i += 3
+        else:
+            out.append(c)
+            i += 1
+    return ("cls", ("^" if negate else "") + "\0".join(out))
+
+
+def _atom_matches(atom: _Atom, ch: str) -> bool:
+    kind, body = atom
+    if kind == "any":
+        return True
+    if kind == "lit":
+        return ch == body
+    negate = body.startswith("^")
+    hit = False
+    for part in (body[1:] if negate else body).split("\0"):
+        if len(part) == 3 and part[1] == "-":
+            hit = hit or part[0] <= ch <= part[2]
+        else:
+            hit = hit or ch == part
+    return hit != negate
+
+
+def _branch_items(text: str) -> tuple[_Item, ...] | None:
+    items: list[_Item] = []
+    i = 0
+    while i < len(text):
+        c = text[i]
+        atom: _Atom
+        if c == "\\":
+            if i + 1 >= len(text) or text[i + 1].isalnum():
+                return None
+            atom, i = ("lit", text[i + 1]), i + 2
+        elif c == "[":
+            j = i + 1
+            while j < len(text) and text[j] != "]":
+                j += 2 if text[j] == "\\" else 1
+            if j >= len(text) or (cls := _class_atom(text[i + 1 : j])) is None:
+                return None
+            atom, i = cls, j + 1
+        elif c == ".":
+            atom, i = ("any", ""), i + 1
+        elif c in "*+?{}()^$|":
+            return None
+        else:
+            atom, i = ("lit", c), i + 1
+        quant = ""
+        if i < len(text) and text[i] in "*+?":
+            quant, i = text[i], i + 1
+            if i < len(text) and text[i] in "*+?":
+                return None  # lazy, possessive or doubled: not the plain subset
+        if quant == "+":
+            items.extend([(atom, ""), (atom, "*")])
+        else:
+            items.append((atom, quant))
+    return tuple(items)
+
+
+def _split_top(text: str) -> list[str] | None:
+    """`text` split at the `|` outside brackets and parentheses; None for nested groups."""
+    parts: list[str] = []
+    depth, cls, last, i = 0, False, 0, 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if cls:
+            cls = c != "]"
+        elif c == "[":
+            cls = True
+        elif c == "(":
+            depth += 1
+            if depth > 1:
+                return None
+        elif c == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif c == "|" and depth == 0:
+            parts.append(text[last:i])
+            last = i + 1
+        i += 1
+    parts.append(text[last:])
+    return None if depth or cls else parts
+
+
+_LITERAL_RUN = re.compile(r"[\w:./@ -]*")
+
+
+def _expand_group(text: str) -> list[str] | None:
+    """A branch with at most one `(a|b)` or `(?:a|b)` group of literals, as one branch per
+    alternative."""
+    m = re.search(r"\(", text)
+    if m is None:
+        return [text]
+    end = text.find(")", m.end())
+    if end < 0 or "(" in text[m.end() : end] or text[end + 1 : end + 2] in ("*", "+", "?", "{"):
+        return None
+    inner = text[m.end() : end].removeprefix("?:")
+    alternatives = inner.split("|")
+    if not all(_LITERAL_RUN.fullmatch(a) for a in alternatives) or "(" in text[end + 1 :]:
+        return None
+    return [text[: m.start()] + a + text[end + 1 :] for a in alternatives]
+
+
+def _parse_pattern(source: str) -> _Pattern | None:
+    """The pattern as an automaton description, None when it is outside the safe subset."""
+    if len(source) > _MAX_PATTERN:
+        return None
+    anchored_start = source.startswith("^")
+    body = source[1:] if anchored_start else source
+    anchored_end = body.endswith("$") and not body.endswith("\\$")
+    body = body[:-1] if anchored_end else body
+    branches: list[tuple[_Item, ...]] = []
+    for part in _split_top(body) or []:
+        expanded = _expand_group(part)
+        if expanded is None:
+            return None
+        for text in expanded:
+            if (items := _branch_items(text)) is None:
+                return None
+            branches.append(items)
+    if not branches or len(branches) > _MAX_BRANCHES:
+        return None
+    return _Pattern(tuple(branches), anchored_start, anchored_end)
+
+
+def _branch_matches(items: tuple[_Item, ...], text: str, start: bool, end: bool) -> bool:
+    """Whether the items match `text` (anywhere unless anchored), in time linear in both sizes."""
+
+    def close(states: set[int]) -> set[int]:
+        out = set(states)
+        for k in sorted(states):
+            while k < len(items) and items[k][1] in ("*", "?"):
+                k += 1
+                out.add(k)
+        return out
+
+    def step(states: set[int], ch: str) -> set[int]:
+        nxt: set[int] = set()
+        for k in states:
+            if k < len(items) and _atom_matches(items[k][0], ch):
+                nxt.add(k if items[k][1] == "*" else k + 1)
+        return close(nxt)
+
+    current = close({0})
+    if len(items) in current and (not end or not text):
+        return True
+    for pos, ch in enumerate(text):
+        current = step(current, ch)
+        if not start:
+            current |= close({0})
+        if len(items) in current and (not end or pos == len(text) - 1):
+            return True
+        if not current:
+            return False
+    return False
+
+
+def _pattern_matcher(name: str, glob: bool) -> Callable[[str], bool] | None:
+    """A matcher for a `/regex/` (pnpm run) or `test:*` glob (run-s) script pattern; None when
+    the pattern is outside the safe subset (callers then treat it as matching every script)."""
+    if len(name) > 2 and name[0] == "/" and name[-1] == "/":
+        source = name[1:-1]
+    elif glob and _is_pattern(name):
+        if len(name) > _MAX_PATTERN:
+            return None
+        source = "^" + "".join(
+            "[^:]*" if c == "*" else "." if c == "?" else re.escape(c) for c in name
+        )
+        # The glob's own `*` and `?` are already translated; `re.escape` made the rest literal.
+        source += "$"
+    else:
+        return None
+    pattern = _parse_pattern(source)
+    if pattern is None:
+        return None
+    return lambda text: any(
+        _branch_matches(items, text[:_MAX_PATTERN], pattern.start, pattern.end)
+        for items in pattern.branches
+    )
+
+
+def _is_matching(name: str, glob: bool) -> bool:
+    """Whether `name` is read as a pattern at all (a `/regex/`, or a glob under run-s)."""
+    return (len(name) > 2 and name[0] == "/" and name[-1] == "/") or (glob and _is_pattern(name))
+
+
+def _unknown_pattern(name: str, glob: bool) -> bool:
+    """A script pattern outside the safe subset (it matches every script)."""
+    return _is_matching(name, glob) and _pattern_matcher(name, glob) is None
+
+
 def _expand(names: Sequence[str], universe: Collection[str], glob: bool) -> list[str]:
     """Script names with `/regex/` (pnpm run) and `test:*` (run-s) patterns replaced by the
-    scripts they match, among `universe`."""
+    scripts they match, among `universe`. A pattern outside the safe subset matches them all."""
     out: list[str] = []
     for name in names:
-        if len(name) > 2 and name[0] == "/" and name[-1] == "/":
-            pattern = name[1:-1]
-        elif glob and _is_pattern(name):
-            pattern = "^" + re.escape(name).replace(r"\*", "[^:]*").replace(r"\?", ".") + "$"
-        else:
+        if not _is_matching(name, glob):
             out.append(name)
-            continue
-        try:
-            rx = re.compile(pattern)
-        except re.error:
-            continue
-        out.extend(u for u in universe if rx.search(u))
+        elif (match := _pattern_matcher(name, glob)) is None:
+            out.extend(universe)
+        else:
+            out.extend(u for u in universe if match(u))
     return out
 
 
@@ -755,6 +980,15 @@ def _check_steps(
         raw, run_all = _raw_refs(st)
         if not (run_all or any(_is_pattern(n) for n in raw)):
             total += int(counts)
+            continue
+        # A pattern outside the safe subset (SPEC 5.6) matches every script, which says nothing
+        # about what runs. Unchanged from the base it counts as the base did; new, it counts for
+        # nothing, so the step it replaced is missing.
+        if (
+            base_texts is not None
+            and any(_unknown_pattern(n, run_all) for n in raw)
+            and st not in (base_texts.texts if isinstance(base_texts, _Known) else base_texts)
+        ):
             continue
         names = _expand(raw, universe, run_all)
         each = [ctx.is_check(f"npm run {n}") for n in names]
@@ -1106,52 +1340,200 @@ def _split_words(line: str) -> list[str]:
         return line.split()
 
 
+_UNRESOLVED = "\0*"  # marks a starred argument that could not be read, followed by its source
+_MUTATORS = frozenset({"append", "extend", "insert", "remove", "pop", "clear", "sort", "reverse"})
+_MAX_RESOLVE_DEPTH = 8
+_Env = dict[str, list[str] | None]
+
+
+def _resolve_words(node: ast.expr, env: _Env, depth: int = 0) -> list[str] | None:
+    """The strings an expression stands for, when that can be told from the file: string and
+    list or tuple literals (starred parts included), names bound once to one of those, `a + b`
+    of them, `"...".split()` and `session.posargs` (what the caller passes: no words of its
+    own). None when it cannot be told."""
+    if depth > _MAX_RESOLVE_DEPTH:
+        return None
+    nxt = depth + 1
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return _split_words(node.value) if " " in node.value else [node.value]
+    if isinstance(node, ast.Attribute) and node.attr == "posargs":
+        return []
+    if isinstance(node, ast.Name):
+        return env.get(node.id)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        out: list[str] = []
+        for e in node.elts:
+            inner = e.value if isinstance(e, ast.Starred) else e
+            part = _resolve_words(inner, env, nxt)
+            if part is None:
+                return None
+            out.extend(part)
+        return out
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _resolve_words(node.left, env, nxt), _resolve_words(node.right, env, nxt)
+        return None if left is None or right is None else left + right
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "split"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str)
+        and not node.keywords
+    ):
+        text = node.func.value.value
+        if not node.args:
+            return text.split()
+        sep = node.args[0]
+        if len(node.args) == 1 and isinstance(sep, ast.Constant) and isinstance(sep.value, str):
+            return text.split(sep.value) if sep.value else None
+    return None
+
+
+def _scope_nodes(body: Sequence[ast.AST]) -> Iterator[ast.AST]:
+    """Every node of a scope, without descending into functions, classes and lambdas."""
+    stack = list(reversed(body))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def _bind(body: Sequence[ast.AST], env: _Env, params: Collection[str] = ()) -> _Env:
+    """`env` extended with a scope's names: one that is assigned once, by a plain assignment, to
+    something readable is bound to its words; a name that is anything else there (assigned
+    twice, extended with `+=` or `.append`, a loop variable, an argument) is unreadable."""
+    out = dict(env)
+    for name in params:
+        out[name] = None
+    nodes = list(_scope_nodes(body))
+    stores: Counter[str] = Counter()
+    for node in nodes:
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            stores[node.id] += 1
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            stores[node.name] += 1
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                stores[(alias.asname or alias.name).partition(".")[0]] += 1
+    mutated = {
+        n.func.value.id
+        for n in nodes
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in _MUTATORS
+        and isinstance(n.func.value, ast.Name)
+    } | {
+        n.value.id
+        for n in nodes
+        if isinstance(n, ast.Subscript)
+        and isinstance(n.ctx, (ast.Store, ast.Del))
+        and isinstance(n.value, ast.Name)
+    }
+    for name in stores:
+        out[name] = None
+    for node in nodes:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            continue
+        name = targets[0].id
+        if stores[name] == 1 and name not in mutated and name not in params:
+            out[name] = _resolve_words(node.value, out)
+    return out
+
+
+def _call_words(elts: Sequence[ast.expr], env: _Env) -> list[str]:
+    """The words of a call's arguments or of a list, a starred part that cannot be read standing
+    in as `_UNRESOLVED` and its source."""
+    words: list[str] = []
+    for e in elts:
+        if isinstance(e, ast.Starred):
+            part = _resolve_words(e.value, env)
+            words.extend(part if part is not None else [_UNRESOLVED + ast.unparse(e.value)])
+        elif isinstance(e, ast.Constant) and isinstance(e.value, str):
+            words.extend(_split_words(e.value) if " " in e.value else [e.value])
+    return words
+
+
+def _python_pytest_arguments(tree: ast.Module) -> list[list[str]]:
+    found: list[list[str]] = []
+
+    def visit(node: ast.AST, env: _Env) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = node.args
+            names = [a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]]
+            names += [a.arg for a in (args.vararg, args.kwarg) if a is not None]
+            body = node.body if isinstance(node.body, list) else [node.body]
+            env = _bind(body, env, names)
+        elif isinstance(node, ast.ClassDef):
+            env = _bind(node.body, env)
+        if isinstance(node, (ast.Call, ast.List, ast.Tuple)):
+            elts = node.args if isinstance(node, ast.Call) else node.elts
+            found.extend(_after_pytest(_call_words(elts, env)))
+        for child in ast.iter_child_nodes(node):
+            visit(child, env)
+
+    visit(tree, _bind(tree.body, {}))
+    return found
+
+
 def _pytest_arguments(name: str, text: str) -> list[list[str]]:
     """The arguments of every pytest command in a noxfile (any call or list of string
-    constants, so a `session.run(...)` spread over lines reads the same) or a tox.ini."""
+    constants, so a `session.run(...)` spread over lines reads the same) or a tox.ini. Starred
+    arguments are read when they are literals, names bound to literals, `+` of those or
+    `"...".split()`; one that cannot be read stays in the words as `_UNRESOLVED`."""
     if name.endswith(".py"):
         try:
             tree = ast.parse(text)
+            return _python_pytest_arguments(tree)
         except (SyntaxError, ValueError, RecursionError):
-            tree = None
-        if tree is not None:
-            found: list[list[str]] = []
-            for node in ast.walk(tree):
-                elts = (
-                    node.args
-                    if isinstance(node, ast.Call)
-                    else node.elts
-                    if isinstance(node, (ast.List, ast.Tuple))
-                    else []
-                )
-                words: list[str] = []
-                for e in elts:
-                    if isinstance(e, ast.Constant) and isinstance(e.value, str):
-                        words.extend(_split_words(e.value) if " " in e.value else [e.value])
-                found.extend(_after_pytest(words))
-            return found
-    found = []
+            pass
+    found: list[list[str]] = []
     for raw in split_lines(re.sub(r"\\\n\s*", " ", text)):
         found.extend(_after_pytest(_split_words(re.sub(r"^\s*[A-Za-z_][\w:]*\s*=\s*", "", raw))))
     return found
 
 
+def _unread(arguments: Sequence[Sequence[str]]) -> Counter[str]:
+    """The pytest commands that were given a starred argument that could not be read, each as
+    its words with the unread part shown as `*source`."""
+    return Counter(
+        " ".join(f"*{w[len(_UNRESOLVED) :]}" if w.startswith(_UNRESOLVED) else w for w in args)
+        for args in arguments
+        if any(w.startswith(_UNRESOLVED) for w in args)
+    )
+
+
 def _noxfile_reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
     """Selecting options a nox or tox pytest command gained. Only the arguments after the
     `pytest` word count (`coverage run -m pytest`: that `-m` is not a marker), and a pair that
-    the base already had does not, so a call reformatted or given `*session.posargs` is the same."""
+    the base already had does not, so a call reformatted or given `*session.posargs` is the same.
+    A starred argument that cannot be read (a function's result, an imported list) warns when the
+    call is new or changed: it may hold `-k`."""
     name = posixpath.basename(f.path)
-    before = Counter(
-        pair for args in _pytest_arguments(name, f.old_text or "") for pair in _select_pairs(args)
-    )
-    after = Counter(
-        pair for args in _pytest_arguments(name, f.new_text or "") for pair in _select_pairs(args)
-    )
+    old_args = _pytest_arguments(name, f.old_text or "")
+    new_args = _pytest_arguments(name, f.new_text or "")
+    before = Counter(pair for args in old_args for pair in _select_pairs(args))
+    after = Counter(pair for args in new_args for pair in _select_pairs(args))
     out: list[tuple[int | None, str]] = []
     for flag, _value in sorted(after - before):
         added = next((n for n, ln in _added_lines(f.old_text, f.new_text) if flag in ln), None)
         number = added or _first_line_with(f.new_text or "", flag)
         out.append((number, f"pytest option `{flag}` added to a test command"))
+    for call in sorted(_unread(new_args) - _unread(old_args)):
+        source = next(w for w in call.split() if w.startswith("*"))
+        out.append(
+            (
+                _first_line_with(f.new_text or "", source[1:]),
+                _Warn(
+                    f"pytest is run with `{source}`, which could not be read from the file: "
+                    "check that it does not hold `-k`, `-m` or a path"
+                ),
+            )
+        )
     return out
 
 
@@ -1394,14 +1776,160 @@ def _go_reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
 
 
 # -- which package.json a policy command reaches ---------------------------------------------
-_RECURSIVE = re.compile(
-    r"(?:^|\s)(?:-r|--recursive|--workspaces|-ws)(?=\s|$)|\b(?:turbo|lerna)\s+run\b"
-    r"|\bnx\s+run-many\b|\bpnpm\b.*?\s(?:--filter|-F)\b|\bworkspaces\s+foreach\b"
+# A nested package.json is only a warning when it is known that no policy command runs it. That
+# is known in two shapes. Every policy command is a plain package-manager run at the root
+# (`npm test`, `pnpm run x`) and the root scripts it reaches stay in the root: no `cd`, no
+# workspace, filter, prefix or directory option, no monorepo tool, no script file, no make. Or the
+# only options that leave the root are workspace selectors (`-r`, `--filter`, `--workspace`),
+# which reach workspace members and nothing else, and the package is not a member. Anything
+# else (a make target, a script, a `cd`, lerna, a file that cannot be read) keeps the block.
+_PM_BUILTINS = frozenset({"ci", "install", "i", "add", "rebuild"})
+_DIR_ESCAPES = frozenset({"--prefix", "--dir", "--cwd"})
+_WS_ESCAPES = frozenset(
+    {"--workspace", "--workspaces", "--recursive", "--filter", "--include-workspace-root"}
+    | {"--workspace-root"}
 )
-_DIR_REF = re.compile(
-    r"(?:\bcd\s+|--prefix[ =]\s*|(?<![\w-])-C[ =]?\s*|--dir[ =]\s*|--cwd[ =]\s*)"
-    r"[\"']?([^\s\"'&;|]+)"
+_DIR_SHORT = frozenset({"-C"})
+_WS_SHORT = frozenset({"-w", "-ws", "-r", "-F"})
+_MONOREPO_FILES = ("lerna.json", "nx.json", "turbo.json", "rush.json")
+_DIR_WORDS = re.compile(
+    r"(?<![\w.-])(?:cd|pushd|make|gmake|just|lerna|nx|turbo|rush|bolt)(?![\w.-])"
 )
+_WS_WORDS = re.compile(r"\byarn\s+workspaces?\b")
+
+
+@dataclass
+class _Leaves:
+    """How far a command can leave the package root: `opaque` for anything unknown (a directory
+    change, a script, another tool), `workspaces` for the workspace selectors alone."""
+
+    opaque: bool = False
+    workspaces: bool = False
+
+    def add(self, other: _Leaves) -> None:
+        self.opaque = self.opaque or other.opaque
+        self.workspaces = self.workspaces or other.workspaces
+
+
+def _option_leaves(tokens: Sequence[str], package_manager: bool) -> _Leaves:
+    out = _Leaves()
+    for tok in tokens:
+        flag = tok.partition("=")[0]
+        if flag in _DIR_ESCAPES or (package_manager and flag in _DIR_SHORT):
+            out.opaque = True
+        elif flag in _WS_ESCAPES or (package_manager and flag in _WS_SHORT):
+            out.workspaces = True
+    return out
+
+
+def _plain_run(statement: str, scripts: Mapping[str, Any]) -> tuple[list[str], _Leaves] | None:
+    """The root scripts a policy statement runs and how far it leaves the root, when it is a
+    package-manager run; None for anything else."""
+    toks = command_tokens(statement)
+    if not toks or posixpath.basename(toks[0]) not in _PM:
+        return None
+    rest = toks[1:]
+    if "--" in rest:
+        rest = rest[: rest.index("--")]
+    leaves = _option_leaves(rest, True)
+    words = [t for t in rest if not t.startswith("-")]
+    head = posixpath.basename(toks[0])
+    if not words:
+        return None
+    if words[0] in ("workspace", "workspaces"):
+        leaves.workspaces = True
+        return [], leaves
+    if words[0] in ("run", "run-script"):
+        words = words[1:]
+        return (words[:1], leaves) if words and not _is_pattern(words[0]) else None
+    if words[0] in ("test", "t", "tst"):
+        return ["test"], leaves
+    if words[0] in _PM_BUILTINS:
+        return [], leaves
+    if head in ("yarn", "pnpm", "bun") and words[0] in scripts and not _is_pattern(words[0]):
+        return [words[0]], leaves
+    return None
+
+
+def _body_leaves(body: str) -> _Leaves:
+    """How far a script body can leave the package root."""
+    out = _Leaves(opaque=bool(_DIR_WORDS.search(body)), workspaces=bool(_WS_WORDS.search(body)))
+    for seg in split_segments(body):
+        toks = command_tokens(seg.text) or seg.text.split()
+        head = posixpath.basename(toks[0]) if toks else ""
+        out.add(
+            _option_leaves(toks[1:], head in _PM or head in _RUN_ALL or head in {"npx", "bunx"})
+        )
+    if any("node_modules" not in path for path in scripts_in(body, "")):
+        out.opaque = True
+    return out
+
+
+def _is_member(changes: ChangeSet, roots: Sequence[str], directory: str) -> bool | None:
+    """Whether `directory` is a workspace member; None when the workspace files cannot be read."""
+    yamls = [
+        t
+        for t in (
+            changes.base_text("pnpm-workspace.yaml"),
+            changes.cand_text("pnpm-workspace.yaml"),
+        )
+        if t
+    ]
+    for text in yamls:
+        if re.search(r"^packages:[ \t]*\S", text, re.MULTILINE):
+            return None  # an inline list: not read here
+        if not _workspace_globs([], [text]):
+            return None
+    globs = _workspace_globs(roots, yamls)
+    if not globs:
+        return None
+    return any(_glob_matches(directory, g) for g in globs if not g.startswith("!")) and not any(
+        _glob_matches(directory, g[1:]) for g in globs if g.startswith("!")
+    )
+
+
+def _provably_unreached(changes: ChangeSet, commands: Mapping[str, str], directory: str) -> bool:
+    """Whether no policy command can run the package.json in `directory` (see the comment above)."""
+    if not commands or any(changes.base_text(n) or changes.cand_text(n) for n in _MONOREPO_FILES):
+        return False
+    roots = [t for t in (changes.base_text("package.json"), changes.cand_text("package.json")) if t]
+    if not roots:
+        return False
+    maps: list[Mapping[str, Any]] = []
+    for text in roots:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return False
+        scripts = data.get("scripts") if isinstance(data, dict) else None
+        maps.append(scripts if isinstance(scripts, dict) else {})
+    seeds: set[str] = set()
+    leaves = _Leaves()
+    for command in commands.values():
+        segments = split_segments(command)
+        if not segments:
+            return False
+        for seg in segments:
+            for scripts in maps:
+                found = _plain_run(seg.text, scripts)
+                if found is None:
+                    return False
+                seeds.update(found[0])
+                leaves.add(found[1])
+    for scripts in maps:
+        for name in _reach(scripts, seeds):
+            for body in _script_lines(scripts, name):
+                leaves.add(_body_leaves(body))
+    if leaves.opaque:
+        return False
+    return not leaves.workspaces or _is_member(changes, roots, directory) is False
+
+
+def _reaches_package(changes: ChangeSet, path: str, commands: Mapping[str, str]) -> bool:
+    """Whether a policy command may run the package.json at `path`: the root one, or, unless it
+    is known that none does (`_provably_unreached`), a nested one."""
+    directory = posixpath.dirname(path)
+    return not directory or not _provably_unreached(changes, commands, directory)
 
 
 def _workspace_globs(pkg_texts: Sequence[str], yaml_texts: Sequence[str]) -> list[str]:
@@ -1426,44 +1954,20 @@ def _workspace_globs(pkg_texts: Sequence[str], yaml_texts: Sequence[str]) -> lis
 
 
 def _glob_matches(directory: str, pattern: str) -> bool:
+    """Whether a workspace glob names `directory` (`*` is one path segment, `**` any depth)."""
     pat = pattern.strip().removeprefix("./").rstrip("/")
-    rx = re.escape(pat).replace(r"\*\*/", "(?:.*/)?").replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
-    return re.fullmatch(rx, directory) is not None
-
-
-def _reaches_package(changes: ChangeSet, path: str, commands: Mapping[str, str]) -> bool:
-    """Whether a policy command runs the package.json at `path`: the root one; a workspace member
-    when the root test script runs recursively; or one in a directory a command moves into."""
-    directory = posixpath.dirname(path)
-    if not directory:
+    if len(pat) > _MAX_PATTERN:
         return True
-    roots = [t for t in (changes.base_text("package.json"), changes.cand_text("package.json")) if t]
-    bodies = list(commands.values())
-    for text in roots:
-        try:
-            data = json.loads(text)
-        except ValueError:
-            continue
-        scripts = data.get("scripts") if isinstance(data, dict) else None
-        if isinstance(scripts, dict):
-            for name in _reach(scripts, _script_names(commands) | {"test"}):
-                bodies.extend(_script_lines(scripts, name))
-    yamls = [
-        t
-        for t in (
-            changes.base_text("pnpm-workspace.yaml"),
-            changes.cand_text("pnpm-workspace.yaml"),
-        )
-        if t
-    ]
-    if any(_RECURSIVE.search(b) for b in bodies):
-        globs = _workspace_globs(roots, yamls)
-        if any(_glob_matches(directory, g) for g in globs if not g.startswith("!")) and not any(
-            _glob_matches(directory, g[1:]) for g in globs if g.startswith("!")
-        ):
-            return True
-    refs = {posixpath.normpath(m[1]) for b in bodies for m in _DIR_REF.finditer(b)}
-    return directory in refs
+    parts = [p for p in re.split(r"(\*\*/|\*\*|\*)", pat) if p]
+    items: list[_Item] = []
+    for part in parts:
+        if part in ("**/", "**"):
+            items.append((("any", ""), "*"))
+        elif part == "*":
+            items.append((("cls", "^/"), "*"))
+        else:
+            items.extend((("lit", c), "") for c in part)
+    return _branch_matches(tuple(items), directory, True, True)
 
 
 # -- driver ------------------------------------------------------------------------------
