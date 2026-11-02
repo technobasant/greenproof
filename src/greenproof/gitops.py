@@ -338,7 +338,9 @@ def _default_branch_base(repo: Path, head: str) -> Base:
     """On the default branch: the fork point from its upstream, else HEAD (uncommitted only).
 
     The upstream is what the branch will be pushed to, so commits not yet pushed are part of
-    the change under test. When HEAD equals the upstream (CI on a push) the base is HEAD.
+    the change under test. When HEAD equals the upstream (CI on a push) the base is HEAD. An
+    upstream that exists but shares no history with HEAD (a shallow clone) is an error, not a
+    reason to compare against HEAD: that would hide every commit.
     """
     name = git(
         repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False
@@ -346,8 +348,9 @@ def _default_branch_base(repo: Path, head: str) -> Base:
     upstream = _out(name) if name.returncode == 0 else ""
     if upstream and rev_parse_commit(repo, upstream):
         proc = git(repo, "merge-base", "HEAD", upstream, check=False)
-        if proc.returncode == 0 and _out(proc):
-            return Base(upstream, _out(proc))
+        if proc.returncode != 0 or not _out(proc):
+            raise UsageError(f"no merge base between HEAD and {upstream}. {_FETCH_HINT}")
+        return Base(upstream, _out(proc))
     return Base("HEAD", head, NO_UPSTREAM_NOTE)
 
 
