@@ -1527,6 +1527,36 @@ def _positionals(family: str, args: list[str]) -> list[str]:
     return out
 
 
+_GOTESTSUM_VALUES = frozenset(
+    {"--format", "-f", "--junitfile", "--jsonfile", "--post-run-command", "--watch-chdir"}
+    | {"--rerun-fails-max-attempts", "--rerun-fails-report", "--format-icons"}
+    | {"--junitfile-testsuite-name", "--junitfile-testcase-classname", "--raw-command"}
+)
+
+
+def _gotestsum_packages(args: list[str]) -> list[str]:
+    """The packages a `gotestsum` run covers: `--packages` and the path words before `--`, the
+    go test arguments after it; with none of them it runs `./...`."""
+    split = args.index("--") if "--" in args else len(args)
+    own, rest = args[:split], args[split + 1 :]
+    words: list[str] = []
+    i = 0
+    while i < len(own):
+        tok = own[i]
+        name = tok.partition("=")[0]
+        if name == "--packages":
+            value = tok.partition("=")[2] if "=" in tok else "".join(own[i + 1 : i + 2])
+            words.extend(value.split())
+            i += 1 if "=" in tok else 2
+        elif tok.startswith("-") and len(tok) > 1:
+            i += 1 if "=" in tok or name not in _GOTESTSUM_VALUES else 2
+        else:
+            words.append(tok)
+            i += 1
+    words.extend(_positionals("go", rest))
+    return words or ["./..."]
+
+
 def _invocations(
     commands: Sequence[str], defs: Mapping[str, str] | None
 ) -> dict[str, list[list[str]]]:
@@ -1546,7 +1576,10 @@ def _invocations(
                     continue
                 args = tokens[start:]
                 if family == "go" and _cmd_name(tokens[0]) == "gotestsum":
-                    args = args[args.index("--") + 1 :] if "--" in args else []
+                    found.setdefault(family, []).append(_gotestsum_packages(args))
+                    continue
+                if family == "cargo" and tokens[start - 1] == "nextest" and args[:1] == ["run"]:
+                    args = args[1:]
                 words = _RUNNER_WORDS.get(_cmd_name(tokens[0]), frozenset())
                 if args[:1] and args[0] in words:
                     args = args[1:]
