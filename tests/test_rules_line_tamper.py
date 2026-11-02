@@ -272,16 +272,15 @@ def test_rust_always_false_condition_makes_the_check_unreachable(tmp_path: Path)
 @pytest.mark.parametrize(
     ("lang", "check"),
     [
-        ("js", "expect(add(1, 2)).toBe(add(1,  2));"),
-        ("js", "expect(f(x)).toEqual(f(x));"),
+        ("js", "expect(total).toBe(total);"),
+        ("js", "expect(res.total).toEqual(res.total);"),
         ("js", "expect(a.b).toStrictEqual(a.b);"),
-        ("js", "assert.strictEqual(sum(1), sum(1));"),
+        ("js", "assert.strictEqual(sum, sum);"),
         ("js", "assert.deepEqual(rows, rows);"),
         ("go", "assert.Equal(t, got, got)"),
-        ("go", "require.Equal(t, Mul(2, 3), Mul(2, 3))"),
-        ("go", 'if got != got {\n\t\tt.Errorf("x")\n\t}'),
-        ("rust", "assert_eq!(add(1, 2), add(1, 2));"),
-        ("rust", "assert!(add(1, 2) == add(1, 2));"),
+        ("go", "require.Equal(t, res.Total, res.Total)"),
+        ("rust", "assert_eq!(total, total);"),
+        ("rust", "assert!(total == total);"),
     ],
 )
 def test_self_equality_is_vacuous(lang: str, check: str) -> None:
@@ -304,6 +303,7 @@ def test_self_equality_is_vacuous(lang: str, check: str) -> None:
         ("js", "expect(add(1, 2)).toBe(add(2, 1));"),
         ("go", "assert.Equal(t, Mul(2, 3), 6)"),
         ("go", 'assert.Equal(t, "a", "b")'),
+        ("go", "assert.Equal(t, Mul(2, 3), Mul(2, 3))"),
         ("rust", "assert_eq!(add(1, 2), add(2, 1));"),
         ("rust", "assert!(a == b && c == c);"),
     ],
@@ -324,7 +324,9 @@ def test_js_self_equality_blocks_an_existing_test(tmp_path: Path) -> None:
         tmp_path,
         JS_PATH,
         JS,
-        JS.replace("expect(add(1, 2)).toBe(3);", "expect(add(1, 2)).toBe(add(1, 2));"),
+        JS.replace(
+            "expect(add(1, 2)).toBe(3);", "const sum = add(1, 2);\n    expect(sum).toBe(sum);"
+        ),
     )
     assert rule_ids(found) == ["tests.weakened"] and "vacuous" in found[0].message
 

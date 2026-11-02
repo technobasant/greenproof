@@ -219,12 +219,18 @@ covering at least one true positive and one legitimate change that must NOT fire
   module or class scope, `pytestmark` gaining a skip/xfail.
 - JS/TS: `.skip(`, `xit(`, `xdescribe(`, `xtest(`, `.todo(`, `test.fails(` added.
 - Go: `t.Skip(`, `t.SkipNow(`, `t.Skipf(`. Rust: `#[ignore]`.
-- Go build constraints: a `//go:build <expr>` or `// +build <tags>` line above the package
-  clause of a `_test.go` file that is added or whose expression changed is `tests.skipped`
-  (block), naming the constraint: with it `go test ./...` no longer compiles the file. A
-  `//go:build` line takes precedence over `// +build` when both are present. An unchanged
-  constraint gives nothing, and neither does a constraint on a brand-new test file (it
-  hides no existing verification, the same rule as a conditional skip on a new test).
+- Go build constraints: every `//go:build <expr>` and `// +build <tags>` line above the
+  package clause of a `_test.go` file is compared between the base and the candidate
+  version of the file. A file that had no constraint in either syntax and gains one is
+  `tests.skipped` (block), naming the constraint: with it `go test ./...` no longer compiles
+  the file. A file that had a constraint whose constraint lines now differ is
+  `tests.skipped` (warn): widening `//go:build linux` to `linux || darwin` is legitimate,
+  narrowing it is a skip, and the rule cannot tell which. Two edits are no finding: adding a
+  `//go:build` line over `// +build` lines that stay the same and name the same tags
+  (gofmt's automatic migration), and removing `// +build` lines under a `//go:build` line
+  that stays the same (`go fix`). An unchanged constraint gives nothing, and neither does a
+  constraint on a brand-new test file (it hides no existing verification, the same rule as
+  a conditional skip on a new test).
 
 ### 5.4 Weakening heuristics
 
@@ -366,23 +372,38 @@ string contents blanked, so brackets inside strings do not count:
   unreachable: uncounted, and `tests.weakened` when the count of unreachable checks rises.
   A `return` inside a branch, a closure or a callback is not an early return, and neither is
   `return expect(...)`, `return promise.then(...)` or `return request(...)`, which return
-  the check itself.
+  the check itself. A bare `return` whose previous code line is a control header with no `{`
+  (`if (...)`, `else if (...)`, `for (...)`, `while (...)` ending in the closing parenthesis,
+  or `else`, also when the condition spans lines) is that branch's body: conditional, not an
+  early return. A one-line `if` on an always-true condition whose only body is a bare
+  `return` at the top level counts as an early return: JS/TS `if (true) return;` and
+  `if (true) { return; }`, Go `if true { return }`, Rust `if true { return; }`. The condition
+  is `true`, or `true` joined to anything by `||` (`x || true`); `x && true` and a
+  `return value;` body are ordinary.
 - **Always-false conditions.** Go `if … && false {`, `if false && … {`, `if false {`; JS/TS
   `if (false)`, `if (… && false)`, `if (false && …)`; Rust `if false {`, `&& false`.
   Checks inside the block are unreachable; an `else` branch is live. `x || false` and
   `x && y` are ordinary conditions.
 - **Self-equality is vacuous.** JS `expect(X).toBe/toEqual/toStrictEqual(X)`; Node
   `assert.equal/strictEqual/deepEqual/deepStrictEqual(X, X)`; Go `assert.Equal(t, X, X)`,
-  `require.Equal(t, X, X)` (also `EqualValues`, `Exactly`) and `if X != X {`; Rust
+  `require.Equal(t, X, X)` (also `EqualValues`, `Exactly`); Rust
   `assert_eq!(X, X)` and `assert!(X == X)`. Operands are compared with whitespace removed.
-  An `X` that calls a nondeterministic source (`random`, `Date`, `now(`, `uuid`, `nanoid`,
+  An `X` that contains a call (any `(`) is not vacuous by itself: `expect(select(state)).toBe(
+  select(state))` checks memoization and `assert_eq!(h("ab"), h("ab"))` checks determinism.
+  Such a call self-comparison is vacuous only when it replaces a real comparison: the base
+  version of the same test compared the same normalised expression with a different one
+  (`expect(add(1, 2)).toBe(3)` → `expect(add(1, 2)).toBe(add(1, 2))`); one already in the base
+  test, in a new test, or on an expression the base did not compare is a real check.
+  Go's `if got != got {` is not vacuous either: it is the NaN check. An `X` that names a
+  nondeterministic source (`random`, `Date`, `now(`, `uuid`, `nanoid`,
   `rand`, `Instant`, `SystemTime`) is exempt. A vacuous check is not counted and raises the
   vacuous count, so it blocks only when it appears in a test that exists on both sides.
 - **Table rows.** `it.each`, `test.each` and `describe.each` with a literal array of arrays
   or objects, or a tagged-template table, count their rows as parametrize cases (a
   `describe.each` multiplies the tests inside it). Fewer rows than at base is `tests.weakened`
   ("parametrize cases reduced from N to M"); adding rows is fine. A table that is not a
-  literal (`it.each(cases)`) is not counted.
+  literal (`it.each(cases)`), or whose array has an element starting with `...`
+  (`it.each([...small, [3, 4, 7]])`), is not counted.
 - **Helper credit.** JS/TS: a function declared in the same file outside any `it`/`test`
   (top level or inside a `describe`) whose body contains an assertion counts as one check
   per call inside a test. Go: the assertion helpers above are read from every `_test.go`
@@ -391,12 +412,19 @@ string contents blanked, so brackets inside strings do not count:
   helpers, unchanged same-directory test files that call them are re-analysed as if they
   had changed, so a helper that loses its checks weakens its callers. A helper without an
   assertion earns nothing.
-- **Expected-output data files.** A modified (not added, not deleted) non-code file with
+- **Rust char literals.** A Rust character literal (`'}'`, `'"'`, `'\n'`, `'\''`, matched
+  by `'(?:\\.|[^\\'])'`) is masked like a string, so its brace or quote is not code. A lifetime
+  (`'a`) is left alone.
+- **Expected-output data files.** A modified, or renamed with changed content (not added,
+  not deleted, not a pure rename), non-code file with
   extension `.json`, `.yaml`, `.yml`, `.txt`, `.csv`, `.snap`, `.golden`, `.out`,
   `.expected`, `.html` or `.xml` under a test path, or under `testdata`, `fixtures`,
   `golden` or `__snapshots__`, gives one `tests.expected_changed` (warn), "expected-output
   file changed: PATH". Files another rule owns (runner configuration such as
-  `package.json` and `tsconfig*.json`, and CI workflows) are not reported here.
+  `package.json` and `tsconfig*.json`, and CI workflows) are not reported here, and neither
+  are files that are configuration rather than expected output: `requirements*.txt`,
+  `constraints*.txt`, `*compose*.yml`, `*compose*.yaml`, `Dockerfile*`, `.pre-commit*`,
+  `codecov.yml` and `.env*`.
 
 Line-engine assertion vocabulary also includes: JS/TS `expectTypeOf(`, `assertType(` and
 a testing-library query that throws when the element is missing (`getBy…(`,

@@ -241,10 +241,11 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
             )
     elif count_drop_allowed and c.asserts < b.asserts:
         out.append((f"assertions dropped from {b.asserts} to {c.asserts}", c.line, BLOCK))
-    if c.vacuous > b.vacuous:
-        out.append(
-            ("an assertion was made vacuous: it can never fail", c.vacuous_line or c.line, BLOCK)
-        )
+    replaced = [line for expr, line in c.self_calls if expr in b.compared]
+    base_replaced = sum(1 for expr, _ in b.self_calls if expr in b.compared)
+    if c.vacuous + len(replaced) > b.vacuous + base_replaced:
+        line = c.vacuous_line or (replaced[0] if replaced else c.line)
+        out.append(("an assertion was made vacuous: it can never fail", line, BLOCK))
     if c.unreachable > b.unreachable:
         out.append(
             (
@@ -330,12 +331,15 @@ def _marker_findings(sides: list[_Side], base_keys: set[str], cand_keys: set[str
     remaining: Counter[tuple[str, str]] = Counter()
     for s in sides:
         if s.base:
-            remaining.update((m.scope, m.kind) for m in s.base.markers)
+            remaining.update((m.scope, m.kind) for m in s.base.markers if not _is_build(m))
     out: list[Finding] = []
     for s in sides:
         if not s.cand:
             continue
+        out.extend(_build_findings(s.base, s.cand))
         for m in s.cand.markers:
+            if _is_build(m):
+                continue
             ident = (m.scope, m.kind)
             if remaining[ident] > 0:
                 remaining[ident] -= 1
@@ -351,6 +355,48 @@ def _marker_findings(sides: list[_Side], base_keys: set[str], cand_keys: set[str
     return out
 
 
+def _is_build(m: Marker) -> bool:
+    return m.kind.startswith(("go:build", "+build"))
+
+
+_BUILD_TAG = re.compile(r"[A-Za-z0-9_.]+")
+
+
+def _tags(kinds: Counter[str]) -> set[str]:
+    """The tag names in build-constraint kinds, ignoring syntax, `!`, `&&`, `||`, `,` and spaces."""
+    return {t for k in kinds for t in _BUILD_TAG.findall(k.split(" ", 1)[1])}
+
+
+def _build_findings(base: FileAnalysis | None, cand: FileAnalysis) -> list[Finding]:
+    """Go build constraints of one `_test.go` file (SPEC 5.3), comparing the two revisions.
+
+    No constraint at base and one now: block. A constraint at base that now differs: warn,
+    since a narrower expression skips the file on more platforms but a wider one does not.
+    Adding `//go:build` over unchanged `// +build` lines (gofmt's migration, which keeps the
+    same tags), or dropping `// +build` lines under an unchanged `//go:build` (`go fix`), is
+    no finding. A brand-new file is never flagged: it hides no existing verification."""
+    if base is None:
+        return []
+    now = [m for m in cand.markers if _is_build(m)]
+    if not now:
+        return []
+    before = [m for m in base.markers if _is_build(m)]
+    modern_b = Counter(m.kind for m in before if m.kind.startswith("go:build"))
+    legacy_b = Counter(m.kind for m in before if m.kind.startswith("+build"))
+    modern_c = Counter(m.kind for m in now if m.kind.startswith("go:build"))
+    legacy_c = Counter(m.kind for m in now if m.kind.startswith("+build"))
+    if modern_b + legacy_b == modern_c + legacy_c:
+        return []
+    if not before:
+        return [_marker_finding(cand.path, now[0])]
+    if legacy_b == legacy_c and not modern_b and _tags(modern_c) == _tags(legacy_c):
+        return []  # gofmt added the `//go:build` for the `// +build` lines already there
+    if modern_b == modern_c and not legacy_c - legacy_b:
+        return []  # `go fix` dropped `// +build` lines under the `//go:build` that stays
+    new = [m for m in now if m.kind not in modern_b + legacy_b]
+    return [_marker_finding(cand.path, new[0], warn=True)] if new else []
+
+
 def _marker_finding(path: str, m: Marker, warn: bool = False) -> Finding:
     text = marker_display(m.text)
     where = _target(m.scope)
@@ -362,7 +408,17 @@ def _marker_finding(path: str, m: Marker, warn: bool = False) -> Finding:
             f"focus marker `{text}` added to {where}; every other test in the run is skipped",
             "Remove the focus marker so the whole suite runs.",
         )
-    if m.kind.startswith(("go:build", "+build")):
+    if _is_build(m):
+        if warn:
+            return sev_finding(
+                "tests.skipped",
+                WARN,
+                path,
+                m.line,
+                f"build constraint changed to `{text}`: `go test ./...` may compile this file "
+                "on fewer platforms",
+                "Check the new constraint still builds the file wherever its tests must run.",
+            )
         return finding(
             "tests.skipped",
             path,

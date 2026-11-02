@@ -17,6 +17,9 @@ from greenproof.rules._common import digest, split_lines
 from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
 
 _NUM = r"-?\d+(?:\.\d+)?"
+# A Rust char literal (`'}'`, `'"'`, `'\n'`): masked like a string so its bracket or quote is not
+# code. A lifetime (`'a`) has no closing quote one character later and is left alone.
+_RUST_CHAR = re.compile(r"'(?:\\.|[^\\'])'")
 
 
 @dataclass(frozen=True)
@@ -181,6 +184,13 @@ def mask_source(text: str, lang: str) -> tuple[list[str], list[str]]:
             c.append(ch * 3)
             i += 3
             continue
+        if lang == "rust" and ch == "'":
+            cm = _RUST_CHAR.match(text, i)
+            if cm is not None:
+                m.append("''")
+                c.append(cm.group())
+                i = cm.end()
+                continue
         if ch in quotes:
             state, quote = "str", ch
             m.append(ch)
@@ -255,6 +265,12 @@ def _blank_strings(text: str, lang: str) -> str:
     i, n = 0, len(text)
     while i < n:
         ch = text[i]
+        if lang == "rust" and ch == "'":
+            cm = _RUST_CHAR.match(text, i)
+            if cm is not None:
+                out.append("'" + " " * (cm.end() - i - 2) + "'")
+                i = cm.end()
+                continue
         if ch not in quotes:
             out.append(ch)
             i += 1
@@ -370,8 +386,28 @@ _NONDETERMINISTIC = re.compile(
 
 
 def _same(a: str, b: str) -> bool:
+    """Both sides are the same call-free expression. A call may be a real test of memoization or
+    determinism (`expect(select(s)).toBe(select(s))`), so only plain operands are vacuous."""
     x = _norm(a)
-    return bool(x) and x == _norm(b) and _NONDETERMINISTIC.search(a) is None
+    return bool(x) and x == _norm(b) and "(" not in x and _NONDETERMINISTIC.search(a) is None
+
+
+def _same_call(a: str, b: str) -> bool:
+    """Both sides are the same deterministic expression and it contains a call."""
+    x = _norm(a)
+    return bool(x) and x == _norm(b) and "(" in x and _NONDETERMINISTIC.search(a) is None
+
+
+@dataclass
+class _SelfEq:
+    """What `_self_equal_lines` found in a test: lines with a call-free self-comparison (vacuous,
+    {line: count}); self-comparisons whose operand has a call, which are vacuous only when they
+    replace a real comparison at the base, as (normalised operand, line); and the normalised
+    operands of every comparison of two different expressions."""
+
+    vacuous: dict[int, int]
+    calls: list[tuple[str, int]]
+    compared: set[str]
 
 
 _JS_EXPECT_SELF = re.compile(r"\s*\.\s*(?:toBe|toEqual|toStrictEqual)\s*\(")
@@ -381,16 +417,24 @@ _RUST_ASSERT_EQ = re.compile(r"\bassert_eq!\s*\(")
 _RUST_ASSERT = re.compile(r"\bassert!\s*\(")
 
 
-def _self_equal_lines(src: _Src, a: int, b: int, skip: dict[int, str]) -> dict[int, int]:
-    """Lines of `[a, b)` (offsets) holding a comparison of an expression with its own text, as
-    {line: count}: `expect(X).toBe(X)`, `assert.equal(X, X)`, `assert_eq!(X, X)` (SPEC 5.4)."""
+def _self_equal_lines(src: _Src, a: int, b: int, skip: dict[int, str]) -> _SelfEq:
+    """Comparisons of an expression with its own text in `[a, b)` (offsets): `expect(X).toBe(X)`,
+    `assert.equal(X, X)`, `assert_eq!(X, X)` (SPEC 5.4), and the operands of the others."""
     found: dict[int, int] = {}
+    calls: list[tuple[str, int]] = []
+    compared: set[str] = set()
     s = src.shadow
 
-    def hit(offset: int) -> None:
+    def pair(left: str, right: str, offset: int) -> None:
         line = src.line_of(offset)
-        if line not in skip:
+        if line in skip:
+            return
+        if _same(left, right):
             found[line] = found.get(line, 0) + 1
+        elif _same_call(left, right):
+            calls.append((_norm(left), line + 1))
+        else:
+            compared.update((_norm(left), _norm(right)))
 
     if src.lang == "js":
         for m in _JS_EXPECT_OPEN.finditer(s, a, b):
@@ -399,12 +443,12 @@ def _self_equal_lines(src: _Src, a: int, b: int, skip: dict[int, str]) -> dict[i
             if nm is None:
                 continue
             args = src.args(nm.end() - 1)
-            if args is not None and len(args) == 1 and _same(src.text[m.end() : close], args[0]):
-                hit(m.start())
+            if args is not None and len(args) == 1:
+                pair(src.text[m.end() : close], args[0], m.start())
         for m in _JS_NODE_EQ.finditer(s, a, b):
             args = src.args(m.end() - 1)
-            if args is not None and len(args) >= 2 and _same(args[0], args[1]):
-                hit(m.start())
+            if args is not None and len(args) >= 2:
+                pair(args[0], args[1], m.start())
     elif src.lang == "go":
         for m in _GO_EQUAL.finditer(s, a, b):
             args = src.args(m.end() - 1)
@@ -412,13 +456,13 @@ def _self_equal_lines(src: _Src, a: int, b: int, skip: dict[int, str]) -> dict[i
                 continue
             if args and args[0].strip() in ("t", "b", "tb") and len(args) >= 3:
                 args = args[1:]
-            if len(args) >= 2 and _same(args[0], args[1]):
-                hit(m.start())
+            if len(args) >= 2:
+                pair(args[0], args[1], m.start())
     elif src.lang == "rust":
         for m in _RUST_ASSERT_EQ.finditer(s, a, b):
             args = src.args(m.end() - 1)
-            if args is not None and len(args) >= 2 and _same(args[0], args[1]):
-                hit(m.start())
+            if args is not None and len(args) >= 2:
+                pair(args[0], args[1], m.start())
         for m in _RUST_ASSERT.finditer(s, a, b):
             close = src.close(m.end() - 1)
             if close < 0:
@@ -426,9 +470,9 @@ def _self_equal_lines(src: _Src, a: int, b: int, skip: dict[int, str]) -> dict[i
             if len(src.split(m.end(), close, "&&")) > 1 or len(src.split(m.end(), close, "||")) > 1:
                 continue
             sides = src.split(m.end(), close, "==")
-            if len(sides) == 2 and _same(sides[0], sides[1]):
-                hit(m.start())
-    return found
+            if len(sides) == 2:
+                pair(sides[0], sides[1], m.start())
+    return _SelfEq(found, calls, compared)
 
 
 def _strip_parens(expr: str) -> str:
@@ -450,20 +494,28 @@ def _wrapped(e: str) -> bool:
     return depth == 0
 
 
-def _always_false(src: _Src, a: int, b: int) -> bool:
-    """`false`, `false && x`, `x && false` over the condition at `[a, b)`; any `||` makes the
-    condition unprovable, so it is not reported."""
-    if len(src.split(a, b, "||")) > 1:
+def _always(src: _Src, a: int, b: int, lit: str) -> bool:
+    """The condition at `[a, b)` is the literal `lit` (`false` or `true`): the literal alone,
+    or joined to anything else by the operator it absorbs (`false && x`, `x || true`). The
+    other operator makes the condition unprovable, so it is not reported."""
+    absorbing, other = ("&&", "||") if lit == "false" else ("||", "&&")
+    if len(src.split(a, b, other)) > 1:
         return False
-    for part in src.split(a, b, "&&"):
+    for part in src.split(a, b, absorbing):
         inner = _strip_parens(part)
-        if inner == "false":
+        if inner == lit:
             return True
         if part.strip().startswith("(") and inner != part.strip():
             off = src.text.find(inner, a, b)
-            if off >= 0 and _always_false(src, off, off + len(inner)):
+            if off >= 0 and _always(src, off, off + len(inner), lit):
                 return True
     return False
+
+
+def _always_false(src: _Src, a: int, b: int) -> bool:
+    """`false`, `false && x`, `x && false` over the condition at `[a, b)`; any `||` makes the
+    condition unprovable, so it is not reported."""
+    return _always(src, a, b, "false")
 
 
 _JS_IF = re.compile(r"\bif\s*\(")
@@ -474,14 +526,81 @@ _BARE_RETURN = {
     "rust": re.compile(r"^\s*return\s*;\s*$"),
 }
 _CLOSER_ONLY = re.compile(r"^\s*\}+[\s)\];,]*$")
+_RET_BODY = {"js": r"return\s*;?", "go": r"return", "rust": r"return\s*;"}
+_JS_IF_OPEN = re.compile(r"\s*if\s*\(")
+_BRACE_IF_RETURN = {
+    lang: re.compile(rf"^\s*if\s+(.*?)\s*\{{\s*{body}\s*\}}\s*$")
+    for lang, body in _RET_BODY.items()
+}
+_HEADER_OPEN = re.compile(r"(?:\}\s*)?(?:else\s+if|if|for|while)\s*\(")
+_ELSE_ONLY = re.compile(r"(?:\}\s*)?else")
+
+
+def _is_header(text: str) -> bool:
+    """`text` is one control header with no body: `if (...)`, `else if (...)`, `for (...)`,
+    `while (...)` whose closing parenthesis ends it, or a bare `else`."""
+    if _ELSE_ONLY.fullmatch(text):
+        return True
+    m = _HEADER_OPEN.match(text)
+    if m is None:
+        return False
+    depth = 0
+    for i in range(m.end() - 1, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i == len(text) - 1
+    return False
+
+
+def _braceless_branch(masked: list[str], k: int, lo: int) -> bool:
+    """The code line before line `k` (not before `lo`) is a control header with no `{`, so the
+    statement on line `k` is that branch's body, not a top-level statement."""
+    p = k - 1
+    while p >= lo and not masked[p].strip():
+        p -= 1
+    for j in range(p, max(lo, p - 8) - 1, -1):
+        if j < p and masked[j].rstrip().endswith((";", "{", "}")):
+            return False
+        if _is_header(" ".join(line.strip() for line in masked[j : p + 1])):
+            return True
+    return False
+
+
+def _true_return(src: _Src, k: int) -> bool:
+    """Line `k` is a one-line `if` on an always-true condition whose whole body is a bare
+    `return`: `if (true) return;`, `if (true) { return; }`, `if true { return }`."""
+    a, b = src.starts[k], src.starts[k] + len(src.code[k])
+    line = src.shadow[a:b]
+    body = _RET_BODY[src.lang]
+    if src.lang == "js":
+        m = _JS_IF_OPEN.match(line)
+        if m is None:
+            return False
+        open_at = a + m.end() - 1
+        close = src.close(open_at)
+        if close < 0 or src.line_of(close) != k:
+            return False
+        if not _always(src, open_at + 1, close, "true"):
+            return False
+        rest = src.shadow[close + 1 : b].strip()
+        return re.fullmatch(rf"{body}|\{{\s*{body}\s*\}}\s*;?", rest) is not None
+    m2 = _BRACE_IF_RETURN[src.lang].match(line)
+    if m2 is None:
+        return False
+    ca, cb = a + m2.start(1), a + m2.end(1)
+    ca = cb - len(src.split(ca, cb, ";")[-1])  # Go's `if init; cond {`
+    return _always(src, ca, cb, "true")
 
 
 def _dead_lines(src: _Src, span: _Span) -> dict[int, str]:
-    """Lines of a test whose checks can never run or never fail, as {line: kind}.
-
-    `unreachable`: after a bare `return` at the top level of the test body, and inside a block
-    guarded by an always-false condition (`if false`, `x && false`). `vacuous` (Go): inside
-    `if X != X {`, which never fires (SPEC 5.4).
+    """Lines of a test whose checks can never run, as {line: "unreachable"}: after a bare
+    `return` at the top level of the test body (or a one-line `if` on an always-true condition
+    that returns), and inside a block guarded by an always-false condition (`if false`,
+    `x && false`). A `return` that is the body of a brace-less `if`/`else`/`for`/`while` is
+    conditional, not an early return (SPEC 5.4).
     """
     dead: dict[int, str] = {}
     lang = src.lang
@@ -491,7 +610,11 @@ def _dead_lines(src: _Src, span: _Span) -> dict[int, str]:
     for k in range(span.start, span.end + 1):
         if returned:
             dead.setdefault(k, "unreachable")
-        elif depth == 1 and ret.match(src.masked[k]):
+        elif (
+            depth == 1
+            and (ret.match(src.masked[k]) or _true_return(src, k))
+            and not _braceless_branch(src.masked, k, span.start)
+        ):
             returned = True
         depth += src.masked[k].count("{") - src.masked[k].count("}")
     for k in range(span.start, span.end + 1):
@@ -536,10 +659,6 @@ def _if_block(src: _Src, k: int) -> tuple[str, int] | None:
     last = src.line_of(end) if end >= 0 else k
     if _always_false(src, ca, cb):
         return "unreachable", last
-    if src.lang == "go":
-        sides = src.split(ca, cb, "!=")
-        if len(sides) == 2 and _same(sides[0], sides[1]):
-            return "vacuous", last
     return None
 
 
@@ -600,8 +719,9 @@ def _parse_each(src: _Src, i: int, m: re.Match[str]) -> _Each | None:
             a += 1
         if a < c and s[a] == "[" and s[src.close(a) + 1 : c].strip() == "":
             elems = [e for e in src.split(a + 1, src.close(a), ",") if e.strip()]
-            cases = len(elems)
-            forms = tuple(_norm(e) for e in elems)
+            if not any(e.lstrip().startswith("...") for e in elems):  # a spread: not a literal
+                cases = len(elems)
+                forms = tuple(_norm(e) for e in elems)
         p = c + 1
     else:
         return None
@@ -976,26 +1096,26 @@ _GO_PACKAGE = re.compile(r"^\s*package\s")
 
 def _go_constraints(raw: list[str]) -> list[Marker]:
     """Build constraints above the package clause. A `_test.go` file with one is not compiled
-    by a plain `go test ./...`, so adding or changing one skips the file's tests. The
-    expression is in the marker kind, so only a new or changed expression is a new marker."""
-    modern: list[Marker] = []
-    legacy: list[Marker] = []
+    by a plain `go test ./...`, so adding or changing one skips the file's tests. Every
+    `//go:build` and `// +build` line is a marker whose kind holds the syntax and expression;
+    the rule compares the two revisions' sets (`tests_integrity._build_findings`)."""
+    out: list[Marker] = []
     for i, line in enumerate(raw):
         if _GO_PACKAGE.match(line):
             break
         gm = _GO_BUILD.match(line)
         if gm:
             expr = " ".join(gm.group(1).split())
-            modern.append(
+            out.append(
                 Marker("", f"go:build {expr}", f"//go:build {expr}", i + 1, "tests.skipped", True)
             )
         pm = _GO_PLUS_BUILD.match(line)
         if pm:
             expr = " ".join(pm.group(1).split())
-            legacy.append(
+            out.append(
                 Marker("", f"+build {expr}", f"// +build {expr}", i + 1, "tests.skipped", True)
             )
-    return modern or legacy
+    return out
 
 
 def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ()) -> FileAnalysis:
@@ -1029,7 +1149,7 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
                 src, src.starts[span.start], src.starts[span.end] + len(code[span.end]), dead
             )
             if src is not None
-            else {}
+            else _SelfEq({}, [], set())
         )
         nested = (
             _inside_open_expect(masked, span.start, span.end)
@@ -1046,6 +1166,8 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
             param_cases=span.cases,
             param_forms=list(span.forms),
         )
+        unit.self_calls = selfeq.calls
+        unit.compared = selfeq.compared
         live: list[str] = []
         for k in lines:
             query = int(
@@ -1058,12 +1180,9 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
             hits = len(_ASSERTS[lang].findall(masked[k])) + query
             if helper_call:
                 hits += len(helper_call.findall(masked[k]))
-            vac = const_hits[k] + selfeq.get(k, 0)
+            vac = const_hits[k] + selfeq.vacuous.get(k, 0)
             if k in dead:
-                if dead[k] == "vacuous":
-                    unit.vacuous += hits
-                    unit.vacuous_line = unit.vacuous_line or (k + 1 if hits else 0)
-                elif hits:
+                if hits:
                     unit.unreachable += hits
                     unit.unreachable_line = unit.unreachable_line or k + 1
                 continue

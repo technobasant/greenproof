@@ -4,6 +4,7 @@ to match what the code now produces hides a bug exactly like editing the literal
 
 from __future__ import annotations
 
+import fnmatch
 import posixpath
 
 from greenproof.changeset import ChangedFile, ChangeSet
@@ -31,6 +32,20 @@ _DATA_DIRS = frozenset(
 _OWNED_DIRS = frozenset({".github", ".circleci", ".gitlab"})
 
 
+# Files under the test paths that are not expected output: dependency pins, container and
+# hook configuration, coverage settings, environment files.
+_NOT_EXPECTED = (
+    "requirements*.txt",
+    "constraints*.txt",
+    "*compose*.yml",
+    "*compose*.yaml",
+    "Dockerfile*",
+    ".pre-commit*",
+    "codecov.yml",
+    ".env*",
+)
+
+
 def _owned_elsewhere(path: str) -> bool:
     name = posixpath.basename(path)
     if name in ("package.json", "package-lock.json") or name.startswith(
@@ -41,9 +56,16 @@ def _owned_elsewhere(path: str) -> bool:
 
 
 def _is_expected_data(f: ChangedFile) -> bool:
-    if f.status != "M" or not f.path.endswith(DATA_SUFFIXES) or language_of(f.path):
+    # A modified file, or a renamed one whose content changed (a pure rename carries nothing).
+    if f.status == "R":
+        if f.old_content == f.new_content:
+            return False
+    elif f.status != "M":
         return False
-    if _owned_elsewhere(f.path):
+    if not f.path.endswith(DATA_SUFFIXES) or language_of(f.path):
+        return False
+    name = posixpath.basename(f.path)
+    if _owned_elsewhere(f.path) or any(fnmatch.fnmatchcase(name, p) for p in _NOT_EXPECTED):
         return False
     return f.is_test or bool(_DATA_DIRS & set(f.path.split("/")[:-1]))
 
