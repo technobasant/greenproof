@@ -197,7 +197,7 @@ covering at least one true positive and one legitimate change that must NOT fire
 | `tests.skipped` | block | a skip/xfail/ignore/todo marker is added to a test that exists at base, or at module/class/conftest scope (see 5.3). On a brand-new test an unconditional skip/xfail is `warn` and a conditional one (`skipif(<condition>)`, `importorskip`) does not fire: neither hides existing verification |
 | `tests.focused` | block | a focus marker is added (`it.only`, `fit`, `describe.only`, `test.only`), which silently skips the rest |
 | `tests.weakened` | block | for a test present on both sides: fewer assertions, a strong assertion replaced by a weaker one, tolerance widened, parametrize cases reduced, an assertion made vacuous, tautological or unreachable, or an assertion wrapped in a swallowing `try/except` (see 5.4) |
-| `tests.expected_changed` | warn | a literal in an assertion's expected side changed in a kept test (same number of expected literals), whether or not non-test code changed. With no non-test code change it is the "edit the test to match what the code returns" pattern, which commands and revert cannot see (the suite passes and revert has no source change to undo); the message says which case it is. Legitimate when the old value was wrong or the spec changed, so warn |
+| `tests.expected_changed` | warn | a literal in an assertion's expected side changed in a kept test (same number of expected literals), whether or not non-test code changed. With no non-test code change it is the "edit the test to match what the code returns" pattern, which commands and revert cannot see (the suite passes and revert has no source change to undo); the message says which case it is. Legitimate when the old value was wrong or the spec changed, so warn. It also fires when a `@pytest.fixture` function in a `conftest.py` or test file returns or yields a different literal (number, string, tuple, list, dict) than at the base; the message names the fixture and file, and every test using the fixture compares against that value |
 | `suppress.added` | warn | an added line introduces a type/lint/coverage suppression (see 5.5) |
 | `runner.tampered` | block | a change narrows or neuters how checks run: test selection, thresholds, strictness, test scripts (see 5.6) |
 | `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `|| true`, `if: false`, path filters excluding tests, or changes the greenproof step itself. The greenproof step is a line, outside a YAML comment, that runs `greenproof check` (any prefix such as `uvx`, `uv run` or a path, any `@version`) or `uses:` the greenproof action; other mentions (`greenproof --version` in a packaging job) do not count. Only those lines count, and a workflow whose base version has none gaining them is adoption, not a change (a new workflow file included); commenting out or deleting an existing greenproof line still fires. A ref-only version bump of the greenproof action (same inputs) is `warn` |
@@ -232,6 +232,16 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   `assertIsNotNone`) or by a broader exception (`Exception`, `BaseException`);
 - `pytest.approx` `rel`/`abs` increased, `assertAlmostEqual` `places` decreased or `delta`
   increased;
+- an exact numeric check loosened to an explicit tolerance: `assert f(x) == 99` (or
+  `assertEqual`) replaced by `pytest.approx(99, rel=..., abs=...)`, `math.isclose(f(x), 99,
+  rel_tol=..., abs_tol=...)` or `assertAlmostEqual(f(x), 99, delta=... | places=...)` is
+  weakened when the band the tolerance allows is at least 1% of the absolute expected
+  value (`rel`/`rel_tol` of 0.01 or more; `abs`/`abs_tol`/`delta` of at least 1% of the
+  expected value; `places` giving `0.5 * 10**-places` that wide). For an expected value of
+  0 the absolute band must be at least 0.01. A bare `pytest.approx(99)`/`math.isclose`
+  (the library defaults) and a tight explicit tolerance are the honest fix for floating
+  point and stay clean. The existing widening check above has no threshold and is
+  unchanged;
 - `@pytest.mark.parametrize` cases removed, unless every removed case (the exact form of
   its argvalues element) appears among the cases the change adds (all cases of new tests,
   plus the cases a paired test gained, as a multiset difference). Splitting cases out
@@ -239,11 +249,17 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
 - an assertion moved inside `try:` whose handler catches `AssertionError`/`Exception`
   without re-raising;
 - an assertion made vacuous or tautological: `assert <truthy constant>` (`assert True`,
-  `assert 1`), `self.assertTrue(True)`, an `or` with a truthy constant operand
-  (`assert x == 3 or True`), or a comparison of an expression with itself, also after
+  `assert 1`, a non-empty string, f-string or bytes literal, a non-zero number, a non-empty
+  list, tuple, set or dict display such as `assert [x]` or `assert (x, "message")`,
+  `assert not []`), `self.assertTrue(True)`, an `or` with a truthy constant operand
+  (`assert x == 3 or True`), or a comparison of an expression with itself (`==`, `is`,
+  `<=`, `>=`; `assertEqual(E, E)`, `assertIs(E, E)`, `assertTrue(E == E)`), also after
   single-assignment locals (assigned exactly once in the test body, before the assertion,
   from any expression, and not used before it in any other way) are inlined:
-  `expected = refund(100)` then `assert refund(100) == expected` checks nothing;
+  `expected = refund(100)` then `assert refund(100) == expected` checks nothing. Two sides
+  that are AST-identical are the same value even when they contain calls (`f(x) == f(x)`),
+  except when they are stateful: `next`, `pop`, `random`, `uuid`, `time`, `now`, `await`,
+  `yield` and walrus expressions are never treated as identical;
 - an assertion whose inputs are all constants, so it checks nothing about the code:
   every operand is a literal, a pure builtin (`len`, `abs`, `min`, `max`, `sum`, `sorted`,
   `reversed`, `list`, `tuple`, `set`, `frozenset`, `dict`, `str`, `int`, `float`, `bool`,
@@ -292,6 +308,31 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   `tests.weakened` **warn** ("only loose checks dropped"), not block. Dropping
   `assert isinstance(stream, Iterable)` while every `==` stays is a cleanup more often
   than a tamper; dropping any exact check, or the only check on a target, still blocks.
+
+Python also treats these as weakening:
+- **shadowed and deleted tests.** Python collects only the last binding of a name in a
+  module or class body. A test `def` that is not the last binding of its name (a later `def`
+  of the same name, a later `del name`, or a later non-def rebinding such as `name = None`
+  or an import alias) is not collected and is not a unit; the earlier checks are gone, so
+  the usual removed/weakened comparison applies. An assignment that reads the same name
+  (`test_x = pytest.mark.slow(test_x)`) is a wrapper, not a rebinding. Duplicates that
+  already exist in an unchanged base file produce no finding;
+- a **swallowing decorator** added to a test. The decorator resolves to a function in the
+  same file, or in a test-path module the file imports (5.4 helpers below), whose body
+  (nested wrappers included) has a `try`/`except` that swallows `AssertionError` or
+  `Exception` without re-raising. The test's checks are treated as swallowed, with the same
+  message as an assertion wrapped in such a `try`. A retry decorator that re-raises is
+  clean;
+- **cross-file helpers.** A test that calls a function imported from a test-path Python
+  module (`from helpers import f`, `from tests.helpers import f`, `from .helpers import f`,
+  `import helpers` with `helpers.f()`) gets the same helper credit as a helper in the test's
+  own file: the helper's own assertions count, and a helper that only does `return a == b`
+  still counts as no check. The module is resolved against the test file's directory, the
+  repository root and the test roots, and read at the same revision as the test file. When
+  a helper module (a test-path file with no tests of its own) or a `conftest.py` changes,
+  the unchanged test files that import it (for a conftest, every collected test file at or
+  below its directory), at most 200, are analysed as if they changed, so a helper that is
+  neutered weakens every test that relied on it.
 
 JS/TS, Go, Rust (line level, per test file): count of assertion calls drops (`expect(`,
 `assert.`, `t.Error`/`t.Fatal`/`require.`/`assert.`, `assert!`/`assert_eq!`), or strong
@@ -484,6 +525,15 @@ calls that callable, so the assertion checks the mock.
   `from <qualifier-module> import <name>` (also when the qualifier is that module's alias).
   It still fires when the patch does not reach the from-imported name; an agent that
   patches the subject of its own test intended to.
+- Python autouse fixtures. An added or changed `@pytest.fixture(autouse=True)` in a
+  `conftest.py` or a test file (a patch not already in the same fixture at the base) that
+  patches a callable with the forms above, or by assigning to a module attribute
+  (`shop.refund = ...`), fires when a test in its scope calls that callable inside an
+  assertion: the fixture's own file (its class, for a class fixture), or for a
+  `conftest.py` every collected test at or below its directory. The patch target is
+  resolved with the fixture file's imports and the call with the test file's. Message:
+  "autouse fixture <name> patches <target> and the tests in its scope assert on <call>(...)
+  (<tests>); they test the mock".
 - JS/TS (line level). An added `jest.mock(P)` or `vi.mock(P)`, or an added
   `jest.spyOn(X, 'n')` / `vi.spyOn(X, 'n')` followed by `.mockReturnValue`,
   `.mockResolvedValue` or `.mockImplementation`, where the same file imports from `P` (or

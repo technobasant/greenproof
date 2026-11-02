@@ -76,16 +76,22 @@ _RULES = [
         BLOCK,
         "A test present on both sides checks less than before: fewer assertions, a strong "
         "assertion replaced by a weaker one, a wider tolerance, fewer parametrize cases, an "
-        "assertion made vacuous (`assert True`, `... or True`, `x == x`) or unreachable (after "
-        "an unconditional return or raise, or under `if False`), or an assertion wrapped in a "
-        "try/except that swallows the failure. Replacing a comparison with its own operand "
+        "assertion made vacuous (`assert True`, `assert [x]`, `... or True`, `x == x`, "
+        "`f(x) == f(x)`) or unreachable (after an unconditional return or raise, or under "
+        "`if False`), an exact check loosened to a wide `pytest.approx`/`math.isclose`/"
+        "`assertAlmostEqual` tolerance, or an assertion wrapped in a try/except or a "
+        "swallowing decorator that swallows the failure. A later def, del or rebinding of a "
+        "test name shadows the earlier test, which Python never collects. Helpers imported "
+        "from other test modules are followed, and a helper or conftest that loses its "
+        "assertions weakens the tests that use it. Replacing a comparison with its own operand "
         "(`assert f() == 1` to `assert f()`) blocks; replacing it with a different expression "
         "is a warning, because that is often a legitimate refactor.",
     ),
     RuleInfo(
         "tests.expected_changed",
         WARN,
-        "The expected value in an assertion changed, whether or not non-test code changed. That is "
+        "The expected value in an assertion, or the literal a `@pytest.fixture` returns, changed, "
+        "whether or not non-test code changed. That is "
         "legitimate when the specification changed, so it is a warning: confirm the new value "
         "comes from the requirement, not from what the code returns.",
     ),
@@ -125,7 +131,8 @@ _RULES = [
         "jest.mock, vi.mock, a mocked spyOn) the same callable its assertions call, so the "
         "assertion checks the mock instead of the code. Patching a collaborator is fine; "
         "patching the subject of the test is not. A patch that was already in the same test "
-        "at the base does not fire.",
+        "at the base does not fire. An added or changed autouse fixture that patches a "
+        "callable the tests in its scope assert on fires too.",
     ),
     RuleInfo(
         "code.hardcoded",
