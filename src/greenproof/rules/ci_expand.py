@@ -9,6 +9,7 @@ found by `ci.py`, which walks every kind of child with one budget.
 
 from __future__ import annotations
 
+import ast
 import json
 import posixpath
 import re
@@ -366,3 +367,179 @@ def pm_children(
         for ref in refs
         for body in _script_lines(scripts, ref)
     ]
+
+
+# -- tox and nox ---------------------------------------------------------------------------
+_TOX_SUBST = {"{envpython}": "python", "{toxinidir}": ".", "{toxworkdir}": ".tox"}
+
+
+def _brace_factors(text: str) -> list[str]:
+    """`py{39,310}` as `py39`, `py310` (one brace group, as tox env lists are written)."""
+    m = re.search(r"\{([^{}]*)\}", text)
+    if m is None:
+        return [text]
+    return [
+        out
+        for part in m[1].split(",")
+        for out in _brace_factors(text[: m.start()] + part.strip() + text[m.end() :])
+    ]
+
+
+def _tox_envs(toks: list[str], ini: Mapping[str, str]) -> list[str] | None:
+    """The environments `tox` runs: those of `-e`, else the `envlist` of the `[tox]` section."""
+    names: list[str] = []
+    args = toks[: toks.index("--")] if "--" in toks else toks
+    i = 1
+    while i < len(args):
+        tok = args[i]
+        name, eq, value = tok.partition("=")
+        if name in ("-e", "--env"):
+            names.append(value if eq else (args[i + 1] if i + 1 < len(args) else ""))
+            i += 1 if eq else 2
+            continue
+        if name.startswith("-e") and len(name) > 2 and not name.startswith("--"):
+            names.append(tok[2:])
+        elif name in ("-a", "--listenvs", "--listenvs-all", "-l"):
+            return None
+        i += 1
+    raw = ",".join(names) if names else ini.get("tox.envlist", "")
+    out = [e for part in re.split(r"[,\n]", raw) for e in _brace_factors(part.strip()) if e]
+    return None if not out or any(e.upper() == "ALL" or "{" in e for e in out) else out
+
+
+def _tox_ini(text: str) -> dict[str, str]:
+    """`{"section.key": value}` of a tox.ini, a continued value kept with its newlines."""
+    out: dict[str, str] = {}
+    section, key = "", ""
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith(("#", ";")):
+            continue
+        if m := re.match(r"^\[([^\]]+)\]\s*$", raw):
+            section, key = m[1].strip(), ""
+        elif raw[0] in " \t" and key:
+            out[key] += "\n" + raw.strip()
+        elif m := re.match(r"^([\w.-]+)\s*[=:]\s*(.*)$", raw):
+            key = f"{section}.{m[1]}"
+            out[key] = m[2].strip()
+        else:
+            key = ""
+    return out
+
+
+def tox_children(
+    toks: list[str], cwd: str, read: Callable[[str], str | None]
+) -> list[Child] | None:
+    """The `commands` of the tox environments a `tox` statement runs, from the tox.ini of the
+    directory. None when it is not `tox`, there is no tox.ini, or an environment, a substitution
+    or a conditional line cannot be read (the statement then stays opaque)."""
+    if not toks or posixpath.basename(toks[0]) != "tox":
+        return None
+    path = posixpath.normpath(posixpath.join(cwd, "tox.ini"))
+    text = read(path)
+    if text is None:
+        return None
+    ini = _tox_ini(text)
+    envs = _tox_envs(toks, ini)
+    if envs is None:
+        return None
+    posargs = " ".join(toks[toks.index("--") + 1 :]) if "--" in toks else ""
+    out: list[Child] = []
+    for env in envs:
+        value = ini.get(f"testenv:{env}.commands", ini.get("testenv.commands"))
+        if value is None:
+            return None
+        for line in value.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if m := re.match(r"^([\w.,-]+):\s+(.*)$", line):  # `py39: cmd`: a factor condition
+                if env not in m[1].split(","):
+                    continue
+                line = m[2]
+            for old, new in _TOX_SUBST.items():
+                line = line.replace(old, new)
+            line = re.sub(r"\{posargs(?::[^}]*)?\}", posargs, line)
+            ignored = line.startswith("-")
+            line = line.removeprefix("-").strip()
+            if "{" in line or "[" in line.split()[0]:
+                return None
+            reason = "a `-` prefix on the tox command" if ignored else ""
+            out.append(Child("recipe", path, line, cwd, ("tox", path, env, line), True, reason))
+    return out
+
+
+def nox_children(
+    toks: list[str], cwd: str, read: Callable[[str], str | None]
+) -> list[Child] | None:
+    """The `session.run(...)` commands of the nox sessions a `nox` statement runs, from the
+    noxfile of the directory. None when it is not `nox`, the file cannot be read, selects its
+    sessions in code (`nox.options.sessions`) or has a call with an argument that is not a
+    string (a variable, an f-string)."""
+    if not toks or posixpath.basename(toks[0]) != "nox":
+        return None
+    path = posixpath.normpath(posixpath.join(cwd, "noxfile.py"))
+    text = read(path)
+    if text is None or "options.sessions" in text:
+        return None
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    args = toks[: toks.index("--")] if "--" in toks else toks
+    posargs = toks[toks.index("--") + 1 :] if "--" in toks else []
+    wanted: list[str] = []
+    i = 1
+    while i < len(args):
+        name, eq, value = args[i].partition("=")
+        if name in ("-s", "--session", "--sessions", "-e", "--envs"):
+            raw = value if eq else (args[i + 1] if i + 1 < len(args) else "")
+            wanted.extend(w for w in raw.split(",") if w)
+            i += 1 if eq else 2
+            continue
+        if name in ("-l", "--list", "--list-sessions", "-k", "--keywords", "-t", "--tags"):
+            return None
+        i += 1
+    out: list[Child] = []
+    seen = 0
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        session = _nox_session_name(node)
+        if session is None:
+            continue
+        if wanted and not any(w == session or w.startswith(session + "-") for w in wanted):
+            continue
+        seen += 1
+        for call in ast.walk(node):
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "run"
+            ):
+                continue
+            words: list[str] = []
+            for arg in call.args:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    words.append(arg.value)
+                elif isinstance(arg, ast.Starred) and "posargs" in ast.unparse(arg.value):
+                    words.extend(posargs)
+                else:
+                    return None
+            if words:
+                line = " ".join(words)
+                out.append(Child("recipe", path, line, cwd, ("nox", path, session, line), True))
+    return out if seen else None
+
+
+def _nox_session_name(node: Any) -> str | None:
+    """The name a `@nox.session` function runs as (`name=` or the function's), else None."""
+    for deco in node.decorator_list:
+        target = deco.func if isinstance(deco, ast.Call) else deco
+        if not (isinstance(target, ast.Attribute) and target.attr == "session"):
+            continue
+        if isinstance(deco, ast.Call):
+            for kw in deco.keywords:
+                if kw.arg == "name" and isinstance(kw.value, ast.Constant):
+                    return str(kw.value.value)
+        return str(node.name)
+    return None

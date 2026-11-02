@@ -34,6 +34,8 @@ from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from functools import lru_cache
 
+from greenproof.changeset import _glob_to_regex
+
 # What a command-position word is, by the kind of check it runs.
 _SIMPLE_CHECKERS = {
     "pytest": "pytest",
@@ -1271,6 +1273,8 @@ _SUB_CHECKERS: dict[str, tuple[frozenset[str], str]] = {
     "cypress": (frozenset({"run"}), "cypress"),
     "karma": (frozenset({"start", "run"}), "karma"),
     "ng": (frozenset({"test", "e2e", "lint"}), "ng test"),
+    "react-scripts": (frozenset({"test"}), "jest/vitest"),
+    "craco": (frozenset({"test"}), "jest/vitest"),
     "deno": (frozenset({"test"}), "deno test"),
     "swift": (frozenset({"test"}), "swift test"),
     "mix": (frozenset({"test"}), "mix test"),
@@ -1306,7 +1310,7 @@ def classify(toks: list[str], make_check: Callable[[str], bool | None] | None = 
             return None
         return _SUB_KINDS.get((cmd, words[0]), kind)
     if cmd in ("node", "nodejs"):
-        return "node test" if "--test" in rest[:3] else None
+        return "jest/vitest" if "--test" in rest[:3] else None
     if cmd == "go":
         return "go test" if rest[:1] == ["test"] else None
     if cmd == "cargo":
@@ -1324,6 +1328,8 @@ def classify(toks: list[str], make_check: Callable[[str], bool | None] | None = 
     if cmd in _MAKERS:
         return _make_kind(rest, make_check)
     if cmd in _PKG_MANAGERS:
+        if cmd == "bun" and _skip_opts(rest, _PKG_VALUE_OPTS)[:1] == ["test"]:
+            return None if _is_info_only(rest) else "jest/vitest"  # bun's own runner
         words = _package_script(rest)
         if not words:
             return None
@@ -2275,7 +2281,10 @@ _VALUE_FLAGS: dict[str, frozenset[str]] = {
         | {"--selectProjects", "--testEnvironment", "--outputFile", "--coverageReporters"}
         | {"--rootDir", "--roots", "--color", "-t", "--testNamePattern", "--project"}
         | {"--testPathPattern", "--testPathIgnorePatterns", "--reporter", "--root", "-r"}
-        | {"--dir", "--pool", "--environment", "--retry"}
+        | {"--dir", "--pool", "--environment", "--retry", "--test-reporter"}
+        | {"--test-concurrency"}
+        | {"--test-reporter-destination", "--test-timeout", "--test-shard", "--import"}
+        | {"--require", "--env-file", "--loader", "--experimental-test-coverage"}
     ),
     "go": frozenset(
         {"-run", "-skip", "-timeout", "-count", "-p", "-parallel", "-coverprofile", "-covermode"}
@@ -2393,33 +2402,98 @@ def _gotestsum_packages(args: list[str]) -> list[str]:
     return words or ["./..."]
 
 
-def _invocations(
-    commands: Sequence[str], defs: Mapping[str, str] | None
-) -> dict[str, list[list[str]]]:
-    """Per runner family, the positional words of each run of it in `commands`."""
-    found: dict[str, list[list[str]]] = {}
+@dataclass(frozen=True)
+class _Run:
+    """One run of a runner: its positional words, which runner it is where families share a word
+    list (`jest` and `vitest` read a word differently), and mocha's `--recursive`."""
+
+    words: list[str]
+    flavor: str = ""
+    recursive: bool = False
+
+
+def _js_runner(tokens: list[str]) -> tuple[str, int] | None:
+    """`(flavor, index after the runner word)` of a JS test runner run: jest, vitest, bun test,
+    `node --test`, `react-scripts test`, `craco test`; a package manager's `test` is a runner
+    that is not known (`jest` is read for it)."""
+    if not tokens:
+        return None
+    head = _cmd_name(tokens[0])
+    if head in ("jest", "vitest"):
+        return head, 1
+    if head in ("react-scripts", "craco") and tokens[1:2] == ["test"]:
+        return "jest", 2
+    if head == "bun" and tokens[1:2] == ["test"]:
+        return "bun", 2
+    if head in ("node", "nodejs"):
+        for i, tok in enumerate(tokens[1:4], start=1):
+            if tok == "--test":
+                return "node", i + 1
+        return None
+    start = _runner_end("js", tokens)
+    return None if start is None else ("jest", start)
+
+
+_EXPRESSION = re.compile(r"\$\{\{.*?\}\}")  # `${{ matrix.x }}` is one word once substituted
+
+
+_REDIRECT = re.compile(r"(?:\d*|&)(?:>>?|<<?<?|>&|<&)(?P<target>.*)")
+
+
+def _without_redirects(args: list[str]) -> list[str]:
+    """`args` without redirections (`2>&1`, `> out.log`, `>out.log`): they are not selections."""
+    out: list[str] = []
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        m = _REDIRECT.fullmatch(a)
+        if m is None:
+            out.append(a)
+        elif not m["target"]:
+            skip = True
+    return out
+
+
+def _invocations(commands: Sequence[str], defs: Mapping[str, str] | None) -> dict[str, list[_Run]]:
+    """Per runner family, each run of it in `commands`, with its positional words."""
+    found: dict[str, list[_Run]] = {}
     for command in commands:
+        command = _EXPRESSION.sub(lambda m: re.sub(r"\s+", "", m[0]), command)
         for _, tokens, _sep in _calls(command, defs):
             if not tokens:
                 continue
             if _is_tox(tokens[0]):
                 args = tokens[tokens.index("--") + 1 :] if "--" in tokens else []
-                found.setdefault("pytest", []).append(_positionals("pytest", args))
+                args = _without_redirects(args)
+                found.setdefault("pytest", []).append(_Run(_positionals("pytest", args)))
                 continue
             for family in _POSITIONAL_FAMILIES:
-                start = _runner_end(family, tokens)
+                flavor = ""
+                if family == "js":
+                    runner = _js_runner(tokens)
+                    start = None if runner is None else runner[1]
+                    flavor = runner[0] if runner else ""
+                else:
+                    start = _runner_end(family, tokens)
                 if start is None:
                     continue
-                args = tokens[start:]
+                args = _without_redirects(tokens[start:])
                 if family == "go" and _cmd_name(tokens[0]) == "gotestsum":
-                    found.setdefault(family, []).append(_gotestsum_packages(args))
+                    found.setdefault(family, []).append(_Run(_gotestsum_packages(args)))
                     continue
                 if family == "cargo" and tokens[start - 1] == "nextest" and args[:1] == ["run"]:
                     args = args[1:]
                 words = _RUNNER_WORDS.get(_cmd_name(tokens[0]), frozenset())
                 if args[:1] and args[0] in words:
                     args = args[1:]
-                found.setdefault(family, []).append(_positionals(family, args))
+                recursive = family == "mocha" and any(
+                    a == "--recursive" or a.startswith("--recursive=") for a in args
+                )
+                found.setdefault(family, []).append(
+                    _Run(_positionals(family, args), flavor, recursive)
+                )
     return found
 
 
@@ -2451,12 +2525,211 @@ def _restricts(family: str, words: list[str]) -> bool:
     return True
 
 
-def narrowed_selection(
-    base_cmds: Sequence[str], cand_cmds: Sequence[str], defs: Mapping[str, str] | None = None
-) -> str | None:
-    """A description when the candidate runs a runner on fewer paths or names than the base did.
+@dataclass(frozen=True)
+class TestFiles:
+    """The test files of the base tree, for judging a selection by what it still runs: `paths`
+    (repo-relative), the Go module path (`go test <module>/pkg` names a directory) and whether a
+    mocha config file exists (it may set `spec` and `recursive`, so the default run is unknown)."""
 
-    A positional is a word after the runner (and its subcommand) that is not a flag, a flag's
+    __test__ = False  # not a pytest class
+
+    paths: Sequence[str]
+    go_module: str = ""
+    mocharc: bool = False
+
+
+_JS_FILE = re.compile(r"\.[cm]?[jt]sx?$")
+_SELECT_BUDGET = 3_000_000  # word-by-file tests per judgement; past it the string reading is used
+_FAMILY_FILES: dict[str, Callable[[str], bool]] = {
+    "pytest": lambda f: posixpath.basename(f).startswith("test_") or f.endswith("_test.py"),
+    "go": lambda f: f.endswith("_test.go"),
+    "js": lambda f: bool(_JS_FILE.search(f)),
+    "mocha": lambda f: bool(_JS_FILE.search(f)),
+    "playwright": lambda f: bool(_JS_FILE.search(f)),
+}
+
+
+def _aligned(word: str, path: str) -> bool:
+    """Whether `word` names `path` or a directory above it, from the root or from a directory
+    the reading cannot tell (`cd backend && pytest tests`): a match on `/` boundaries."""
+    return f"/{word}/" in f"/{path}/"
+
+
+def _glob_hits(word: str, path: str) -> bool:
+    return any(
+        _glob_to_regex(w).match(p) is not None
+        for w in _brace_expand(word)
+        for p in (path, *(path.split("/", n)[-1] for n in range(1, path.count("/") + 1)))
+    )
+
+
+def _brace_expand(word: str) -> list[str]:
+    m = re.search(r"\{([^{}]*)\}", word)
+    if m is None:
+        return [word]
+    return [
+        e
+        for alt in m[1].split(",")
+        for e in _brace_expand(word[: m.start()] + alt + word[m.end() :])
+    ][:64]
+
+
+def _unit(family: str, run: _Run, word: str, files: Sequence[str], tf: TestFiles) -> set[str]:
+    """The test files one positional word of a run selects, with the real semantics of each
+    runner: jest and playwright read a word as a regex searched in the path, vitest and bun as a
+    substring, pytest as a path or `path::id` (the id stays in the unit: a node id selects part of
+    a file), go as a package (`./...` is recursive), mocha and `node --test` as a file, directory
+    (mocha not below it unless `--recursive`) or glob."""
+    word = word.removeprefix("./") if word != "./..." else word
+    word = word.rstrip("/") or word
+    if family == "pytest":
+        path, sep, node = word.partition("::")
+        if path in ("", "."):
+            hit = list(files)
+        elif any(c in path for c in "*?["):
+            hit = [f for f in files if _glob_hits(path, f)]
+        else:
+            hit = [f for f in files if _aligned(path, f)]
+        return {f + sep + node for f in hit} if sep else set(hit)
+    if family == "go":
+        if tf.go_module and (word == tf.go_module or word.startswith(tf.go_module + "/")):
+            word = "./" + word[len(tf.go_module) :].lstrip("/") if word != tf.go_module else "."
+        word = word.removeprefix("./") if word != "./..." else word
+        if word in ("...", "./...", "./"):
+            return set(files)
+        if word.endswith("/..."):
+            root = word[:-4].removeprefix("./")
+            return {f for f in files if posixpath.dirname(f) == root or f.startswith(root + "/")}
+        root = "" if word == "." else word
+        return {f for f in files if posixpath.dirname(f) == root}
+    if family in ("js", "playwright"):
+        if run.flavor in ("vitest", "bun"):
+            return {f for f in files if word in f}
+        if run.flavor == "node":
+            return _node_or_mocha(word, files, True)
+        try:
+            pattern = re.compile(word)
+        except re.error:
+            return {f for f in files if word in f}
+        return {f for f in files if pattern.search(f)}
+    if family == "mocha":
+        return _node_or_mocha(word, files, run.recursive)
+    return set()
+
+
+def _node_or_mocha(word: str, files: Sequence[str], recursive: bool) -> set[str]:
+    if any(c in word for c in "*?[{"):
+        return {f for f in files if _glob_hits(word, f)}
+    if word in ("", "."):
+        return {f for f in files if recursive or "/" not in f}
+    exact = {f for f in files if _aligned(word, f) and (f == word or f.endswith("/" + word))}
+    if exact:
+        return exact
+    out: set[str] = set()
+    for f in files:
+        if _aligned(word, f):
+            rest = f"/{f}/".split(f"/{word}/", 1)[1].rstrip("/")
+            if recursive or "/" not in rest:
+                out.add(f)
+    return out
+
+
+def _pins(family: str, run: _Run, word: str, tf: TestFiles) -> bool:
+    """Whether a positional word hand-picks tests (a name filter, a test file, a node id) rather
+    than an area (a directory, a package, a glob): an area keeps covering the tests added to it,
+    a hand-picked one covers today's files by coincidence, so selecting every file through it is
+    still a narrowing."""
+    shaped = "/" in word.removeprefix("./").strip("/") or (word.endswith("/") and len(word) > 1)
+    word = word.removeprefix("./").rstrip("/")
+    if family == "go" or word in ("", ".") or any(c in word for c in "*?[{"):
+        return False
+    files = [f for f in tf.paths if (_FAMILY_FILES.get(family) or (lambda _: False))(f)]
+    if family == "pytest":
+        path, sep, _ = word.partition("::")
+        return bool(sep) or any(f == path or f.endswith("/" + path) for f in files)
+    if family == "mocha" or run.flavor == "node":
+        return any(f == word or f.endswith("/" + word) for f in files)
+    if any(f == word or f.endswith("/" + word) for f in files):
+        return True
+    if shaped:
+        return False  # a path-shaped regex (`(test|e2e)/`, `^src/`) names an area
+    return not any(f.startswith(word + "/") or f"/{word}/" in f for f in files)
+
+
+def _all_default(family: str, run: _Run, files: Sequence[str], tf: TestFiles) -> set[str]:
+    """What a run with no positional words selects: everything, but a mocha run reads
+    `./test/*.js` (below it with `--recursive`) unless a config file may say otherwise."""
+    if family != "mocha" or tf.mocharc or run.words:
+        return set(files)
+    return {
+        f
+        for f in files
+        if f.startswith("test/") and (run.recursive or "/" not in f.removeprefix("test/"))
+    }
+
+
+def selected_test_files(family: str, runs: Sequence[_Run], tf: TestFiles | None) -> set[str] | None:
+    """The base test files that runs of a runner family select, None when that cannot be told
+    (no test file of the family is known, or the judgement would cost more than its budget).
+    A word that names nothing contributes nothing, so a run pointed at a missing path selects
+    less than the base did."""
+    pool = _FAMILY_FILES.get(family)
+    if tf is None or pool is None:
+        return None
+    files = [f for f in tf.paths if pool(f)]
+    if not files:
+        return None
+    words = sum(len(r.words) for r in runs)
+    if words * len(files) > _SELECT_BUDGET:
+        return None
+    if any("$" in w or "`" in w for r in runs for w in r.words):
+        return None  # a word the shell expands (`"$@"`, `$DIR`) names what this reading cannot know
+    out: set[str] = set()
+    for run in runs:
+        if not run.words:
+            out |= _all_default(family, run, files, tf)
+        for word in run.words:
+            out |= _unit(family, run, word, files, tf)
+    return out
+
+
+def covered_test_files(
+    commands: Sequence[str], files: TestFiles | None, defs: Mapping[str, str] | None = None
+) -> dict[str, set[str] | None]:
+    """Per runner family the commands run, the base test files they select (None when that
+    cannot be told). The entry point for a rule that asks "which tests does this run cover",
+    with `TestFiles` from the base tree (`_BaseTests.selectable()`)."""
+    return {
+        family: selected_test_files(family, runs, files)
+        for family, runs in _invocations(commands, defs).items()
+    }
+
+
+def _lost_files(
+    family: str, base: Sequence[_Run], cand: Sequence[_Run], tf: TestFiles | None
+) -> list[str] | None:
+    """The test files the base's runs selected that the candidate's no longer do; None when the
+    selection cannot be judged by files (the caller reads the words), [] when none is lost."""
+    before = selected_test_files(family, base, tf)
+    if not before:
+        return None
+    after = selected_test_files(family, cand, tf)
+    return None if after is None else sorted(before - after)
+
+
+def narrowed_selection(
+    base_cmds: Sequence[str],
+    cand_cmds: Sequence[str],
+    defs: Mapping[str, str] | None = None,
+    files: TestFiles | None = None,
+) -> str | None:
+    """A description when the candidate runs a runner on fewer tests than the base did.
+
+    With the base tree's test files (`files`), a selection narrows only when some test file the
+    base selected is no longer selected (`selected_test_files`: `jest` and `jest test` are the
+    same when every test is under `test/`); a name filter is a flag, which `selection_flags`
+    judges. Without them (or when a word selects no known file) the words are compared. A
+    positional is a word after the runner (and its subcommand) that is not a flag, a flag's
     value, or a number. For a runner family on both sides: with positionals at the base, the
     candidate narrows when some base path is covered by no candidate path (`tests` is covered
     by `tests`, `.`, `./`, a parent; for go also by `./...`); a candidate run with none runs
@@ -2470,8 +2743,16 @@ def narrowed_selection(
     for family in _POSITIONAL_FAMILIES:
         if family == "mocha" or family not in base or family not in cand:
             continue
-        base_words = [w for words in base[family] for w in words]
-        cand_runs = cand[family]
+        if (lost := _lost_files(family, base[family], cand[family], files)) is not None:
+            if lost:
+                now = _listing([w for r in cand[family] for w in r.words])
+                return f"{family} ran `{lost[0]}` before and now runs only {now or 'other paths'}"
+            if files is None or not any(
+                _pins(family, r, w, files) for r in cand[family] for w in r.words
+            ):
+                continue
+        base_words = [w for run in base[family] for w in run.words]
+        cand_runs = [run.words for run in cand[family]]
         if family == "go":
             base_words = base_words or ["."]
             cand_runs = [words or ["."] for words in cand_runs]
@@ -2479,10 +2760,12 @@ def narrowed_selection(
         if base_words:
             if family != "go" and any(not words for words in cand_runs):
                 continue  # a candidate run with no path runs everything
-            lost = [b for b in base_words if not any(_covers(family, c, b) for c in cand_words)]
-            if lost:
+            lost_words = [
+                b for b in base_words if not any(_covers(family, c, b) for c in cand_words)
+            ]
+            if lost_words:
                 return (
-                    f"{family} ran `{lost[0]}` before and now runs only"
+                    f"{family} ran `{lost_words[0]}` before and now runs only"
                     f" {_listing(cand_words) or 'other paths'}"
                 )
         elif all(_restricts(family, words) for words in cand_runs):
@@ -2491,18 +2774,32 @@ def narrowed_selection(
 
 
 def selection_changed_warning(
-    base_cmds: Sequence[str], cand_cmds: Sequence[str], defs: Mapping[str, str] | None = None
+    base_cmds: Sequence[str],
+    cand_cmds: Sequence[str],
+    defs: Mapping[str, str] | None = None,
+    files: TestFiles | None = None,
 ) -> str | None:
-    """A description when the mocha spec arguments differ: a glob can widen as well as narrow,
-    so this is a warning, never a block."""
+    """A description when the mocha spec arguments select fewer test files than the base's (a
+    glob or a missing `--recursive` can drop files without a flag): a warning, never a block.
+    With no test file to judge by, any change of the arguments is one."""
     base = _invocations(base_cmds, defs).get("mocha")
     cand = _invocations(cand_cmds, defs).get("mocha")
     if base is None or cand is None:
         return None
-    before = sorted({w for words in base for w in words})
-    after = sorted({w for words in cand for w in words})
-    if before == after:
+    before = sorted({w for run in base for w in run.words})
+    after = sorted({w for run in cand for w in run.words})
+    lost = _lost_files("mocha", base, cand, files)
+    if lost is None:
+        if before == after and {r.recursive for r in base} == {r.recursive for r in cand}:
+            return None
+    elif not lost:
         return None
+    where = f"to {_listing(after)}" if after else "to none (the default `test`)"
+    if lost:
+        return (
+            f"mocha spec arguments changed from {_listing(before) or 'none'} {where}: it no"
+            f" longer selects `{lost[0]}`"
+        )
     return f"mocha spec arguments changed from {_listing(before) or 'none'} to {_listing(after)}"
 
 
