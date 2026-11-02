@@ -120,6 +120,7 @@ class Child(NamedTuple):
     key: tuple[str, ...]  # what it is, to stop a cycle
     errexit: bool = False  # run by a shell that stops at the first failure (script: `bash -e`)
     ignored: str = ""  # why make ignores the failure of its checks, "" when it does not
+    pipefail: bool = False  # run by a shell whose pipeline status is its first failure
 
 
 @dataclass(frozen=True)
@@ -130,15 +131,31 @@ class _Make:
     ignore: frozenset[str]
     flags_ignore: bool
     errexit: bool
+    pipefail: bool = False
 
 
 def _ignores(flags: str) -> bool:
-    """Whether a `MAKEFLAGS` value turns on `-i` (`-i`, `-ik`, `--ignore-errors`, or the bare
-    letters of its first word)."""
-    words = flags.split()
-    return any(w == "--ignore-errors" or (w.startswith("-") and "i" in w[1:]) for w in words) or (
-        bool(words) and not words[0].startswith("-") and "=" not in words[0] and "i" in words[0]
-    )
+    """Whether a `MAKEFLAGS` value turns on `-i`: the `--ignore-errors` word, or an `i` in a
+    cluster of short options (`-i`, `-ik`, or the bare letters of the first word, `ik`). A long
+    option is matched whole (`--no-print-directory` holds an `i` and is not `-i`), and a short
+    option that takes a value ends its cluster (`-j4i` is `-j 4i`)."""
+    for k, word in enumerate(flags.split()):
+        if word == "--ignore-errors":
+            return True
+        if word.startswith("--"):
+            continue
+        if word.startswith("-"):
+            cluster = word[1:]
+        elif k == 0 and "=" not in word:
+            cluster = word
+        else:
+            continue
+        for ch in cluster:
+            if ch == "i":
+                return True
+            if ch in _VALUE_FLAGS:
+                break
+    return False
 
 
 @lru_cache(maxsize=64)
@@ -153,6 +170,7 @@ def _makefile(text: str, overrides: tuple[str, ...]) -> _Make:
     ignore: set[str] = set()
     ignore_all = False
     errexit = False
+    shellflags = ""
     for raw in joined.split("\n"):
         if m := re.match(r"^\.IGNORE\s*:(.*)$", raw):
             names = re.sub(r"#.*$", "", m[1]).split()
@@ -160,8 +178,17 @@ def _makefile(text: str, overrides: tuple[str, ...]) -> _Make:
             ignore_all = ignore_all or not names
         elif m := re.match(r"^\.SHELLFLAGS\s*[:?+]?=\s*(.*)$", raw):
             errexit = bool(re.search(r"(?:^|\s)-[A-Za-z]*e|errexit", m[1]))
-    flags = _variables(joined).get("MAKEFLAGS", "")
-    return _Make(targets, tuple(targets), ignore_all, frozenset(ignore), _ignores(flags), errexit)
+            shellflags = m[1]
+    variables = _variables(joined)
+    # a recipe runs under `/bin/sh -c`: its pipelines keep the last stage's status unless SHELL
+    # is bash and `.SHELLFLAGS` adds `-o pipefail`
+    pipefail = "bash" in variables.get("SHELL", "") and bool(
+        re.search(r"(?:^|\s)-[A-Za-z]*o\s+pipefail", shellflags)
+    )
+    flags = variables.get("MAKEFLAGS", "")
+    return _Make(
+        targets, tuple(targets), ignore_all, frozenset(ignore), _ignores(flags), errexit, pipefail
+    )
 
 
 def _recipe(raw: str) -> tuple[str, bool]:
@@ -278,7 +305,9 @@ def make_children(
             text, dash = _recipe(line)
             if text.strip():
                 reason = "a `-` prefix on the recipe line" if dash else why
-                out.append(Child("recipe", src, text, directory, key, make.errexit, reason))
+                out.append(
+                    Child("recipe", src, text, directory, key, make.errexit, reason, make.pipefail)
+                )
     return out
 
 
