@@ -683,7 +683,17 @@ string get the same analysis as a `run:` step, compared with the base: a swallow
 `set +e`, an early `exit 0`, a trailing `&`, `trap '... exit 0' EXIT`, `true || check`), an
 inner step with `if: false` or `continue-on-error`, a `bash -n` or `sh -n` (which runs
 nothing), or a script that is missing in the candidate, no longer counts as running the
-check. Script bodies are read with errexit assumed. `A || B` is a retry, and so not a
+check. A script body is read with errexit only when its shebang passes `-e` (`#!/bin/bash -e`,
+`#!/bin/sh -eu`, `#!/usr/bin/env -S bash -e`, `-o errexit`) or the statement that runs it does
+(`bash -e ci.sh`): a script is a shell of its own and does not inherit the step's `bash -e`.
+Without errexit a check followed by another command is a swallow (kind `noerr`) and the finding
+says to add `set -e`; `set -e`, `set -o errexit` and `set +e` inside the body are followed. Swallows
+are compared by `(kind, text)` as for a `run:` step, so a script that never had `set -e` and edits
+a line that was already swallowed blocks. A script whose shebang names another interpreter
+(`python`, `node`, `ruby`, `perl`, `pwsh`, ...) is not shell and is read on neither side. The
+check kinds of the base are counted through the same expansion as the candidate's, with the base
+files read from the base tree, so a check dropped from a script is a removed check whether or
+not the workflow file changed. `A || B` is a retry, and so not a
 swallow, only when B is A plus `--lf`, `--last-failed`, `--ff`, `--failed-first`, `--sw`,
 `--stepwise` or `--reruns N`. A trailing `&` makes the check a swallow. `$VAR`, `${VAR}` and
 `$(VAR)` as a command head are substituted from the step, job or workflow `env:`, then by
@@ -697,8 +707,21 @@ at job level by the sorted signatures of the check steps. Selection narrowing (t
 runner on fewer paths or names) is judged per runner across all workflows and expanded
 bodies; mocha spec changes only warn.
 
+*Changed scripts and actions.* The rule also runs when no workflow file changed but a changed
+file (its path or old path) is one a GitHub workflow step reads on either side: the
+`action.yml` or `action.yaml` of a local composite action (`uses: ./...`), or a local script
+(`.sh`, `.bash`, `.zsh` or no extension) found the way expanded bodies are: named by the step's
+`run:` or by a step of the action it uses. Each workflow that reaches such a file is judged as
+if touched, with its own text unchanged on both sides, and the finding names the changed file.
+A commit that changes no file of that shape, and no workflow, never reads the CI files.
+Scripts and actions over 64 KiB are not read.
+
 *Known limits.* Flow-style `steps: [...]`, a `runs-on` computed by `fromJSON`, a `make`
-target that secretly runs tests and `always() && false` are not read.
+target that secretly runs tests and `always() && false` are not read. Expansion is one level:
+a script called by a script, or by a script an action runs, is not followed, so a check moved
+into a nested script reads as removed; GitLab CI and CircleCI scripts are not followed; `make`
+targets are not read; `bash -o errexit ci.sh` is not read (the script path is taken for the
+option's value) and `bash -c './ci.sh'` does not name its script.
 
 *The greenproof step.* Greenproof steps are compared across all GitHub workflow files as a
 multiset of signatures: the `uses:` without its ref, `with:` (block scalars read; the raw text

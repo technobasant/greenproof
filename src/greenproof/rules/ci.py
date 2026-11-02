@@ -82,6 +82,7 @@ def _wf(text: str) -> workflow.Workflow:
 
 _MAX_SCRIPT = 64 * 1024  # bytes of a local script or action file the rule will read
 _SCRIPT_EXTS = frozenset({"", ".sh", ".bash", ".zsh"})
+_ACTION_NAMES = ("action.yml", "action.yaml")
 # `uses:` of actions that run no check. Anything else a step can `uses:` may run the tests.
 _NONCHECK_ACTIONS = re.compile(
     r"^(?:actions/(?:checkout|setup-[\w.-]+|cache|upload-artifact|download-artifact)"
@@ -117,22 +118,96 @@ def _read(world: _World, path: str, base: bool = False) -> str | None:
     return world.files[key]
 
 
-def _action_parts(
-    world: _World, uses: str, base: bool = False
-) -> list[tuple[workflow.Workflow, workflow.Step]]:
-    """The `run:` steps of a local composite action (`uses: ./path`), with the action's file."""
+def _action_files(uses: str) -> list[str]:
+    """The files a local composite action (`uses: ./path`) may be defined in; none for any other
+    `uses:`."""
     ref = uses.split("@")[0].strip()
     if not (ref == "." or ref.startswith("./")) or ref.endswith((".yml", ".yaml")):
         return []
     directory = posixpath.normpath(ref)
     if directory.startswith(".."):
         return []
-    for name in ("action.yml", "action.yaml"):
-        text = _read(world, posixpath.normpath(posixpath.join(directory, name)), base)
+    return [posixpath.normpath(posixpath.join(directory, name)) for name in _ACTION_NAMES]
+
+
+def _action_parts(
+    world: _World, uses: str, base: bool = False
+) -> list[tuple[workflow.Workflow, workflow.Step, str]]:
+    """The `run:` steps of a local composite action (`uses: ./path`), with the action's file and
+    its path."""
+    for path in _action_files(uses):
+        text = _read(world, path, base)
         if text is not None:
             wf = _wf(text)
-            return [(wf, s) for s in wf.steps if s.run]
+            return [(wf, s, path) for s in wf.steps if s.run]
     return []
+
+
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "mksh"})
+
+
+def _shebang(body: str) -> tuple[bool, bool]:
+    """`(is a shell script, its shebang turns errexit on)`. A script with no shebang is a shell
+    script without errexit; one whose shebang names another interpreter (`python`, `node`,
+    `pwsh`, ...) is not read as shell at all. `#!/bin/sh -e`, `-eu`, `-o errexit` and
+    `#!/usr/bin/env -S bash -e` turn errexit on; nothing else does."""
+    first = body.split("\n", 1)[0]
+    if not first.startswith("#!"):
+        return True, False
+    words = first[2:].split()
+    if words and posixpath.basename(words[0]).lower() == "env":
+        words = words[1:]
+        while words and (words[0].startswith("-") or "=" in words[0]):
+            skip = 2 if words[0] in ("-u", "--unset") else 1
+            words = words[skip:]
+    if words and posixpath.basename(words[0]).lower() == "busybox":
+        words = words[1:]
+    if not words or posixpath.basename(words[0]).lower() not in _SHELLS:
+        return not words, False
+    return True, _flags_errexit(words[1:])
+
+
+def _flags_errexit(flags: list[str]) -> bool:
+    """Whether the option words before a shell's script (`-e`, `-eu`, `-o errexit`) set -e."""
+    i = 0
+    while i < len(flags) and flags[i].startswith(("-", "+")) and flags[i] != "--":
+        flag = flags[i]
+        if flag in ("-o", "+o"):
+            if flag == "-o" and flags[i + 1 : i + 2] == ["errexit"]:
+                return True
+            i += 1
+        elif flag.startswith("-") and not flag.startswith("--") and "e" in flag:
+            return True
+        i += 1
+    return False
+
+
+def _script_calls(text: str, defs: Defs | None) -> dict[str, bool]:
+    """The local shell scripts `text` runs, each with whether every call of it passes `-e` to
+    the shell that runs it (`bash -e ci.sh`)."""
+    out: dict[str, bool] = {}
+    for seg in split_segments(text):
+        paths = scripts_in(seg.text, "", defs)
+        if not paths:
+            continue
+        toks = command_tokens(seg.text, defs)
+        shell = bool(toks) and posixpath.basename(toks[0]) in _POSIX
+        errexit = shell and _flags_errexit(toks[1:])
+        for path in paths:
+            if posixpath.splitext(path)[1].lower() in _SCRIPT_EXTS:
+                out[path] = out.get(path, True) and errexit
+    return out
+
+
+def _script_mode(body: str, invoked_e: bool) -> _Mode | None:
+    """How a script's own shell reads exit statuses: errexit only when its shebang or the
+    command that runs it passes `-e` (a child shell does not inherit the step's); None for a
+    script that is not shell."""
+    is_shell, errexit = _shebang(body)
+    if not is_shell:
+        return None
+    errexit = errexit or invoked_e
+    return _Mode(errexit, not errexit, False)
 
 
 def _script_bodies(
@@ -140,11 +215,9 @@ def _script_bodies(
 ) -> list[str]:
     """The bodies of the local shell scripts `run` runs (one level, not their own scripts)."""
     out: list[str] = []
-    for path in dict.fromkeys(scripts_in(run, "", defs)):
-        if posixpath.splitext(path)[1].lower() not in _SCRIPT_EXTS:
-            continue
+    for path in _script_calls(run, defs):
         body = _read(world, path, base)
-        if body is not None:
+        if body is not None and _shebang(body)[0]:
             out.append(body)
     return out
 
@@ -164,6 +237,7 @@ class _Body(NamedTuple):
     own: bool  # the step's own `run:` rather than an action's step or a script
     modes: list[_Mode]
     defs: Defs
+    src: str = ""  # the script or action file an expanded body is read from
 
 
 def _bodies(world: _World, wf: workflow.Workflow, step: workflow.Step, base: bool) -> list[_Body]:
@@ -177,18 +251,19 @@ def _bodies(world: _World, wf: workflow.Workflow, step: workflow.Step, base: boo
         out.append(_Body(step.run, step.run_line, True, _modes(wf, step), defs))
         texts.append((step.run, defs))
     if step.uses:
-        for inner_wf, inner in _action_parts(world, step.uses, base):
+        for inner_wf, inner, src in _action_parts(world, step.uses, base):
             if _disabled(inner):
                 continue
             inner_defs = {**defs, **inner_wf.defs_of(inner)}
-            out.append(_Body(inner.run, step.line, False, _modes(inner_wf, inner), inner_defs))
+            modes = _modes(inner_wf, inner)
+            out.append(_Body(inner.run, step.line, False, modes, inner_defs, src))
             texts.append((inner.run, inner_defs))
     for text, text_defs in texts:
-        for path in dict.fromkeys(scripts_in(text, "", text_defs)):
-            if posixpath.splitext(path)[1].lower() not in _SCRIPT_EXTS:
-                continue
-            if (body := _read(world, path, base)) is not None:
-                out.append(_Body(body, step.run_line or step.line, False, [_BASH_E], text_defs))
+        for path, invoked_e in _script_calls(text, text_defs).items():
+            body = _read(world, path, base)
+            if body is not None and (mode := _script_mode(body, invoked_e)) is not None:
+                line = step.run_line or step.line
+                out.append(_Body(body, line, False, [mode], text_defs, path))
     return out
 
 
@@ -230,9 +305,10 @@ def _counted_kinds(
     literals: list[str],
     scripts: frozenset[str],
     world: _World | None = None,
+    base: bool = False,
 ) -> Counter[str]:
     out: Counter[str] = Counter()
-    for seg, defs in _segments(path, text, world):
+    for seg, defs in _segments(path, text, world, base):
         kind = check_kind(seg, literals=literals, scripts=scripts, defs=defs)
         if kind and kind not in _UNCOUNTED:
             out[kind] += 1
@@ -564,6 +640,17 @@ def _ci_files(changes: ChangeSet, base: bool) -> dict[str, str]:
     return out
 
 
+def _reason_in(kind: str, reason: str, body: _Body, mode: _Mode) -> str:
+    """A swallow's reason, naming the script or action file it is in; a script that runs without
+    errexit is told to add `set -e`."""
+    if not body.src:
+        return reason
+    where = f"{reason} (in {body.src})"
+    if kind in ("noerr", "true") and not mode.errexit and not body.src.endswith(_ACTION_NAMES):
+        where += "; add `set -e` at the top of the script"
+    return where
+
+
 def _swallow_keys(
     wf: workflow.Workflow, step: workflow.Step, world: _World, base: bool = False
 ) -> list[tuple[str, str, int, str]]:
@@ -574,7 +661,12 @@ def _swallow_keys(
     for body in _bodies(world, wf, step, base):
         for mode in body.modes:
             out.extend(
-                (w.kind, w.text, body.line + (w.line - 1 if body.own else 0), w.reason)
+                (
+                    w.kind,
+                    w.text,
+                    body.line + (w.line - 1 if body.own else 0),
+                    _reason_in(w.kind, w.reason, body, mode),
+                )
                 for w in find_swallows(
                     body.text,
                     world.literals,
@@ -590,12 +682,20 @@ def _swallow_keys(
     return out
 
 
-def _world(changes: ChangeSet, commands: Mapping[str, str] | None) -> _World:
+def _bare_world(changes: ChangeSet, commands: Mapping[str, str] | None) -> _World:
+    """The CI files of both sides, nothing judged yet: enough to read what a workflow runs."""
     literals = [c for c in (commands or {}).values() if isinstance(c, str) and len(c) >= 6]
     scripts = frozenset(p for c in literals for p in scripts_in(c, ""))
-    world = _World(_ci_files(changes, True), _ci_files(changes, False), literals, scripts, changes)
+    return _World(_ci_files(changes, True), _ci_files(changes, False), literals, scripts, changes)
+
+
+def _world(
+    changes: ChangeSet, commands: Mapping[str, str] | None, bare: _World | None = None
+) -> _World:
+    world = bare or _bare_world(changes, commands)
+    literals, scripts = world.literals, world.scripts
     for path, text in world.base.items():
-        world.base_kinds[path] = _counted_kinds(path, text, literals, scripts)
+        world.base_kinds[path] = _counted_kinds(path, text, literals, scripts, world, True)
     for path, text in world.cand.items():
         world.cand_kinds[path] = _counted_kinds(path, text, literals, scripts, world)
     for path, text in world.base.items():
@@ -1300,15 +1400,74 @@ def _selection_reasons(world: _World, path: str) -> list[tuple[str, int | None, 
     return out
 
 
+def _candidate(path: str) -> bool:
+    """Whether a changed file may be one a workflow step reads: a local action's file, or a script
+    by its extension. Anything else never builds the world."""
+    name = posixpath.basename(path)
+    return name in _ACTION_NAMES or posixpath.splitext(name)[1].lower() in _SCRIPT_EXTS
+
+
+def _reads(world: _World, wf: workflow.Workflow, step: workflow.Step, base: bool) -> set[str]:
+    """The files a step reads to run: the action file of a local `uses:`, and the local scripts its
+    `run:` and that action's steps call (one level, the way `_bodies` reads them)."""
+    out: set[str] = set(_action_files(step.uses)) if step.uses else set()
+    defs = wf.defs_of(step)
+    if step.run:
+        out.update(_script_calls(step.run, defs))
+    if step.uses:
+        for inner_wf, inner, _ in _action_parts(world, step.uses, base):
+            out.update(_script_calls(inner.run, {**defs, **inner_wf.defs_of(inner)}))
+    return out
+
+
+def _reached(world: _World, changed: Mapping[str, str]) -> dict[str, list[str]]:
+    """For each GitHub workflow that reads a changed file on either side, the changed files it
+    reads (as named by `changed`)."""
+    out: dict[str, set[str]] = {}
+    for base in (True, False):
+        for path, text in (world.base if base else world.cand).items():
+            if not _GITHUB.match(path):
+                continue
+            wf = _wf(text)
+            for step in wf.steps:
+                if step.run or step.uses:
+                    hit = {changed[r] for r in _reads(world, wf, step, base) if r in changed}
+                    if hit:
+                        out.setdefault(path, set()).update(hit)
+    return {path: sorted(names) for path, names in out.items()}
+
+
+def _unchanged(world: _World, path: str) -> ChangedFile | None:
+    """A workflow file the change did not touch, as a change that leaves it as it was: it is
+    judged with its steps' changed scripts and actions."""
+    old, new = world.base.get(path), world.cand.get(path)
+    if old is None or new is None:
+        return None
+    return ChangedFile(path, "M", None, old.encode(), new.encode(), False, False)
+
+
 def check_ci(changes: ChangeSet, commands: Mapping[str, str] | None = None) -> list[Finding]:
     touched = [
         f
         for f in changes.files
         if _WORKFLOW.match(f.path) or (f.old_path and _WORKFLOW.match(f.old_path))
     ]
+    changed: dict[str, str] = {}
+    for f in changes.files:
+        for path in (f.path, f.old_path):
+            if path and _candidate(path) and not _WORKFLOW.match(path):
+                changed.setdefault(path, f.path)
+    if not touched and not changed:
+        return []
+    bare = _bare_world(changes, commands)
+    via = _reached(bare, changed) if changed else {}
+    judged = {p for f in touched for p in (f.path, f.old_path) if p}
+    for path in via:
+        if path not in judged and (extra := _unchanged(bare, path)) is not None:
+            touched.append(extra)
     if not touched:
         return []
-    world = _world(changes, commands)
+    world = _world(changes, commands, bare)
     out: list[Finding] = []
     reasons = [(f.path, line, why, warn) for f in touched for line, why, warn in _reasons(f, world)]
     reasons.extend(_greenproof_reasons(world))
@@ -1316,6 +1475,8 @@ def check_ci(changes: ChangeSet, commands: Mapping[str, str] | None = None) -> l
     reasons.extend(_selection_reasons(world, here))
     for path, line, why, warn in reasons:
         message = f"{path}: {why}"
+        if names := via.get(path):
+            message += f" (this workflow runs the changed {', '.join(names)})"
         if warn:
             hint = "Confirm the new ref is intended." if "action ref" in why else _CONFIRM
             out.append(sev_finding("ci.tampered", WARN, path, line, message, hint))
