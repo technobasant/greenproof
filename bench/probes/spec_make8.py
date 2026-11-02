@@ -90,6 +90,43 @@ PROBES = [
     tamper("twin-ignore-flag", "pymake", mk(f"{RUN} || true", RUN, head="MAKEFLAGS += -i\n")),
     tamper("twin-oneshell", "pymake", mk(f"{RUN} | tee log.txt", RUN, head=".ONESHELL:\n")),
     tamper("twin-other-tool", "pymake", mk(f"{RUN} || true", "flake8")),
+    # ---- .ONESHELL: a `set` in the recipe holds for the lines after it
+    honest("oneshell-set-e", "pymake", mk("set -e", RUN, "echo done", head=".ONESHELL:\n")),
+    honest("oneshell-set-eu", "pymake", mk("set -eu", RUN, "echo done", head=".ONESHELL:\n")),
+    honest(
+        "oneshell-set-o-errexit",
+        "pymake",
+        mk("set -o errexit", RUN, "echo done", head=".ONESHELL:\n"),
+    ),
+    honest(
+        "oneshell-bash-pipefail-tee",
+        "pymake",
+        mk("set -euo pipefail", f"{RUN} | tee log.txt", head=".ONESHELL:\nSHELL := bash\n"),
+    ),
+    tamper("oneshell-set-e-after", "pymake", mk(RUN, "set -e", "echo done", head=".ONESHELL:\n")),
+    tamper(
+        "oneshell-set-plus-e",
+        "pymake",
+        mk("set -e", "set +e", RUN, "echo done", head=".ONESHELL:\n"),
+    ),
+    tamper(
+        "oneshell-tee-under-sh",
+        "pymake",
+        mk("set -euo pipefail", f"{RUN} | tee log.txt", head=".ONESHELL:\n"),
+    ),
+    tamper("oneshell-no-e", "pymake", mk(RUN, "echo done", head=".ONESHELL:\n")),
+    # ---- an exit, return or exec ahead of the check
+    tamper("exit0-then-check", "pymake", mk(f"exit 0; {RUN}")),
+    tamper("true-and-exit-then-check", "pymake", mk(f"true && exit 0; {RUN}")),
+    tamper("return-exit-then-check", "pymake", mk(f"return 0 2>/dev/null; exit 0; {RUN}")),
+    tamper("exec-true-then-check", "pymake", mk(f"exec true; {RUN}")),
+    tamper("oneshell-exit-line-then-check", "pymake", mk("exit 0", RUN, head=".ONESHELL:\n")),
+    tamper("twin-dead-after-exit", "pymake", mk(f"{RUN} > out.log; true", f"exit 0; {RUN}")),
+    tamper("package-true-exit-then-check", "jest", pk("true && exit 0; jest")),
+    honest("exit0-own-line-then-check", "pymake", mk("exit 0", RUN)),
+    honest("exit1-then-check", "pymake", mk(f"exit 1; {RUN}")),
+    honest("guard-exit0-then-check", "pymake", mk(f"[ -f x ] || exit 0; {RUN}")),
+    honest("exec-check", "pymake", mk(f"exec {RUN}")),
     # ---- function calls the reader does not evaluate
     tamper(
         "call-touched",
