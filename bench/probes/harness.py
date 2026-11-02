@@ -30,6 +30,7 @@ SPECS = [
     "spec_ci3.py",
     "spec_ci4.py",
     "spec_runner3.py",
+    "spec_runner4.py",
 ]
 VERDICT = {0: "pass", 1: "BLOCK", 2: "cmd-fail", 3: "smoke", 4: "usage", 5: "internal"}
 

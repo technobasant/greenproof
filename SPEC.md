@@ -543,7 +543,31 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   are the same opaque step only when their subcommand matches (`ng test` and `ng lint`
   differ, `ng test` and `ng test --no-watch` do not; the subcommands are `test`, `lint`,
   `check`, `build`, `run`, `e2e`, `typecheck`, `format`, `verify`, `ci`, `coverage`, `spec`,
-  `unit`, `integration`, `serve`, `start`, `watch`). A nested `package.json` is a `warn`, not
+  `unit`, `integration`, `serve`, `start`, `watch`). Kinds are tool-granular, with one
+  exception: `ng test` and `ng e2e` are the test kind `ng test`, `ng lint` is the lint kind
+  `ng lint` (counted with the other linters), so a `test` script that drops `ng lint` blocks and
+  `ng test --no-watch --browsers=ChromeHeadless` does not. A script or recipe that now runs
+  fewer paths than the base blocks, by the reader `ci.tampered` uses (`narrowed_selection`):
+  with paths at the base, a base path that no candidate path covers (`tests` is covered by
+  `tests`, `.`, a parent; for Go also by `./...`) is the reason, and with none, a candidate
+  where every run of the runner is given a path (`jest` became `jest cart.test`, `pytest`
+  gained `tests/test_shop.py`; for pytest and rspec a plain directory such as `tests` is not
+  one). `pytest tests/unit` becoming `pytest tests` and `go test ./pkg/...` becoming
+  `go test ./...` widen and pass. A statement the candidate added to a check script or recipe
+  (an invoked script, a package.json script, a Makefile recipe) blocks when it removes or
+  moves a path that, at the base, is a test file (SPEC 5.1, or the policy's `tests.paths`) or
+  a directory holding one: `rm`, `git rm` (not `--cached`), `unlink`, `mv` (a source, or the
+  file it overwrites), `find ... -delete` or `-exec rm` or `| xargs rm` (read through its
+  `-name` and `-type` filters; a negation, `-o`, `-path` or `-regex` makes it unfiltered),
+  `rimraf`, `del`, `shx rm`, `sh -c '...'`, and globs and `{a,b}` lists matched against the
+  base paths. Paths resolve from the directory of the file (and, for an invoked script, the
+  repo root); an absolute path or an unexpanded variable names nothing. A path not tracked at
+  the base (`.pytest_cache`, `tests/__pycache__`, `coverage`, `build`) is not a test, and a
+  statement the base already had (compared as written) says nothing. The base tree is listed
+  once per check and only when such a statement is added, globs are matched against the sorted
+  test paths from their literal prefix, and a glob past a fixed work limit counts as matching.
+  Known limits: a `cd` before the removal, `python -c 'shutil.rmtree(...)'` and a removal in a
+  target the policy does not run are not read. A nested `package.json` is a `warn`, not
   a block, only when it is known that no policy command reaches it: every policy command is a
   plain root package-manager run (`npm test`, `pnpm run x`, `yarn test`, `bun test`) with no
   workspace, filter, prefix or directory option, and the root scripts it reaches contain no
