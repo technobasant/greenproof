@@ -290,7 +290,8 @@ def test_a_narrowed_branch_filter_warns(tmp_path: Path) -> None:
     added = CI.replace(
         "on: [push, pull_request]", "on:\n  push:\n    branches: [main]\n  pull_request:"
     )
-    assert verdict(ci(tmp_path / "b", added)) == "warn"
+    # pull_request still runs unfiltered, so every change proposed for merge is checked (0.3.0)
+    assert verdict(ci(tmp_path / "b", added)) == "pass"
 
 
 # ---- B5: step kinds across all workflows ----------------------------------------------------

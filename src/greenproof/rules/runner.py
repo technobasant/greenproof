@@ -848,14 +848,16 @@ class _BaseTests:
             return None, self._cd(posixpath.basename(toks[0]), toks[1:], where)
         return (self._removes(toks, where) if look else None), where
 
-    def _cd(self, head: str, args: Sequence[str], where: _Dir) -> _Dir:
+    @staticmethod
+    def _cd(head: str, args: Sequence[str], where: _Dir) -> _Dir:
+        """Where a shell stands after `cd`, `chdir`, `pushd` or `popd` with these arguments."""
         words = _operands(args)
         if head == "popd":
             return _Dir(where.stack[-1], where.stack[:-1]) if where.stack else _Dir(None)
         stack = (*where.stack, where.path) if head == "pushd" else where.stack
         if not words or words[0] == "-" or where.path is None:
             return _Dir(None, stack)
-        path = self._resolve(words[0], where.path)
+        path = _BaseTests._resolve(words[0], where.path)
         if path is None or path == ".." or path.startswith("../"):
             return _Dir(None, stack)
         return _Dir("" if path == "." else path, stack)

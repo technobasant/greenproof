@@ -28,8 +28,10 @@ from __future__ import annotations
 import posixpath
 import re
 import shlex
+from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from fnmatch import fnmatchcase
 from functools import lru_cache
 
 # What a command-position word is, by the kind of check it runs.
@@ -145,15 +147,15 @@ def _skip_expansion(text: str, i: int) -> int:
     return i + 1
 
 
+_ARM_END = re.compile(r";;&|;;|;&")
 _HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?([A-Za-z_][\w.-]*))")
 
 
-def split_segments(script: str) -> list[Seg]:
-    """Top-level commands of a script, split at `;`, newlines, `&&`, `||` and `&`.
+def _split(script: str) -> list[Seg]:
+    """The raw statements of a script: `split_segments` before functions and `case` are read.
 
-    Quotes, `$(...)`, `( ... )` and `{ ...; }` groups keep their contents in one segment, a
-    trailing backslash joins lines, `#` starts a comment, and a here-document's body is data
-    that is skipped.
+    A `;;` (or `;&`, `;;&`) is not a separator but the end of a `case` arm: the next segment's
+    `sep` is `;;`, which `_expand` consumes.
     """
     text = script.replace("\r\n", "\n").replace("\r", "\n")
     segs: list[Seg] = []
@@ -242,7 +244,11 @@ def split_segments(script: str) -> list[Seg]:
         elif c == ")":
             paren = max(0, paren - 1)
             buf.append(c)
-        elif c == "{" and (not buf or buf[-1] in " \t;") and text[i + 1 : i + 2] in (" ", "\n"):
+        elif (
+            c == "{"
+            and (not buf or buf[-1] in " \t;" or (buf[-1] == ")" and "".join(buf).endswith("()")))
+            and text[i + 1 : i + 2] in (" ", "\n")
+        ):
             brace += 1
             buf.append(c)
         elif c == "}" and brace and (not buf or buf[-1] in " \t;\n"):
@@ -261,6 +267,9 @@ def split_segments(script: str) -> list[Seg]:
             if heredocs:
                 i = skip_heredocs(i + 1) - 1
                 seg_line = line
+        elif c == ";" and (arm := _ARM_END.match(text, i)):
+            flush(";;")
+            i = arm.end() - 1
         elif c == ";":
             flush(";")
         elif c == "&" and text[i + 1 : i + 2] == "&":
@@ -278,7 +287,7 @@ def split_segments(script: str) -> list[Seg]:
             buf.append(c)
         i += 1
     flush("")
-    return _drop_dead(segs)
+    return segs
 
 
 def _constant_status(text: str) -> int | None:
@@ -302,6 +311,425 @@ def _drop_dead(segs: list[Seg]) -> list[Seg]:
         status = _constant_status(seg.text) if status is not None else None
         out.append(seg)
     return out
+
+
+# -- shell functions and `case` -----------------------------------------------------------
+# A function definition is not a command and a call to it runs its body; a `case` runs the arm
+# its word matches. `split_segments` reads both so that the rest of this module sees the
+# statements that run, in order, the way `check; exit 0` in a script is seen.
+_MAX_FN_DEPTH = 8  # function calls inside function calls
+_MAX_EMIT = 4000  # statements one script may grow to once its calls are inlined
+_FUNC_HEAD = re.compile(
+    r"^(?:function\s+(?P<a>[\w.:+-]+)\s*(?:\(\s*\))?|(?P<b>[\w.:+-]+)\s*\(\s*\))\s*(?P<body>.*)$",
+    re.DOTALL,
+)
+_CASE_HEAD = re.compile(r"^case\s+(?P<word>\"[^\"]*\"|'[^']*'|\S+)\s+in(?:\s+(?P<rest>.*))?$", re.S)
+_ARM = re.compile(r"^\(?\s*(?P<pat>[^)]*)\)\s*(?P<rest>.*)$", re.DOTALL)
+_POSITIONAL = re.compile(
+    r"(?P<q>\"?)(?:\$(?P<star>[@*])|\$\{(?P<n1>[1-9])(?P<op>:?-)?(?P<d>[^}]*)\}|\$(?P<n2>[1-9]))"
+    r"(?P=q)"
+)
+
+
+@dataclass(frozen=True)
+class Func:
+    """A shell function: the text between its braces and the line of its first line (None when
+    it is defined in another file, so that its statements are reported at the call)."""
+
+    body: str
+    line: int | None
+
+
+@dataclass
+class Scope:
+    """What a script is read with: the functions an earlier `source` defined, the positional
+    parameters its caller gave it (None when they are not literal), and, once `split_segments`
+    ran, why reading stopped short."""
+
+    funcs: dict[str, Func] = field(default_factory=dict)
+    args: tuple[str, ...] | None = None
+    cuts: list[str] = field(default_factory=list)
+
+
+def _subst(text: str, args: Sequence[str] | None) -> str:
+    """`text` with `$1`, `${1:-x}`, `"$@"` and `$*` replaced by literal arguments. Unchanged when
+    the arguments are not known."""
+    if args is None:
+        return text
+
+    def repl(m: re.Match[str]) -> str:
+        quoted = bool(m["q"])
+        if m["star"]:
+            if m["star"] == "*" and quoted:
+                return shlex.quote(" ".join(args))
+            return " ".join(shlex.quote(a) for a in args)
+        n = int(m["n1"] or m["n2"])
+        value = args[n - 1] if n <= len(args) else None
+        if m["op"] and (value is None or (value == "" and ":" in m["op"])):
+            value = m["d"]
+        if not value:
+            return '""' if quoted else ""
+        return shlex.quote(value)
+
+    return _POSITIONAL.sub(repl, text)
+
+
+def _call_args(words: list[str], args: tuple[str, ...] | None) -> tuple[str, ...] | None:
+    """The arguments of a call as the callee sees them: the caller's own `$@` and `$1` are
+    replaced; None when one is still not a literal."""
+    out: list[str] = []
+    for word in words:
+        if word in ("$@", "$*"):
+            if args is None:
+                return None
+            out.extend(args)
+            continue
+        if args is not None:
+            word = _subst(shlex.quote(word), args)
+            try:
+                word = " ".join(shlex.split(word))
+            except ValueError:
+                return None
+        if "$" in word or "`" in word:
+            return None
+        out.append(word)
+    return tuple(out)
+
+
+def _parse_def(seg: Seg, following: Seg | None) -> tuple[str, Func, int] | None:
+    """`(name, function, segments used)` when `seg` defines a function: `name() { ... }`,
+    `function name { ... }`, `name() ( ... )`, or `name()` with its group on the next segment."""
+    text = seg.text
+    if "(" not in text and not text.startswith("function"):
+        return None
+    m = _FUNC_HEAD.match(text)
+    if not m:
+        return None
+    name, rest, used = m["a"] or m["b"], m["body"].strip(), 1
+    if not rest and following is not None and following.text[:1] in ("(", "{"):
+        rest, used = following.text, 2
+    inner = _group_inner(rest) if rest else None
+    if inner is None:
+        return None
+    return name, Func(inner, seg.line), used
+
+
+def functions_in(script: str) -> dict[str, Func]:
+    """The functions a script defines at its top level (what `source script` brings in), with
+    their statements placed at the call (`line` None)."""
+    out: dict[str, Func] = {}
+    segs = _split(script)
+    i = 0
+    while i < len(segs):
+        parsed = _parse_def(segs[i], segs[i + 1] if i + 1 < len(segs) else None)
+        if parsed:
+            out[parsed[0]] = Func(parsed[1].body, None)
+            i += parsed[2]
+        else:
+            i += 1
+    return out
+
+
+def _words(text: str) -> list[str]:
+    """The words of a simple statement after leading assignments; [] for a pipeline, a list or a
+    group (a call is only read when it stands alone)."""
+    if any(c in text for c in "|&;\n(){}<>") and not text.startswith(('"$@"', "$@")):
+        quoted = _tokens(text)
+        if any(t in ("|", "&&", "||") for t in quoted):
+            return []
+    toks = _tokens(text)
+    while toks and _ASSIGN.match(toks[0]):
+        toks = toks[1:]
+    return toks
+
+
+def _esac(segs: list[Seg], start: int) -> int | None:
+    """The index of the `esac` that closes the `case` at `start`."""
+    depth = 0
+    for k in range(start, len(segs)):
+        word = _first_word(segs[k].text)
+        if word == "case":
+            depth += 1
+        elif word == "esac":
+            depth -= 1
+            if depth == 0:
+                return k
+    return None
+
+
+def _arms(segs: list[Seg], rest: str) -> list[tuple[list[str], list[Seg]]] | None:
+    """The `(patterns, statements)` of each arm of a `case` (`segs[0]` is its head, the last is
+    `esac`), None when an arm does not parse."""
+    inside = segs[1:-1]
+    if rest.strip():
+        inside = [Seg("\n", rest.strip(), segs[0].line), *inside]
+    chunks: list[list[Seg]] = []
+    depth = 0
+    for seg in inside:
+        if (depth == 0 and seg.sep == ";;") or not chunks:
+            chunks.append([])
+        chunks[-1].append(seg)
+        word = _first_word(seg.text)
+        depth += word == "case"
+        depth -= word == "esac" and depth > 0
+    arms: list[tuple[list[str], list[Seg]]] = []
+    for chunk in chunks:
+        m = _ARM.match(chunk[0].text)
+        if not m:
+            return None
+        pats = [p.strip() for p in re.split(r"(?<!\\)\|", m["pat"])]
+        body = chunk[1:]
+        if m["rest"].strip():
+            body = [Seg("\n", m["rest"].strip(), chunk[0].line), *body]
+        arms.append((pats, body))
+    return arms
+
+
+def _literal(word: str) -> str | None:
+    """The value of a word that is a plain literal, None when it has an expansion left."""
+    if "$" in word or "`" in word:
+        return None
+    try:
+        return " ".join(shlex.split(word))
+    except ValueError:
+        return None
+
+
+def _glob(value: str, pattern: str) -> bool:
+    if pattern[:1] in ("'", '"') and pattern[-1:] == pattern[:1]:
+        return value == pattern[1:-1]
+    return fnmatchcase(value, pattern)
+
+
+def _until_return(segs: list[Seg]) -> list[Seg]:
+    """A function body up to its first unconditional `return`: nothing after it runs. A
+    `return N` stays when N is not 0 (the function fails) and goes with `return 0`."""
+    top = _top_level(segs)
+    for k, seg in enumerate(segs):
+        m = re.match(r"^return(?:\s+(\S+))?$", seg.text.strip())
+        if top[k] and m:
+            zero = m[1] is None or re.fullmatch(r"0+", _unquote(m[1]))
+            return [*segs[:k], *([] if zero else [seg])]
+    return segs
+
+
+def _as_group(segs: list[Seg]) -> str:
+    """Statements as one `{ ...; }` group, keeping what joins them."""
+    parts: list[str] = []
+    for k, s in enumerate(segs):
+        glue = " && " if s.sep == "&&" else " || " if s.sep == "||" else "; "
+        parts.append(("" if k == 0 else glue) + s.text)
+    return "{ " + "".join(parts) + "; }"
+
+
+class _Reader:
+    """One reading of a script: the functions in force, the budget, the way `case` is read."""
+
+    def __init__(self, scope: Scope, all_arms: bool) -> None:
+        self.scope = scope
+        self.funcs = dict(scope.funcs)
+        self.all_arms = all_arms
+        self.budget = _MAX_EMIT
+        self.stack: list[str] = []
+
+    def cut(self, why: str) -> None:
+        if why not in self.scope.cuts:
+            self.scope.cuts.append(why)
+
+    def read(self, segs: list[Seg], args: tuple[str, ...] | None, at: int | None) -> list[Seg]:
+        """`segs` with definitions dropped, calls replaced by their bodies and a `case` by the
+        arms that run. `at` is the line every statement is reported at (inside a call to a
+        function of another file), else each keeps its own."""
+        out: list[Seg] = []
+        i = 0
+        while i < len(segs):
+            seg = segs[i]
+            self.budget -= 1
+            if self.budget < 0:
+                self.cut(f"a script grew past {_MAX_EMIT} statements once its functions were read")
+                out.extend(segs[i:])
+                break
+            if parsed := _parse_def(seg, segs[i + 1] if i + 1 < len(segs) else None):
+                name, fn, used = parsed
+                self.funcs[name] = Func(fn.body, fn.line if at is None else None)
+                i += used
+                continue
+            if _CASE_HEAD.match(seg.text) and (end := _esac(segs, i)) is not None:
+                out.extend(self._case(segs[i : end + 1], args, at))
+                i = end + 1
+                continue
+            words = _words(seg.text)
+            if words and (words[0] in self.funcs or words[0] in ('"$@"', "$@")):
+                got = self._call(seg, words, args, at)
+                out.extend(
+                    got if got is not None else [seg if at is None else replace(seg, line=at)]
+                )
+            else:
+                text = _subst(seg.text, args)
+                out.append(replace(seg, text=text, line=seg.line if at is None else at))
+            i += 1
+        return [replace(s, sep="\n") if s.sep == ";;" else s for s in out]
+
+    def _call(
+        self, seg: Seg, words: list[str], args: tuple[str, ...] | None, at: int | None
+    ) -> list[Seg] | None:
+        name = words[0]
+        if name in ('"$@"', "$@"):  # the caller's command: `run() { "$@"; }`
+            if not args:
+                return None
+            text = " ".join(shlex.quote(a) for a in args)
+            rest = _tail(seg.text)
+            return [replace(seg, text=text + rest, line=seg.line if at is None else at)]
+        fn = self.funcs[name]
+        if name in self.stack or len(self.stack) >= _MAX_FN_DEPTH:
+            self.cut(f"function `{name}` calls itself or nests past {_MAX_FN_DEPTH} calls")
+            return None
+        call = _call_args(words[1:], args)
+        here = at if at is not None else seg.line
+        body: list[Seg] = []
+        for s in _split(fn.body):
+            line = here if fn.line is None else fn.line + s.line - 1
+            body.append(replace(s, text=_subst(s.text, call), line=line))
+        self.stack.append(name)
+        try:
+            inner = self.read(body, call, here if fn.line is None else None)
+        finally:
+            self.stack.pop()
+        inner = _until_return(inner)
+        tail = _tail(seg.text)
+        if tail and len(inner) == 1:
+            return [replace(inner[0], sep=seg.sep, text=inner[0].text + tail, bg=seg.bg)]
+        if seg.sep in ("&&", "||") or seg.bg or tail:
+            return (
+                [replace(seg, text=_as_group(inner) + tail, line=here)]
+                if inner
+                else [replace(seg, text="true", line=here)]
+            )
+        if not inner:
+            return []
+        return [replace(inner[0], sep=seg.sep), *inner[1:]]
+
+    def _case(self, segs: list[Seg], args: tuple[str, ...] | None, at: int | None) -> list[Seg]:
+        head = segs[0]
+        m = _CASE_HEAD.match(head.text)
+        assert m is not None
+        arms = _arms(segs, m["rest"] or "")
+        if arms is None:
+            self.cut("a `case` whose arms could not be read")
+            return segs
+        word = _literal(_subst(m["word"], args))
+        bodies = [(pats, self.read(body, args, at)) for pats, body in arms]
+        if word is not None:
+            for pats, body in bodies:
+                if any(_glob(word, p) for p in pats):
+                    return [replace(body[0], sep=head.sep), *body[1:]] if body else []
+            return []
+        if self.all_arms:  # each arm a conditional block: any of them may be the one that runs
+            out: list[Seg] = []
+            for k, (_, body) in enumerate(bodies):
+                first = body[0] if body else Seg("\n", "true", head.line)
+                out.append(Seg(head.sep if k == 0 else "\n", 'if [ -n "$1" ]', head.line))
+                out.append(replace(first, sep="\n", text=f"then {first.text}"))
+                out.extend(body[1:])
+                out.append(Seg("\n", "fi", segs[-1].line))
+            return out
+        return _common(bodies, head)
+
+
+def _tail(text: str) -> str:
+    """What follows the command words of a call: its pipe and redirects, from the first
+    unquoted `|`, `<` or `>`, with the character."""
+    quote = ""
+    for i, c in enumerate(text):
+        if quote:
+            quote = "" if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        elif c in "|<>" or (c == "2" and text[i + 1 : i + 2] == ">"):
+            return " " + text[i:]
+    return ""
+
+
+def _common(bodies: list[tuple[list[str], list[Seg]]], head: Seg) -> list[Seg]:
+    """The statements that run whatever the `case` word is: those in every arm that does not
+    exit non-zero. A `case` without a `*` arm has a fall-through that runs nothing."""
+    ok: list[list[Seg]] = []
+    for _, body in bodies:
+        if not any(_is_failing_exit(s.text) for s in body):
+            ok.append(body)
+    if not any(p == "*" for pats, _ in bodies for p in pats):
+        ok.append([])
+    if not ok[0]:
+        return []
+    shared = Counter(s.text for s in ok[0])
+    for body in ok[1:]:
+        shared &= Counter(s.text for s in body)
+    out: list[Seg] = []
+    for s in ok[0]:
+        if shared[s.text] > 0:
+            shared[s.text] -= 1
+            out.append(replace(s, sep=head.sep if not out else "\n"))
+    return out
+
+
+def split_segments(script: str, scope: Scope | None = None, all_arms: bool = False) -> list[Seg]:
+    """Top-level commands of a script, split at `;`, newlines, `&&`, `||` and `&`.
+
+    Quotes, `$(...)`, `( ... )` and `{ ...; }` groups keep their contents in one segment, a
+    trailing backslash joins lines, `#` starts a comment, and a here-document's body is data
+    that is skipped.
+
+    Functions and `case` are read as they run. A definition is no statement; a call is replaced
+    by the function's body, with `$1`, `$@` and `"$@"` taken from the call's literal arguments (a
+    command word `"$@"` runs the caller's). `scope` adds the functions a sourced file defined
+    and the script's own arguments. A `case` whose word is literal keeps its matching arm; with
+    an unknown word it keeps the statements in every arm that does not exit non-zero, or, with
+    `all_arms`, every arm between its `case` and `esac`. Reading stops at `_MAX_FN_DEPTH`
+    calls and `_MAX_EMIT` statements: the reason is added to `scope.cuts`.
+    """
+    segs = _split(script)
+    if scope is None:
+        scope = Scope()
+    if not scope.funcs and scope.args is None and not _MAYBE.search(script):
+        return _drop_dead(segs)
+    return _drop_dead(_Reader(scope, all_arms).read(segs, scope.args, None))
+
+
+_MAYBE = re.compile(r"\(\s*\)|\bfunction\b|\bcase\b|;;")
+
+
+def _render(segs: Sequence[Seg]) -> str:
+    """Statements as a script again, each on the line it came from where that is possible, so
+    that a line number found in the result still points at the original."""
+    out: list[str] = []
+    line = 1
+    for k, seg in enumerate(segs):
+        text = _HEREDOC.sub("", seg.text) + (" &" if seg.bg else "")
+        glue = {"&&": " && ", "||": " || ", ";": "; "}.get(seg.sep)
+        if glue is None:
+            glue = "\n" * max(1, seg.line - line) if k else ""
+        out.append(glue + text)
+        line += (glue + text).count("\n")
+    return "".join(out) + "\n"
+
+
+def expand_script(script: str, scope: Scope) -> tuple[str, str]:
+    """`script` with functions and `case` read as `split_segments` reads them, as text: what runs
+    whatever a `case` word is, and what may run (every arm of a `case` as an `if` block). Both
+    are `script` itself when there is nothing to read."""
+    if not scope.funcs and scope.args is None and not _MAYBE.search(script):
+        return script, script
+    common = _render(split_segments(script, scope))
+    arms = _render(split_segments(script, scope, all_arms=True))
+    return common, arms
+
+
+def group_inner(text: str) -> str | None:
+    """The inside of a statement that is one `( ... )` subshell or `{ ...; }` group."""
+    t = text.strip()
+    if (t.startswith("(") and t.endswith(")")) or (t.startswith("{") and t.endswith("}")):
+        return _group_inner(t)
+    return None
 
 
 # -- command position --------------------------------------------------------------------
@@ -1269,6 +1697,8 @@ def _flat_swallows(
     strict_status: bool = False,
     powershell: bool = False,
     defs: Mapping[str, str] | None = None,
+    pipefail: bool = False,
+    scope: Scope | None = None,
 ) -> list[Swallow]:
     """The places where `script` can fail a check and still exit 0 (see the module docstring).
 
@@ -1285,8 +1715,15 @@ def _flat_swallows(
     runs in the background and its status is lost (kind `bg`); `trap 'exit 0' EXIT` makes the
     shell exit 0 whatever ran (kind `trap`); `python -c "pytest.main()"` exits 0 (kind
     `dropped`). `defs` are the variables a `$VAR` command word may be defined by.
+
+    A pipeline whose first stage is a check hides the check's status behind the last stage's
+    (kind `pipe`) unless `pipefail` is on (the shell starts with it, or `set -o pipefail` ran) or
+    `${PIPESTATUS[0]}` is read afterwards. A check kept in a variable, `check || rc=$?`, is
+    honest only when the script goes on to `exit $rc` with nothing resetting `rc` in between;
+    otherwise it is a swallow (kind `or`). Functions and `case` are read as `split_segments`
+    reads them, a `case` through all of its arms. `scope` carries the functions and arguments.
     """
-    segs = split_segments(script)
+    segs = split_segments(script, scope, all_arms=True)
     literals = [e for e in extra if len(e) >= 6]
     kinds = [
         check_kind(s.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs)
@@ -1320,14 +1757,17 @@ def _flat_swallows(
         next_read[i] = i if reads[i] else next_read[i + 1]
 
     out: list[Swallow] = []
-    seen: set[tuple[int, str]] = set()
+    seen: set[tuple[int, str, str]] = set()
+    at_line: set[tuple[int, str]] = set()  # where a swallow of each kind was already reported
 
     def add(seg: Seg, kind: str, reason: str) -> None:
-        if (seg.line, kind) not in seen:
-            seen.add((seg.line, kind))
+        if (seg.line, kind, seg.text) not in seen:
+            seen.add((seg.line, kind, seg.text))
+            at_line.add((seg.line, kind))
             out.append(Swallow(seg.line, kind, _short(seg.text), reason))
 
     state_errexit = errexit
+    state_pipefail = pipefail
     unguarded = [False] * len(segs)
     last_ok = -1  # the last check that could fail with nothing turning that into a failure
     last_read = -1  # the last statement before the current one that reads a status
@@ -1344,7 +1784,16 @@ def _flat_swallows(
                     break
                 rhs.append(segs[k].text)
             before = [j for j in chain_members[chain_of[i]] if j < i and check(j)]
-            if (
+            keeper = next((m for r in rhs if (m := _RC_SET.match(r))), None)
+            if before and keeper and not any(_is_failing_exit(r) for r in rhs):
+                if not _rc_kept(segs, i, keeper["v"]):
+                    add(
+                        seg,
+                        "or",
+                        f"the status is kept in `${keeper['v']}` but the script never ends with"
+                        f" `exit ${keeper['v']}`",
+                    )
+            elif (
                 before
                 and not any(_is_failing_exit(r) for r in rhs)
                 and not _is_retry(
@@ -1361,6 +1810,16 @@ def _flat_swallows(
             before = chain_members[chain_of[i] - 1]
             if nxt_sep in ("\n", "") and not state_errexit and any(check(j) for j in before):
                 add(seg, "true", f"`; {text}` after a check discards its status")
+        elif (rc_then := _RC_SET.match(text) or _RC_NONZERO.match(text)) and _in_check_if(
+            segs, i, check
+        ):
+            if not _rc_kept(segs, i, rc_then["v"]):
+                add(
+                    seg,
+                    "or",
+                    f"the failure sets `${rc_then['v']}` but the script never ends with"
+                    f" `exit ${rc_then['v']}`",
+                )
         elif _SET_PLUS_E.match(text):
             state_errexit = False
             end = next(
@@ -1375,6 +1834,25 @@ def _flat_swallows(
                     break
         elif _SET_MINUS_E.match(text):
             state_errexit = True
+        if (flip := _pipefail_set(text)) is not None:
+            state_pipefail = flip
+        stages = _stages(text) if check(i) and not state_pipefail else []
+        if (
+            len(stages) > 1
+            and (
+                kinds[i] is None
+                or check_kind(
+                    stages[0], literals=literals, scripts=scripts, make_check=make_check, defs=defs
+                )
+            )
+            and not any("PIPESTATUS" in segs[k].text for k in range(i + 1, len(segs)))
+        ):
+            add(
+                seg,
+                "pipe",
+                f"`{_short(text)}` pipes the check into another command and its"
+                " status is the last stage's: use `set -o pipefail` or `${PIPESTATUS[0]}`",
+            )
         if seg.bg and check(i) and not _waited(segs, i):
             add(seg, "bg", f"`{_short(seg.text)}` runs in the background and its status is lost")
         if check(i) and status_dropped(seg.text):
@@ -1406,7 +1884,7 @@ def _flat_swallows(
             if powershell and all(_CMDLET.match(segs[j].text) for j in after):
                 continue
             nxt = segs[after[0]]
-            if (nxt.line, "true") in seen or (nxt.line, "exit0") in seen:
+            if (nxt.line, "true") in at_line or (nxt.line, "exit0") in at_line:
                 continue
             label = kinds[i] or "check"
             out.append(
@@ -1419,6 +1897,77 @@ def _flat_swallows(
                 )
             )
     return out
+
+
+_RC_SET = re.compile(r"^(?P<v>[A-Za-z_]\w*)=(?:\$\?|\"\$\?\"|\$\{\?\})$")
+_RC_NONZERO = re.compile(r"^(?P<v>[A-Za-z_]\w*)=\"?[1-9]\d*\"?$")
+
+
+def _rc_kept(segs: Sequence[Seg], i: int, var: str) -> bool:
+    """Whether the script, after `segs[i]` saved a status in `$var`, goes on to `exit $var` at
+    its top level with no later statement assigning `var` in between."""
+    top = _top_level(segs)
+    exit_rc = re.compile(rf"^exit\s+\"?\$\{{?{re.escape(var)}\}}?\"?$")
+    reset = re.compile(rf"^{re.escape(var)}=")
+    for j in range(i + 1, len(segs)):
+        if top[j] and exit_rc.match(segs[j].text.strip()):
+            return True
+        if segs[j].sep in ("", ";", "\n") and reset.match(_KEYWORD.sub(r"\g<rest>", segs[j].text)):
+            return False
+    return False
+
+
+def _in_check_if(segs: Sequence[Seg], i: int, check: Callable[[int], bool]) -> bool:
+    """Whether `segs[i]` sits inside an `if` or `elif` whose condition runs a check."""
+    depth = 0
+    for k in range(i - 1, -1, -1):
+        word = _first_word(_KEYWORD.sub(r"\g<rest>", segs[k].text))
+        if word == "fi":
+            depth += 1
+        elif word in ("if", "elif") and depth == 0:
+            return check(k)
+        elif word == "if":
+            depth -= 1
+    return False
+
+
+def _stages(text: str) -> list[str]:
+    """The stages of a pipeline: `text` split at each unquoted `|` that is not `||`."""
+    stages: list[str] = []
+    quote = ""
+    start = 0
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if quote:
+            quote = "" if c == quote else quote
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "$" and text[i + 1 : i + 2] in ("(", "{"):
+            i = _skip_expansion(text, i) - 1 if text[i + 1] == "{" else i
+        elif c == "|":
+            if text[i + 1 : i + 2] == "|":
+                i += 1
+            else:
+                stages.append(text[start:i])
+                start = i + 1 + (text[i + 1 : i + 2] == "&")
+        i += 1
+    stages.append(text[start:])
+    return [t for t in stages if t.strip()]
+
+
+def _pipefail_set(text: str) -> bool | None:
+    """True after `set -o pipefail` (also `-eo`, `-euo`), False after `set +o pipefail`, None for
+    any other statement."""
+    toks = _tokens(text)
+    if not toks or toks[0] != "set":
+        return None
+    for k, tok in enumerate(toks[1:-1], 1):
+        if re.fullmatch(r"[-+][A-Za-z]*o", tok) and toks[k + 1] == "pipefail":
+            return tok[0] == "-"
+    return None
 
 
 def _waited(segs: Sequence[Seg], i: int) -> bool:
@@ -1450,6 +1999,8 @@ def find_swallows(
     strict_status: bool = False,
     powershell: bool = False,
     defs: Mapping[str, str] | None = None,
+    pipefail: bool = False,
+    scope: Scope | None = None,
 ) -> list[Swallow]:
     """The places where `script` can fail a check and still exit 0 (see `_flat_swallows`), also
     inside the body of a `sh -c` or `bash -c` statement, which is a shell of its own."""
@@ -1466,8 +2017,10 @@ def find_swallows(
         strict_status=strict_status,
         powershell=powershell,
         defs=defs,
+        pipefail=pipefail,
+        scope=scope,
     )
-    for seg in split_segments(script):
+    for seg in split_segments(script, scope, all_arms=True):
         body = shell_c_body(seg.text, defs)
         if body is None:
             continue

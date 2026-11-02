@@ -11,7 +11,7 @@ from __future__ import annotations
 import posixpath
 import re
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import NamedTuple
@@ -33,9 +33,13 @@ from greenproof.rules.runner import (
 )
 from greenproof.rules.shell import (
     NOOP_FLAGS,
+    Scope,
     check_kind,
     command_tokens,
+    expand_script,
     find_swallows,
+    functions_in,
+    group_inner,
     is_non_check,
     narrowed_selection,
     script_token,
@@ -162,6 +166,25 @@ def _action_parts(
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "mksh"})
 
 
+def _shebang_words(body: str) -> list[str] | None:
+    """The words after the interpreter of a script's shebang; None when it has no shebang or
+    names no shell."""
+    first = body.split("\n", 1)[0]
+    if not first.startswith("#!"):
+        return None
+    words = first[2:].split()
+    if words and posixpath.basename(words[0]).lower() == "env":
+        words = words[1:]
+        while words and (words[0].startswith("-") or "=" in words[0]):
+            skip = 2 if words[0] in ("-u", "--unset") else 1
+            words = words[skip:]
+    if words and posixpath.basename(words[0]).lower() == "busybox":
+        words = words[1:]
+    if not words or posixpath.basename(words[0]).lower() not in _SHELLS:
+        return None
+    return words[1:]
+
+
 def _shebang(body: str) -> tuple[bool, bool]:
     """`(is a shell script, its shebang turns errexit on)`. A script with no shebang is a shell
     script without errexit; one whose shebang names another interpreter (`python`, `node`,
@@ -181,6 +204,19 @@ def _shebang(body: str) -> tuple[bool, bool]:
     if not words or posixpath.basename(words[0]).lower() not in _SHELLS:
         return not words, False
     return True, _flags_errexit(words[1:])
+
+
+def _flags_pipefail(flags: list[str]) -> bool:
+    """Whether the option words before a shell's script set `-o pipefail` (`-eo pipefail`)."""
+    for k, flag in enumerate(flags[:-1]):
+        if (
+            flag.startswith("-")
+            and not flag.startswith("--")
+            and flag.endswith("o")
+            and flags[k + 1] == "pipefail"
+        ):
+            return True
+    return False
 
 
 def _flags_errexit(flags: list[str]) -> bool:
@@ -215,7 +251,7 @@ def _script_calls(text: str, defs: Defs | None) -> dict[str, bool]:
     return out
 
 
-def _script_mode(body: str, invoked_e: bool) -> _Mode | None:
+def _script_mode(body: str, invoked_e: bool, invoked_pf: bool = False) -> _Mode | None:
     """How a script's own shell reads exit statuses: errexit only when its shebang or the
     command that runs it passes `-e` (a child shell does not inherit the step's); None for a
     script that is not shell."""
@@ -223,7 +259,8 @@ def _script_mode(body: str, invoked_e: bool) -> _Mode | None:
     if not is_shell:
         return None
     errexit = errexit or invoked_e
-    return _Mode(errexit, not errexit, False)
+    pipefail = invoked_pf or _flags_pipefail(_shebang_words(body) or [])
+    return _Mode(errexit, not errexit, False, pipefail)
 
 
 def _script_bodies(
@@ -257,6 +294,8 @@ class _Body(NamedTuple):
     cwd: str = ""  # the directory it runs in, from the repo root
     kind: str = "run"  # "script", "recipe" (a make recipe line) or "pm" (a package.json script)
     ignored: str = ""  # a recipe line whose failure make ignores: why
+    scope: Scope | None = None  # the functions and arguments its text was read with
+    arms: str = ""  # its text with every arm of each `case` kept, "" when `text` already is
 
 
 _MAX_DEPTH = 4  # levels of scripts, recipes and package.json scripts followed below a step
@@ -275,20 +314,104 @@ class _Expansion(NamedTuple):
     stop: str  # where reading stopped short (a cap), "" when it did not
 
 
-def _flat(text: str, defs: Defs) -> Iterator[str]:
-    """The statements of a script, those inside `bash -c '...'` taken in place."""
+_CD = frozenset({"cd", "chdir", "pushd", "popd"})
+
+
+def _walk_leaves(
+    text: str, defs: Defs, at: tuple[str, _Dir]
+) -> Generator[tuple[str, str, _Dir], None, tuple[str, _Dir]]:
+    """`_leaf_dirs` with the directory as `_leaves` tells it too, returning where the script
+    ends."""
+    cwd, where = at
     for seg in split_segments(text):
+        before = where
         inner = shell_c_body(seg.text, defs)
-        if inner is None:
-            yield seg.text
+        if inner is not None:  # a shell of its own: its `cd` stays in it
+            yield from _walk_leaves(inner, defs, (cwd, where))
+            continue
+        group = group_inner(seg.text)
+        if group is not None:
+            moved = yield from _walk_leaves(group, defs, (cwd, where))
+            if not seg.text.lstrip().startswith("("):
+                cwd, where = moved
         else:
-            yield from _flat(inner, defs)
+            toks = command_tokens(seg.text, defs)
+            head = posixpath.basename(toks[0]) if toks else ""
+            if head not in _CD:
+                yield seg.text, cwd, where
+                continue
+            where = _BaseTests._cd(head, toks[1:], where)
+            target = toks[1] if toks[:1] == ["cd"] and len(toks) == 2 else ""
+            if target and "$" not in target and not target.startswith(("/", "~", "-")):
+                cwd = _join(cwd, target) or cwd
+                cwd = "" if cwd == "." else cwd
+        if seg.bg:
+            where = before  # a background job is a child shell
+        elif seg.sep == "||" and where != before:
+            where = _Dir(None, where.stack)  # a `cd` that may not have happened
+    return cwd, where
+
+
+def _leaf_dirs(text: str, defs: Defs, cwd: str = "") -> Iterator[tuple[str, _Dir]]:
+    """The statements of a script with where its shell stands for each: those inside `bash -c
+    '...'` and `{ ...; }` taken in place, those inside a `( ... )` subshell too but with its `cd`
+    left behind when it ends. `cd`, `pushd` and `popd` move the shell for what follows them; to
+    a directory the reading cannot tell (`cd "$X"`, `cd -`, one outside the repo, a `cd` after
+    `||` or in the background) the path is None."""
+    for stmt, _, where in _walk_leaves(text, defs, (cwd, _Dir(cwd))):
+        yield stmt, where
+
+
+def _leaves(text: str, defs: Defs, cwd: str = "") -> Iterator[tuple[str, str]]:
+    """The statements of `_leaf_dirs`, each with the directory a script it names is looked up
+    from: a literal `cd dir` moves it, a `cd` it cannot read leaves it where it was."""
+    for stmt, at, _ in _walk_leaves(text, defs, (cwd, _Dir(cwd))):
+        yield stmt, at
+
+
+def _flat(text: str, defs: Defs) -> Iterator[str]:
+    """The statements of a script (see `_leaf_dirs`)."""
+    for stmt, _ in _leaves(text, defs):
+        yield stmt
 
 
 def _join(cwd: str, path: str) -> str | None:
     """A path from a directory of the repo; None when it leaves the repo."""
     joined = posixpath.normpath(posixpath.join(cwd, path))
     return None if joined.startswith("..") else joined
+
+
+_SELF = (
+    r"(?:\$\(\s*dirname\s+\"?\$(?:0|\{0\}|\{BASH_SOURCE(?:\[0\])?\})\"?\s*\)"
+    r"|\$\{(?:0|BASH_SOURCE(?:\[0\])?)%/\*\})"
+)
+_SELF_PWD = rf"\$\(\s*cd\s+\"?{_SELF}\"?\s*&&\s*pwd(?:\s+-P)?\s*\)"
+_SELF_EXPR = re.compile(rf"{_SELF_PWD}|{_SELF}")
+_SELF_ASSIGN = re.compile(rf"^(?P<v>[A-Za-z_]\w*)=\"?(?:{_SELF_PWD}|{_SELF})\"?$")
+
+
+def _self_dir(stmt: str, body: _Body, cwd: str, here: set[str]) -> str:
+    """`stmt` with the directory of the running script, `$(dirname "$0")` or `${BASH_SOURCE%/*}`
+    (or a variable `HERE="$(cd "$(dirname "$0")" && pwd)"` holds), written as a path from `cwd`.
+    Only for a script that is read from a file."""
+    if body.kind != "script" or not body.src:
+        return stmt
+    if m := _SELF_ASSIGN.match(stmt.strip()):
+        here.add(m["v"])
+        return stmt
+    where = posixpath.relpath(posixpath.dirname(body.src) or ".", cwd or ".")
+    stmt = _SELF_EXPR.sub(where, stmt)
+    for var in here:
+        stmt = re.sub(rf"\$(?:\{{{var}\}}|{var}\b)", where, stmt)
+    return stmt
+
+
+def _literal_args(toks: list[str], script: str) -> tuple[str, ...] | None:
+    """The arguments a call gives the script `script`, None when one is not a literal."""
+    if script not in toks:
+        return None
+    args = tuple(toks[toks.index(script) + 1 :])
+    return None if any(c in a for a in args for c in "$`*?[") else args
 
 
 @dataclass
@@ -330,17 +453,45 @@ class _Walk:
     def tree(self, directory: str) -> set[str]:
         return _tree_names(self.world.changes, directory, self.base)
 
+    def render(self, text: str, cwd: str, scope: Scope) -> tuple[str, str]:
+        """A script read with its functions (those of the files it sources too) and arguments:
+        what runs whatever a `case` word is, and what may run. Why reading stopped short is
+        noted."""
+        self.load(text, cwd, scope, 0, set())
+        common, arms = expand_script(text, scope)
+        for why in scope.cuts:
+            self.cut(why)
+        return common, arms if arms != common else ""
+
+    def load(self, text: str, cwd: str, scope: Scope, depth: int, seen: set[str]) -> None:
+        """The functions of the files `text` sources, added to `scope`."""
+        for stmt, at in _leaves(text, {}, cwd):
+            toks = command_tokens(stmt)
+            if toks[:1] not in (["."], ["source"]) or len(toks) < 2 or "$" in toks[1]:
+                continue
+            path = _join(at, toks[1])
+            if (
+                path is None
+                or path in seen
+                or posixpath.splitext(path)[1].lower() not in _SCRIPT_EXTS
+            ):
+                continue
+            seen.add(path)
+            lib = self.read(path)
+            if lib is None or not _shebang(lib)[0]:
+                continue
+            scope.funcs.update(functions_in(lib))
+            if depth + 1 > _MAX_DEPTH:
+                self.cut(f"`{path}` is {_MAX_DEPTH} levels below the step")
+            else:
+                self.load(lib, at, scope, depth + 1, seen)
+
     def descend(self, body: _Body, depth: int) -> None:
-        cwd = body.cwd
-        for stmt in _flat(body.text, body.defs):
+        here: set[str] = set()  # variables holding the directory of the script itself
+        for stmt, cwd in _leaves(body.text, body.defs, body.cwd):
+            stmt = _self_dir(stmt, body, cwd, here)
             toks = command_tokens(stmt, body.defs)
             if not toks:
-                continue
-            if toks[0] == "cd":
-                target = toks[1] if len(toks) == 2 else ""
-                if target and "$" not in target and not target.startswith(("/", "~", "-")):
-                    cwd = _join(cwd, target) or cwd
-                    cwd = "" if cwd == "." else cwd
                 continue
             children = make_children(toks, stmt, body.defs, cwd, self.read, self.tree)
             if children is None:
@@ -371,7 +522,7 @@ class _Walk:
             return
         self.seen.add(key)
         for child in children:
-            mode = _Mode(child.errexit, not child.errexit, False)
+            mode = _Mode(child.errexit, not child.errexit, False, child.pipefail)
             sub = _Body(
                 child.text,
                 self.line,
@@ -396,12 +547,17 @@ class _Walk:
         if path is None or posixpath.splitext(path)[1].lower() not in _SCRIPT_EXTS:
             return
         self.reads.add(path)
-        errexit = not sourced and posixpath.basename(toks[0]) in _POSIX and _flags_errexit(toks[1:])
+        shell = not sourced and posixpath.basename(toks[0]) in _POSIX
+        errexit = shell and _flags_errexit(toks[1:])
+        pipefail = shell and _flags_pipefail(toks[1:])
+        args = _literal_args(toks, tok) if not sourced else None
         key: tuple[object, ...] = (
             "script",
             path,
             cwd,
             errexit,
+            pipefail,
+            args,
             repr(body.modes) if sourced else "",
         )
         if key in self.seen:
@@ -418,11 +574,25 @@ class _Walk:
                 return
             modes = body.modes
         else:
-            mode = _script_mode(text, errexit)
+            mode = _script_mode(text, errexit, pipefail)
             if mode is None:
                 return
             modes = [mode]
-        sub = _Body(text, self.line, False, modes, body.defs, path, cwd, "script", body.ignored)
+        scope = body.scope if sourced and body.scope is not None else Scope(args=args)
+        common, arms = self.render(text, cwd, scope)
+        sub = _Body(
+            common,
+            self.line,
+            False,
+            modes,
+            body.defs,
+            path,
+            cwd,
+            "script",
+            body.ignored,
+            scope,
+            arms,
+        )
         self.out.append(sub)
         self.descend(sub, depth + 1)
 
@@ -463,8 +633,11 @@ def _expand(world: _World, wf: workflow.Workflow, step: workflow.Step, base: boo
     if step.uses:
         walk.reads.update(_action_files(step.uses))
     if step.run:
+        scope = Scope()
+        cwd = wf.directory_of(step)
+        text, arms = walk.render(step.run, cwd, scope)
         root = _Body(
-            step.run, step.run_line, True, _modes(wf, step), defs, cwd=wf.directory_of(step)
+            text, step.run_line, True, _modes(wf, step), defs, cwd=cwd, scope=scope, arms=arms
         )
         walk.out.append(root)
         walk.descend(root, 0)
@@ -473,14 +646,19 @@ def _expand(world: _World, wf: workflow.Workflow, step: workflow.Step, base: boo
             if _disabled(inner):
                 continue
             inner_defs = {**defs, **inner_wf.defs_of(inner)}
+            inner_cwd = inner_wf.directory_of(inner)
+            inner_scope = Scope()
+            inner_text, inner_arms = walk.render(inner.run, inner_cwd, inner_scope)
             part = _Body(
-                inner.run,
+                inner_text,
                 step.line,
                 False,
                 _modes(inner_wf, inner),
                 inner_defs,
                 src,
-                inner_wf.directory_of(inner),
+                inner_cwd,
+                scope=inner_scope,
+                arms=inner_arms,
             )
             walk.out.append(part)
             walk.descend(part, 0)
@@ -652,9 +830,11 @@ class _Mode(NamedTuple):
     errexit: bool  # the shell stops at the first failing command
     strict: bool  # the exit status is the last command's, and nothing stops earlier
     ps: bool  # PowerShell: cmdlets and `$x = ...` leave the status alone
+    pipefail: bool = False  # a pipeline's status is its first failure, not the last stage's
 
 
-_BASH_E = _Mode(True, False, False)
+_BASH_E = _Mode(True, False, False)  # a step with no `shell:`: `bash -e {0}`
+_BASH_PIPEFAIL = _Mode(True, False, False, True)  # `shell: bash`: `bash -eo pipefail {0}`
 _PWSH = _Mode(False, True, True)
 _CMD = _Mode(False, True, False)
 _POSIX = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
@@ -675,8 +855,9 @@ def _shell_mode(shell: str) -> _Mode | None:
         return _CMD
     if "{0}" in shell:
         errexit = bool(re.search(r"(?:^|\s)-[A-Za-z]*e|errexit", shell))
-        return _Mode(errexit, not errexit and name in _POSIX, False)
-    return _BASH_E
+        pipefail = bool(re.search(r"(?:^|\s)-[A-Za-z]*o\s+pipefail", shell))
+        return _Mode(errexit, not errexit and name in _POSIX, False, pipefail)
+    return _BASH_PIPEFAIL if name == "bash" else _BASH_E
 
 
 def _modes(wf: workflow.Workflow, step: workflow.Step) -> list[_Mode]:
@@ -910,7 +1091,7 @@ def _swallow_keys(
                     _reason_in(w.kind, w.reason, body, mode),
                 )
                 for w in find_swallows(
-                    body.text,
+                    body.arms or body.text,
                     world.literals,
                     opaque=False,
                     errexit=mode.errexit,
@@ -919,6 +1100,7 @@ def _swallow_keys(
                     strict_status=mode.strict,
                     powershell=mode.ps,
                     defs=body.defs,
+                    pipefail=mode.pipefail,
                 )
             )
         if body.ignored:
@@ -1383,13 +1565,13 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                         "unless named with `-p`: check what they were doing)",
                     )
                 )
-            where = _Dir(body.cwd)  # a `cd` in one statement moves the ones after it
-            for stmt in _flat(body.text, body.defs):
-                known = pending[stmt] > 0
-                pending[stmt] -= known
+            for stmt, where in _leaf_dirs(body.text, body.defs, body.cwd):
+                if pending[stmt] > 0:
+                    pending[stmt] -= 1
+                    continue
                 if tests is None:
                     continue
-                gone, where = tests.scan(stmt, where, not known)
+                gone, _ = tests.scan(stmt, where)
                 if gone is not None:
                     why = removal_reason(stmt[:80], gone)
                     if (at, why) not in reported:
