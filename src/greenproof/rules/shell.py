@@ -28,7 +28,7 @@ from __future__ import annotations
 import posixpath
 import re
 import shlex
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 # What a command-position word is, by the kind of check it runs.
@@ -76,15 +76,42 @@ SELECT_FLAGS: dict[str, frozenset[str]] = {
     "go": frozenset({"-run", "-skip", "-short", "-test.run", "-test.skip", "-test.short"}),
     "js": frozenset(
         {"-t", "--testNamePattern", "--testPathIgnorePatterns", "--onlyChanged", "-o"}
-        | {"--findRelatedTests"}
+        | {"--findRelatedTests", "--shard", "--testPathPattern", "--selectProjects"}
+        | {"--project", "--changed", "--related"}
     ),
     "cargo": frozenset({"--skip"}),
     "mocha": frozenset({"--grep", "-g", "--invert"}),
+    "playwright": frozenset(
+        {"--grep", "-g", "--grep-invert", "--project", "--only-changed", "--last-failed"}
+        | {"--shard"}
+    ),
+    "cypress": frozenset({"--spec", "-s"}),
+    "nextest": frozenset({"-E", "--filter-expr", "--partition", "--run-ignored"}),
+    "phpunit": frozenset({"--filter", "--group", "--exclude-group", "--testsuite"}),
+    "dotnet": frozenset({"--filter"}),
+    "rspec": frozenset({"-e", "--example", "-t", "--tag", "--only-failures", "--next-failure"}),
+    "ctest": frozenset({"-R", "--tests-regex", "-E", "--exclude-regex", "-L", "-LE", "-I"}),
+    "bats": frozenset({"-f", "--filter", "--filter-tags"}),
+    "deno": frozenset({"--filter"}),
+    "bun": frozenset({"-t", "--test-name-pattern"}),
+    "node": frozenset({"--test-name-pattern", "--test-skip-pattern", "--test-only"}),
+    "swift": frozenset({"--filter", "--skip"}),
+    "mix": frozenset({"--only", "--exclude", "--failed", "--stale"}),
+    "ava": frozenset({"--match", "-m"}),
+    "tap": frozenset({"--grep", "--only"}),
+    "gradle": frozenset({"--tests"}),
+    "mvn": frozenset({"-Dtest"}),
+    "ng": frozenset({"--include"}),
 }
-# Flags after which the runner runs no test, or passes with none.
+# Flags after which the runner runs no test, or passes with none. `-x test` (gradle) is a flag
+# and its value, written as one name.
 NOOP_FLAGS: dict[str, frozenset[str]] = {
     "pytest": frozenset({"--co", "--collect-only"}),
     "js": frozenset({"--passWithNoTests"}),
+    "mvn": frozenset({"-DskipTests", "-Dmaven.test.skip"}),
+    "gradle": frozenset({"-x test"}),
+    "nextest": frozenset({"--no-run"}),
+    "cargo": frozenset({"--no-run"}),
 }
 _ALL_FLAGS = {
     family: SELECT_FLAGS.get(family, frozenset()) | NOOP_FLAGS.get(family, frozenset())
@@ -97,12 +124,13 @@ class Seg:
     sep: str  # what came before: "", ";", "\n", "&&", "||"
     text: str
     line: int  # 1-based physical line of the segment's first character
+    bg: bool = False  # ended by a single `&`: it runs in the background, its status is lost
 
 
 @dataclass(frozen=True)
 class Swallow:
     line: int
-    kind: str  # "or", "exit0", "true", "set+e", "early"
+    kind: str  # "or", "exit0", "true", "set+e", "early", "noerr", "bg", "trap", "dropped"
     text: str
     reason: str
 
@@ -238,7 +266,10 @@ def split_segments(script: str) -> list[Seg]:
             flush("&&")
             i += 1
         elif c == "&" and (not buf or buf[-1] not in "<>") and text[i + 1 : i + 2] != ">":
+            before = len(segs)
             flush(";")
+            if len(segs) > before:
+                segs[-1] = replace(segs[-1], bg=True)
         elif c == "|" and text[i + 1 : i + 2] == "|":
             flush("||")
             i += 1
@@ -246,7 +277,30 @@ def split_segments(script: str) -> list[Seg]:
             buf.append(c)
         i += 1
     flush("")
-    return segs
+    return _drop_dead(segs)
+
+
+def _constant_status(text: str) -> int | None:
+    """0 for `true` and `:`, 1 for `false`, None for any other statement."""
+    if text in ("true", ":"):
+        return 0
+    return 1 if text == "false" else None
+
+
+def _drop_dead(segs: list[Seg]) -> list[Seg]:
+    """Segments that can never run: `true || X` and `: || X` skip X, `false && X` skips X."""
+    out: list[Seg] = []
+    status: int | None = None  # the status of the chain so far, when it is a known constant
+    for seg in segs:
+        if seg.sep not in ("&&", "||"):
+            status = _constant_status(seg.text)
+            out.append(seg)
+            continue
+        if (seg.sep == "||" and status == 0) or (seg.sep == "&&" and status == 1):
+            continue
+        status = _constant_status(seg.text) if status is not None else None
+        out.append(seg)
+    return out
 
 
 # -- command position --------------------------------------------------------------------
@@ -319,23 +373,64 @@ def _skip_opts(toks: list[str], values: Collection[str], positional: int = 0) ->
     return toks[min(i + positional, len(toks)) :]
 
 
+_DETACH_CLUSTER = re.compile(r"^-[itdPq]*d[itdPq]*$")
+
+
 def _container_command(base: str, rest: list[str]) -> list[str] | None:
-    """The command `docker run|exec IMAGE ...` or `docker compose run|exec SERVICE ...` runs."""
+    """The command `docker run|exec IMAGE ...` or `docker compose run|exec SERVICE ...` runs.
+
+    `--entrypoint E` replaces the image's command word: the command is `E args...`. `-d` and
+    `--detach` start it without waiting for it: that is `docker-detach`, which is no check.
+    """
     if base == "docker-compose" or rest[:1] == ["compose"]:
         rest = _skip_opts(rest if base == "docker-compose" else rest[1:], _COMPOSE_VALUES)
-    if rest[:1] in (["run"], ["exec"]):
-        return _skip_opts(rest[1:], _DOCKER_VALUES, 1)
-    return None
+    if rest[:1] not in (["run"], ["exec"]):
+        return None
+    toks = rest[1:]
+    entrypoint: str | None = None
+    detach = False
+    i = 0
+    while i < len(toks) and toks[i].startswith("-") and toks[i] != "--":
+        tok = toks[i]
+        if tok == "--entrypoint" and i + 1 < len(toks):
+            entrypoint = toks[i + 1]
+            i += 2
+        elif tok.startswith("--entrypoint="):
+            entrypoint = tok.partition("=")[2]
+            i += 1
+        else:
+            detach = detach or tok == "--detach" or bool(_DETACH_CLUSTER.match(tok))
+            i += 2 if tok in _DOCKER_VALUES else 1
+    if i < len(toks) and toks[i] == "--":
+        i += 1
+    if detach:
+        return ["docker-detach"]
+    args = toks[min(i + 1, len(toks)) :]
+    if entrypoint is not None:
+        words = _tokens(entrypoint)
+        return [*words, *args] if words else args
+    return args
 
 
-def _strip(tokens: list[str]) -> list[str]:
-    """Drop what comes before the command: assignments, `if`/`then`/`!`, and wrappers."""
+def _var_name(token: str) -> str | None:
+    """`PYTEST` for `$PYTEST`, `${PYTEST}` and `$(PYTEST)` (a variable as the command word)."""
+    m = _VAR.match(token)
+    return (m["a"] or m["b"] or m["c"]) if m else None
+
+
+def _strip(tokens: list[str], defs: Mapping[str, str] | None = None) -> list[str]:
+    """Drop what comes before the command: assignments, `if`/`then`/`!`, and wrappers. A variable
+    as the command word that `defs` defines is replaced by its value."""
     toks = list(tokens)
+    substitutions = 0
     while toks:
         tok = toks[0]
         base = _cmd_name(tok)
         nxt = toks[1] if len(toks) > 1 else ""
-        if _ASSIGN.match(tok) or tok in _LEADING:
+        if defs and (name := _var_name(tok)) and name in defs and substitutions < 8:
+            substitutions += 1
+            toks = [*_tokens(defs[name]), *toks[1:]]
+        elif _ASSIGN.match(tok) or tok in _LEADING:
             toks = toks[1:]
         elif base in _OPT_VALUES or base in _PLAIN_WRAPPERS:
             rest = _skip_opts(toks[1:], _OPT_VALUES.get(base, frozenset()), int(base == "timeout"))
@@ -370,11 +465,66 @@ def _strip(tokens: list[str]) -> list[str]:
 
 _PYTHON = re.compile(r"^(?:python[\d.]*|pypy[\d.]*|py)$")
 _CODE_FLAG = re.compile(r"""['"](-[^'"\s]+)['"]""")
+_EXIT_CALL = r"(?:sys\.exit|raise\s+SystemExit|SystemExit|exit|quit|os\._exit)"
+_NODE_VALUE_OPTS = frozenset({"-r", "--require", "--loader", "--import", "--env-file", "-C"})
+_NODE_BIN = re.compile(r"(?:^|/)node_modules/(?P<pkg>(?:@[^/]+/)?[^/]+)/(?:bin/)?(?P<x>[^/]+)$")
+
+
+def _python_code(toks: list[str]) -> str | None:
+    """The code string of `python -c "..."`, else None."""
+    if not toks or not _PYTHON.match(_cmd_name(toks[0])):
+        return None
+    j = 1
+    while j < len(toks) and toks[j].startswith("-") and toks[j] != "-m":
+        if toks[j] == "-c":
+            return toks[j + 1] if j + 1 < len(toks) else None
+        j += 2 if toks[j] in ("-W", "-X") else 1
+    return None
+
+
+def _pytest_main_exits(code: str) -> bool:
+    """Whether `pytest.main(...)` in `code` has its result turned into the exit status:
+    `sys.exit(pytest.main(...))`, `raise SystemExit(pytest.main(...))`, `exit(...)`, or the result
+    stored and passed to one of them."""
+    if re.search(_EXIT_CALL + r"\s*\(\s*(?:[\w.]+\s*\.\s*)?pytest\.main\b", code):
+        return True
+    return any(
+        re.search(_EXIT_CALL + rf"\s*\(\s*{re.escape(var)}\s*\)", code)
+        for var in re.findall(r"\b(\w+)\s*=\s*pytest\.main\b", code)
+    )
+
+
+def status_dropped(text: str) -> bool:
+    """A statement `python -c "...pytest.main(...)"` that does not exit with pytest's status:
+    pytest.main returns the code, it does not exit, so the process exits 0 whatever happened."""
+    code = _python_code(_strip(_tokens(text)))
+    return code is not None and "pytest.main" in code and not _pytest_main_exits(code)
+
+
+def _node_tool(toks: list[str]) -> list[str] | None:
+    """`node node_modules/.bin/jest -t x` and `node node_modules/jest/bin/jest.js` as the tool."""
+    j = 1
+    while j < len(toks) and toks[j].startswith("-"):
+        if toks[j] == "--test":
+            return None
+        j += 2 if toks[j] in _NODE_VALUE_OPTS else 1
+    if j >= len(toks):
+        return None
+    script = toks[j]
+    names: list[str] = []
+    if "/.bin/" in script or script.startswith(".bin/"):
+        names = [posixpath.basename(script)]
+    elif m := _NODE_BIN.search(script):
+        names = [m["x"].rpartition(".")[0] or m["x"], posixpath.basename(m["pkg"])]
+    for name in names:
+        if name in _SIMPLE_CHECKERS or name in _SUB_CHECKERS:
+            return [name, *toks[j + 1 :]]
+    return None
 
 
 def _collapse(toks: list[str]) -> list[str]:
     """`python -m X ...` and `coverage run -m X ...` are `X ...`; `python -c "pytest.main(...)"`
-    is `pytest ...`."""
+    is `pytest ...`; `node node_modules/.bin/jest ...` is `jest ...`."""
     if not toks:
         return toks
     base = _cmd_name(toks[0])
@@ -383,18 +533,38 @@ def _collapse(toks: list[str]) -> list[str]:
         while j < len(toks) and toks[j].startswith("-") and toks[j] != "-m":
             if toks[j] == "-c" and j + 1 < len(toks):
                 code = toks[j + 1]
-                return ["pytest", *_CODE_FLAG.findall(code)] if "pytest.main" in code else toks
+                if "pytest.main" in code:
+                    return ["pytest", *_CODE_FLAG.findall(code)]
+                if re.search(r"\bunittest\.main\b", code):
+                    return ["unittest"]
+                return toks
             j += 2 if toks[j] in ("-W", "-X") else 1
         if j < len(toks) and toks[j] == "-m":
             return toks[j + 1 :]
     elif base in ("coverage", "coverage3") and toks[1:2] == ["run"] and "-m" in toks:
         return toks[toks.index("-m") + 1 :]
+    elif base in ("node", "nodejs") and (tool := _node_tool(toks)) is not None:
+        return tool
     return toks
+
+
+def _syntax_only(toks: list[str]) -> bool:
+    """`bash -n script` and `sh -n -c "..."` parse a script and run none of it."""
+    if not toks or _cmd_name(toks[0]) not in _SHELLS:
+        return False
+    for tok in toks[1:]:
+        if not (tok[:1] == "-" and len(tok) > 1):
+            break
+        if tok != "--" and re.match(r"^-[A-Za-z]*n[A-Za-z]*$", tok):
+            return True
+    return False
 
 
 def _shell_c(toks: list[str]) -> str | None:
     """The script string of `sh|bash -c "..."` (`-lc`, `-ec`, `-e -c` too), else None."""
     if not toks or _cmd_name(toks[0]) not in _SHELLS:
+        return None
+    if _syntax_only(toks):
         return None
     i = 1
     while i < len(toks) and toks[i][:1] in "-+" and len(toks[i]) > 1:
@@ -404,18 +574,19 @@ def _shell_c(toks: list[str]) -> str | None:
     return None
 
 
-def shell_c_body(text: str) -> str | None:
+def shell_c_body(text: str, defs: Mapping[str, str] | None = None) -> str | None:
     """The script a `bash -c "..."` statement runs (wrappers like `sudo` allowed), else None."""
-    return _shell_c(_strip(_tokens(text)))
+    return _shell_c(_strip(_tokens(text), defs))
 
 
-def command_tokens(text: str) -> list[str]:
-    """The words of a statement from its command on: the wrappers are gone, `python -m X` is X."""
+def command_tokens(text: str, defs: Mapping[str, str] | None = None) -> list[str]:
+    """The words of a statement from its command on: the wrappers are gone, `python -m X` is X.
+    A variable command word that `defs` defines is replaced by its value."""
     toks = _tokens(text)
     previous: list[str] | None = None
     while toks != previous:
         previous = toks
-        toks = _strip(_collapse(_strip(toks)))
+        toks = _strip(_collapse(_strip(toks, defs)), defs)
         if (body := _shell_c(toks)) is not None:
             segs = split_segments(body)
             toks = _tokens(segs[0].text) if segs else []
@@ -473,7 +644,9 @@ def classify(toks: list[str], make_check: Callable[[str], bool | None] | None = 
     if "|" in rest:
         rest = rest[: rest.index("|")]
     if cmd in _SIMPLE_CHECKERS:
-        return None if _is_info_only(rest) else _SIMPLE_CHECKERS[cmd]
+        if _is_info_only(rest) or (cmd == "gotestsum" and rest[:1] == ["tool"]):
+            return None  # `gotestsum tool slowest` reads a report, it runs no test
+        return _SIMPLE_CHECKERS[cmd]
     if cmd in _SUB_CHECKERS:
         subs, kind = _SUB_CHECKERS[cmd]
         words = _skip_opts(rest, frozenset())
@@ -486,7 +659,7 @@ def classify(toks: list[str], make_check: Callable[[str], bool | None] | None = 
         rest = [a for a in rest if not a.startswith("+")]
         sub = rest[0] if rest else ""
         if sub in _CARGO_TESTS:
-            return "cargo test"
+            return None if _cargo_no_run(rest) else "cargo test"
         return "clippy" if sub in ("clippy", "fmt") else None
     if cmd == "dotnet":
         return "dotnet test" if rest[:1] == ["test"] else None
@@ -511,6 +684,19 @@ def classify(toks: list[str], make_check: Callable[[str], bool | None] | None = 
     return None
 
 
+_LLVM_COV_REPORTS = frozenset({"report", "show-env", "clean"})
+
+
+def _cargo_no_run(rest: list[str]) -> bool:
+    """`cargo test --no-run` only builds; `cargo llvm-cov report|show-env|clean` runs no test."""
+    if "--no-run" in rest:
+        return True
+    if rest[:1] == ["llvm-cov"]:
+        words = [a for a in rest[1:] if not a.startswith("-")]
+        return words[:1] != [] and words[0] in _LLVM_COV_REPORTS
+    return False
+
+
 def _make_kind(rest: list[str], make_check: Callable[[str], bool | None] | None) -> str | None:
     for arg in rest:
         if arg in ("-C", "-f", "--directory", "--file", "--justfile", "--makefile") or (
@@ -530,31 +716,37 @@ def check_kind(
     literals: Sequence[str] = (),
     scripts: Collection[str] = (),
     make_check: Callable[[str], bool | None] | None = None,
+    defs: Mapping[str, str] | None = None,
 ) -> str | None:
     """The kind of check a statement runs in command position, None when it is not a check.
 
     `literals` are policy commands (a statement containing one is a check), `scripts` the
-    repo-relative paths of scripts a policy command runs.
+    repo-relative paths of scripts a policy command runs, `defs` the variables (`env:`, Makefile
+    assignments) a `$VAR` command word may be defined by.
     """
     inner = _group_inner(text)
     if inner is not None:
         for seg in split_segments(inner):
-            kind = check_kind(seg.text, literals=literals, scripts=scripts, make_check=make_check)
+            kind = check_kind(
+                seg.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs
+            )
             if kind:
                 return kind
         return None
-    if (body := shell_c_body(text)) is not None:  # sh -c "..."
+    if (body := shell_c_body(text, defs)) is not None:  # sh -c "..."
         for seg in split_segments(body):
-            kind = check_kind(seg.text, literals=literals, scripts=scripts, make_check=make_check)
+            kind = check_kind(
+                seg.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs
+            )
             if kind:
                 return kind
         return None
-    toks = command_tokens(text)
+    toks = command_tokens(text, defs)
     if kind := classify(toks, make_check):
         return kind
     if literals and any(lit in text for lit in literals):
         return "policy"
-    if scripts and (script := script_of(_tokens(text))) is not None:
+    if scripts and (script := script_of(_tokens(text), defs)) is not None:
         norm = posixpath.normpath(script)
         if norm in scripts:
             return "policy"
@@ -566,6 +758,7 @@ def check_kind(
 # only of these has no check in it; any other command might be one (`poe test`, `pre-commit run`).
 _NON_CHECK_WORDS = frozenset(
     {"echo", "printf", "true", "false", ":", "exit", "return", "sleep", "cat", "head", "tail"}
+    | {"docker-detach"}
     | {"tee", "ls", "pwd", "cd", "pushd", "popd", "mkdir", "rmdir", "rm", "cp", "mv", "ln", "touch"}
     | {"chmod", "chown", "export", "unset", "set", "shopt", "env", "printenv", "which", "type"}
     | {"test", "[", "[[", "read", "source", ".", "tar", "zip", "unzip", "gzip", "gunzip", "find"}
@@ -610,18 +803,40 @@ _PS_CMDLET = re.compile(
 )
 
 
-def is_non_check(text: str) -> bool:
+_INLINE_EVAL = frozenset({"node", "nodejs", "ruby", "perl"})
+_EVAL_FLAG = re.compile(r"^(?:-[A-Za-z]*[eEp]|--eval|--print)$")
+
+
+def _inline_eval(toks: list[str]) -> bool:
+    """`python -c "..."`, `node -e "..."`, `ruby -e`, `perl -e`: code on the command line. The
+    only inline code read as a check is `pytest.main` and `unittest.main` (see `_collapse`); any
+    other is judged by content, and none is recognised."""
+    cmd = _cmd_name(toks[0])
+    if _PYTHON.match(cmd):
+        return _python_code(toks) is not None
+    return cmd in _INLINE_EVAL and any(_EVAL_FLAG.match(t) for t in toks[1:3])
+
+
+def is_non_check(text: str, defs: Mapping[str, str] | None = None) -> bool:
     """Whether a statement is recognisably not a check: a command from the list of ones that run
-    no tests (`echo`, `exit 0`, `pip install`, `git`, `docker push`, a `deploy.sh`)."""
+    no tests (`echo`, `exit 0`, `pip install`, `git`, `docker push`, a `deploy.sh`, `bash -n`,
+    inline code that is not a recognised check)."""
     inner = _group_inner(text)
     if inner is not None:
-        return all(is_non_check(seg.text) for seg in split_segments(inner))
-    if (body := shell_c_body(text)) is not None:
-        return all(is_non_check(seg.text) for seg in split_segments(body))
-    toks = command_tokens(text)
+        return all(is_non_check(seg.text, defs) for seg in split_segments(inner))
+    if (body := shell_c_body(text, defs)) is not None:
+        return all(is_non_check(seg.text, defs) for seg in split_segments(body))
+    toks = command_tokens(text, defs)
     if not toks:
         return True  # nothing but assignments
     cmd = _cmd_name(toks[0])
+    if _syntax_only(toks) or _inline_eval(toks):
+        return True
+    if classify(toks) is None and (
+        (cmd == "gotestsum" and toks[1:2] == ["tool"])
+        or (cmd == "cargo" and _cargo_no_run([t for t in toks[1:] if not t.startswith("+")]))
+    ):
+        return True
     if cmd in _NON_CHECK_WORDS or (
         re.match(r"^[A-Za-z]+-[A-Za-z]+$", toks[0]) and _PS_CMDLET.match(toks[0])
     ):
@@ -651,10 +866,10 @@ _INTERPRETERS = re.compile(
 _SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".php")
 
 
-def script_of(tokens: list[str]) -> str | None:
+def script_of(tokens: list[str], defs: Mapping[str, str] | None = None) -> str | None:
     """The script file a statement runs, when its command is a script or an interpreter's."""
-    toks = _strip(tokens)
-    if not toks:
+    toks = _strip(tokens, defs)
+    if not toks or _syntax_only(toks):
         return None
     tok = toks[0]
     if _INTERPRETERS.match(_cmd_name(tok)):
@@ -665,11 +880,11 @@ def script_of(tokens: list[str]) -> str | None:
     return tok if "/" in tok or tok.endswith(_SCRIPT_EXT) else None
 
 
-def scripts_in(text: str, here: str) -> list[str]:
+def scripts_in(text: str, here: str, defs: Mapping[str, str] | None = None) -> list[str]:
     """Repo-relative paths of the scripts the statements of `text` run."""
     found: list[str] = []
     for seg in split_segments(text):
-        tok = script_of(_tokens(seg.text))
+        tok = script_of(_tokens(seg.text), defs)
         if tok is None or tok.startswith(("/", "~", "$")) or "$" in tok:
             continue
         norm = posixpath.normpath(tok)
@@ -697,10 +912,12 @@ _CMDLET = re.compile(
     r"^(?:[A-Za-z]+-[A-Za-z]+|echo|cd|ls|dir|cat|type|sleep|pwd|cls|clear|\$\w+\s*=)(?:\s|$)",
     re.IGNORECASE,
 )
-# What `A || B` may retry with: flags that rerun the failures of the run `A` made.
+# What `A || B` may retry with: flags that rerun the failures of the run `A` made. `--reruns`
+# takes a count (`--reruns 3`, `--reruns=3`); B is otherwise A's own words (see `_is_retry`).
 RERUN_FLAGS = frozenset(
     {"--lf", "--last-failed", "--ff", "--failed-first", "--sw", "--stepwise", "--reruns"}
 )
+_TRAP = frozenset({"EXIT", "0", "ERR", "SIGEXIT"})
 _CONDITION = re.compile(r"^(?:if|elif|while|until)\b|^\[|^test\b")
 _KEYWORD = re.compile(r"^(?P<kw>then|else|do)\b\s*(?P<rest>.*)$", re.DOTALL)
 _BARE_EXIT = re.compile(r"^exit(?:\s+0+)?$")
@@ -787,6 +1004,7 @@ def _flat_swallows(
     known: bool | None = None,
     strict_status: bool = False,
     powershell: bool = False,
+    defs: Mapping[str, str] | None = None,
 ) -> list[Swallow]:
     """The places where `script` can fail a check and still exit 0 (see the module docstring).
 
@@ -799,12 +1017,16 @@ def _flat_swallows(
     whose exit status is its last command's (`bash {0}`, `sh {0}`, PowerShell, cmd): a check
     followed by another command, with its status neither read nor chained to the end, is swallowed
     (kind `noerr`). `powershell` makes cmdlets and `$x = ...` leave the status alone.
-    A retry, `check || check --lf`, is not a swallow (see `RERUN_FLAGS`).
+    A retry, `check || check --lf`, is not a swallow (see `RERUN_FLAGS`). A check followed by `&`
+    runs in the background and its status is lost (kind `bg`); `trap 'exit 0' EXIT` makes the
+    shell exit 0 whatever ran (kind `trap`); `python -c "pytest.main()"` exits 0 (kind
+    `dropped`). `defs` are the variables a `$VAR` command word may be defined by.
     """
     segs = split_segments(script)
     literals = [e for e in extra if len(e) >= 6]
     kinds = [
-        check_kind(s.text, literals=literals, scripts=scripts, make_check=make_check) for s in segs
+        check_kind(s.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs)
+        for s in segs
     ]
     is_check = [k is not None for k in kinds]
     has_check = any(is_check) if known is None else known
@@ -861,7 +1083,9 @@ def _flat_swallows(
             if (
                 before
                 and not any(_is_failing_exit(r) for r in rhs)
-                and not _is_retry(text, kinds[before[-1]], literals, scripts, make_check)
+                and not _is_retry(
+                    text, segs[before[-1]].text, kinds[before[-1]], literals, scripts, make_check
+                )
             ):
                 add(seg, "or", f"a failure is swallowed by `|| {_short(text)}`")
         elif (_is_zero_exit(text) or _RESET_STATUS.match(text)) and top[i]:
@@ -887,6 +1111,12 @@ def _flat_swallows(
                     break
         elif _SET_MINUS_E.match(text):
             state_errexit = True
+        if seg.bg and check(i) and not _waited(segs, i):
+            add(seg, "bg", f"`{_short(seg.text)}` runs in the background and its status is lost")
+        if check(i) and status_dropped(seg.text):
+            add(seg, "dropped", "`pytest.main(...)` returns the status, it does not exit with it")
+        if _trap_exit0(text) and any(check(j) for j in range(len(segs))):
+            add(seg, "trap", f"`{_short(text)}` makes the shell exit 0 whatever a check did")
         if early and top[i] and _is_zero_exit(text):
             if first_exit is None:
                 first_exit = seg
@@ -927,6 +1157,21 @@ def _flat_swallows(
     return out
 
 
+def _waited(segs: Sequence[Seg], i: int) -> bool:
+    """Whether a later statement waits on a named job (`wait $pid`) and so reads its status."""
+    return any(re.match(r"^wait\s+\S", segs[k].text) for k in range(i + 1, len(segs)))
+
+
+def _trap_exit0(text: str) -> bool:
+    """`trap 'exit 0' EXIT` (or `ERR`): the shell's last word is a success."""
+    toks = _tokens(text)
+    if len(toks) < 3 or toks[0] != "trap":
+        return False
+    return bool(_TRAP & set(toks[2:])) and any(
+        _is_zero_exit(seg.text) for seg in split_segments(toks[1])
+    )
+
+
 def find_swallows(
     script: str,
     extra: Sequence[str] = (),
@@ -940,6 +1185,7 @@ def find_swallows(
     known: bool | None = None,
     strict_status: bool = False,
     powershell: bool = False,
+    defs: Mapping[str, str] | None = None,
 ) -> list[Swallow]:
     """The places where `script` can fail a check and still exit 0 (see `_flat_swallows`), also
     inside the body of a `sh -c` or `bash -c` statement, which is a shell of its own."""
@@ -955,9 +1201,10 @@ def find_swallows(
         known=known,
         strict_status=strict_status,
         powershell=powershell,
+        defs=defs,
     )
     for seg in split_segments(script):
-        body = shell_c_body(seg.text)
+        body = shell_c_body(seg.text, defs)
         if body is None:
             continue
         out.extend(
@@ -967,28 +1214,52 @@ def find_swallows(
                 extra,
                 opaque=False,
                 errexit=False,
+                early=True,
                 scripts=scripts,
                 make_check=make_check,
                 strict_status=True,
+                defs=defs,
             )
         )
     return out
 
 
+def _retry_words(command: str) -> list[str]:
+    """The words of a check statement without the flags that only rerun failures
+    (`--lf`, `--reruns 3`, `--reruns=3`)."""
+    toks = command_tokens(command)
+    if "|" in toks:
+        toks = toks[: toks.index("|")]
+    out: list[str] = []
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        if tok in RERUN_FLAGS - {"--reruns"} or re.fullmatch(r"--reruns=\d+", tok):
+            i += 1
+        elif tok == "--reruns" and i + 1 < len(toks) and toks[i + 1].isdigit():
+            i += 2
+        else:
+            out.append(tok)
+            i += 1
+    return out
+
+
 def _is_retry(
     text: str,
+    first: str,
     kind: str | None,
     literals: Sequence[str],
     scripts: Collection[str],
     make_check: Callable[[str], bool | None] | None,
 ) -> bool:
-    """Whether `text`, the right side of `A || ...`, reruns a check of A's kind unnarrowed (only
-    the rerun-the-failures flags): the failure of A is then not swallowed."""
+    """Whether `text`, the right side of `A || ...`, reruns A (`first`) as it was, plus only the
+    rerun-the-failures flags (see `RERUN_FLAGS`): the failure of A is then not swallowed. Any
+    other difference, a path, `-k`, `--sw-skip`, is a narrower run that can pass."""
     if kind is None or kind == "policy":
         return False
     if check_kind(text, literals=literals, scripts=scripts, make_check=make_check) != kind:
         return False
-    return all(flag in RERUN_FLAGS for _, flag, _ in selection_uses(text))
+    return _retry_words(text) == _retry_words(first)
 
 
 def _block_depth(segs: Sequence[Seg]) -> list[int]:
@@ -1010,6 +1281,9 @@ def _block_depth(segs: Sequence[Seg]) -> list[int]:
 
 
 # -- selection flags -------------------------------------------------------------------
+_ATTACHED = "kmtgesRELIf"  # short flags whose value may follow them directly: `-kfoo`, `-Rfoo`
+
+
 def _flag_name(token: str, flags: frozenset[str]) -> str | None:
     """The selection flag `token` is (`-k`, `-k=x`, `-kx`, `--grep=x`), else None."""
     if token in flags:
@@ -1017,7 +1291,7 @@ def _flag_name(token: str, flags: frozenset[str]) -> str | None:
     head = token.partition("=")[0]
     if head in flags:
         return head
-    if re.match(r"^-[km].+", token) and token[:2] in flags:
+    if re.match(r"^-[A-Za-z].+", token) and token[1] in _ATTACHED and token[:2] in flags:
         return token[:2]
     return None
 
@@ -1027,35 +1301,84 @@ def _is_tox(token: str) -> bool:
 
 
 def _runner_end(family: str, tokens: list[str]) -> int | None:
-    """The index just after the family's runner word, or None when the command is not it."""
+    """The index just after the family's runner word and subcommand (`go test`, `playwright
+    test`, `vitest run` is `vitest`), or None when the command is not that runner."""
     if not tokens:
         return None
     head = _cmd_name(tokens[0])
+    sub = tokens[1:2]
     if family == "pytest":
-        return 1 if head in ("pytest", "py.test") else None
+        if head in ("pytest", "py.test"):
+            return 1
+        return 2 if head == "hatch" and sub == ["test"] else None
     if family == "mocha":
         return 1 if head == "mocha" else None
     if family == "go":
         if head == "gotestsum":
             return 1
-        return 2 if head == "go" and tokens[1:2] == ["test"] else None
-    if family == "cargo":
+        return 2 if head == "go" and sub == ["test"] else None
+    if family in ("cargo", "nextest"):
         rest = [t for t in tokens[1:] if not t.startswith("+")]
-        return (
-            len(tokens) - len(rest) + 1
-            if head == "cargo" and rest[:1] in (["test"], ["nextest"])
-            else None
-        )
-    if head in ("jest", "vitest"):
-        return 1
-    if head in _PKG_MANAGERS:
+        want = (["test"], ["nextest"]) if family == "cargo" else (["nextest"],)
+        return len(tokens) - len(rest) + 1 if head == "cargo" and rest[:1] in want else None
+    if family == "js":
+        if head in ("jest", "vitest"):
+            return 1
+        if head in _PKG_MANAGERS:
+            for i, tok in enumerate(tokens[1:4], start=1):
+                if tok == "test":
+                    return i + 1
+        return None
+    subcommand = {
+        "playwright": ("playwright", "test"),
+        "cypress": ("cypress", "run"),
+        "dotnet": ("dotnet", "test"),
+        "deno": ("deno", "test"),
+        "bun": ("bun", "test"),
+        "swift": ("swift", "test"),
+        "mix": ("mix", "test"),
+        "ng": ("ng", "test"),
+    }
+    if family in subcommand:
+        name, word = subcommand[family]
+        return 2 if head == name and sub == [word] else None
+    single = {
+        "phpunit": ("phpunit",),
+        "rspec": ("rspec",),
+        "ctest": ("ctest",),
+        "bats": ("bats",),
+        "ava": ("ava",),
+        "tap": ("tap",),
+        "gradle": ("gradle", "gradlew"),
+        "mvn": ("mvn", "mvnw"),
+    }
+    if family in single:
+        return 1 if head in single[family] else None
+    if family == "node" and head in ("node", "nodejs"):
         for i, tok in enumerate(tokens[1:4], start=1):
-            if tok == "test":
+            if tok == "--test":
                 return i + 1
     return None
 
 
-def selection_uses(command: str, *, retries_ok: bool = False) -> list[tuple[str, str, str]]:
+def _calls(command: str, defs: Mapping[str, str] | None = None) -> list[tuple[Seg, list[str], str]]:
+    """`(statement, its command words, how it joins the previous one)` for each statement of a
+    script, descending into the body of `sh -c "..."`."""
+    out: list[tuple[Seg, list[str], str]] = []
+    for seg in split_segments(command):
+        if (body := shell_c_body(seg.text, defs)) is not None:
+            out.extend(_calls(body, defs))
+            continue
+        tokens = command_tokens(seg.text, defs)
+        if "|" in tokens:
+            tokens = tokens[: tokens.index("|")]
+        out.append((seg, tokens, seg.sep))
+    return out
+
+
+def selection_uses(
+    command: str, *, retries_ok: bool = False, defs: Mapping[str, str] | None = None
+) -> list[tuple[str, str, str]]:
     """`(runner family, flag, the statement)` for each narrowing flag a runner is run with.
 
     With `retries_ok`, the rerun-the-failures flags (`--lf`) do not count on the right side of
@@ -1064,26 +1387,35 @@ def selection_uses(command: str, *, retries_ok: bool = False) -> list[tuple[str,
     found: list[tuple[str, str, str]] = []
     chain: list[str] = []  # the kinds of check on the current `&&` / `||` chain
     for seg in split_segments(command):
-        if (body := shell_c_body(seg.text)) is not None:
-            found.extend(selection_uses(body, retries_ok=retries_ok))
+        if (body := shell_c_body(seg.text, defs)) is not None:
+            found.extend(selection_uses(body, retries_ok=retries_ok, defs=defs))
             continue
         if seg.sep not in ("&&", "||"):
             chain = []
-        kind = check_kind(seg.text)
+        kind = check_kind(seg.text, defs=defs)
         retry = retries_ok and seg.sep == "||" and kind is not None and kind in chain
         if kind is not None:
             chain.append(kind)
-        tokens = command_tokens(seg.text)
+        tokens = command_tokens(seg.text, defs)
         if "|" in tokens:
             tokens = tokens[: tokens.index("|")]
         for family, flags in _ALL_FLAGS.items():
             start = _runner_end(family, tokens)
             if start is not None:
+                args = tokens[start:]
                 found.extend(
                     (family, n, seg.text)
-                    for t in tokens[start:]
-                    if (n := _flag_name(t, flags)) and not (retry and n in RERUN_FLAGS)
+                    for t in args
+                    if (n := _flag_name(t, flags))
+                    and not (retry and n in RERUN_FLAGS)
+                    and not (n in _VALUED_NOOP and re.search(r"=(?:false|0|no)$", t, re.IGNORECASE))
                 )
+                if "-x test" in flags:
+                    found.extend(
+                        (family, "-x test", seg.text)
+                        for k, t in enumerate(args[:-1])
+                        if t in ("-x", "--exclude-task") and args[k + 1] in ("test", "check")
+                    )
         if "--" in tokens and tokens and _is_tox(tokens[0]):
             pytest_flags = _ALL_FLAGS["pytest"]
             found.extend(
@@ -1094,11 +1426,268 @@ def selection_uses(command: str, *, retries_ok: bool = False) -> list[tuple[str,
     return found
 
 
-def selection_flags(command: str) -> list[tuple[str, str]]:
+_VALUED_NOOP = frozenset({"-DskipTests", "-Dmaven.test.skip"})
+
+
+def selection_flags(command: str, defs: Mapping[str, str] | None = None) -> list[tuple[str, str]]:
     """`(runner family, flag)` for each narrowing flag a test runner is invoked with.
 
     Flags before the runner (`python -m pytest`: the `-m`) do not count; for `tox` and `nox`
     the arguments after `--` are the runner's. `--collect-only` and `--passWithNoTests` count:
     the run then passes without running a test.
     """
-    return sorted({(family, flag) for family, flag, _ in selection_uses(command)})
+    return sorted({(family, flag) for family, flag, _ in selection_uses(command, defs=defs)})
+
+
+# -- positional selection ----------------------------------------------------------------
+# Runners whose command-line paths or names pick what runs, and the flags that take a value
+# (so the value is not read as a path). A flag in `_OPTIONAL_VALUE` takes the next word only
+# when that word is not a flag.
+_POSITIONAL_FAMILIES = ("pytest", "go", "js", "cargo", "playwright", "rspec", "mocha")
+_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "pytest": frozenset(
+        {"-k", "-m", "-p", "-c", "-o", "-W", "-n", "-r", "--maxfail", "--tb", "--durations"}
+        | {"--timeout", "--reruns", "--cov-report", "--junitxml", "--junit-xml", "--rootdir"}
+        | {"--basetemp", "--log-level", "--log-cli-level", "--confcutdir", "--import-mode"}
+        | {"--capture", "--dist", "--color", "--deselect", "--ignore", "--ignore-glob"}
+        | {"--numprocesses", "--cov-config", "--cov-fail-under", "--override-ini", "--html"}
+        | {"--reruns-delay", "--timeout-method", "--randomly-seed", "--durations-min"}
+    ),
+    "js": frozenset(
+        {"-c", "--config", "-w", "--maxWorkers", "--testTimeout", "--reporters", "--shard"}
+        | {"--selectProjects", "--testEnvironment", "--outputFile", "--coverageReporters"}
+        | {"--rootDir", "--roots", "--color", "-t", "--testNamePattern", "--project"}
+        | {"--testPathPattern", "--testPathIgnorePatterns", "--reporter", "--root", "-r"}
+        | {"--dir", "--pool", "--environment", "--retry"}
+    ),
+    "go": frozenset(
+        {"-run", "-skip", "-timeout", "-count", "-p", "-parallel", "-coverprofile", "-covermode"}
+        | {"-tags", "-o", "-bench", "-benchtime", "-cpu", "-coverpkg", "-ldflags", "-mod"}
+        | {"-vet", "-exec", "-gcflags", "-asmflags", "-overlay", "-pkgdir", "-fuzz", "-shuffle"}
+    ),
+    "cargo": frozenset(
+        {"-p", "--package", "--features", "-F", "--target", "--manifest-path", "--profile"}
+        | {"-j", "--jobs", "--test", "--bin", "--example", "--bench", "--target-dir", "--color"}
+        | {"--exclude", "--message-format", "-Z", "--config", "--skip", "--test-threads"}
+    ),
+    "playwright": frozenset(
+        {"--project", "-j", "--workers", "--reporter", "--timeout", "--config", "-c"}
+        | {"--retries", "--grep", "-g", "--grep-invert", "--shard", "--output", "--max-failures"}
+        | {"--global-timeout", "--repeat-each", "--browser", "--trace"}
+    ),
+    "rspec": frozenset(
+        {"-e", "--example", "-t", "--tag", "--format", "-f", "--out", "-o", "--require", "-r"}
+        | {"-P", "--pattern", "--seed", "--default-path", "--order", "-O", "--options"}
+    ),
+    "mocha": frozenset(
+        {"--grep", "-g", "--config", "--require", "-r", "--reporter", "-R", "--timeout", "-t"}
+        | {"--spec", "--file", "--extension", "--ui", "-u", "--retries", "--slow", "-s"}
+    ),
+}
+_OPTIONAL_VALUE: dict[str, frozenset[str]] = {
+    "pytest": frozenset({"--cov"}),
+    "js": frozenset({"--bail", "--coverage"}),
+}
+_PATH_LIKE = re.compile(r"/|::|\.py$|_spec\.rb$")
+# Words after the runner that are its subcommand, not a path.
+_RUNNER_WORDS = {"vitest": frozenset({"run", "watch", "dev", "related"})}
+
+
+def _join_expressions(args: list[str]) -> list[str]:
+    """`${{ matrix.x }}` split on its spaces back into one word."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if "${{" in tok and "}}" not in tok.split("${{", 1)[1]:
+            j = i
+            while j + 1 < len(args) and "}}" not in args[j]:
+                j += 1
+            out.append(" ".join(args[i : j + 1]))
+            i = j + 1
+        else:
+            out.append(tok)
+            i += 1
+    return out
+
+
+def _positionals(family: str, args: list[str]) -> list[str]:
+    """The paths and names among a runner's arguments: flags, their values and numbers dropped."""
+    values = _VALUE_FLAGS.get(family, frozenset())
+    optional = _OPTIONAL_VALUE.get(family, frozenset())
+    args = _join_expressions(args)
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--":
+            if family in ("pytest", "rspec"):
+                out.extend(t for t in args[i + 1 :] if not t.startswith("-") and not t.isdigit())
+            elif family == "go":
+                break
+            i += 1
+        elif tok == "-args" and family == "go":
+            break
+        elif tok.startswith("-") and len(tok) > 1:
+            name = tok.partition("=")[0]
+            if "=" in tok:
+                i += 1
+            elif name in values:
+                i += 2
+            elif name in optional:
+                i += 2 if i + 1 < len(args) and not args[i + 1].startswith("-") else 1
+            else:
+                i += 1
+        elif tok.isdigit():
+            i += 1
+        else:
+            out.append(tok)
+            i += 1
+    return out
+
+
+_GOTESTSUM_VALUES = frozenset(
+    {"--format", "-f", "--junitfile", "--jsonfile", "--post-run-command", "--watch-chdir"}
+    | {"--rerun-fails-max-attempts", "--rerun-fails-report", "--format-icons"}
+    | {"--junitfile-testsuite-name", "--junitfile-testcase-classname", "--raw-command"}
+)
+
+
+def _gotestsum_packages(args: list[str]) -> list[str]:
+    """The packages a `gotestsum` run covers: `--packages` and the path words before `--`, the
+    go test arguments after it; with none of them it runs `./...`."""
+    split = args.index("--") if "--" in args else len(args)
+    own, rest = args[:split], args[split + 1 :]
+    words: list[str] = []
+    i = 0
+    while i < len(own):
+        tok = own[i]
+        name = tok.partition("=")[0]
+        if name == "--packages":
+            value = tok.partition("=")[2] if "=" in tok else "".join(own[i + 1 : i + 2])
+            words.extend(value.split())
+            i += 1 if "=" in tok else 2
+        elif tok.startswith("-") and len(tok) > 1:
+            i += 1 if "=" in tok or name not in _GOTESTSUM_VALUES else 2
+        else:
+            words.append(tok)
+            i += 1
+    words.extend(_positionals("go", rest))
+    return words or ["./..."]
+
+
+def _invocations(
+    commands: Sequence[str], defs: Mapping[str, str] | None
+) -> dict[str, list[list[str]]]:
+    """Per runner family, the positional words of each run of it in `commands`."""
+    found: dict[str, list[list[str]]] = {}
+    for command in commands:
+        for _, tokens, _sep in _calls(command, defs):
+            if not tokens:
+                continue
+            if _is_tox(tokens[0]):
+                args = tokens[tokens.index("--") + 1 :] if "--" in tokens else []
+                found.setdefault("pytest", []).append(_positionals("pytest", args))
+                continue
+            for family in _POSITIONAL_FAMILIES:
+                start = _runner_end(family, tokens)
+                if start is None:
+                    continue
+                args = tokens[start:]
+                if family == "go" and _cmd_name(tokens[0]) == "gotestsum":
+                    found.setdefault(family, []).append(_gotestsum_packages(args))
+                    continue
+                if family == "cargo" and tokens[start - 1] == "nextest" and args[:1] == ["run"]:
+                    args = args[1:]
+                words = _RUNNER_WORDS.get(_cmd_name(tokens[0]), frozenset())
+                if args[:1] and args[0] in words:
+                    args = args[1:]
+                found.setdefault(family, []).append(_positionals(family, args))
+    return found
+
+
+def _norm_path(family: str, word: str) -> str:
+    word = word.rstrip("/") or word
+    if word == "":
+        return "."
+    return word if family == "go" or word == "." else word.removeprefix("./") or "."
+
+
+def _covers(family: str, c: str, b: str) -> bool:
+    """Whether the candidate's positional `c` runs everything the base's `b` ran."""
+    c, b = _norm_path(family, c), _norm_path(family, b)
+    if c == b:
+        return True
+    if family == "go":
+        if c in ("./...", "..."):
+            return True
+        return c.endswith("/...") and (b.startswith(c[:-3]) or b == c[:-4])
+    return c == "." or b.startswith((c + "/", c + "::"))
+
+
+def _restricts(family: str, words: list[str]) -> bool:
+    """Whether a run with these positional words runs less than everything."""
+    if not words:
+        return False
+    if family in ("pytest", "rspec"):
+        return all(_PATH_LIKE.search(w.rstrip("/")) for w in words)
+    return True
+
+
+def narrowed_selection(
+    base_cmds: Sequence[str], cand_cmds: Sequence[str], defs: Mapping[str, str] | None = None
+) -> str | None:
+    """A description when the candidate runs a runner on fewer paths or names than the base did.
+
+    A positional is a word after the runner (and its subcommand) that is not a flag, a flag's
+    value, or a number. For a runner family on both sides: with positionals at the base, the
+    candidate narrows when some base path is covered by no candidate path (`tests` is covered
+    by `tests`, `.`, `./`, a parent; for go also by `./...`); a candidate run with none runs
+    everything. With none at the base, pytest and rspec narrow when every candidate run is
+    given a path (`tests/test_one.py`, `a.py::t`; a plain `tests` is not one), the others
+    (jest, vitest, playwright, cargo) when every candidate run is given any positional, and go
+    reads the base as `.`. mocha is left to `selection_changed_warning`.
+    """
+    base = _invocations(base_cmds, defs)
+    cand = _invocations(cand_cmds, defs)
+    for family in _POSITIONAL_FAMILIES:
+        if family == "mocha" or family not in base or family not in cand:
+            continue
+        base_words = [w for words in base[family] for w in words]
+        cand_runs = cand[family]
+        if family == "go":
+            base_words = base_words or ["."]
+            cand_runs = [words or ["."] for words in cand_runs]
+        cand_words = [w for words in cand_runs for w in words]
+        if base_words:
+            if family != "go" and any(not words for words in cand_runs):
+                continue  # a candidate run with no path runs everything
+            lost = [b for b in base_words if not any(_covers(family, c, b) for c in cand_words)]
+            if lost:
+                return (
+                    f"{family} ran `{lost[0]}` before and now runs only"
+                    f" {_listing(cand_words) or 'other paths'}"
+                )
+        elif all(_restricts(family, words) for words in cand_runs):
+            return f"{family} ran everything before and now runs only {_listing(cand_words)}"
+    return None
+
+
+def selection_changed_warning(
+    base_cmds: Sequence[str], cand_cmds: Sequence[str], defs: Mapping[str, str] | None = None
+) -> str | None:
+    """A description when the mocha spec arguments differ: a glob can widen as well as narrow,
+    so this is a warning, never a block."""
+    base = _invocations(base_cmds, defs).get("mocha")
+    cand = _invocations(cand_cmds, defs).get("mocha")
+    if base is None or cand is None:
+        return None
+    before = sorted({w for words in base for w in words})
+    after = sorted({w for words in cand for w in words})
+    if before == after:
+        return None
+    return f"mocha spec arguments changed from {_listing(before) or 'none'} to {_listing(after)}"
+
+
+def _listing(words: Sequence[str]) -> str:
+    return ", ".join(f"`{w}`" for w in dict.fromkeys(words))

@@ -667,17 +667,46 @@ action (`uses: ./path`, read from `action.yml` or `action.yaml` in the candidate
 `sh x.sh`), read one level deep with a 64 KiB cap. Expansion only adds kinds on the
 candidate side; the base is read as written. A kind that vanishes from every candidate
 workflow blocks, unless the step that replaced it is something the rule cannot classify
-(`poe test`, `pre-commit run`, `uses: astral-sh/ruff-action@...`, an unknown action): then
-it is a `warn`. Replacing a check with a recognised non-check (`echo`, `true`, `exit 0`)
+(`poe test`, `pre-commit run`, `uses: astral-sh/ruff-action@...`, an unknown action) and
+sits in the same workflow file and the same job as the check it replaces, is not disabled
+(`if: false`, `continue-on-error`), is not an inline eval and, when it runs a local script,
+that script exists in the candidate: then it is a `warn`. An unknown step in another job or
+file blocks. Replacing a check with a recognised non-check (`echo`, `true`, `exit 0`)
 still blocks. Fewer steps of a kind that still exists is `warn`. A kind that vanishes is
 also only a `warn` when the candidate tree holds a CI system this rule does not read
 (`.travis.yml`, `azure-pipelines.yml`, `Jenkinsfile`, ...) or a surviving `make test`,
 `npm test` or `tox`/`nox` step that may run it. A YAML anchor on `steps:` (`steps: &name`
 and `steps: *name`) is read; aliased steps report the line of the anchor.
 
+*Expanded bodies.* A local script, a local composite action step and a `bash -c` or `sh -c`
+string get the same analysis as a `run:` step, compared with the base: a swallow (`|| true`,
+`set +e`, an early `exit 0`, a trailing `&`, `trap '... exit 0' EXIT`, `true || check`), an
+inner step with `if: false` or `continue-on-error`, a `bash -n` or `sh -n` (which runs
+nothing), or a script that is missing in the candidate, no longer counts as running the
+check. Script bodies are read with errexit assumed. `A || B` is a retry, and so not a
+swallow, only when B is A plus `--lf`, `--last-failed`, `--ff`, `--failed-first`, `--sw`,
+`--stepwise` or `--reruns N`. A trailing `&` makes the check a swallow. `$VAR`, `${VAR}` and
+`$(VAR)` as a command head are substituted from the step, job or workflow `env:`, then by
+name. `docker run -d`/`--detach` runs no check, and `--entrypoint E` makes the command `E
+args`; `python -c` with `pytest.main` is pytest only when wrapped in `sys.exit`, `raise
+SystemExit` or `exit(...)`; `gotestsum tool ...`, `cargo llvm-cov report|show-env|clean` and
+`--no-run` are not runs. A constant-false `if:` (`false`, `0`, `''`, `!true`, `${{ false }}`)
+disables the step. `continue-on-error` and a false `if:` are matched by step as a multiset
+across the workflow files (a step moved into a reusable workflow with its flag passes), and
+at job level by the sorted signatures of the check steps. Selection narrowing (the same
+runner on fewer paths or names) is judged per runner across all workflows and expanded
+bodies; mocha spec changes only warn.
+
+*Known limits.* Flow-style `steps: [...]`, a `runs-on` computed by `fromJSON`, a `make`
+target that secretly runs tests and `always() && false` are not read.
+
 *The greenproof step.* Greenproof steps are compared across all GitHub workflow files as a
-multiset of signatures: the `uses:` without its ref, `with:`, `if:`, `continue-on-error` and
-`env:`. Moving a step unchanged, or to another file or job, passes. Changing a `with:` input,
+multiset of signatures: the `uses:` without its ref, `with:` (block scalars read; the raw text
+when it cannot be parsed), `if:` of the step and its job, `continue-on-error` and `env:`, and
+whether the workflow has an automatic code event (`push`, `pull_request`,
+`pull_request_target`, `merge_group`) and whether one of them runs on every ref. Moving a step
+unchanged, or to another file or job under the same kind of triggers, passes; moving it to a
+manual or scheduled workflow, or to one whose events are all branch-filtered, blocks. Changing a `with:` input,
 `if:` or `env:` blocks, as does removing the step or deleting the workflow that holds it;
 adding the first greenproof step is adoption. A ref-only bump is `warn`. Non-GitHub files
 compare their greenproof lines per file.

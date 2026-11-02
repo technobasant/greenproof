@@ -40,6 +40,10 @@ class Step:
     coe_line: int = 0
     with_: tuple[tuple[str, str], ...] = ()
     env: tuple[tuple[str, str], ...] = ()
+    # The text of the `with:` block, and whether `with_` holds all of it (False for nested
+    # values, merge keys or an alias it could not resolve: compare the raw text then).
+    with_raw: str = ""
+    with_exact: bool = True
     stop: int = 0  # 1-based line after the step's last line
     job_line: int = 0  # 1-based line of the job's key, 0 when it is not under a job
 
@@ -56,6 +60,7 @@ class Job:
     coe: str | None = None
     coe_line: int = 0
     shell: str | None = None  # the job's `defaults.run.shell`
+    env: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -63,6 +68,7 @@ class Workflow:
     steps: list[Step]
     jobs: list[Job]
     shell: str | None  # the workflow's `defaults.run.shell`
+    env: tuple[tuple[str, str], ...] = ()
 
     def job_of(self, step: Step) -> Job | None:
         return next((j for j in self.jobs if j.line == step.job_line), None)
@@ -73,6 +79,11 @@ class Workflow:
             return step.shell
         job = self.job_of(step)
         return (job.shell if job else None) or self.shell
+
+    def defs_of(self, step: Step) -> dict[str, str]:
+        """The `env:` a step sees: the workflow's, overridden by its job's and its own."""
+        job = self.job_of(step)
+        return {**dict(self.env), **dict(job.env if job else ()), **dict(step.env)}
 
 
 def _indent(raw: str) -> int:
@@ -128,7 +139,7 @@ def parse(text: str) -> Workflow:
     """The workflow's steps and jobs, read once."""
     lines = split_lines(text)
     jobs = _jobs(lines)
-    return Workflow(_steps(lines, jobs), jobs, _workflow_shell(lines))
+    return Workflow(_steps(lines, jobs), jobs, _workflow_shell(lines), _workflow_env(lines))
 
 
 def steps(text: str) -> list[Step]:
@@ -143,6 +154,7 @@ def _job_line(jobs: list[Job], line: int) -> int:
 def _steps(lines: list[str], jobs: list[Job]) -> list[Step]:
     out: list[Step] = []
     anchored: dict[str, list[Step]] = {}
+    anchors: _Anchors = {}
     i = 0
     while i < len(lines):
         alias = _STEPS_ALIAS.match(lines[i])
@@ -178,7 +190,7 @@ def _steps(lines: list[str], jobs: list[Job]) -> list[Step]:
         found: list[Step] = []
         for n, start in enumerate(starts):
             stop = starts[n + 1] if n + 1 < len(starts) else end
-            found.append(_step(lines, start, stop, _job_line(jobs, start + 1)))
+            found.append(_step(lines, start, stop, _job_line(jobs, start + 1), anchors))
         out.extend(found)
         if m.group(2):
             anchored[m.group(2)] = found
@@ -186,44 +198,92 @@ def _steps(lines: list[str], jobs: list[Job]) -> list[Step]:
     return out
 
 
-def _mapping(
-    lines: list[str], at: int, stop: int, col: int, rest: str
-) -> tuple[tuple[str, str], ...]:
-    """The `key: value` pairs of a `with:` or `env:` mapping whose key is on line index `at`."""
+_Map = tuple[tuple[tuple[str, str], ...], str, bool]  # pairs, raw text, pairs are all of it
+_Anchors = dict[str, _Map]
+
+
+def _mapping(lines: list[str], at: int, stop: int, col: int, rest: str) -> _Map:
+    """The `key: value` pairs of a `with:` or `env:` mapping whose key is on line index `at`,
+    the block's raw text, and whether the pairs account for all of it. Block scalars (`|`, `>`)
+    are read; a nested value, a merge key or an alias leaves the pairs partial."""
     rest = rest.strip()
     if rest.startswith("{"):
         try:
             value, _ = _flow(rest)
         except _Unreadable:
-            return ()
+            return (), rest, False
         if isinstance(value, dict):
-            return tuple((str(k), str(v)) for k, v in value.items())
-        return ()
+            return tuple((str(k), str(v)) for k, v in value.items()), rest, True
+        return (), rest, False
     if rest and not rest.startswith("#"):
-        return ()
+        return (), rest, False
     items: list[tuple[str, str]] = []
+    raw_lines: list[str] = []
+    exact = True
+    unresolved = False
     child: int | None = None
-    for k in range(at + 1, stop):
+    k = at + 1
+    while k < stop:
         raw = lines[k]
         if _blank(raw):
+            k += 1
             continue
         ind = _indent(raw)
         if ind <= col:
             break
+        raw_lines.append(re.sub(r"\s+#.*$", "", raw.strip()))
         child = ind if child is None else child
-        if ind == child and (m := re.match(r"^\s*([^\s:#][^:]*?)\s*:\s*(.*)$", raw)):
-            items.append((_unquote(m.group(1)), _clean(m.group(2))))
-    return tuple(items)
+        m = re.match(r"^\s*([^\s:#][^:]*?)\s*:\s*(.*)$", raw) if ind == child else None
+        if not m:
+            exact = False
+            k += 1
+            continue
+        key, value = _unquote(m.group(1)), re.sub(r"\s+#.*$", "", m.group(2).strip())
+        if value[:1] in ("|", ">"):
+            text, _ = _run_value(lines, k, stop, ind, value)
+            items.append((key, text))
+            k += 1
+            while k < stop and (not lines[k].strip() or _indent(lines[k]) > ind):
+                if lines[k].strip():
+                    raw_lines.append(lines[k].strip())
+                k += 1
+            continue
+        if not value or key == "<<" or value[:1] in ("*", "&", "!"):
+            exact = False
+            unresolved = unresolved or key == "<<" or value[:1] == "*"
+        items.append((key, _clean(m.group(2))))
+        k += 1
+    text = "\n".join(raw_lines)
+    return tuple(items), ("\0" + text if unresolved else text), exact
 
 
-def _step(lines: list[str], start: int, stop: int, job_line: int = 0) -> Step:
+def _named_map(
+    lines: list[str], at: int, stop: int, col: int, rest: str, anchors: _Anchors
+) -> _Map:
+    """`_mapping` that follows `&anchor` and `*alias` between steps of one file. An alias it
+    cannot resolve gives a raw text marked with a leading NUL: it is never equal to another."""
+    plain = re.sub(r"\s+#.*$", "", rest.strip())
+    if plain.startswith("*"):
+        name = plain[1:].strip()
+        return anchors.get(name) or ((("*", name),), "\0*" + name, False)
+    anchor = re.match(r"^&([\w.-]+)\s*(.*)$", plain)
+    got = _mapping(lines, at, stop, col, anchor.group(2) if anchor else rest)
+    if anchor:
+        anchors[anchor.group(1)] = got
+    return got
+
+
+def _step(
+    lines: list[str], start: int, stop: int, job_line: int = 0, anchors: _Anchors | None = None
+) -> Step:
+    anchors = {} if anchors is None else anchors
     first = lines[start]
     marker = re.match(r"^(\s*-\s+)", first)
     col = len(marker.group(1)) if marker else _indent(first) + 2
     run: tuple[str, int] | None = None
     shell: str | None = None
     fields: dict[str, tuple[str, int]] = {}
-    maps: dict[str, tuple[tuple[str, str], ...]] = {}
+    maps: dict[str, _Map] = {}
     for k in range(start, stop):
         raw = lines[k]
         body = raw[col:] if k == start and marker else raw
@@ -235,8 +295,8 @@ def _step(lines: list[str], start: int, stop: int, job_line: int = 0) -> Step:
             shell = _unquote(re.sub(r"\s+#.*$", "", m.group(1)))
         elif m := re.match(r"^\s*(uses|name|if|continue-on-error)\s*:\s*(.*)$", body):
             fields.setdefault(m.group(1), (_clean(m.group(2)), k + 1))
-        elif m := re.match(r"^\s*(with|env)\s*:\s*(.*)$", body):
-            maps.setdefault(m.group(1), _mapping(lines, k, stop, col, m.group(2)))
+        elif (m := re.match(r"^\s*(with|env)\s*:\s*(.*)$", body)) and m.group(1) not in maps:
+            maps[m.group(1)] = _named_map(lines, k, stop, col, m.group(2), anchors)
     return Step(
         start + 1,
         *(run or ("", start + 1)),
@@ -247,8 +307,10 @@ def _step(lines: list[str], start: int, stop: int, job_line: int = 0) -> Step:
         if_line=fields.get("if", ("", 0))[1],
         coe=fields.get("continue-on-error", (None, 0))[0],
         coe_line=fields.get("continue-on-error", ("", 0))[1],
-        with_=maps.get("with", ()),
-        env=maps.get("env", ()),
+        with_=maps.get("with", ((), "", True))[0],
+        env=maps.get("env", ((), "", True))[0],
+        with_raw=maps.get("with", ((), "", True))[1],
+        with_exact=maps.get("with", ((), "", True))[2],
         stop=stop + 1,
         job_line=job_line,
     )
@@ -270,6 +332,13 @@ def _workflow_shell(lines: list[str]) -> str | None:
         if re.match(r"^defaults\s*:\s*(?:#.*)?$", raw):
             return _shell_in(_block_after(lines, k, len(lines), 0))
     return None
+
+
+def _workflow_env(lines: list[str]) -> tuple[tuple[str, str], ...]:
+    for k, raw in enumerate(lines):
+        if m := re.match(r"^env\s*:\s*(.*)$", raw):
+            return _mapping(lines, k, len(lines), 0, m.group(1))[0]
+    return ()
 
 
 def _list_items(value: str) -> list[str]:
@@ -345,6 +414,7 @@ def _job(lines: list[str], at: int, stop: int, name: str) -> Job:
     shell: str | None = None
     strategy: list[str] = []
     runs_on_block: list[str] = []
+    env: tuple[tuple[str, str], ...] = ()
     for k in range(at + 1, stop):
         raw = lines[k]
         if _blank(raw):
@@ -361,6 +431,8 @@ def _job(lines: list[str], at: int, stop: int, name: str) -> Job:
             shell = _shell_in(_block_after(lines, k, stop, child))
         elif key == "strategy":
             strategy = _block_after(lines, k, stop, child)
+        elif key == "env":
+            env = _mapping(lines, k, stop, child, value)[0]
     runs_on = fields.get("runs-on", ("", 0))[0]
     if runs_on_block:
         runs_on = " ".join(ln.strip().lstrip("-").strip() for ln in runs_on_block)
@@ -375,6 +447,7 @@ def _job(lines: list[str], at: int, stop: int, name: str) -> Job:
         coe=fields.get("continue-on-error", (None, 0))[0],
         coe_line=fields.get("continue-on-error", ("", 0))[1],
         shell=shell,
+        env=env,
     )
 
 
@@ -563,6 +636,31 @@ def triggers(text: str) -> tuple[Triggers, int] | None:
                 return None
         return _to_triggers(raw), number
     return {}, 1
+
+
+_AUTO_EVENTS = frozenset({"push", "pull_request", "pull_request_target", "merge_group"})
+_REF_FILTERS = ("branches", "branches-ignore", "tags", "tags-ignore")
+
+
+def trigger_key(text: str) -> tuple[object, ...]:
+    """What decides whether a step runs on the code that is changed, in a comparable form: whether
+    the workflow has an automatic event on code at all (push, pull_request, pull_request_target,
+    merge_group), and whether one of them runs on every ref. A workflow that is only manual or
+    scheduled runs on nothing a change touches. Which of the automatic events, and the path
+    filters, are not part of it: a `paths-ignore` has its own check. The raw text of `on:` when
+    it cannot be read."""
+    got = triggers(text)
+    if got is not None:
+        auto = {e: spec for e, spec in got[0].items() if e in _AUTO_EVENTS}
+        every = any(not any(k in spec for k in _REF_FILTERS) for spec in auto.values())
+        return ("on", bool(auto), every)
+    lines = _content_lines(text)
+    for n, (_, indent, content) in enumerate(lines):
+        if indent == 0 and re.match(r"^(?:on|\"on\"|'on')\s*:", content):
+            body = [c for _, ind, c in lines[n + 1 :]]
+            end = next((k for k, (_, ind, _c) in enumerate(lines[n + 1 :]) if ind == 0), len(body))
+            return ("raw", content, tuple(body[:end]))
+    return ("on", ())
 
 
 def _to_triggers(raw: object) -> Triggers:

@@ -166,7 +166,11 @@ _RULES = [
         "GitLab CI and CircleCI get the line-level swallow check. Narrowed branch, tag or "
         "type filters, a matrix-chosen selection flag, continue-on-error with an expression, "
         "fewer steps of a kind that still exists, a replacement the rule cannot classify, and "
-        "a ref-only version bump of the greenproof action are warnings.",
+        "a ref-only version bump of the greenproof action are warnings; an unclassifiable "
+        "replacement counts only in the same file and job, enabled, with its script present. "
+        "Scripts, composite steps and bash -c bodies get the same judgement as a run step, "
+        "and a moved greenproof step keeps its if: and its automatic triggers. Flow-style "
+        "steps, fromJSON runners and make targets that run tests are not read.",
     ),
     RuleInfo(
         "static.parse_error",

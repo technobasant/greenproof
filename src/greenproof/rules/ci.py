@@ -26,7 +26,9 @@ from greenproof.rules.shell import (
     command_tokens,
     find_swallows,
     is_non_check,
+    narrowed_selection,
     scripts_in,
+    selection_changed_warning,
     selection_flags,
     selection_uses,
     split_segments,
@@ -56,9 +58,7 @@ _LINE_SCRIPT = re.compile(r"^(?:-\s*)?(?:(?:run|script|command)\s*:\s*)?")
 _CONTINUE = re.compile(
     r"^continue-on-error\s*:\s*(?!['\"]?false['\"]?\s*(?:#.*)?$)(\S.*)$", re.IGNORECASE
 )
-_IF_FALSE = re.compile(
-    r"^(?:-\s*)?if\s*:\s*['\"]?(?:\$\{\{\s*)?false(?:\s*\}\})?['\"]?\s*$", re.IGNORECASE
-)
+_IF_LINE = re.compile(r"^(?:-\s*)?if\s*:\s*(\S.*?)\s*(?:#.*)?$", re.IGNORECASE)
 _MATRIX = re.compile(r"\$\{\{\s*matrix\.")
 
 # (line, why, warn)
@@ -74,14 +74,6 @@ def _warn(line: int | None, why: str) -> Reason:
 
 
 # -- what a step runs --------------------------------------------------------------------
-def _run_kinds(run: str, literals: list[str], scripts: frozenset[str]) -> list[str]:
-    return [
-        kind
-        for seg in split_segments(run)
-        if (kind := check_kind(seg.text, literals=literals, scripts=scripts))
-    ]
-
-
 @lru_cache(maxsize=128)
 def _wf(text: str) -> workflow.Workflow:
     """A workflow file read once: every later question about it reuses the parse."""
@@ -98,6 +90,7 @@ _NONCHECK_ACTIONS = re.compile(
     r"(?:/[\w./-]+)?$",
     re.IGNORECASE,
 )
+Defs = Mapping[str, str]
 
 
 def _uses_name(uses: str) -> str:
@@ -111,19 +104,23 @@ def _sig(step: workflow.Step) -> tuple[str, str]:
     return ("run", " ".join(step.run.split()))
 
 
-def _read_cand(world: _World, path: str) -> str | None:
-    """A file of the candidate tree, None when it is absent or over the size cap."""
-    if path not in world.files:
+def _read(world: _World, path: str, base: bool = False) -> str | None:
+    """A file of the candidate tree (or the base's), None when it is absent or over the size
+    cap."""
+    key = ("b:" if base else "c:") + path
+    if key not in world.files:
         try:
-            text = world.changes.cand_text(path)
+            text = world.changes.base_text(path) if base else world.changes.cand_text(path)
         except Exception:  # a directory or an unreadable blob is just absent
             text = None
-        world.files[path] = text if text is not None and len(text) <= _MAX_SCRIPT else None
-    return world.files[path]
+        world.files[key] = text if text is not None and len(text) <= _MAX_SCRIPT else None
+    return world.files[key]
 
 
-def _action_runs(world: _World, uses: str) -> list[str]:
-    """The `run:` scripts of a local composite action (`uses: ./path`), read from the candidate."""
+def _action_parts(
+    world: _World, uses: str, base: bool = False
+) -> list[tuple[workflow.Workflow, workflow.Step]]:
+    """The `run:` steps of a local composite action (`uses: ./path`), with the action's file."""
     ref = uses.split("@")[0].strip()
     if not (ref == "." or ref.startswith("./")) or ref.endswith((".yml", ".yaml")):
         return []
@@ -131,52 +128,99 @@ def _action_runs(world: _World, uses: str) -> list[str]:
     if directory.startswith(".."):
         return []
     for name in ("action.yml", "action.yaml"):
-        text = _read_cand(world, posixpath.normpath(posixpath.join(directory, name)))
+        text = _read(world, posixpath.normpath(posixpath.join(directory, name)), base)
         if text is not None:
-            return [s.run for s in _wf(text).steps if s.run]
+            wf = _wf(text)
+            return [(wf, s) for s in wf.steps if s.run]
     return []
 
 
-def _script_bodies(world: _World, run: str) -> list[str]:
+def _script_bodies(
+    world: _World, run: str, defs: Defs | None = None, base: bool = False
+) -> list[str]:
     """The bodies of the local shell scripts `run` runs (one level, not their own scripts)."""
     out: list[str] = []
-    for path in dict.fromkeys(scripts_in(run, "")):
+    for path in dict.fromkeys(scripts_in(run, "", defs)):
         if posixpath.splitext(path)[1].lower() not in _SCRIPT_EXTS:
             continue
-        body = _read_cand(world, path)
+        body = _read(world, path, base)
         if body is not None:
             out.append(body)
     return out
 
 
-def _unit_runs(world: _World | None, step: workflow.Step, expand: bool) -> list[str]:
-    """The scripts a step runs: its own, and on the candidate side those of the local
-    composite action and local scripts it calls."""
-    runs = [step.run] if step.run else []
-    if expand and world is not None:
-        if step.uses:
-            runs.extend(_action_runs(world, step.uses))
-        for run in list(runs):
-            runs.extend(_script_bodies(world, run))
-    return runs
+def _disabled(step: workflow.Step) -> bool:
+    """A step that never runs or whose failure does not fail the job."""
+    return bool(
+        (step.if_ is not None and _if_false(step.if_)) or (step.coe is not None and _coe(step.coe))
+    )
 
 
-def _segments(path: str, text: str, world: _World | None = None) -> list[str]:
-    """The statements of a CI file's scripts: `run:` bodies, or the lines of other CI files.
-    With a `world`, a GitHub step's local action and scripts count too (candidate side)."""
+class _Body(NamedTuple):
+    """A script a step runs, with the shells it may run in and the variables it sees."""
+
+    text: str
+    line: int  # file line of its first line; the step's own line for an expanded body
+    own: bool  # the step's own `run:` rather than an action's step or a script
+    modes: list[_Mode]
+    defs: Defs
+
+
+def _bodies(world: _World, wf: workflow.Workflow, step: workflow.Step, base: bool) -> list[_Body]:
+    """What a step runs: its `run:`, the live `run:` steps of the local composite action it uses
+    and the local shell scripts either calls (one level). A composite step that is disabled
+    (`if: false`, `continue-on-error`) runs no check. The scripts are read from the same side."""
+    defs = wf.defs_of(step)
+    out: list[_Body] = []
+    texts: list[tuple[str, Defs]] = []
+    if step.run:
+        out.append(_Body(step.run, step.run_line, True, _modes(wf, step), defs))
+        texts.append((step.run, defs))
+    if step.uses:
+        for inner_wf, inner in _action_parts(world, step.uses, base):
+            if _disabled(inner):
+                continue
+            inner_defs = {**defs, **inner_wf.defs_of(inner)}
+            out.append(_Body(inner.run, step.line, False, _modes(inner_wf, inner), inner_defs))
+            texts.append((inner.run, inner_defs))
+    for text, text_defs in texts:
+        for path in dict.fromkeys(scripts_in(text, "", text_defs)):
+            if posixpath.splitext(path)[1].lower() not in _SCRIPT_EXTS:
+                continue
+            if (body := _read(world, path, base)) is not None:
+                out.append(_Body(body, step.run_line or step.line, False, [_BASH_E], text_defs))
+    return out
+
+
+def _unit_texts(
+    world: _World | None, wf: workflow.Workflow, step: workflow.Step, base: bool = False
+) -> list[tuple[str, Defs]]:
+    """The scripts a step runs, with the variables they see. Without a `world` only the step's
+    own `run:`."""
+    if world is None:
+        return [(step.run, wf.defs_of(step))] if step.run else []
+    return [(b.text, b.defs) for b in _bodies(world, wf, step, base)]
+
+
+def _segments(
+    path: str, text: str, world: _World | None = None, base: bool = False
+) -> list[tuple[str, Defs]]:
+    """The statements of a CI file's scripts, with the variables they see: `run:` bodies, or the
+    lines of other CI files. With a `world`, a GitHub step's local action and scripts count too."""
     if _GITHUB.match(path):
+        wf = _wf(text)
         return [
-            seg.text
-            for step in _wf(text).steps
-            for run in _unit_runs(world, step, True)
+            (seg.text, defs)
+            for step in wf.steps
+            for run, defs in _unit_texts(world, wf, step, base)
             for seg in split_segments(run)
         ]
-    out: list[str] = []
+    out: list[tuple[str, Defs]] = []
     for raw in split_lines(text):
         line = raw.strip()
         if not line.startswith("#"):
             body = _LINE_SCRIPT.sub("", line, count=1).strip().strip("\"'")
-            out.extend(seg.text for seg in split_segments(body))
+            out.extend((seg.text, {}) for seg in split_segments(body))
     return out
 
 
@@ -188,8 +232,8 @@ def _counted_kinds(
     world: _World | None = None,
 ) -> Counter[str]:
     out: Counter[str] = Counter()
-    for seg in _segments(path, text, world):
-        kind = check_kind(seg, literals=literals, scripts=scripts)
+    for seg, defs in _segments(path, text, world):
+        kind = check_kind(seg, literals=literals, scripts=scripts, defs=defs)
         if kind and kind not in _UNCOUNTED:
             out[kind] += 1
     return out
@@ -200,26 +244,29 @@ CHECK, NONCHECK, UNKNOWN = "check", "noncheck", "unknown"
 
 def _local_action_class(world: _World, uses: str) -> str:
     """A local composite action judged by what is in it. An action that is not in the tree runs
-    nothing."""
+    nothing; an inner step that is disabled runs no check."""
     ref = posixpath.normpath(uses.split("@")[0].strip())
     text = next(
         (
             t
             for name in ("action.yml", "action.yaml")
-            if (t := _read_cand(world, posixpath.normpath(posixpath.join(ref, name)))) is not None
+            if (t := _read(world, posixpath.normpath(posixpath.join(ref, name)))) is not None
         ),
         None,
     )
     if text is None:
         return NONCHECK
-    inner = _wf(text).steps
+    inner_wf = _wf(text)
+    inner = inner_wf.steps
     if not inner:
         return UNKNOWN
-    classes = {_step_class(world, s) for s in inner}
+    classes = {NONCHECK if _disabled(s) else _step_class(world, inner_wf, s) for s in inner}
     return CHECK if CHECK in classes else UNKNOWN if UNKNOWN in classes else NONCHECK
 
 
-def _step_class(world: _World, step: workflow.Step, *, local_known: bool = False) -> str:
+def _step_class(
+    world: _World, wf: workflow.Workflow, step: workflow.Step, *, local_known: bool = False
+) -> str:
     """Whether a candidate step runs a check, recognisably runs none, or cannot be told. A local
     action stays unknown unless `local_known`: it may hold anything, so a flag on it blocks."""
     if step.uses:
@@ -231,38 +278,38 @@ def _step_class(world: _World, step: workflow.Step, *, local_known: bool = False
                 return UNKNOWN
             if local_known:
                 return _local_action_class(world, step.uses)
-            runs = _unit_runs(world, step, True)
-            return CHECK if _has_kind(world, runs) else UNKNOWN
+            return CHECK if _has_kind(world, _unit_texts(world, wf, step)) else UNKNOWN
         return NONCHECK if _NONCHECK_ACTIONS.match(name) else UNKNOWN
-    runs = _unit_runs(world, step, True)
-    if not runs:
+    texts = _unit_texts(world, wf, step)
+    if not texts:
         return UNKNOWN
-    if _has_kind(world, runs):
+    if _has_kind(world, texts):
         return CHECK
+    defs = wf.defs_of(step)
     for seg in split_segments(step.run):
-        if is_non_check(seg.text):
+        if is_non_check(seg.text, defs):
             continue
-        bodies = _script_bodies(world, seg.text)
+        bodies = _script_bodies(world, seg.text, defs)
         if not bodies or not all(
-            is_non_check(s.text) for body in bodies for s in split_segments(body)
+            is_non_check(s.text, defs) for body in bodies for s in split_segments(body)
         ):
             return UNKNOWN
     return NONCHECK
 
 
-def _has_kind(world: _World, runs: list[str]) -> bool:
+def _has_kind(world: _World, texts: list[tuple[str, Defs]]) -> bool:
     return any(
-        check_kind(seg.text, literals=world.literals, scripts=world.scripts)
-        for run in runs
+        check_kind(seg.text, literals=world.literals, scripts=world.scripts, defs=defs)
+        for run, defs in texts
         for seg in split_segments(run)
     )
 
 
-def _hands_off(seg: str, literals: list[str], scripts: frozenset[str]) -> bool:
+def _hands_off(seg: str, literals: list[str], scripts: frozenset[str], defs: Defs) -> bool:
     """A statement that runs a make target the rule cannot read, which may hold the checks."""
-    if check_kind(seg, literals=literals, scripts=scripts):
+    if check_kind(seg, literals=literals, scripts=scripts, defs=defs):
         return False
-    tokens = command_tokens(seg)
+    tokens = command_tokens(seg, defs)
     return bool(tokens) and tokens[0] in _TASK_RUNNERS
 
 
@@ -355,14 +402,29 @@ def _coe(value: str) -> str | None:
     return "expr" if text.startswith("${{") else "yes"
 
 
+_FALSE_AND = re.compile(r"^(?:false|0|!\s*true|null)\s*&&", re.IGNORECASE)
+_CONSTANT_FALSE = frozenset({"false", "0", "", "!true", "null"})
+
+
 def _if_false(value: str) -> bool:
-    text = value.strip().strip("'\"").strip()
-    if text.startswith("${{") and text.endswith("}}"):
-        text = text[3:-2].strip()
-    return text.strip("'\"").strip().lower() == "false"
+    """An `if:` that is constant false: `false`, `0`, `''`, `!true`, `null`, `false && ...`,
+    quoted or inside `${{ }}`. (`always() && false` is not read: a known limit.)"""
+    text = value.strip()
+    for _ in range(3):
+        text = text.strip("'\"").strip()
+        if text.startswith("${{") and text.endswith("}}"):
+            text = text[3:-2].strip()
+    text = re.sub(r"\s+", " ", text.strip("'\"").strip()).lower()
+    return text in _CONSTANT_FALSE or bool(_FALSE_AND.match(text.replace(" ", "")))
 
 
 # -- the world: every CI file at the base and in the candidate -----------------------------
+class _Unknown(NamedTuple):
+    path: str
+    job: str
+    desc: str
+
+
 @dataclass
 class _World:
     base: dict[str, str]
@@ -386,7 +448,10 @@ class _World:
     base_job_if_false: set[str] = field(default_factory=set)
     base_sigs: Counter[tuple[str, str]] = field(default_factory=Counter)
     base_job_uses: set[str] = field(default_factory=set)
-    unknown: list[str] | None = None
+    unknown: list[_Unknown] | None = None
+    strict: dict[bool, tuple[Counter[tuple[str, str]], Counter[tuple[object, ...]]]] = field(
+        default_factory=dict
+    )
 
     def total(self, base: bool) -> Counter[str]:
         out: Counter[str] = Counter()
@@ -394,11 +459,35 @@ class _World:
             out.update(counts)
         return out
 
-    def new_unknown(self) -> list[str]:
+    def strict_counts(
+        self, base: bool
+    ) -> tuple[Counter[tuple[str, str]], Counter[tuple[object, ...]]]:
+        """How many steps (by signature) and jobs (by the signatures of their check steps) run
+        strictly in every workflow file of a side: not disabled, no `continue-on-error`, and not
+        inside a job that is."""
+        if base not in self.strict:
+            steps: Counter[tuple[str, str]] = Counter()
+            jobs: Counter[tuple[object, ...]] = Counter()
+            for path, text in (self.base if base else self.cand).items():
+                if not _GITHUB.match(path):
+                    continue
+                wf = _wf(text)
+                for step in wf.steps:
+                    job = wf.job_of(step)
+                    if not _disabled(step) and not (job and _job_disabled(job)):
+                        steps[_sig(step)] += 1
+                for job in wf.jobs:
+                    if not _job_disabled(job):
+                        jobs[_job_key(self, wf, job)] += 1
+            self.strict[base] = (steps, jobs)
+        return self.strict[base]
+
+    def new_unknown(self) -> list[_Unknown]:
         """Steps (and called workflows) the candidate has that the base did not, and whose
-        commands the rule cannot read: one of them may run a check that was removed."""
+        commands the rule cannot read: one of them may run a check that was removed. A step that
+        is disabled, or runs a script that is not in the tree, runs nothing."""
         if self.unknown is None:
-            found: list[str] = []
+            found: list[_Unknown] = []
             seen = Counter(self.base_sigs)
             for path, text in self.cand.items():
                 if not _GITHUB.match(path):
@@ -408,14 +497,46 @@ class _World:
                     sig = _sig(step)
                     if seen[sig] > 0:
                         seen[sig] -= 1
-                    elif _step_class(self, step, local_known=True) == UNKNOWN:
-                        found.append(_describe(step))
+                        continue
+                    job = wf.job_of(step)
+                    if _disabled(step) or (job and _job_disabled(job)):
+                        continue
+                    if _step_class(self, wf, step, local_known=True) != UNKNOWN:
+                        continue
+                    if self._missing_script(wf, step):
+                        continue
+                    found.append(_Unknown(path, job.name if job else "", _describe(step)))
                 for job in wf.jobs:
                     uses = _uses_name(job.uses) if job.uses else ""
-                    if uses and not uses.startswith(".") and uses not in self.base_job_uses:
-                        found.append(f"uses: {job.uses}")
+                    if (
+                        uses
+                        and not uses.startswith(".")
+                        and uses not in self.base_job_uses
+                        and not _job_disabled(job)
+                    ):
+                        found.append(_Unknown(path, job.name, f"uses: {job.uses}"))
             self.unknown = found
         return self.unknown
+
+    def _missing_script(self, wf: workflow.Workflow, step: workflow.Step) -> bool:
+        """Whether a step runs a script that is not in the candidate tree."""
+        paths = scripts_in(step.run, "", wf.defs_of(step)) if step.run else []
+        return any(_read(self, path) is None for path in paths)
+
+
+def _job_disabled(job: workflow.Job) -> bool:
+    return bool(
+        (job.if_ is not None and _if_false(job.if_)) or (job.coe is not None and _coe(job.coe))
+    )
+
+
+def _job_key(world: _World, wf: workflow.Workflow, job: workflow.Job) -> tuple[object, ...]:
+    """A job apart from its name: the signatures of the steps in it that are or may be checks,
+    or the workflow it calls."""
+    if job.uses:
+        return ("uses", _uses_name(job.uses))
+    members = [s for s in wf.steps if s.job_line == job.line]
+    return tuple(sorted(_sig(s) for s in members if _step_class(world, wf, s) != NONCHECK))
 
 
 def _describe(step: workflow.Step) -> str:
@@ -444,25 +565,28 @@ def _ci_files(changes: ChangeSet, base: bool) -> dict[str, str]:
 
 
 def _swallow_keys(
-    wf: workflow.Workflow, step: workflow.Step, world: _World
+    wf: workflow.Workflow, step: workflow.Step, world: _World, base: bool = False
 ) -> list[tuple[str, str, int, str]]:
-    """`(kind, text, line, reason)` of each place a step's script swallows a check failure,
-    under every shell the step may run in."""
+    """`(kind, text, line, reason)` of each place what a step runs swallows a check failure: its
+    script, its local composite action's steps and the local scripts they call, each under every
+    shell it may run in."""
     out: list[tuple[str, str, int, str]] = []
-    for mode in _modes(wf, step):
-        out.extend(
-            (w.kind, w.text, step.run_line + w.line - 1, w.reason)
-            for w in find_swallows(
-                step.run,
-                world.literals,
-                opaque=False,
-                errexit=mode.errexit,
-                early=True,
-                scripts=world.scripts,
-                strict_status=mode.strict,
-                powershell=mode.ps,
+    for body in _bodies(world, wf, step, base):
+        for mode in body.modes:
+            out.extend(
+                (w.kind, w.text, body.line + (w.line - 1 if body.own else 0), w.reason)
+                for w in find_swallows(
+                    body.text,
+                    world.literals,
+                    opaque=False,
+                    errexit=mode.errexit,
+                    early=True,
+                    scripts=world.scripts,
+                    strict_status=mode.strict,
+                    powershell=mode.ps,
+                    defs=body.defs,
+                )
             )
-        )
     return out
 
 
@@ -484,10 +608,11 @@ def _world(changes: ChangeSet, commands: Mapping[str, str] | None) -> _World:
                 world.base_coe.add(_sig(step))
             if step.if_ is not None and _if_false(step.if_):
                 world.base_if_false.add(_sig(step))
-            if not step.run:
-                continue
-            world.base_flags.update(selection_flags(step.run))
-            world.base_swallows.update((k, t) for k, t, _, _ in _swallow_keys(wf, step, world))
+            for body in _bodies(world, wf, step, True):
+                world.base_flags.update(selection_flags(body.text, body.defs))
+            world.base_swallows.update(
+                (k, t) for k, t, _, _ in _swallow_keys(wf, step, world, True)
+            )
         for job in wf.jobs:
             if job.coe is not None and _coe(job.coe):
                 world.base_job_coe.add(job.name)
@@ -496,9 +621,9 @@ def _world(changes: ChangeSet, commands: Mapping[str, str] | None) -> _World:
             if job.uses:
                 world.base_job_uses.add(_uses_name(job.uses))
     world.hands_off = any(
-        _hands_off(seg, literals, scripts)
+        _hands_off(seg, literals, scripts, defs)
         for path, text in world.cand.items()
-        for seg in _segments(path, text, world)
+        for seg, defs in _segments(path, text, world)
     )
     world.other_ci = any(_OTHER_CI.match(p) for p in changes.cand_paths())
     world.base_has_tests = any(
@@ -833,41 +958,60 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
     base_flags = set(world.base_flags)
     reported: set[tuple[int, str]] = set()
     for step in wf.steps:
-        if not step.run or not _modes(wf, step):
-            continue
         for kind, stmt, at, why in _swallow_keys(wf, step, world):
             if remaining[(kind, stmt)] > 0:
                 remaining[(kind, stmt)] -= 1
             elif (at, why) not in reported:
                 reported.add((at, why))
                 out.append(_block(at, why))
-        for family, flag, stmt in selection_uses(step.run, retries_ok=True):
-            if (family, flag) in base_flags:
-                continue
-            noop = any(flag in flags for flags in NOOP_FLAGS.values())
-            if not noop and not world.base_has_tests:
-                continue
-            base_flags.add((family, flag))
-            at = _line_of(lines, step.run_line, step.stop, flag)
-            if noop:
-                why = f"`{flag}` added to a {family} test step: the run passes without a test"
-                out.append(_block(at, why))
-            elif _MATRIX.search(stmt[stmt.find(flag) :]):
-                why = f"`{flag}` with a matrix value added to a {family} test step"
-                out.append(_warn(at, why + ": it may run fewer tests"))
-            else:
-                out.append(
-                    _block(at, f"`{flag}` added to a {family} test step: it runs fewer tests")
-                )
+        for body in _bodies(world, wf, step, False):
+            for family, flag, stmt in selection_uses(body.text, retries_ok=True, defs=body.defs):
+                if (family, flag) in base_flags:
+                    continue
+                noop = any(flag in flags for flags in NOOP_FLAGS.values())
+                if not noop and not world.base_has_tests:
+                    continue
+                base_flags.add((family, flag))
+                at = _line_of(lines, step.run_line, step.stop, flag) if body.own else step.line
+                if noop:
+                    why = f"`{flag}` added to a {family} test step: the run passes without a test"
+                    out.append(_block(at, why))
+                elif _MATRIX.search(stmt[stmt.find(flag) :]):
+                    why = f"`{flag}` with a matrix value added to a {family} test step"
+                    out.append(_warn(at, why + ": it may run fewer tests"))
+                else:
+                    out.append(
+                        _block(at, f"`{flag}` added to a {family} test step: it runs fewer tests")
+                    )
     return out
 
 
-def _flag_reasons(text: str, world: _World, consumed: set[int]) -> list[Reason]:
-    """`continue-on-error` and `if: false` added to a step or job that runs a check. One that
-    was already there, or sits on a step or job that runs no check, is not a finding."""
+def _bad_steps(wf: workflow.Workflow) -> Counter[tuple[str, tuple[str, str]]]:
+    """The steps with `continue-on-error` or `if: false`, counted by (job, signature)."""
+    out: Counter[tuple[str, tuple[str, str]]] = Counter()
+    for step in wf.steps:
+        if _disabled(step):
+            job = wf.job_of(step)
+            out[(job.name if job else "", _sig(step))] += 1
+    return out
+
+
+def _flag_reasons(text: str, world: _World, consumed: set[int], old: str | None) -> list[Reason]:
+    """`continue-on-error` and `if: false` added to a step or job that runs a check.
+
+    A step or job that carries the flag at the base (in any file) is not a finding, unless a
+    strict run of the same step (or of a job with the same check steps) is gone and the flag is
+    new in this file: the flag moved onto the check that was strict. One that sits on a step or
+    job that runs no check is not a finding."""
     out: list[Reason] = []
     wf = _wf(text)
+    base_wf = _wf(old) if old is not None else None
+    base_bad = _bad_steps(base_wf) if base_wf else Counter()
+    base_bad_jobs = {j.name for j in base_wf.jobs if _job_disabled(j)} if base_wf else set()
+    strict_steps, strict_jobs = world.strict_counts(False)
+    was_steps, was_jobs = world.strict_counts(True)
     seen: set[tuple[int, str]] = set()
+    now_bad: Counter[tuple[str, tuple[str, str]]] = Counter()
 
     def add(reason: Reason) -> None:
         if reason[0] is None or (reason[0], reason[1]) not in seen:
@@ -882,47 +1026,78 @@ def _flag_reasons(text: str, world: _World, consumed: set[int]) -> list[Reason]:
     by_job: dict[int, list[workflow.Step]] = {}
     for step in wf.steps:
         by_job.setdefault(step.job_line, []).append(step)
-        consumed.update(n for n in (step.coe_line, step.if_line) if n)
         bad_coe = _coe(step.coe) if step.coe is not None else None
         bad_if = step.if_ is not None and _if_false(step.if_)
-        if not (bad_coe or bad_if) or _step_class(world, step) == NONCHECK:
+        if not (bad_coe or bad_if) or _step_class(world, wf, step) == NONCHECK:
+            consumed.update(n for n in (step.coe_line, step.if_line) if n)
             continue
         sig = _sig(step)
-        if bad_coe and sig not in world.base_coe:
+        job = wf.job_of(step)
+        where = (job.name if job else "", sig)
+        now_bad[where] += 1
+        moved = now_bad[where] > base_bad[where] and strict_steps[sig] < was_steps[sig]
+        if bad_coe and (sig not in world.base_coe or moved):
             add(coe_reason(step.coe_line, bad_coe == "expr", "a step"))
-        if bad_if and sig not in world.base_if_false:
+        elif bad_coe:
+            consumed.add(step.coe_line)
+        if bad_if and (sig not in world.base_if_false or moved):
             add(_block(step.if_line, "`if: false` added, the step never runs"))
+        elif bad_if:
+            consumed.add(step.if_line)
+        consumed.update(n for n in (step.coe_line, step.if_line) if n and (bad_coe or bad_if))
     for job in wf.jobs:
-        consumed.update(n for n in (job.coe_line, job.if_line) if n)
         bad_coe = _coe(job.coe) if job.coe is not None else None
         bad_if = job.if_ is not None and _if_false(job.if_)
-        if not (bad_coe or bad_if):
-            continue
         members = by_job.get(job.line, [])
-        if not job.uses and all(_step_class(world, s) == NONCHECK for s in members):
+        if not (bad_coe or bad_if) or (
+            not job.uses and all(_step_class(world, wf, s) == NONCHECK for s in members)
+        ):
+            consumed.update(n for n in (job.coe_line, job.if_line) if n)
             continue
-        if bad_coe and job.name not in world.base_job_coe:
+        key = _job_key(world, wf, job)
+        moved = job.name not in base_bad_jobs and strict_jobs[key] < was_jobs[key]
+        if bad_coe and (job.name not in world.base_job_coe or moved):
             add(coe_reason(job.coe_line, bad_coe == "expr", "a job"))
-        if bad_if and job.name not in world.base_job_if_false:
+        if bad_if and (job.name not in world.base_job_if_false or moved):
             add(_block(job.if_line, "`if: false` added, the job never runs"))
+        consumed.update(n for n in (job.coe_line, job.if_line) if n)
     return out
 
 
-def _gone_reasons(gone: list[str], world: _World) -> list[Reason]:
-    """Check kinds that left every workflow. A new step the rule cannot read may run them (a
-    warning); otherwise they are plainly lost."""
+def _gone_reasons(gone: list[str], world: _World, path: str, base_path: str) -> list[Reason]:
+    """Check kinds that left every workflow. A new step the rule cannot read, in the same
+    workflow file and job that ran the kind, may run it (a warning); otherwise they are plainly
+    lost."""
     if not gone:
         return []
-    if unknown := world.new_unknown():
+    if unknown := _unknown_in_place(world, gone, path, base_path):
         kinds = ", ".join(gone)
         return [
             _warn(
                 None,
                 f"the {kinds} step is gone; a new step the rule cannot read may run it"
-                f" ({unknown[0]})",
+                f" ({unknown[0].desc})",
             )
         ]
     return [_block(None, f"a {kind} step was removed or replaced") for kind in gone]
+
+
+def _unknown_in_place(world: _World, gone: list[str], path: str, base_path: str) -> list[_Unknown]:
+    """The new unreadable steps in the workflow file and job where a gone kind used to run."""
+    text = world.base.get(base_path)
+    if text is None or not _GITHUB.match(base_path):
+        return []
+    wf = _wf(text)
+    jobs: set[str] = set()
+    for step in wf.steps:
+        defs = wf.defs_of(step)
+        if any(
+            check_kind(seg.text, literals=world.literals, scripts=world.scripts, defs=defs) in gone
+            for seg in split_segments(step.run)
+        ):
+            job = wf.job_of(step)
+            jobs.add(job.name if job else "")
+    return [u for u in world.new_unknown() if u.path == path and u.job in jobs]
 
 
 def _reasons(f: ChangedFile, world: _World) -> list[Reason]:
@@ -954,25 +1129,17 @@ def _reasons(f: ChangedFile, world: _World) -> list[Reason]:
                 _warn(None, f"fewer {kind} steps than before ({base_c[kind]} -> {cand_c[kind]})")
             )
     if new is None:
-        if len(gone) and (unknown := world.new_unknown()):
-            out.append(
-                _warn(
-                    None,
-                    f"the workflow file was deleted, removing its {', '.join(gone)} steps;"
-                    f" a new step the rule cannot read may run them ({unknown[0]})",
-                )
-            )
-        elif gone:
+        if gone:
             out.append(
                 _block(None, f"the workflow file was deleted, removing its {', '.join(gone)} steps")
             )
         if not github and _greenproof_lines(old):
             out.append(_block(None, "the workflow that runs greenproof was deleted"))
         return out
-    out.extend(_gone_reasons(gone, world))
+    out.extend(_gone_reasons(gone, world, f.path, base_path))
     consumed: set[int] = set()
     if github:
-        out.extend(_flag_reasons(new, world, consumed))
+        out.extend(_flag_reasons(new, world, consumed, old))
     before_lines = Counter(ln.strip() for ln in split_lines(old or ""))
     for number, raw in enumerate(split_lines(new), start=1):
         line = raw.strip()
@@ -988,7 +1155,7 @@ def _reasons(f: ChangedFile, world: _World) -> list[Reason]:
                 out.append(_warn(number, "`continue-on-error` added with an expression"))
             else:
                 out.append(_block(number, "`continue-on-error` added"))
-        elif _IF_FALSE.match(line):
+        elif (m := _IF_LINE.match(line)) and _if_false(m.group(1)):
             out.append(_block(number, "`if: false` added, the step or job never runs"))
         elif not github and (why := _line_swallow(line, world)):
             out.append(_block(number, f"{why}: {line[:80]}"))
@@ -1032,12 +1199,16 @@ class _Gp(NamedTuple):
 def _gp_steps(files: dict[str, str]) -> list[_Gp]:
     """Each GitHub step that is the greenproof step: it `uses:` the action or runs
     `greenproof check`. Its signature covers the action (with and without the ref), the script
-    and the `with:`, `if:`, `continue-on-error` and `env:` that decide what it does."""
+    and the `with:` (as read, or its raw text when it holds more than the reader follows), the
+    `if:` of the step and of its job, `continue-on-error` and `env:`, and the workflow's
+    triggers: the step is the same only where it runs under the same conditions."""
     out: list[_Gp] = []
     for path, text in files.items():
         if not _GITHUB.match(path):
             continue
-        for step in _wf(text).steps:
+        wf = _wf(text)
+        when: tuple[object, ...] | None = None
+        for step in wf.steps:
             uses = step.uses or ""
             runs = any(
                 not ln.strip().startswith("#") and _GP_RUN.search(ln)
@@ -1045,12 +1216,23 @@ def _gp_steps(files: dict[str, str]) -> list[_Gp]:
             )
             if "greenproof" not in uses.lower() and not runs:
                 continue
+            if when is None:
+                when = workflow.trigger_key(text)
+            job = wf.job_of(step)
+            with_: tuple[object, ...] = (
+                tuple(sorted(step.with_)) if step.with_exact else (step.with_raw,)
+            )
+            if step.with_raw.startswith("\0"):
+                with_ += ((path, step.line),)  # an alias it could not resolve: never equal
             rest = (
                 " ".join(step.run.split()),
-                tuple(sorted(step.with_)),
+                with_,
                 step.if_,
                 step.coe,
                 tuple(sorted(step.env)),
+                when,
+                job.if_ if job else None,
+                job.coe if job else None,
             )
             desc = _describe(step)
             if step.with_:
@@ -1083,6 +1265,41 @@ def _greenproof_reasons(world: _World) -> list[tuple[str, int | None, str, bool]
     return [(gone.path, None, f"the greenproof step was removed ({gone.desc})", False)]
 
 
+def _commands(world: _World, base: bool) -> tuple[list[str], dict[str, str]]:
+    """Every command the CI files of a side run (live steps only, local scripts and composite
+    actions included), and the variables they are defined by."""
+    cmds: list[str] = []
+    defs: dict[str, str] = {}
+    for path, text in (world.base if base else world.cand).items():
+        if not _GITHUB.match(path):
+            cmds.extend(seg for seg, _ in _segments(path, text))
+            continue
+        wf = _wf(text)
+        for step in wf.steps:
+            job = wf.job_of(step)
+            if _disabled(step) or (job and _job_disabled(job)):
+                continue
+            for body in _bodies(world, wf, step, base):
+                cmds.append(body.text)
+                defs.update(body.defs)
+    return cmds, defs
+
+
+def _selection_reasons(world: _World, path: str) -> list[tuple[str, int | None, str, bool]]:
+    """A runner that ran a set of paths at the base and now runs fewer, across all workflows."""
+    base_cmds, base_defs = _commands(world, True)
+    cand_cmds, cand_defs = _commands(world, False)
+    if base_cmds == cand_cmds:
+        return []
+    defs = {**base_defs, **cand_defs}
+    out: list[tuple[str, int | None, str, bool]] = []
+    if why := narrowed_selection(base_cmds, cand_cmds, defs):
+        out.append((path, None, f"the tests run on a narrower selection: {why}", False))
+    if why := selection_changed_warning(base_cmds, cand_cmds, defs):
+        out.append((path, None, why, True))
+    return out
+
+
 def check_ci(changes: ChangeSet, commands: Mapping[str, str] | None = None) -> list[Finding]:
     touched = [
         f
@@ -1095,6 +1312,8 @@ def check_ci(changes: ChangeSet, commands: Mapping[str, str] | None = None) -> l
     out: list[Finding] = []
     reasons = [(f.path, line, why, warn) for f in touched for line, why, warn in _reasons(f, world)]
     reasons.extend(_greenproof_reasons(world))
+    here = next((f.path for f in touched if f.new_text is not None), touched[0].path)
+    reasons.extend(_selection_reasons(world, here))
     for path, line, why, warn in reasons:
         message = f"{path}: {why}"
         if warn:
