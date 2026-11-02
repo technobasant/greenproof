@@ -1875,6 +1875,25 @@ def _js_runner(tokens: list[str]) -> tuple[str, int] | None:
 _EXPRESSION = re.compile(r"\$\{\{.*?\}\}")  # `${{ matrix.x }}` is one word once substituted
 
 
+_REDIRECT = re.compile(r"(?:\d*|&)(?:>>?|<<?<?|>&|<&)(?P<target>.*)")
+
+
+def _without_redirects(args: list[str]) -> list[str]:
+    """`args` without redirections (`2>&1`, `> out.log`, `>out.log`): they are not selections."""
+    out: list[str] = []
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        m = _REDIRECT.fullmatch(a)
+        if m is None:
+            out.append(a)
+        elif not m["target"]:
+            skip = True
+    return out
+
+
 def _invocations(commands: Sequence[str], defs: Mapping[str, str] | None) -> dict[str, list[_Run]]:
     """Per runner family, each run of it in `commands`, with its positional words."""
     found: dict[str, list[_Run]] = {}
@@ -1885,6 +1904,7 @@ def _invocations(commands: Sequence[str], defs: Mapping[str, str] | None) -> dic
                 continue
             if _is_tox(tokens[0]):
                 args = tokens[tokens.index("--") + 1 :] if "--" in tokens else []
+                args = _without_redirects(args)
                 found.setdefault("pytest", []).append(_Run(_positionals("pytest", args)))
                 continue
             for family in _POSITIONAL_FAMILIES:
@@ -1897,7 +1917,7 @@ def _invocations(commands: Sequence[str], defs: Mapping[str, str] | None) -> dic
                     start = _runner_end(family, tokens)
                 if start is None:
                     continue
-                args = tokens[start:]
+                args = _without_redirects(tokens[start:])
                 if family == "go" and _cmd_name(tokens[0]) == "gotestsum":
                     found.setdefault(family, []).append(_Run(_gotestsum_packages(args)))
                     continue
@@ -2095,6 +2115,8 @@ def selected_test_files(family: str, runs: Sequence[_Run], tf: TestFiles | None)
     words = sum(len(r.words) for r in runs)
     if words * len(files) > _SELECT_BUDGET:
         return None
+    if any("$" in w or "`" in w for r in runs for w in r.words):
+        return None  # a word the shell expands (`"$@"`, `$DIR`) names what this reading cannot know
     out: set[str] = set()
     for run in runs:
         if not run.words:

@@ -122,6 +122,23 @@ def test_a_name_filter_is_still_a_narrowing(tmp_path: Path) -> None:
     assert run_js(tmp_path / "p", "jest", "jest --testNamePattern smoke test e2e") == "block"
 
 
+def test_a_filter_or_one_test_file_that_happens_to_cover_everything_is_a_narrowing(
+    tmp_path: Path,
+) -> None:
+    one = {"cart.test.js": JS}
+    assert run_js(tmp_path, "jest", "jest cart.test", one) == "block"
+    assert run_js(tmp_path / "p", "jest", "jest cart.test.js", one) == "block"
+    assert run_js(tmp_path / "q", "jest", "jest test e2e", TWO) != "block"
+
+
+def test_a_redirection_or_an_expanded_word_is_not_a_selection() -> None:
+    tf = TestFiles(["tests/test_a.py"])
+    assert covered_test_files(["pytest 2>&1 | tee out.log"], tf) == {"pytest": {"tests/test_a.py"}}
+    assert covered_test_files(["pytest > out.log tests"], tf) == {"pytest": {"tests/test_a.py"}}
+    assert covered_test_files(['pytest "$@"'], tf) == {"pytest": None}
+    assert covered_test_files(["pytest $DIR"], tf) == {"pytest": None}
+
+
 # ---- S2: task runners are read into the commands they run ----------------------------------
 
 WS = {"workspaces": ["packages/*"]}
