@@ -28,8 +28,10 @@ from greenproof.rules.shell import (
     NEXTEST,
     NOOP_FLAGS,
     SELECT_FLAGS,
+    Swallow,
     TestFiles,
     _group_inner,
+    _top_level,
     check_kind,
     command_env,
     command_tokens,
@@ -645,13 +647,17 @@ class _Mode(NamedTuple):
     """How the shell that runs a recipe line or a package.json script treats a failing command:
     `errexit` (it stops at the first failure: `.SHELLFLAGS` has `-e`), `pipefail` (a pipeline's
     status is its first failure), `strict` (its status is the last command's, so a check followed
-    by another command is lost), and `credit` (a masked check is not a swallow when the recipe
-    runs the same check unmasked on another line)."""
+    by another command is lost), `credit` (a masked check is not a swallow when the recipe
+    runs the same check unmasked on another line), and `oneshell` (the lines are one script, so a
+    `set -e` or `set -o pipefail` on a line holds for the lines after it; `bash` says `set -o
+    pipefail` is understood, as `SHELL` is bash)."""
 
     errexit: bool = False
     pipefail: bool = False
     strict: bool = False
     credit: bool = False
+    oneshell: bool = False
+    bash: bool = False
 
 
 class _Ctx:
@@ -2042,6 +2048,44 @@ def _line_checks(line: str, ctx: _Ctx) -> Counter[tuple[str, ...]]:
     )
 
 
+def _leaves_the_shell(statement: str, ctx: _Ctx) -> bool:
+    """`exit` (bare, `0` or a variable), `return`, or `exec` of something that is not a check: the
+    shell is done with the statements after it. `exit 1` fails the target, so it is not one."""
+    words = _plain_check(statement)
+    if not words:
+        return False
+    if words[0] in ("exit", "return"):
+        code = words[1].strip("\"'") if len(words) > 1 else "0"
+        return bool(re.fullmatch(r"0+|\$.*", code))
+    return words[0] == "exec" and len(words) > 1 and not ctx.is_check(" ".join(words[1:]))
+
+
+def _dead_check(chunk: str, ctx: _Ctx) -> str | None:
+    """The statement that ends a shell before a check, in a recipe line or a package.json script:
+    an unconditional `exit 0`, `return` or `exec true` with a check after it. `true && exit 0` is
+    unconditional, `pytest || exit 0` is not."""
+    segs = split_segments(chunk)
+    top = _top_level(segs)
+    for i, seg in enumerate(segs):
+        if not _leaves_the_shell(seg.text, ctx):
+            continue
+        head = i
+        while head > 0 and segs[head].sep in ("&&", "||"):
+            before = segs[head - 1].text.strip()
+            if before != ("true" if segs[head].sep == "&&" else "false") and not (
+                segs[head].sep == "&&" and before == ":"
+            ):
+                break
+            head -= 1
+        if (
+            top[head]
+            and segs[head].sep not in ("&&", "||")
+            and any(ctx.is_check(later.text) for later in segs[i + 1 :])
+        ):
+            return seg.text.strip()
+    return None
+
+
 def _swallow_counts(
     lines: list[str],
     script: bool,
@@ -2054,8 +2098,14 @@ def _swallow_counts(
     a `mode`, the shell is read as it is (see `_Mode`). A line that swallows is let off when
     `mode.credit` and another line runs the same check with nothing swallowed: make stops at the
     first line that fails, so the masked copy hides nothing."""
+    given = mode is not None
     mode = mode or _Mode()
-    chunks = ["\n".join(lines)] if script else [_RECIPE_PREFIX.sub("", ln, count=1) for ln in lines]
+    stripped = [_RECIPE_PREFIX.sub("", ln, count=1) for ln in lines]
+    if mode.oneshell and not script:
+        joined = "\n".join(stripped)
+        chunks = [joined if mode.bash else re.sub(r"\bpipefail\b", "no-pipefail", joined)]
+    else:
+        chunks = ["\n".join(lines)] if script else stripped
     per_chunk = [
         find_swallows(
             chunk,
@@ -2070,6 +2120,13 @@ def _swallow_counts(
             strict_status=mode.strict,
         )
         for chunk in chunks
+    ]
+    dead = [_dead_check(chunk, ctx) if given else None for chunk in chunks]
+    per_chunk = [
+        [*found, Swallow(0, "early", text, f"`{text}` ends the shell before a check")]
+        if text
+        else found
+        for found, text in zip(per_chunk, dead, strict=True)
     ]
     if mode.credit and not script and any(per_chunk):
         clean = [
@@ -3457,18 +3514,49 @@ def _shell_reason(old: _Targets, new: _Targets) -> str | None:
     return None
 
 
+def _is_bash(shell: str | None) -> bool:
+    words = (shell or "").split()
+    return bool(words) and posixpath.basename(words[0]) == "bash"
+
+
+def _errexit_set(text: str) -> bool | None:
+    """True after `set -e` (also `-eu`, `-o errexit`, `-eo pipefail`), False after `set +e` or
+    `set +o errexit`, None for any other statement."""
+    toks = _tokens(text)
+    if not toks or toks[0] != "set":
+        return None
+    flip: bool | None = None
+    k = 1
+    while k < len(toks) and toks[k] != "--":
+        if m := re.fullmatch(r"([-+])([A-Za-z]+)", toks[k]):
+            on, letters = m[1] == "-", m[2]
+            if "e" in letters.replace("o", ""):
+                flip = on
+            if letters.endswith("o") and k + 1 < len(toks):
+                k += 1
+                if toks[k] == "errexit":
+                    flip = on
+        k += 1
+    return flip
+
+
 def _oneshell_reason(old: _Targets, new: _Targets, name: str, ctx: _Ctx) -> str | None:
     """`.ONESHELL` without `-e` in `.SHELLFLAGS` newly puts a target's recipe lines in one shell
-    script, in which a failing check followed by another line does not fail the target."""
+    script, in which a failing check followed by another line does not fail the target, unless a
+    `set -e` before the check turned errexit on (and no `set +e` turned it off)."""
     if not new.oneshell or new.errexit or (old.oneshell and not old.errexit):
         return None
     for node in _chain(new, name):
+        errexit = False
         for line in node.lines[:-1]:
-            if any(ctx.is_check(st) for st in _statements([line], False)):
-                return (
-                    "`.ONESHELL` runs its recipe lines as one script, and only the last line's "
-                    "exit status counts without `-e` in `.SHELLFLAGS`"
-                )
+            for st in _statements([line], False):
+                if (flip := _errexit_set(st)) is not None:
+                    errexit = flip
+                elif not errexit and ctx.is_check(st):
+                    return (
+                        "`.ONESHELL` runs its recipe lines as one script, and only the last "
+                        "line's exit status counts without `-e` in `.SHELLFLAGS`"
+                    )
     return None
 
 
@@ -3583,12 +3671,20 @@ def _make_reasons(
             recipe=True,
             exports=exported,
             modes=(
-                _Mode(old.errexit, old.pipefail, True),
+                _Mode(
+                    old.errexit,
+                    old.pipefail,
+                    True,
+                    oneshell=old.oneshell,
+                    bash=_is_bash(old.shell),
+                ),
                 _Mode(
                     new.errexit,
                     new.pipefail,
                     True,
                     not ((new.oneshell and not new.errexit) or ignoring or new.ignore),
+                    new.oneshell,
+                    _is_bash(new.shell),
                 ),
             ),
         )

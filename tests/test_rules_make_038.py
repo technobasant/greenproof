@@ -252,3 +252,90 @@ def test_ci_reaching_a_touched_call_warns(tmp_path: Path) -> None:
     repo.write("Makefile", f"{CALL_DEF}test:\n\tpytest\n\t$(call run,flake8)\n")
     found = [f for f in static_findings(repo) if f.rule == "ci.tampered"]
     assert any("function call" in f.message for f in found)
+
+
+# ---- K6: .ONESHELL, a `set` in the recipe holds for the lines after it ----------------------
+
+OS = ".ONESHELL:\n"
+
+
+@pytest.mark.parametrize(
+    "head, lines",
+    [
+        (OS, "set -e\n\tpytest\n\techo done"),
+        (OS, "set -eu\n\tpytest\n\techo done"),
+        (OS, "set -o errexit\n\tpytest\n\techo done"),
+        (OS + "SHELL := bash\n", "set -euo pipefail\n\tpytest\n\techo done"),
+        (OS + "SHELL := bash\n", "set -e -o pipefail\n\tpytest\n\techo done"),
+        (OS + "SHELL := bash\n", "set -euo pipefail\n\tpytest | tee log.txt"),
+        (OS, "set -e; pytest\n\techo done"),
+    ],
+)
+def test_oneshell_set_e_first_keeps_the_status(tmp_path: Path, head: str, lines: str) -> None:
+    assert mk(tmp_path, f"{head}test:\n\t{lines}\n") == "pass"
+
+
+@pytest.mark.parametrize(
+    "head, lines",
+    [
+        (OS, "pytest\n\tset -e\n\techo done"),
+        (OS, "set -e\n\tset +e\n\tpytest\n\techo done"),
+        (OS, "set -e\n\tset +o errexit\n\tpytest\n\techo done"),
+        (OS, "set -e\n\tpytest || true\n\techo done"),
+        (OS + "SHELL := bash\n", "set -o pipefail\n\tpytest\n\techo done"),
+        (OS, "set -euo pipefail\n\tpytest | tee log.txt"),
+        (OS + "SHELL := bash\n", "set -e\n\tpytest | tee log.txt"),
+        (OS + "SHELL := bash\n", "set -euo pipefail\n\tset +o pipefail\n\tpytest | tee log.txt"),
+    ],
+)
+def test_oneshell_set_that_does_not_hold_blocks(tmp_path: Path, head: str, lines: str) -> None:
+    assert mk(tmp_path, f"{head}test:\n\t{lines}\n") == "block"
+
+
+# ---- K7: an exit, return or exec ahead of the check ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        "exit 0; pytest",
+        "exit; pytest",
+        "exit $$RC; pytest",
+        "exit 0 2>/dev/null; pytest",
+        "true && exit 0; pytest",
+        ": && exit 0; pytest",
+        "false || exit 0; pytest",
+        "return 0 2>/dev/null; exit 0; pytest",
+        "exec true; pytest",
+        "pytest > out.log; true\n\texit 0; pytest",
+    ],
+)
+def test_an_unconditional_exit_before_the_check_blocks(tmp_path: Path, recipe: str) -> None:
+    assert mk(tmp_path, f"test:\n\t{recipe}\n") == "block"
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        "exit 0\n\tpytest",
+        "exit 1; pytest",
+        "(exit 0); pytest",
+        'if [ -z "$$X" ]; then exit 0; fi; pytest',
+        "[ -f x ] || exit 0; pytest",
+        "exec pytest",
+        "echo start; pytest",
+        "pytest && exit 0",
+    ],
+)
+def test_exit_that_does_not_end_the_shell_before_the_check_passes(
+    tmp_path: Path, recipe: str
+) -> None:
+    assert mk(tmp_path, f"test:\n\t{recipe}\n") == "pass"
+
+
+def test_oneshell_exit_line_before_the_check_blocks(tmp_path: Path) -> None:
+    assert mk(tmp_path, ".ONESHELL:\ntest:\n\texit 0\n\tpytest\n") == "block"
+
+
+def test_package_script_exit_before_the_check_blocks(tmp_path: Path) -> None:
+    assert pk(tmp_path, "true && exit 0; jest") == "block"
