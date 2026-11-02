@@ -13,6 +13,7 @@ import posixpath
 import re
 import shlex
 import tomllib
+from bisect import bisect_left
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -30,8 +31,10 @@ from greenproof.rules.shell import (
     early_exit,
     find_swallows,
     is_non_check,
+    narrowed_selection,
     scripts_in,
     selection_flags,
+    shell_c_body,
     split_segments,
 )
 
@@ -455,6 +458,252 @@ class _Ctx:
         return any(self.is_check(st) for st in _statements(lines, script))
 
 
+# -- tests deleted at run time ------------------------------------------------------------
+_REMOVERS = frozenset({"rm", "unlink", "rimraf", "del", "del-cli", "trash", "trash-cli"})
+_GLOB_CHARS = frozenset("*?[{")
+_CWD_PREFIX = re.compile(r"^(?:\$\(CURDIR\)|\$\{CURDIR\}|\$\(PWD\)|\$\{PWD\}|\$PWD)/")
+_MV_TARGET = frozenset({"-t", "--target-directory"})
+_FIND_UNFILTERED = frozenset(
+    {"!", "-not", "-o", "-or", "-regex", "-iregex", "-path", "-ipath", "-wholename"}
+)
+_MATCH_BUDGET = 400_000  # glob-against-path tests per check; past it a glob counts as a match
+
+
+def _glob_regex(pattern: str) -> re.Pattern[str]:
+    """A shell glob as a regex: `*` and `?` stay inside a path segment, `**` crosses them,
+    `[...]` is a class and `{a,b}` an alternation (not nested)."""
+    out: list[str] = []
+    i, n = 0, len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "*":
+            deep = pattern[i : i + 2] == "**"
+            if pattern[i : i + 3] == "**/":
+                out.append("(?:.*/)?")
+                i += 3
+                continue
+            out.append(".*" if deep else "[^/]*")
+            i += 2 if deep else 1
+            continue
+        if ch == "?":
+            out.append("[^/]")
+        elif ch == "[" and (end := pattern.find("]", i + 2)) > 0:
+            body = pattern[i + 1 : end]
+            body = "^" + body[1:] if body[:1] == "!" else body
+            out.append("[" + body.replace("\\", "\\\\") + "]")
+            i = end
+        elif ch == "{" and (end := pattern.find("}", i + 1)) > 0:
+            alternatives = "|".join(re.escape(alt) for alt in pattern[i + 1 : end].split(","))
+            out.append(f"(?:{alternatives})")
+            i = end
+        else:
+            out.append(re.escape(ch))
+        i += 1
+    try:
+        return re.compile("".join(out))
+    except re.error:
+        return re.compile(".*")
+
+
+def _operands(args: Sequence[str], valued: Collection[str] = ()) -> list[str]:
+    """The path words among a command's arguments: options (and the values of `valued` ones)
+    dropped, everything after `--` kept."""
+    out: list[str] = []
+    done = skip = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif not done and arg == "--":
+            done = True
+        elif not done and arg in valued:
+            skip = True
+        elif done or not arg.startswith("-") or arg == "-":
+            out.append(arg)
+    return out
+
+
+class _BaseTests:
+    """The test files of the base tree and the directories that hold them, read from the tree
+    listing once per check, and only when an added statement that removes or moves something
+    needs it. A test file is what the project says it is (`ChangeSet.is_test`, SPEC 5.1); a path
+    that is not tracked at the base (`.pytest_cache`, `tests/__pycache__`) is not one."""
+
+    def __init__(self, changes: ChangeSet) -> None:
+        self._changes = changes
+        self._built = False
+        self.files: set[str] = set()
+        self.dirs: set[str] = set()
+        self._sorted: list[str] = []
+        self._budget = _MATCH_BUDGET
+
+    def _build(self) -> None:
+        if self._built:
+            return
+        self._built = True
+        changes = self._changes
+        paths = (
+            changes.list_base()
+            if changes.list_base is not None
+            else [f.old_path or f.path for f in changes.files if f.status != "A"]
+        )
+        for path in paths:
+            if not changes.is_test(path):
+                continue
+            self.files.add(path)
+            parent = posixpath.dirname(path)
+            while parent and parent not in self.dirs:
+                self.dirs.add(parent)
+                parent = posixpath.dirname(parent)
+        if self.files:
+            self.dirs.add(".")
+        self._sorted = sorted(self.files | self.dirs)
+
+    def _starting(self, prefix: str) -> Iterator[str]:
+        """The test paths that start with `prefix`, read from the sorted list by bisection."""
+        i = bisect_left(self._sorted, prefix)
+        while i < len(self._sorted) and self._sorted[i].startswith(prefix):
+            yield self._sorted[i]
+            i += 1
+
+    @staticmethod
+    def _resolve(word: str, cwd: str) -> str | None:
+        """The repo path a word names from `cwd`; None for one that is not a plain path (an
+        absolute path, `~`, a shell or make variable that is still unexpanded)."""
+        word = _CWD_PREFIX.sub("", word)
+        if not word or word.startswith(("/", "~")) or "$" in word or "`" in word:
+            return None
+        return posixpath.normpath(posixpath.join(cwd, word))
+
+    def hit(self, word: str, cwd: str, files_only: bool = False) -> bool:
+        """Whether a path or glob names a base test file or a directory holding one."""
+        path = self._resolve(word, cwd)
+        if path is None:
+            return False
+        self._build()
+        meta = [path.index(c) for c in _GLOB_CHARS if c in path]
+        if not meta:
+            return path in self.files or (path in self.dirs and not files_only)
+        regex = _glob_regex(path)
+        for candidate in self._starting(path[: min(meta)]):
+            if (files_only and candidate not in self.files) or candidate == ".":
+                continue
+            self._budget -= 1
+            if self._budget < 0 or regex.fullmatch(candidate):
+                return True  # past the budget a glob is taken to match: fail closed
+        return False
+
+    def removes(self, statement: str, cwd: str) -> str | None:
+        """The path a statement removes or moves that is a base test file or a directory holding
+        one, as written there; None when it touches none."""
+        inner = shell_c_body(statement)
+        texts = [statement] if inner is None else [seg.text for seg in split_segments(inner)]
+        for text in texts:
+            if found := self._removes(command_tokens(text), cwd):
+                return found
+        return None
+
+    def _removes(self, toks: list[str], cwd: str) -> str | None:
+        if toks[:1] == ["shx"]:
+            toks = toks[1:]
+        if "|" in toks:
+            left, right = toks[: toks.index("|")], toks[toks.index("|") + 1 :]
+            piped = [posixpath.basename(t) for t in right[:6]]
+            if (
+                left[:1] == ["find"]
+                and piped[:1] == ["xargs"]
+                and any(t in _REMOVERS for t in piped[1:])
+            ):
+                return self._found([*left[1:], "-delete"], cwd, recursive=True)
+            toks = left
+        if not toks:
+            return None
+        head, rest = posixpath.basename(toks[0]), toks[1:]
+        if head == "git" and rest[:1] in (["rm"], ["mv"]) and "--cached" not in rest:
+            head, rest = rest[0], rest[1:]
+        if head in _REMOVERS:
+            return next((w for w in _operands(rest) if self.hit(w, cwd)), None)
+        if head == "mv":
+            return self._moved(rest, cwd)
+        if head == "find":
+            return self._found(rest, cwd)
+        return None
+
+    def _moved(self, args: Sequence[str], cwd: str) -> str | None:
+        words = _operands(args, _MV_TARGET)
+        to_dir = any(a in _MV_TARGET or a.startswith("--target-directory=") for a in args)
+        sources = words if to_dir else words[:-1]
+        if hit := next((w for w in sources if self.hit(w, cwd)), None):
+            return hit
+        # `mv new.py tests/test_a.py` writes over a test file
+        return words[-1] if words and not to_dir and self.hit(words[-1], cwd, True) else None
+
+    def _found(self, args: Sequence[str], cwd: str, recursive: bool = False) -> str | None:
+        """`find ROOT ... -delete`, `-exec rm`, or `| xargs rm`: a root that holds base tests the
+        name and type filters do not rule out. `-delete` removes files (and empty directories),
+        the others whole directories. A negation, `-o`, `-path` or `-regex` is not read: the
+        filters are then taken as matching everything."""
+        i = 0
+        while i < len(args) and args[i] in ("-H", "-L", "-P"):
+            i += 1
+        roots: list[str] = []
+        while i < len(args) and not args[i].startswith(("-", "(", "!")):
+            roots.append(args[i])
+            i += 1
+        expr = list(args[i:])
+        deletes = "-delete" in expr
+        for j, tok in enumerate(expr):
+            if tok in ("-exec", "-execdir", "-ok", "-okdir"):
+                cmd = [posixpath.basename(t) for t in expr[j + 1 : j + 3]]
+                if cmd[:2] == ["git", "rm"] or (cmd and cmd[0] in _REMOVERS):
+                    deletes = recursive = True
+        if not deletes:
+            return None
+        names = [expr[j + 1] for j, t in enumerate(expr[:-1]) if t in ("-name", "-iname")]
+        folded = "-iname" in expr
+        types = {c for j, t in enumerate(expr[:-1]) if t == "-type" for c in expr[j + 1].split(",")}
+        if _FIND_UNFILTERED & set(expr):
+            names = []
+        for root in roots or ["."]:
+            top = self._resolve(root, cwd)
+            if top is None:
+                continue
+            self._build()
+            for path in self._starting("" if top == "." else top):
+                if top != "." and path != top and not path.startswith(top + "/"):
+                    continue
+                is_dir = path not in self.files
+                if (is_dir and (not recursive or "f" in types)) or (
+                    not is_dir and types and "f" not in types
+                ):
+                    continue
+                name = posixpath.basename(path)
+                if folded:
+                    name = name.lower()
+                if all(fnmatchcase(name, n.lower() if folded else n) for n in names):
+                    return root
+        return None
+
+
+def _removed_tests(
+    base: Sequence[str], cand: Sequence[str], tests: _BaseTests, cwds: Sequence[str]
+) -> str | None:
+    """A statement the candidate added that removes or moves a base test file, or a directory
+    that holds some: `rm -rf tests`, `git rm`, `mv`, `find ... -delete`, `rimraf`, a glob like
+    `tests/test_*.py` matched against the base paths. A statement the base had says nothing."""
+    seen = Counter(base)
+    for statement in cand:
+        if seen[statement] > 0:
+            seen[statement] -= 1
+            continue
+        for cwd in cwds:
+            if (path := tests.removes(statement, cwd)) is not None:
+                return (
+                    f"it now removes tests (`{statement}` removes `{path}`,"
+                    " which holds the project's tests)"
+                )
+    return None
+
+
 def neutering_reason(
     base_lines: list[str],
     cand_lines: list[str],
@@ -466,6 +715,8 @@ def neutering_reason(
     base_pool: Sequence[str] = (),
     names: tuple[Collection[str], Collection[str]] | None = None,
     expanders: tuple[Expander, Expander] | None = None,
+    tests: _BaseTests | None = None,
+    cwds: Sequence[str] = ("",),
 ) -> str | None:
     """Whether a command (a script or recipe) was emptied, no-opped, narrowed or shortened.
 
@@ -503,6 +754,14 @@ def neutering_reason(
         return f"it now passes {added[0]}"
     if flag := _new_selection_flag(base_c, cand_c):
         return f"it now passes {flag}"
+    if narrowed := narrowed_selection(_statements(base_c, script), _statements(cand_c, script)):
+        return f"it now selects fewer paths ({narrowed})"
+    if tests is not None and (
+        gone := _removed_tests(
+            _statements(base_c, script), _statements(cand_c, script), tests, cwds
+        )
+    ):
+        return gone
     if swallowed := _new_swallow(base_c, cand_c, script, ctx, known, base_texts):
         return f"a failure is now swallowed (`{swallowed}`)"
     if script and early_exit("\n".join(cand_c)) and not early_exit("\n".join(base_c)):
@@ -520,7 +779,9 @@ def neutering_reason(
 
 
 Expander = Callable[[str], "list[str] | None"]
-_LINT_KINDS = frozenset({"ruff", "mypy", "flake8", "pylint", "eslint", "clippy", "package lint"})
+_LINT_KINDS = frozenset(
+    {"ruff", "mypy", "flake8", "pylint", "eslint", "clippy", "package lint", "ng lint"}
+)
 # Kinds that wrap another command: they stand for whatever test runner is behind them.
 _WRAPPER_KINDS = frozenset({"make test", "package test", "tox/nox"})
 
@@ -1173,13 +1434,16 @@ def _script_expander(scripts: Mapping[str, Any]) -> Expander:
     return expand
 
 
-def _package_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int | None, str]]:
+def _package_reasons(
+    f: ChangedFile, commands: Mapping[str, str], tests: _BaseTests | None = None
+) -> list[tuple[int | None, str]]:
     base = json.loads(f.old_text) if f.old_text else {}
     cand = json.loads(f.new_text or "{}")
     old_scripts = base.get("scripts", {}) if isinstance(base, dict) else {}
     new_scripts = cand.get("scripts", {}) if isinstance(cand, dict) else {}
     out: list[tuple[int | None, str]] = []
     extra = list(commands.values())
+    cwds = (posixpath.dirname(f.path),)
     seeds = _script_names(commands)
     # The scripts a policy command runs at the base, and in the candidate: a `test` pointed at a
     # new alias runs the alias's body, which is read as a new script.
@@ -1206,6 +1470,8 @@ def _package_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[
                 base_pool=pool,
                 names=(old_scripts.keys(), new_scripts.keys()),
                 expanders=(_script_expander(old_scripts), _script_expander(new_scripts)),
+                tests=tests,
+                cwds=cwds,
             ):
                 out.append((line, f"package.json script `{name}` changed and {why}"))
         elif name in after and isinstance(new, str) and new != old and new not in old_bodies:
@@ -1217,6 +1483,8 @@ def _package_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[
                 script_check=resolve,
                 base_pool=pool,
                 names=(old_scripts.keys(), new_scripts.keys()),
+                tests=tests,
+                cwds=cwds,
             ):
                 out.append(
                     (line, f"package.json script `{name}` is now run by the tests and {why}")
@@ -1513,7 +1781,10 @@ _SHADOW_WHY = (
 
 
 def _make_reasons(
-    f: ChangedFile, commands: Mapping[str, str], changes: ChangeSet | None = None
+    f: ChangedFile,
+    commands: Mapping[str, str],
+    changes: ChangeSet | None = None,
+    tests: _BaseTests | None = None,
 ) -> list[tuple[int | None, str]]:
     names: set[str] = set()
     for cmd in commands.values():
@@ -1544,6 +1815,8 @@ def _make_reasons(
             extra=extra,
             make_check=resolve,
             expanders=(_make_expander(old, old_shadow), _make_expander(new, new_shadow)),
+            tests=tests,
+            cwds=(posixpath.dirname(f.path),),
         )
         if why and not cand_lines and _effective(new, name):
             why = _SHADOW_WHY
@@ -1895,14 +2168,21 @@ _TRIVIAL = re.compile(
 
 
 def _invoked_reasons(
-    f: ChangedFile, command: str, extra: list[str]
+    f: ChangedFile, command: str, extra: list[str], tests: _BaseTests | None = None
 ) -> list[tuple[int | None, str]]:
     run = f"`{command}` runs it"
     if f.new_content is None:
         return [(None, f"it was deleted, and {run}")]
     old, new = f.old_text or "", f.new_text or ""
     if _is_shell(f.path, old or new):
-        why = neutering_reason(split_lines(old), split_lines(new), script=True, extra=extra)
+        why = neutering_reason(
+            split_lines(old),
+            split_lines(new),
+            script=True,
+            extra=extra,
+            tests=tests,
+            cwds=tuple(dict.fromkeys(("", posixpath.dirname(f.path)))),
+        )
     else:
         why = _program_neutering(split_lines(old), split_lines(new))
     return [(None, f"it changed and {why} ({run})")] if why else []
@@ -2281,15 +2561,18 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
     out: list[Finding] = []
     invoked = _invoked_files(changes, commands)
     extra = list(commands.values())
+    tests = _BaseTests(changes)
     for f in changes.files:
         run_by = invoked.get(f.old_path or f.path)
         if f.new_content is None and run_by is None:
             continue
         name = posixpath.basename(f.path)
         try:
-            reasons = [] if f.new_content is None else _file_reasons(f, name, commands, changes)
+            reasons = (
+                [] if f.new_content is None else _file_reasons(f, name, commands, changes, tests)
+            )
             if run_by is not None and not (f.is_test or f.was_test):
-                reasons = [*reasons, *_invoked_reasons(f, run_by, extra)]
+                reasons = [*reasons, *_invoked_reasons(f, run_by, extra, tests)]
         except (ValueError, configparser.Error, KeyError, TypeError, AttributeError) as exc:
             out.append(
                 warn_finding(
@@ -2318,12 +2601,16 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
 
 
 def _file_reasons(
-    f: ChangedFile, name: str, commands: Mapping[str, str], changes: ChangeSet
+    f: ChangedFile,
+    name: str,
+    commands: Mapping[str, str],
+    changes: ChangeSet,
+    tests: _BaseTests | None = None,
 ) -> list[tuple[int | None, str]]:
     new = f.new_text or ""
     found: list[tuple[int | None, str]]
     if name == "package.json":
-        found = _package_reasons(f, commands)
+        found = _package_reasons(f, commands, tests)
         found.extend(_jest_reasons(f, True))
         if found and not _reaches_package(changes, f.path, commands):
             return [(line, _Warn(why)) for line, why in found]
@@ -2333,7 +2620,7 @@ def _file_reasons(
     if re.match(r"^(?:jest|vitest)\.config\.\w+$", name):
         return _jest_reasons(f, False)
     if name in ("Makefile", "makefile", "GNUmakefile", "justfile", "Justfile"):
-        return _make_reasons(f, commands, changes)
+        return _make_reasons(f, commands, changes, tests)
     if name == "noxfile.py":
         return _noxfile_reasons(f)
     if name.endswith("_test.go"):

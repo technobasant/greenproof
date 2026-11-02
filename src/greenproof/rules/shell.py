@@ -621,13 +621,16 @@ _SUB_CHECKERS: dict[str, tuple[frozenset[str], str]] = {
     "playwright": (frozenset({"test"}), "playwright"),
     "cypress": (frozenset({"run"}), "cypress"),
     "karma": (frozenset({"start", "run"}), "karma"),
-    "ng": (frozenset({"test"}), "ng test"),
+    "ng": (frozenset({"test", "e2e", "lint"}), "ng test"),
     "deno": (frozenset({"test"}), "deno test"),
     "swift": (frozenset({"test"}), "swift test"),
     "mix": (frozenset({"test"}), "mix test"),
     "hatch": (frozenset({"test"}), "pytest"),
     "rails": (frozenset({"test"}), "rake"),
 }
+# A subcommand of a `_SUB_CHECKERS` tool that is a kind of its own (kinds are tool-granular, the
+# subcommand only where it is another check: `ng lint` is a lint, `ng test` and `ng e2e` tests).
+_SUB_KINDS = {("ng", "lint"): "ng lint"}
 _CARGO_TESTS = frozenset({"test", "nextest", "llvm-cov", "tarpaulin"})
 
 
@@ -650,7 +653,9 @@ def classify(toks: list[str], make_check: Callable[[str], bool | None] | None = 
     if cmd in _SUB_CHECKERS:
         subs, kind = _SUB_CHECKERS[cmd]
         words = _skip_opts(rest, frozenset())
-        return kind if words[:1] and words[0] in subs and not _is_info_only(rest) else None
+        if not words[:1] or words[0] not in subs or _is_info_only(rest):
+            return None
+        return _SUB_KINDS.get((cmd, words[0]), kind)
     if cmd in ("node", "nodejs"):
         return "node test" if "--test" in rest[:3] else None
     if cmd == "go":
