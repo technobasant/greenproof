@@ -5,6 +5,16 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `scripts/release_notes.py X.Y.Z`, which prints the GitHub Release notes for a version: the
+  install line, that version's CHANGELOG section and the compare link from the previous
+  release. `tests/test_release_notes.py` runs it against the real CHANGELOG.
+- The release workflow checks that CHANGELOG.md has a section for the tag before it builds
+  anything for PyPI, and after PyPI accepts the upload it creates the GitHub Release with that
+  section as the notes and the built files attached.
+- Link references at the end of the CHANGELOG for each version and for `[Unreleased]`.
+
 ## [0.2.0] - 2026-11-02
 
 ### Added
@@ -151,3 +161,7 @@ First release.
 
 - The test suite runs in parallel with `pytest-xdist` (`pytest -n auto`) in CI and in the
   documented gate.
+
+[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/technobasant/greenproof/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/technobasant/greenproof/releases/tag/v0.1.0
