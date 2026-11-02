@@ -21,7 +21,14 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SPECS = ["spec_py.py", "spec_other.py", "spec_more.py", "spec_ci2.py", "spec_runner2.py"]
+SPECS = [
+    "spec_py.py",
+    "spec_other.py",
+    "spec_more.py",
+    "spec_ci2.py",
+    "spec_runner2.py",
+    "spec_runner3.py",
+]
 VERDICT = {0: "pass", 1: "BLOCK", 2: "cmd-fail", 3: "smoke", 4: "usage", 5: "internal"}
 
 
