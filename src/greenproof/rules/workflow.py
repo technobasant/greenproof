@@ -9,6 +9,7 @@ aliases, a flow collection that does not close on its line, or anything else it 
 
 from __future__ import annotations
 
+import posixpath
 import re
 from dataclasses import dataclass, replace
 
@@ -46,6 +47,7 @@ class Step:
     with_exact: bool = True
     stop: int = 0  # 1-based line after the step's last line
     job_line: int = 0  # 1-based line of the job's key, 0 when it is not under a job
+    working_directory: str | None = None  # the step's own `working-directory:`
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,7 @@ class Job:
     coe_line: int = 0
     shell: str | None = None  # the job's `defaults.run.shell`
     env: tuple[tuple[str, str], ...] = ()
+    working_directory: str | None = None  # the job's `defaults.run.working-directory`
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,7 @@ class Workflow:
     jobs: list[Job]
     shell: str | None  # the workflow's `defaults.run.shell`
     env: tuple[tuple[str, str], ...] = ()
+    working_directory: str | None = None  # the workflow's `defaults.run.working-directory`
 
     def job_of(self, step: Step) -> Job | None:
         return next((j for j in self.jobs if j.line == step.job_line), None)
@@ -79,6 +83,21 @@ class Workflow:
             return step.shell
         job = self.job_of(step)
         return (job.shell if job else None) or self.shell
+
+    def directory_of(self, step: Step) -> str:
+        """The directory a step's `run:` runs in, from the repo root: its own `working-directory`,
+        else its job's or the workflow's default. "" for the root and for an expression, an
+        absolute path or a path out of the repo, which are not resolved."""
+        job = self.job_of(step)
+        raw = (
+            step.working_directory
+            or (job.working_directory if job else None)
+            or (self.working_directory)
+        )
+        if not raw or "$" in raw or raw.startswith("/"):
+            return ""
+        path = posixpath.normpath(raw)
+        return "" if path == "." or path.startswith("..") else path
 
     def defs_of(self, step: Step) -> dict[str, str]:
         """The `env:` a step sees: the workflow's, overridden by its job's and its own."""
@@ -139,7 +158,13 @@ def parse(text: str) -> Workflow:
     """The workflow's steps and jobs, read once."""
     lines = split_lines(text)
     jobs = _jobs(lines)
-    return Workflow(_steps(lines, jobs), jobs, _workflow_shell(lines), _workflow_env(lines))
+    return Workflow(
+        _steps(lines, jobs),
+        jobs,
+        _workflow_shell(lines),
+        _workflow_env(lines),
+        _workflow_directory(lines),
+    )
 
 
 def steps(text: str) -> list[Step]:
@@ -282,6 +307,7 @@ def _step(
     col = len(marker.group(1)) if marker else _indent(first) + 2
     run: tuple[str, int] | None = None
     shell: str | None = None
+    directory: str | None = None
     fields: dict[str, tuple[str, int]] = {}
     maps: dict[str, _Map] = {}
     for k in range(start, stop):
@@ -293,6 +319,8 @@ def _step(
             run = _run_value(lines, k, stop, col, m.group(1))
         elif m := re.match(r"^\s*shell\s*:\s*(.+)$", body):
             shell = _unquote(re.sub(r"\s+#.*$", "", m.group(1)))
+        elif m := re.match(r"^\s*working-directory\s*:\s*(.+)$", body):
+            directory = _clean(m.group(1))
         elif m := re.match(r"^\s*(uses|name|if|continue-on-error)\s*:\s*(.*)$", body):
             fields.setdefault(m.group(1), (_clean(m.group(2)), k + 1))
         elif (m := re.match(r"^\s*(with|env)\s*:\s*(.*)$", body)) and m.group(1) not in maps:
@@ -313,6 +341,7 @@ def _step(
         with_exact=maps.get("with", ((), "", True))[2],
         stop=stop + 1,
         job_line=job_line,
+        working_directory=directory,
     )
 
 
@@ -324,6 +353,20 @@ def _shell_in(block: list[str]) -> str | None:
     for raw in block:
         if m := re.match(r"^\s*shell\s*:\s*(.+)$", raw):
             return _clean(m.group(1))
+    return None
+
+
+def _directory_in(block: list[str]) -> str | None:
+    for raw in block:
+        if m := re.match(r"^\s*working-directory\s*:\s*(.+)$", raw):
+            return _clean(m.group(1))
+    return None
+
+
+def _workflow_directory(lines: list[str]) -> str | None:
+    for k, raw in enumerate(lines):
+        if re.match(r"^defaults\s*:\s*(?:#.*)?$", raw):
+            return _directory_in(_block_after(lines, k, len(lines), 0))
     return None
 
 
@@ -412,6 +455,7 @@ def _job(lines: list[str], at: int, stop: int, name: str) -> Job:
     child: int | None = None
     fields: dict[str, tuple[str, int]] = {}
     shell: str | None = None
+    directory: str | None = None
     strategy: list[str] = []
     runs_on_block: list[str] = []
     env: tuple[tuple[str, str], ...] = ()
@@ -429,6 +473,7 @@ def _job(lines: list[str], at: int, stop: int, name: str) -> Job:
                 runs_on_block = _block_after(lines, k, stop, child)
         elif key == "defaults":
             shell = _shell_in(_block_after(lines, k, stop, child))
+            directory = _directory_in(_block_after(lines, k, stop, child))
         elif key == "strategy":
             strategy = _block_after(lines, k, stop, child)
         elif key == "env":
@@ -448,6 +493,7 @@ def _job(lines: list[str], at: int, stop: int, name: str) -> Job:
         coe_line=fields.get("continue-on-error", ("", 0))[1],
         shell=shell,
         env=env,
+        working_directory=directory,
     )
 
 

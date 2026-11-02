@@ -871,12 +871,38 @@ _INTERPRETERS = re.compile(
 _SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".php")
 
 
+_SHELL_NAMES = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_SHELL_VALUE_OPTS = frozenset({"--rcfile", "--init-file"})
+
+
+def _shell_script(args: list[str]) -> str | None:
+    """The script word of a shell's arguments: options and the values some take (`-o errexit`,
+    `-eo pipefail`, `+O extglob`) are skipped. None for `-c` (a command string, not a file)."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            return args[i] if i < len(args) else None
+        if arg in ("-", "+") or not arg.startswith(("-", "+")):
+            return arg
+        if arg.startswith("--"):
+            i += 1 if arg in _SHELL_VALUE_OPTS else 0
+        elif arg[0] == "-" and "c" in arg[1:]:
+            return None
+        elif arg[-1] in "oO":
+            i += 1
+    return None
+
+
 def script_of(tokens: list[str], defs: Mapping[str, str] | None = None) -> str | None:
     """The script file a statement runs, when its command is a script or an interpreter's."""
     toks = _strip(tokens, defs)
     if not toks or _syntax_only(toks):
         return None
     tok = toks[0]
+    if _cmd_name(tok) in _SHELL_NAMES:
+        return _shell_script(toks[1:])
     if _INTERPRETERS.match(_cmd_name(tok)):
         rest = [t for t in toks[1:] if not t.startswith("-")]
         if toks[1:2] in (["-m"], ["-c"]):
@@ -885,12 +911,24 @@ def script_of(tokens: list[str], defs: Mapping[str, str] | None = None) -> str |
     return tok if "/" in tok or tok.endswith(_SCRIPT_EXT) else None
 
 
+def script_token(text: str, defs: Mapping[str, str] | None = None) -> str | None:
+    """The script one statement runs, as written (relative to where it runs): None when it runs
+    none, or one at an absolute path, under `~` or named by a variable."""
+    tok = script_of(_tokens(text), defs)
+    if tok is None or tok.startswith(("/", "~", "$")) or "$" in tok:
+        return None
+    return tok
+
+
 def scripts_in(text: str, here: str, defs: Mapping[str, str] | None = None) -> list[str]:
     """Repo-relative paths of the scripts the statements of `text` run."""
     found: list[str] = []
     for seg in split_segments(text):
-        tok = script_of(_tokens(seg.text), defs)
-        if tok is None or tok.startswith(("/", "~", "$")) or "$" in tok:
+        if (body := shell_c_body(seg.text, defs)) is not None:
+            found.extend(scripts_in(body, here, defs))  # `bash -c './ci.sh'`
+            continue
+        tok = script_token(seg.text, defs)
+        if tok is None:
             continue
         norm = posixpath.normpath(tok)
         if not norm.startswith(".."):

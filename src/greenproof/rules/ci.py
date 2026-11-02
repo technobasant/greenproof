@@ -11,7 +11,7 @@ from __future__ import annotations
 import posixpath
 import re
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import NamedTuple
@@ -20,6 +20,8 @@ from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import WARN, Finding
 from greenproof.rules import workflow
 from greenproof.rules._common import CODE_SUFFIXES, finding, sev_finding, split_lines
+from greenproof.rules.ci_expand import Child, make_children, pm_children
+from greenproof.rules.runner import _BaseTests, _tree_names
 from greenproof.rules.shell import (
     NOOP_FLAGS,
     check_kind,
@@ -27,10 +29,12 @@ from greenproof.rules.shell import (
     find_swallows,
     is_non_check,
     narrowed_selection,
+    script_token,
     scripts_in,
     selection_changed_warning,
     selection_flags,
     selection_uses,
+    shell_c_body,
     split_segments,
 )
 
@@ -114,7 +118,10 @@ def _read(world: _World, path: str, base: bool = False) -> str | None:
             text = world.changes.base_text(path) if base else world.changes.cand_text(path)
         except Exception:  # a directory or an unreadable blob is just absent
             text = None
-        world.files[key] = text if text is not None and len(text) <= _MAX_SCRIPT else None
+        if text is not None and len(text) > _MAX_SCRIPT:
+            world.oversize.add(key)
+            text = None
+        world.files[key] = text
     return world.files[key]
 
 
@@ -237,34 +244,222 @@ class _Body(NamedTuple):
     own: bool  # the step's own `run:` rather than an action's step or a script
     modes: list[_Mode]
     defs: Defs
-    src: str = ""  # the script or action file an expanded body is read from
+    src: str = ""  # the script, action, Makefile or package.json an expanded body is read from
+    cwd: str = ""  # the directory it runs in, from the repo root
+    kind: str = "run"  # "script", "recipe" (a make recipe line) or "pm" (a package.json script)
+    ignored: str = ""  # a recipe line whose failure make ignores: why
 
 
-def _bodies(world: _World, wf: workflow.Workflow, step: workflow.Step, base: bool) -> list[_Body]:
-    """What a step runs: its `run:`, the live `run:` steps of the local composite action it uses
-    and the local shell scripts either calls (one level). A composite step that is disabled
-    (`if: false`, `continue-on-error`) runs no check. The scripts are read from the same side."""
+_MAX_DEPTH = 4  # levels of scripts, recipes and package.json scripts followed below a step
+_MAX_FILES = 32  # distinct files read for one step
+_MAX_BYTES = 512 * 1024  # bytes of them
+_SOURCE = frozenset({".", "source"})
+_AUTOLOAD = re.compile(r"\bPYTEST_DISABLE_PLUGIN_AUTOLOAD=[^\s;&|]")
+
+
+class _Expansion(NamedTuple):
+    """Everything one step runs, read from one side of the change."""
+
+    bodies: list[_Body]
+    reads: frozenset[str]  # every file consulted, the absent ones too
+    expanded: frozenset[str]  # `make` and package-manager statements whose targets were read
+    stop: str  # where reading stopped short (a cap), "" when it did not
+
+
+def _flat(text: str, defs: Defs) -> Iterator[str]:
+    """The statements of a script, those inside `bash -c '...'` taken in place."""
+    for seg in split_segments(text):
+        inner = shell_c_body(seg.text, defs)
+        if inner is None:
+            yield seg.text
+        else:
+            yield from _flat(inner, defs)
+
+
+def _join(cwd: str, path: str) -> str | None:
+    """A path from a directory of the repo; None when it leaves the repo."""
+    joined = posixpath.normpath(posixpath.join(cwd, path))
+    return None if joined.startswith("..") else joined
+
+
+@dataclass
+class _Walk:
+    """Follows what a step runs: the local scripts a script calls (`./x.sh`, `bash x.sh`,
+    `bash -c '...'`, `source x.sh`), the recipe lines of the `make` targets it names and the
+    package.json scripts it calls, to `_MAX_DEPTH` levels, each file once, within a budget."""
+
+    world: _World
+    base: bool
+    line: int
+    out: list[_Body] = field(default_factory=list)
+    reads: set[str] = field(default_factory=set)
+    expanded: set[str] = field(default_factory=set)
+    seen: set[tuple[object, ...]] = field(default_factory=set)
+    paths: set[str] = field(default_factory=set)
+    size: int = 0
+    stop: str = ""
+
+    def cut(self, why: str) -> None:
+        self.stop = self.stop or why
+
+    def read(self, path: str) -> str | None:
+        self.reads.add(path)
+        text = _read(self.world, path, self.base)
+        if text is None:
+            if ("b:" if self.base else "c:") + path in self.world.oversize:
+                self.cut(f"`{path}` is over {_MAX_SCRIPT // 1024} KiB")
+            return None
+        if path not in self.paths:
+            if len(self.paths) >= _MAX_FILES or self.size + len(text) > _MAX_BYTES:
+                budget = f"{_MAX_FILES} files or {_MAX_BYTES // 1024} KiB"
+                self.cut(f"the budget of {budget} ran out at `{path}`")
+                return None
+            self.paths.add(path)
+            self.size += len(text)
+        return text
+
+    def tree(self, directory: str) -> set[str]:
+        return _tree_names(self.world.changes, directory, self.base)
+
+    def descend(self, body: _Body, depth: int) -> None:
+        cwd = body.cwd
+        for stmt in _flat(body.text, body.defs):
+            toks = command_tokens(stmt, body.defs)
+            if not toks:
+                continue
+            if toks[0] == "cd":
+                target = toks[1] if len(toks) == 2 else ""
+                if target and "$" not in target and not target.startswith(("/", "~", "-")):
+                    cwd = _join(cwd, target) or cwd
+                    cwd = "" if cwd == "." else cwd
+                continue
+            children = make_children(toks, stmt, body.defs, cwd, self.read, self.tree)
+            if children is None:
+                children = pm_children(stmt, toks, cwd, self.read)
+            if children is None:
+                self.script(body, stmt, toks, cwd, depth)
+            else:
+                self.group(body, stmt, children, depth)
+
+    def group(self, body: _Body, stmt: str, children: list[Child], depth: int) -> None:
+        """The recipe lines or package.json scripts a statement runs."""
+        world = self.world
+        known = not children or any(
+            check_kind(seg.text, literals=world.literals, scripts=world.scripts, defs=body.defs)
+            for child in children
+            for seg in split_segments(child.text)
+        )
+        if known:  # a target that holds nothing the rule recognises stays opaque
+            self.expanded.add(stmt)
+        if not children:
+            return
+        if depth + 1 > _MAX_DEPTH:
+            self.cut(f"`{stmt[:60]}` is {_MAX_DEPTH} levels below the step")
+            return
+        first = children[0]
+        key = (*first.key, first.cwd)
+        if key in self.seen:
+            return
+        self.seen.add(key)
+        for child in children:
+            mode = _Mode(child.errexit, not child.errexit, False)
+            sub = _Body(
+                child.text,
+                self.line,
+                False,
+                [mode],
+                body.defs,
+                child.src,
+                child.cwd,
+                child.kind,
+                child.ignored or body.ignored,
+            )
+            self.out.append(sub)
+            self.descend(sub, depth + 1)
+
+    def script(self, body: _Body, stmt: str, toks: list[str], cwd: str, depth: int) -> None:
+        """A local shell script a statement runs, or sources into the shell that runs it."""
+        sourced = toks[0] in _SOURCE and len(toks) > 1
+        tok = toks[1] if sourced else script_token(stmt, body.defs)
+        if not tok or "$" in tok or tok.startswith(("/", "~", "-")):
+            return
+        path = _join(cwd, tok)
+        if path is None or posixpath.splitext(path)[1].lower() not in _SCRIPT_EXTS:
+            return
+        self.reads.add(path)
+        errexit = not sourced and posixpath.basename(toks[0]) in _POSIX and _flags_errexit(toks[1:])
+        key: tuple[object, ...] = (
+            "script",
+            path,
+            cwd,
+            errexit,
+            repr(body.modes) if sourced else "",
+        )
+        if key in self.seen:
+            return
+        if depth + 1 > _MAX_DEPTH:
+            self.cut(f"`{path}` is {_MAX_DEPTH} levels below the step")
+            return
+        text = self.read(path)
+        if text is None:
+            return
+        self.seen.add(key)
+        if sourced:
+            if not _shebang(text)[0]:
+                return
+            modes = body.modes
+        else:
+            mode = _script_mode(text, errexit)
+            if mode is None:
+                return
+            modes = [mode]
+        sub = _Body(text, self.line, False, modes, body.defs, path, cwd, "script", body.ignored)
+        self.out.append(sub)
+        self.descend(sub, depth + 1)
+
+
+def _expand(world: _World, wf: workflow.Workflow, step: workflow.Step, base: bool) -> _Expansion:
+    """What a step runs, read once per side: its `run:`, the live `run:` steps of the local
+    composite action it uses, and what each of them calls (see `_Walk`). A composite step that is
+    disabled (`if: false`, `continue-on-error`) runs no check. Everything is read from the same
+    side as the step."""
+    key = (base, id(wf), step.line)
+    cached = world.expansions.get(key)
+    if cached is not None and cached[0] is wf:
+        return cached[1]
+    walk = _Walk(world, base, step.run_line or step.line)
     defs = wf.defs_of(step)
-    out: list[_Body] = []
-    texts: list[tuple[str, Defs]] = []
+    if step.uses:
+        walk.reads.update(_action_files(step.uses))
     if step.run:
-        out.append(_Body(step.run, step.run_line, True, _modes(wf, step), defs))
-        texts.append((step.run, defs))
+        root = _Body(
+            step.run, step.run_line, True, _modes(wf, step), defs, cwd=wf.directory_of(step)
+        )
+        walk.out.append(root)
+        walk.descend(root, 0)
     if step.uses:
         for inner_wf, inner, src in _action_parts(world, step.uses, base):
             if _disabled(inner):
                 continue
             inner_defs = {**defs, **inner_wf.defs_of(inner)}
-            modes = _modes(inner_wf, inner)
-            out.append(_Body(inner.run, step.line, False, modes, inner_defs, src))
-            texts.append((inner.run, inner_defs))
-    for text, text_defs in texts:
-        for path, invoked_e in _script_calls(text, text_defs).items():
-            body = _read(world, path, base)
-            if body is not None and (mode := _script_mode(body, invoked_e)) is not None:
-                line = step.run_line or step.line
-                out.append(_Body(body, line, False, [mode], text_defs, path))
-    return out
+            part = _Body(
+                inner.run,
+                step.line,
+                False,
+                _modes(inner_wf, inner),
+                inner_defs,
+                src,
+                inner_wf.directory_of(inner),
+            )
+            walk.out.append(part)
+            walk.descend(part, 0)
+    result = _Expansion(walk.out, frozenset(walk.reads), frozenset(walk.expanded), walk.stop)
+    world.expansions[key] = (wf, result)
+    return result
+
+
+def _bodies(world: _World, wf: workflow.Workflow, step: workflow.Step, base: bool) -> list[_Body]:
+    return _expand(world, wf, step, base).bodies
 
 
 def _unit_texts(
@@ -528,6 +723,15 @@ class _World:
     strict: dict[bool, tuple[Counter[tuple[str, str]], Counter[tuple[object, ...]]]] = field(
         default_factory=dict
     )
+    oversize: set[str] = field(default_factory=set)
+    expansions: dict[tuple[object, ...], tuple[workflow.Workflow, _Expansion]] = field(
+        default_factory=dict
+    )
+    # Statements that hand work to a task runner the rule could not read, by kind.
+    opaque: Counter[str] = field(default_factory=Counter)
+    base_statements: Counter[str] = field(default_factory=Counter)
+    base_autoload: bool = False
+    tests: _BaseTests | None = None
 
     def total(self, base: bool) -> Counter[str]:
         out: Counter[str] = Counter()
@@ -646,8 +850,13 @@ def _reason_in(kind: str, reason: str, body: _Body, mode: _Mode) -> str:
     if not body.src:
         return reason
     where = f"{reason} (in {body.src})"
-    if kind in ("noerr", "true") and not mode.errexit and not body.src.endswith(_ACTION_NAMES):
-        where += "; add `set -e` at the top of the script"
+    if kind in ("noerr", "true") and not mode.errexit:
+        if body.kind == "script":
+            where += "; add `set -e` at the top of the script"
+        elif body.kind == "recipe":
+            where += "; put each command on its own recipe line, or join them with `&&`"
+        elif body.kind == "pm":
+            where += "; join the commands with `&&`"
     return where
 
 
@@ -679,6 +888,14 @@ def _swallow_keys(
                     defs=body.defs,
                 )
             )
+        if body.ignored:
+            for seg in split_segments(body.text):
+                kind = check_kind(
+                    seg.text, literals=world.literals, scripts=world.scripts, defs=body.defs
+                )
+                if kind:
+                    why = f"`{seg.text[:60]}` runs with its failure ignored ({body.ignored})"
+                    out.append(("ignored", seg.text, body.line, f"{why} (in {body.src})"))
     return out
 
 
@@ -687,6 +904,32 @@ def _bare_world(changes: ChangeSet, commands: Mapping[str, str] | None) -> _Worl
     literals = [c for c in (commands or {}).values() if isinstance(c, str) and len(c) >= 6]
     scripts = frozenset(p for c in literals for p in scripts_in(c, ""))
     return _World(_ci_files(changes, True), _ci_files(changes, False), literals, scripts, changes)
+
+
+def _autoload(body: _Body) -> bool:
+    """Whether a script sets `PYTEST_DISABLE_PLUGIN_AUTOLOAD` (any value turns it on): in an
+    `env:` it sees or inline."""
+    return bool(body.defs.get("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "").strip()) or bool(
+        _AUTOLOAD.search(body.text)
+    )
+
+
+def _opaque(world: _World, path: str, text: str) -> list[tuple[str, Defs]]:
+    """The statements of a candidate CI file that may hand work to a task runner, apart from the
+    `make` and package-manager statements whose targets were read."""
+    if not _GITHUB.match(path):
+        return _segments(path, text)
+    wf = _wf(text)
+    out: list[tuple[str, Defs]] = []
+    for step in wf.steps:
+        exp = _expand(world, wf, step, False)
+        out.extend(
+            (stmt, body.defs)
+            for body in exp.bodies
+            for stmt in _flat(body.text, body.defs)
+            if stmt not in exp.expanded
+        )
+    return out
 
 
 def _world(
@@ -710,6 +953,8 @@ def _world(
                 world.base_if_false.add(_sig(step))
             for body in _bodies(world, wf, step, True):
                 world.base_flags.update(selection_flags(body.text, body.defs))
+                world.base_statements.update(_flat(body.text, body.defs))
+                world.base_autoload = world.base_autoload or _autoload(body)
             world.base_swallows.update(
                 (k, t) for k, t, _, _ in _swallow_keys(wf, step, world, True)
             )
@@ -720,11 +965,15 @@ def _world(
                 world.base_job_if_false.add(job.name)
             if job.uses:
                 world.base_job_uses.add(_uses_name(job.uses))
-    world.hands_off = any(
-        _hands_off(seg, literals, scripts, defs)
-        for path, text in world.cand.items()
-        for seg, defs in _segments(path, text, world)
-    )
+    world.tests = _BaseTests(changes)
+    handed = [
+        (seg, defs) for path, text in world.cand.items() for seg, defs in _opaque(world, path, text)
+    ]
+    world.hands_off = any(_hands_off(seg, literals, scripts, defs) for seg, defs in handed)
+    for seg, defs in handed:
+        kind = check_kind(seg, literals=literals, scripts=scripts, defs=defs)
+        if kind in _DELEGATING:
+            world.opaque[kind] += 1
     world.other_ci = any(_OTHER_CI.match(p) for p in changes.cand_paths())
     world.base_has_tests = any(
         k not in _NOT_TESTS for counts in world.base_kinds.values() for k in counts
@@ -1057,7 +1306,41 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
     remaining = Counter(world.base_swallows)
     base_flags = set(world.base_flags)
     reported: set[tuple[int, str]] = set()
+    pending = Counter(world.base_statements)
+    autoload = world.base_autoload
+    tests = world.tests
     for step in wf.steps:
+        exp = _expand(world, wf, step, False)
+        if exp.stop:
+            out.append(
+                _warn(
+                    step.line,
+                    f"what this step runs was read only up to a point: {exp.stop}. "
+                    "The checks beyond it are not judged",
+                )
+            )
+        for body in exp.bodies:
+            at = (step.run_line or step.line) if body.own else step.line
+            if not autoload and _autoload(body):
+                autoload = True
+                out.append(
+                    _warn(
+                        at,
+                        "`PYTEST_DISABLE_PLUGIN_AUTOLOAD` set (no installed pytest plugin loads "
+                        "unless named with `-p`: check what they were doing)",
+                    )
+                )
+            for stmt in _flat(body.text, body.defs):
+                if pending[stmt] > 0:
+                    pending[stmt] -= 1
+                elif tests is not None and (gone := tests.removes(stmt, body.cwd)) is not None:
+                    why = (
+                        f"it now removes tests (`{stmt[:80]}` removes `{gone}`, "
+                        "which holds the project's tests)"
+                    )
+                    if (at, why) not in reported:
+                        reported.add((at, why))
+                        out.append(_block(at, why))
         for kind, stmt, at, why in _swallow_keys(wf, step, world):
             if remaining[(kind, stmt)] > 0:
                 remaining[(kind, stmt)] -= 1
@@ -1217,7 +1500,7 @@ def _reasons(f: ChangedFile, world: _World) -> list[Reason]:
             if (
                 renamed
                 or world.other_ci
-                or (kind not in _DELEGATING and any(total_cand[k] for k in _DELEGATING))
+                or (kind not in _DELEGATING and any(world.opaque[k] for k in _DELEGATING))
             ):
                 out.append(
                     _warn(None, f"the {kind} step is gone; a task runner or another CI may run it")
@@ -1401,23 +1684,21 @@ def _selection_reasons(world: _World, path: str) -> list[tuple[str, int | None, 
 
 
 def _candidate(path: str) -> bool:
-    """Whether a changed file may be one a workflow step reads: a local action's file, or a script
-    by its extension. Anything else never builds the world."""
+    """Whether a changed file may be one a workflow step reads: a local action's file, a script
+    by its extension, a Makefile or a package.json. Anything else never builds the world."""
     name = posixpath.basename(path)
-    return name in _ACTION_NAMES or posixpath.splitext(name)[1].lower() in _SCRIPT_EXTS
+    return (
+        name in _ACTION_NAMES
+        or name == "package.json"
+        or name.startswith(("Makefile", "makefile", "GNUmakefile"))
+        or posixpath.splitext(name)[1].lower() in _SCRIPT_EXTS | {".mk"}
+    )
 
 
 def _reads(world: _World, wf: workflow.Workflow, step: workflow.Step, base: bool) -> set[str]:
-    """The files a step reads to run: the action file of a local `uses:`, and the local scripts its
-    `run:` and that action's steps call (one level, the way `_bodies` reads them)."""
-    out: set[str] = set(_action_files(step.uses)) if step.uses else set()
-    defs = wf.defs_of(step)
-    if step.run:
-        out.update(_script_calls(step.run, defs))
-    if step.uses:
-        for inner_wf, inner, _ in _action_parts(world, step.uses, base):
-            out.update(_script_calls(inner.run, {**defs, **inner_wf.defs_of(inner)}))
-    return out
+    """The files a step reads to run: the action file of a local `uses:`, the scripts, Makefiles
+    and package.json files it calls, at every level `_expand` follows (absent ones included)."""
+    return set(_expand(world, wf, step, base).reads)
 
 
 def _reached(world: _World, changed: Mapping[str, str]) -> dict[str, list[str]]:
@@ -1435,6 +1716,17 @@ def _reached(world: _World, changed: Mapping[str, str]) -> dict[str, list[str]]:
                     if hit:
                         out.setdefault(path, set()).update(hit)
     return {path: sorted(names) for path, names in out.items()}
+
+
+def _truncated(world: _World) -> set[str]:
+    """The candidate's GitHub workflows with a step whose expansion stopped at a cap."""
+    out: set[str] = set()
+    for path, text in world.cand.items():
+        if _GITHUB.match(path):
+            wf = _wf(text)
+            if any(_expand(world, wf, step, False).stop for step in wf.steps):
+                out.add(path)
+    return out
 
 
 def _unchanged(world: _World, path: str) -> ChangedFile | None:
@@ -1462,7 +1754,10 @@ def check_ci(changes: ChangeSet, commands: Mapping[str, str] | None = None) -> l
     bare = _bare_world(changes, commands)
     via = _reached(bare, changed) if changed else {}
     judged = {p for f in touched for p in (f.path, f.old_path) if p}
-    for path in via:
+    wanted = set(via)
+    if changed and set(changed.values()) - {n for names in via.values() for n in names}:
+        wanted.update(_truncated(bare))  # a changed file may sit past where reading stopped
+    for path in sorted(wanted):
         if path not in judged and (extra := _unchanged(bare, path)) is not None:
             touched.append(extra)
     if not touched:

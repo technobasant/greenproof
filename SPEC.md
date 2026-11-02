@@ -688,8 +688,9 @@ runners the list covers `playwright test`, `cypress run`, `rspec`, `rake test`/`
 A candidate step also counts for the checks it runs through another file: a local composite
 action (`uses: ./path`, read from `action.yml` or `action.yaml` in the candidate tree, its
 `runs.steps[*].run`) and a local script (`./scripts/test.sh`, `bash scripts/test`,
-`sh x.sh`), read one level deep with a 64 KiB cap. Expansion only adds kinds on the
-candidate side; the base is read as written. A kind that vanishes from every candidate
+`sh x.sh`, `bash -c '...'`, `bash -o errexit x.sh`, `make [-C dir] [-f file] target`, `npm|pnpm|yarn|bun
+test|run X` with its `preX` and `postX`), read to depth 4 (see 'Nested reading' below). The
+same reader is applied to the base and to the candidate. A kind that vanishes from every candidate
 workflow blocks, unless the step that replaced it is something the rule cannot classify
 (`poe test`, `pre-commit run`, `uses: astral-sh/ruff-action@...`, an unknown action) and
 sits in the same workflow file and the same job as the check it replaces, is not disabled
@@ -740,12 +741,34 @@ if touched, with its own text unchanged on both sides, and the finding names the
 A commit that changes no file of that shape, and no workflow, never reads the CI files.
 Scripts and actions over 64 KiB are not read.
 
+*Nested reading.* A step is read as a tree. Each step has a budget of 32 files and 512 KiB, each
+file at most 64 KiB, and the depth is 4. A cap that cuts the candidate side is a `warn` naming
+where the reader stopped, and a workflow with a cut expansion is judged when a changed file was
+reached by no workflow. The same expansion is used to find the workflows a changed file reaches.
+Paths resolve from the step's `working-directory`, else the job's or the workflow's default; an
+expression resolves from the repo root (documented limit), and `cd X` moves the directory of the
+statements after it.
+- A called script takes errexit from its shebang and the command flags (`-e`, `-o errexit`,
+  `-eo pipefail`); a sourced script inherits the caller's mode.
+- `make`: the recipe lines of the named targets and their prerequisites, or the default goal. Each
+  recipe line is its own `sh -c` without errexit, so a check followed by a command on the same line
+  is a swallow. A `-` prefix, `make -i`, `.IGNORE` and `MAKEFLAGS += -i` swallow; `make -k` does
+  not. `-C`, `-f` and command-line variables (`SHELL`, `.SHELLFLAGS`) are read.
+- `npm test|start|run|run-script X`, `pnpm [run] X`, `yarn [run] X`, `bun run X`: the package.json
+  script with `preX` and `postX`, found from `--prefix`, `-C`, `--dir` or the step's directory.
+- A statement a step adds that removes the project's tests (`rm`, `find -delete`, `git rm`, ...,
+  judged by the runner rule's `removes`, against the base's statements) blocks.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD` set in `env:` or inline is a `warn`.
+- A `make` or package-manager statement counts as expanded only when its target or script is read
+  and holds a recognised check or nothing; otherwise it stays opaque, and a kind that vanishes in
+  its presence keeps the old `warn` excuse.
+
 *Known limits.* Flow-style `steps: [...]`, a `runs-on` computed by `fromJSON`, a `make`
-target that secretly runs tests and `always() && false` are not read. Expansion is one level:
-a script called by a script, or by a script an action runs, is not followed, so a check moved
-into a nested script reads as removed; GitLab CI and CircleCI scripts are not followed; `make`
-targets are not read; `bash -o errexit ci.sh` is not read (the script path is taken for the
-option's value) and `bash -c './ci.sh'` does not name its script.
+and `always() && false` are not read. Expansion stops at depth 4, 32 files or 512 KiB per step
+(a `warn`); GitLab CI and CircleCI scripts are not followed; a Makefile `include`, several rules
+for one target and workspace flags (`npm -w`, `pnpm -F`) are not read; `cd` is not scoped, so a
+subshell's `cd` carries on; a `working-directory` expression resolves from the repo root; a make
+target or script with content the rule cannot classify stays opaque.
 
 *The greenproof step.* Greenproof steps are compared across all GitHub workflow files as a
 multiset of signatures: the `uses:` without its ref, `with:` (block scalars read; the raw text
