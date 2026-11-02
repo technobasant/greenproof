@@ -392,7 +392,34 @@ def match_rows(
     there is no such assignment or the work would pass the budget."""
     if len(needs) * len(pool) > MAX_MATCH:
         return None
-    options = [[j for j, (row, body) in enumerate(pool) if fits(n, row, body)] for n in needs]
+    # Rows that share a body are tried together: what a need still lacks after the body is
+    # computed once per body, and only rows holding its rarest remaining value are checked.
+    index: dict[str, list[int]] = {}
+    groups: dict[tuple[tuple[str, int], ...], set[int]] = {}
+    bodies: dict[tuple[tuple[str, int], ...], Counter[str]] = {}
+    for j, (row, body) in enumerate(pool):
+        for tok in row:
+            index.setdefault(tok, []).append(j)
+        key = tuple(sorted(body.items()))
+        groups.setdefault(key, set()).add(j)
+        bodies[key] = body
+    options: list[list[int]] = []
+    for n in needs:
+        found: set[int] = set()
+        for key, members in groups.items():
+            rest = n - bodies[key]
+            if not rest:
+                continue
+            lists = [index.get(tok) for tok in rest]
+            if any(lst is None for lst in lists):
+                continue
+            rarest = min((lst for lst in lists if lst is not None), key=len)
+            found.update(
+                j
+                for j in rarest
+                if j in members and all(pool[j][0].get(t, 0) >= c for t, c in rest.items())
+            )
+        options.append(sorted(found))
     owner: dict[int, int] = {}
 
     def place(i: int, seen: set[int]) -> bool:
@@ -405,7 +432,10 @@ def match_rows(
                 return True
         return False
 
-    if not all(place(i, set()) for i in range(len(needs))):
+    try:
+        if not all(place(i, set()) for i in range(len(needs))):
+            return None
+    except RecursionError:  # an assignment too tangled to search: not accounted for
         return None
     result = [0] * len(needs)
     for j, i in owner.items():

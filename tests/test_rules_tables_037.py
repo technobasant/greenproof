@@ -340,3 +340,37 @@ def test_analyse_reads_the_rows_of_each_language() -> None:
     assert rs.table is not None and len(rs.table.rows) == 2 and rs.table.runs
     plain = analyse_lines("t.test.js", JS_BASE, "js").units[0]
     assert plain.table is None
+
+
+def test_a_large_conversion_is_matched_row_for_row(tmp_path: Path) -> None:
+    n = 300
+    base = JS_HEAD + "".join(
+        f'test("t{i}", () => {{\n  expect(add({i}, {i})).toBe({2 * i});\n}});\n\n' for i in range(n)
+    )
+    rows = "".join(f"  [{i}, {i}, {2 * i}],\n" for i in range(n))
+    new = (
+        JS_HEAD
+        + "test.each([\n"
+        + rows
+        + "])('adds', (a, b, w) => {\n  expect(add(a, b)).toBe(w);\n});\n"
+    )
+    found = verdict(tmp_path, JS_PATH, base, new)
+    assert found == [("warn", "tests.replaced")] * n
+    # One row short: the last test has no row of its own left.
+    short = new.replace(f"  [{n - 1}, {n - 1}, {2 * (n - 1)}],\n", "")
+    assert blocked(verdict(tmp_path / "b", JS_PATH, base, short))
+
+
+def test_match_rows_gives_every_test_its_own_row() -> None:
+    from collections import Counter
+
+    from greenproof.rules.tests_tables import match_rows
+
+    body: Counter[str] = Counter({"s:x": 1})
+    pool = [(Counter({"n:1": 1, "n:2": 1}), body), (Counter({"n:1": 1}), body)]
+    # The first need fits both rows, the second only the second: a greedy pick would reuse row 1.
+    assert match_rows([Counter({"n:1": 1}), Counter({"n:1": 1, "n:2": 1})], pool) == [1, 0]
+    # Two needs, one row that carries them: not accounted for.
+    assert match_rows([Counter({"n:2": 1}), Counter({"n:2": 1})], pool) is None
+    # A need that the shared body already covers has no value of its own to carry.
+    assert match_rows([Counter({"s:x": 1})], pool) is None
