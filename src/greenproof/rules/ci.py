@@ -324,21 +324,28 @@ class _Expansion(NamedTuple):
 _CD = frozenset({"cd", "chdir", "pushd", "popd"})
 
 
+_GROUP_DEPTH = 32  # levels of `( ... )`, `{ ...; }` and `sh -c` a script is walked through
+
+
 def _walk_leaves(
-    text: str, defs: Defs, at: tuple[str, _Dir]
+    text: str, defs: Defs, at: tuple[str, _Dir], depth: int = 0
 ) -> Generator[tuple[str, str, _Dir], None, tuple[str, _Dir]]:
     """`_leaf_dirs` with the directory as `_leaves` tells it too, returning where the script
-    ends."""
+    ends. Past `_GROUP_DEPTH` levels a nested statement is one leaf, not walked into (the readers
+    of a statement bound their own nesting the same way)."""
     cwd, where = at
     for seg in split_segments(text):
         before = where
         inner = shell_c_body(seg.text, defs)
-        if inner is not None:  # a shell of its own: its `cd` stays in it
-            yield from _walk_leaves(inner, defs, (cwd, where))
+        group = None if inner is not None else group_inner(seg.text)
+        if depth >= _GROUP_DEPTH and (inner is not None or group is not None):
+            yield seg.text, cwd, where
             continue
-        group = group_inner(seg.text)
+        if inner is not None:  # a shell of its own: its `cd` stays in it
+            yield from _walk_leaves(inner, defs, (cwd, where), depth + 1)
+            continue
         if group is not None:
-            moved = yield from _walk_leaves(group, defs, (cwd, where))
+            moved = yield from _walk_leaves(group, defs, (cwd, where), depth + 1)
             if not seg.text.lstrip().startswith("("):
                 cwd, where = moved
         else:
@@ -1551,25 +1558,31 @@ def _balanced(text: str) -> bool:
     return depth == 0
 
 
-def _if_on(value: str, event: str) -> bool | None:
+_IF_DEPTH = 32  # nested parentheses and `&&`/`||` levels read before the reading gives up
+
+
+def _if_on(value: str, event: str, depth: int = 0) -> bool | None:
     """Whether an `if:` holds on an `event` run: False for `github.event_name == 'push'` on a
     pull request, True for `!= 'pull_request'` on one; `github.ref` and `github.ref_name`
     conditions are False on `pull_request` (a pull request's ref is `refs/pull/N/merge`) and
-    unknown on any other event. None for anything the reading cannot tell."""
+    unknown on any other event. None for anything the reading cannot tell, and for an expression
+    nested more than `_IF_DEPTH` levels deep."""
+    if depth > _IF_DEPTH:
+        return None
     text = " ".join(value.split())
     if len(text) > 1 and text[0] == text[-1] and text[0] in "'\"" and text[0] not in text[1:-1]:
         text = text[1:-1].strip()
     if m := _EXPR.match(text):
         text = m[1].strip()
     if _wrapped(text):
-        return _if_on(text[1:-1], event)
+        return _if_on(text[1:-1], event, depth + 1)
     ors = _split_top(text, "||")
     if len(ors) > 1:
-        got = [_if_on(p, event) for p in ors]
+        got = [_if_on(p, event, depth + 1) for p in ors]
         return True if True in got else False if all(g is False for g in got) else None
     ands = _split_top(text, "&&")
     if len(ands) > 1:
-        got = [_if_on(p, event) for p in ands]
+        got = [_if_on(p, event, depth + 1) for p in ands]
         return False if False in got else True if all(g is True for g in got) else None
     text = text.strip()
     if text in ("true", "'true'"):

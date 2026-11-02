@@ -1403,6 +1403,13 @@ def _make_kind(rest: list[str], make_check: Callable[[str], bool | None] | None)
     return None
 
 
+# How many `( ... )`, `{ ...; }` and `sh -c` levels a statement is read through. Past it the
+# statement is read flat (see `check_kind`): a script is not nested this deep by hand, and each
+# level costs a pass over the text and a stack frame.
+_NEST_BUDGET = 32
+_FLAT_SPLIT = re.compile(r"[;&|(){}\n]+")
+
+
 def check_kind(
     text: str,
     *,
@@ -1410,18 +1417,30 @@ def check_kind(
     scripts: Collection[str] = (),
     make_check: Callable[[str], bool | None] | None = None,
     defs: Mapping[str, str] | None = None,
+    _depth: int = 0,
 ) -> str | None:
     """The kind of check a statement runs in command position, None when it is not a check.
 
     `literals` are policy commands (a statement containing one is a check), `scripts` the
     repo-relative paths of scripts a policy command runs, `defs` the variables (`env:`, Makefile
-    assignments) a `$VAR` command word may be defined by.
+    assignments) a `$VAR` command word may be defined by. Past `_NEST_BUDGET` levels of groups the
+    statement is read flat: its first piece that is a check, without descending into any `sh -c`.
     """
+    if _depth > _NEST_BUDGET:
+        for piece in _FLAT_SPLIT.split(text):
+            if kind := classify(command_tokens(piece, defs), make_check):
+                return kind
+        return None
     inner = _group_inner(text)
     if inner is not None:
         for seg in split_segments(inner):
             kind = check_kind(
-                seg.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs
+                seg.text,
+                literals=literals,
+                scripts=scripts,
+                make_check=make_check,
+                defs=defs,
+                _depth=_depth + 1,
             )
             if kind:
                 return kind
@@ -1429,7 +1448,12 @@ def check_kind(
     if (body := shell_c_body(text, defs)) is not None:  # sh -c "..."
         for seg in split_segments(body):
             kind = check_kind(
-                seg.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs
+                seg.text,
+                literals=literals,
+                scripts=scripts,
+                make_check=make_check,
+                defs=defs,
+                _depth=_depth + 1,
             )
             if kind:
                 return kind
@@ -1510,15 +1534,17 @@ def _inline_eval(toks: list[str]) -> bool:
     return cmd in _INLINE_EVAL and any(_EVAL_FLAG.match(t) for t in toks[1:3])
 
 
-def is_non_check(text: str, defs: Mapping[str, str] | None = None) -> bool:
+def is_non_check(text: str, defs: Mapping[str, str] | None = None, _depth: int = 0) -> bool:
     """Whether a statement is recognisably not a check: a command from the list of ones that run
     no tests (`echo`, `exit 0`, `pip install`, `git`, `docker push`, a `deploy.sh`, `bash -n`,
     inline code that is not a recognised check)."""
+    if _depth > _NEST_BUDGET:
+        return False  # nested past the budget: not read, so not known to be free of a check
     inner = _group_inner(text)
     if inner is not None:
-        return all(is_non_check(seg.text, defs) for seg in split_segments(inner))
+        return all(is_non_check(seg.text, defs, _depth + 1) for seg in split_segments(inner))
     if (body := shell_c_body(text, defs)) is not None:
-        return all(is_non_check(seg.text, defs) for seg in split_segments(body))
+        return all(is_non_check(seg.text, defs, _depth + 1) for seg in split_segments(body))
     toks = command_tokens(text, defs)
     if not toks:
         return True  # nothing but assignments
@@ -1791,6 +1817,17 @@ def _flat_swallows(
         if seg.sep == "||" and _is_failing_exit(seg.text):
             chain_guard[-1] = True
     reads = [bool(_STATUS_READ.search(s.text)) for s in segs]
+    # `rc=$?` on a line of its own saves the status of the statement before it: it reads that
+    # status only if the script then ends with `$rc` (see `_rc_kept`)
+    saves = [""] * len(segs)
+    for i, seg in enumerate(segs):
+        if (
+            i
+            and seg.sep in ("", ";", "\n")
+            and (m := _RC_SET.match(_KEYWORD.sub(r"\g<rest>", seg.text)))
+        ):
+            saves[i] = m["v"]
+            reads[i] = _rc_kept(segs, i, m["v"])
     next_read = [-1] * (len(segs) + 1)  # the first statement at or after each one that reads
     for i in range(len(segs) - 1, -1, -1):
         next_read[i] = i if reads[i] else next_read[i + 1]
@@ -1860,6 +1897,13 @@ def _flat_swallows(
                     f"the failure sets `${rc_then['v']}` but the script never ends with"
                     f" `exit ${rc_then['v']}`",
                 )
+        elif saves[i] and unguarded[i - 1] and not reads[i]:
+            add(
+                seg,
+                "or",
+                f"the status is saved in `${saves[i]}` but the script never ends with"
+                f" `exit ${saves[i]}`",
+            )
         elif _SET_PLUS_E.match(text):
             state_errexit = False
             end = next(
@@ -1933,6 +1977,8 @@ def _flat_swallows(
         for i, seg in enumerate(segs):
             if not (check(i) and unguarded[i]) or depth[i] or reads[i]:
                 continue
+            if i + 1 < len(segs) and saves[i + 1]:
+                continue  # judged above, where the status is saved
             members = chain_members[chain_of[i]]
             if any(segs[j].sep != "&&" for j in members if j > i):
                 continue  # a `||` after it: judged above
@@ -1986,7 +2032,8 @@ def _and_list_swallowed(segs: Sequence[Seg], i: int, depth: list[int], members: 
     return False
 
 
-_RC_SET = re.compile(r"^(?P<v>[A-Za-z_]\w*)=(?:\$\?|\"\$\?\"|\$\{\?\})$")
+_DECL = r"(?:(?:local|declare|typeset|readonly|export)\s+(?:-\w+\s+)*)?"
+_RC_SET = re.compile(rf"^{_DECL}(?P<v>[A-Za-z_]\w*)=(?:\$\?|\"\$\?\"|\$\{{\?\}})$")
 _RC_NONZERO = re.compile(r"^(?P<v>[A-Za-z_]\w*)=\"?[1-9]\d*\"?$")
 
 
@@ -2050,6 +2097,17 @@ def _rc_branches(
     return None
 
 
+def _rc_final_test(text: str, var: str, last: bool) -> bool:
+    """Whether `text`, the last statement of the script, is a test that fails when `$var` is not
+    0 (`test $rc -eq 0`, `[ "$rc" = 0 ]`, `(( rc == 0 ))`), its status being the script's."""
+    if not last:
+        return False
+    if _rc_test(text, var) == "zero":
+        return True
+    v = re.escape(var)
+    return re.fullmatch(rf"\(\(\s*(?:{v}\s*==\s*0|!\s*{v})\s*\)\)", text.strip()) is not None
+
+
 def _rc_kept(segs: Sequence[Seg], i: int, var: str) -> bool:
     """Whether the script, after `segs[i]` saved a status in `$var`, ends non-zero when `$var`
     is: `exit $var` (also `exit ${var:-0}`, `exit $((var))`) at its top level or last in a
@@ -2058,18 +2116,26 @@ def _rc_kept(segs: Sequence[Seg], i: int, var: str) -> bool:
     between. A test that cannot be read does not count."""
     top = _top_level(segs)
     depth = _block_depth(segs)
-    reset = re.compile(rf"^{re.escape(var)}=")
+    reset = re.compile(rf"^{_DECL}{re.escape(var)}=")
     for j in range(i + 1, len(segs)):
         text = segs[j].text.strip()
         if top[j]:
             if re.fullmatch(rf"exit\s+{_rc_operand(var)}", text):
                 return True
+            if j + 1 == len(segs) and re.fullmatch(rf"return\s+{_rc_operand(var)}", text):
+                return True  # a function's value is the script's only when nothing follows it
             inner = group_inner(text) if text.startswith("{") else None
             tail = split_segments(inner.strip(" ;")) if inner else []
             if tail and re.fullmatch(rf"exit\s+{_rc_operand(var)}", tail[-1].text.strip()):
                 return True
             joined = j + 1 < len(segs) and segs[j + 1].sep in ("&&", "||")
+            if segs[j].sep in ("", ";", "\n") and _rc_final_test(text, var, j + 1 == len(segs)):
+                return True
             if joined and (pol := _rc_test(text, var)):
+                if pol == "zero" and segs[j + 1].sep == "&&" and j + 2 == len(segs):
+                    return (
+                        True  # `[ "$rc" -eq 0 ] && echo ok` last: the list's status is the test's
+                    )
                 want = "nonzero" if segs[j + 1].sep == "&&" else "zero"
                 if pol == want and _rc_exits(segs[j + 1].text, var, j + 2 == len(segs)):
                     return True
