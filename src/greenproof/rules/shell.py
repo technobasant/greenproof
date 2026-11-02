@@ -29,7 +29,7 @@ import posixpath
 import re
 import shlex
 from collections.abc import Callable, Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # What a command-position word is, by the kind of check it runs.
 _SIMPLE_CHECKERS = {
@@ -774,7 +774,7 @@ def early_exit(script: str) -> bool:
     return False
 
 
-def find_swallows(
+def _flat_swallows(
     script: str,
     extra: Sequence[str] = (),
     *,
@@ -924,6 +924,54 @@ def find_swallows(
                     " this shell's exit status is the last command's",
                 )
             )
+    return out
+
+
+def find_swallows(
+    script: str,
+    extra: Sequence[str] = (),
+    *,
+    opaque: bool = True,
+    errexit: bool = False,
+    early: bool = False,
+    scripts: Collection[str] = (),
+    make_check: Callable[[str], bool | None] | None = None,
+    base_segments: Collection[str] | None = None,
+    known: bool | None = None,
+    strict_status: bool = False,
+    powershell: bool = False,
+) -> list[Swallow]:
+    """The places where `script` can fail a check and still exit 0 (see `_flat_swallows`), also
+    inside the body of a `sh -c` or `bash -c` statement, which is a shell of its own."""
+    out = _flat_swallows(
+        script,
+        extra,
+        opaque=opaque,
+        errexit=errexit,
+        early=early,
+        scripts=scripts,
+        make_check=make_check,
+        base_segments=base_segments,
+        known=known,
+        strict_status=strict_status,
+        powershell=powershell,
+    )
+    for seg in split_segments(script):
+        body = shell_c_body(seg.text)
+        if body is None:
+            continue
+        out.extend(
+            replace(w, line=seg.line + w.line - 1)
+            for w in _flat_swallows(
+                body,
+                extra,
+                opaque=False,
+                errexit=False,
+                scripts=scripts,
+                make_check=make_check,
+                strict_status=True,
+            )
+        )
     return out
 
 
