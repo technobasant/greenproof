@@ -148,7 +148,11 @@ _RULES = [
         "only when it is known that no policy command reaches it, Makefile variables are "
         "expanded before a recipe is read, a script that no longer runs a kind of check the "
         "base ran blocks, the same tool with another subcommand is another step, and a make "
-        "target named like an existing path and not in .PHONY runs nothing.",
+        "target named like an existing path and not in .PHONY runs nothing. Tool "
+        "configuration is compared as each tool reads it (one file wins, nothing merged), so a "
+        "pytest.ini or ruff.toml that shadows pyproject.toml counts and a move between files "
+        "does not; an exclude or omit blocks only when it removes files the base checked, and a "
+        "coverage exclusion that matches ordinary code blocks.",
     ),
     RuleInfo(
         "ci.tampered",
