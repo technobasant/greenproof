@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 
@@ -12,14 +13,47 @@ class Table:
     a `[]struct` or map ranged over, rstest `#[case]` or `#[test_case]`.
 
     `rows` holds the literal tokens of each row (numbers, strings, true/false/null) and `forms`
-    its whitespace-free text. `runs` is True only when the rows reach the test body: the table is
-    iterated (or each-called) and the body reads a parameter of the row.
+    its whitespace-free text. `runs` is True only when every row reaches the test body and is
+    asserted there: the wrappers on the way are live (not skipped, not inverted by `.failing` or
+    `#[should_panic]`), the body reads a parameter, no row leaves before asserting, and some
+    parameter reaches an assertion. `why` says which of these failed when `runs` is False.
+
+    `cells` holds each row's values by column (`(column, tokens)`), `reach` whether the
+    parameter of each column is read by an assertion, and `reach_all` whether every parameter
+    the body reads is: a fold is credited only when the columns that carry the removed test's
+    values reach an assertion. `note` is a limit of the reading (a body too large to check).
     """
 
     rows: tuple[tuple[str, ...], ...]
     forms: tuple[str, ...]
     runs: bool
     implicit: bool = False  # Rust `#[test_case(.. => expected)]`: each row is its own check
+    why: str = ""
+    note: str = ""
+    cells: tuple[tuple[tuple[str, tuple[str, ...]], ...], ...] = ()
+    reach: tuple[tuple[str, bool], ...] = ()
+    reach_all: bool = True
+
+    def unasserted(self, index: int, tokens: Iterable[str]) -> str:
+        """Why row `index` does not put these values (a removed test's literals) under an
+        assertion, else "". The column of each value must reach an assertion; when the columns
+        cannot be told apart, every parameter must."""
+        if self.reach_all:
+            return ""
+        reach = dict(self.reach)
+        cells = self.cells[index] if index < len(self.cells) else ()
+        for tok in tokens:
+            keys = [k for k, toks in cells if tok in toks]
+            if keys and all(k in reach for k in keys):
+                if not any(reach[k] for k in keys):
+                    shown = ", ".join(f"`{k}`" for k in keys)
+                    value = tok.split(":", 1)[-1]
+                    return f"the row's value {value} is bound to {shown}, which no assertion reads"
+            else:
+                return (
+                    "a row parameter that no assertion reads, and the columns cannot be told apart"
+                )
+        return ""
 
 
 @dataclass
