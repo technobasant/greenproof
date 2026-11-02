@@ -65,6 +65,21 @@ class Unit:
         return self.key.rsplit("::", 1)[-1] if self.engine.startswith("python") else self.key
 
 
+@dataclass
+class Fixture:
+    """A `@pytest.fixture` function: where it is, whether every test in scope uses it, and the
+    literals it returns or yields (the expected values a test may compare against)."""
+
+    path: str
+    name: str  # `Class::name` for a fixture defined in a class
+    line: int
+    autouse: bool
+    literals: list[str]  # ast.dump of each returned or yielded literal
+    body_hash: str
+    scope: str = ""  # the class prefix (`Class::`) it is defined in, else ""
+    node: ast.AST | None = field(default=None, repr=False, compare=False)
+
+
 @dataclass(frozen=True)
 class Marker:
     """A skip or focus marker. `scope` is the unit key it sits in, else `<path>::<module>`."""
@@ -85,3 +100,6 @@ class FileAnalysis:
     markers: list[Marker] = field(default_factory=list)
     collected: bool = True  # whether the runner's file patterns pick this file up
     tree: ast.Module | None = field(default=None, repr=False, compare=False)  # Python only
+    # Python only: paths of the test-path modules whose functions this file imports and may call.
+    imports: set[str] = field(default_factory=set)
+    fixtures: dict[str, Fixture] = field(default_factory=dict)  # Python only, by name

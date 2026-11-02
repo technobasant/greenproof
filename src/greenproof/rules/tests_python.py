@@ -10,7 +10,7 @@ import re
 from collections.abc import Callable, Sequence
 
 from greenproof.rules._common import digest
-from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
+from greenproof.rules.tests_model import FileAnalysis, Fixture, Marker, Unit
 
 _MARK_SUFFIXES = ("mark.skip", "mark.skipif", "mark.xfail")
 _FULL_KINDS = {
@@ -587,6 +587,40 @@ def _expected_of(node: ast.AST) -> ast.AST | None:
     return None
 
 
+class _Helpers(dict[str, _FuncDef]):
+    """The functions a test may call and get credit for, by the name it calls them with: the
+    file's own top-level helpers and the functions of the test-path modules it imports. `scopes`
+    gives, for an imported function, the helpers of the module it lives in; `swallowers` names
+    those whose body swallows assertion failures (a decorator that does is a tamper)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scopes: dict[str, dict[str, _FuncDef]] = {}
+        self.swallowers: set[str] = set()
+
+
+def _handler_swallows(handler: ast.ExceptHandler) -> bool:
+    caught: list[str] = []
+    if handler.type is None:
+        caught = ["BaseException"]
+    elif isinstance(handler.type, ast.Tuple):
+        caught = [dotted(e) for e in handler.type.elts]
+    else:
+        caught = [dotted(handler.type)]
+    if not any(c.rsplit(".", 1)[-1] in _SWALLOWED for c in caught):
+        return False
+    return not any(isinstance(n, ast.Raise) for s in handler.body for n in ast.walk(s))
+
+
+def _fn_swallows(fn: _FuncDef) -> bool:
+    """The function (or a wrapper defined inside it) has a try/except that swallows assertion
+    failures: AssertionError, Exception, BaseException or a bare except, with no re-raise."""
+    return any(
+        isinstance(n, (ast.Try, ast.TryStar)) and any(_handler_swallows(h) for h in n.handlers)
+        for n in ast.walk(fn)
+    )
+
+
 class _Stats(ast.NodeVisitor):
     """Assertion statistics for one test body, crediting same-module helper functions."""
 
@@ -957,14 +991,21 @@ class _Stats(ast.NodeVisitor):
         target: str | None = None
         if isinstance(func, ast.Name):
             target = func.id
-        elif isinstance(func, ast.Attribute) and dotted(func.value) in {"self", "cls"}:
-            target = func.attr
+        elif isinstance(func, ast.Attribute):
+            if dotted(func.value) in {"self", "cls"}:
+                target = func.attr
+            elif dotted(func) in self.helpers:  # `helpers.check(...)` on an imported module
+                target = dotted(func)
         if target is None or target not in self.helpers or self.depth >= 2:
             return
         if target in self.stack:
             return
+        scopes = getattr(self.helpers, "scopes", {})
         sub = _Stats(
-            self.helpers, self.depth + 1, (*self.stack, target), _Consts(self.helpers[target])
+            scopes.get(target, self.helpers),
+            self.depth + 1,
+            (*self.stack, target),
+            _Consts(self.helpers[target]),
         )
         for stmt in self.helpers[target].body:
             sub.visit(stmt)
@@ -981,16 +1022,7 @@ class _Stats(ast.NodeVisitor):
 
     # -- swallowing ---------------------------------------------------------------------
     def _swallows(self, handler: ast.ExceptHandler) -> bool:
-        caught: list[str] = []
-        if handler.type is None:
-            caught = ["BaseException"]
-        elif isinstance(handler.type, ast.Tuple):
-            caught = [dotted(e) for e in handler.type.elts]
-        else:
-            caught = [dotted(handler.type)]
-        if not any(c.rsplit(".", 1)[-1] in _SWALLOWED for c in caught):
-            return False
-        return not any(isinstance(n, ast.Raise) for s in handler.body for n in ast.walk(s))
+        return _handler_swallows(handler)
 
     def _count_inside(self, body: Sequence[ast.stmt], line: int) -> None:
         inner = _Stats(self.helpers, self.depth, self.stack)
@@ -1133,6 +1165,13 @@ def _unit(
     stats.literal_params = _literal_params(fn)
     for stmt in live.body:
         stats.visit(stmt)
+    swallowers: set[str] = getattr(helpers, "swallowers", set())
+    for dec in fn.decorator_list:
+        # A decorator that swallows assertion failures wraps every check of the test.
+        if dotted(dec.func if isinstance(dec, ast.Call) else dec) in swallowers and stats.asserts:
+            stats.swallowed += stats.asserts
+            stats.swallow_line = stats.swallow_line or dec.lineno
+            break
     cases, literal, case_forms = _parametrize(fn)
     lost = _Stats(helpers)
     for stmt in dropped:
@@ -1192,6 +1231,39 @@ def _test_disabled(body: Sequence[ast.stmt]) -> ast.stmt | None:
     return None
 
 
+def _reads(node: ast.AST, name: str) -> bool:
+    return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
+
+
+def _last_bindings(body: Sequence[ast.stmt]) -> dict[str, ast.AST | None]:
+    """Python keeps only the last binding of a name in a module or class body. Maps each name to
+    the definition that is its last binding, or None when a later `del`, assignment or import
+    replaced it. An assignment that reads the name (`test_x = decorate(test_x)`) wraps the
+    definition rather than replacing it, so it is not a rebinding."""
+    last: dict[str, ast.AST | None] = {}
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            last[node.name] = node
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    last[target.id] = None
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    last[alias.asname or alias.name.split(".")[0]] = None
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                names = [target] if isinstance(target, ast.Name) else []
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    names = [e for e in target.elts if isinstance(e, ast.Name)]
+                for name in names:
+                    if not _reads(node.value, name.id):
+                        last[name.id] = None
+    return last
+
+
 def _collect_units(
     path: str,
     body: Sequence[ast.stmt],
@@ -1203,7 +1275,13 @@ def _collect_units(
     disabled: bool = False,
 ) -> None:
     in_class = bool(prefix)
+    last = _last_bindings(body)
     for node in body:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and last.get(node.name) is not node
+        ):
+            continue  # shadowed by a later definition, or deleted or rebound: not collected
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _is_test_name(node.name, in_class):
                 unit = _unit(
@@ -1319,17 +1397,198 @@ def _conftest_markers(path: str, tree: ast.Module) -> list[Marker]:
     return out
 
 
-def analyse_python(path: str, text: str) -> FileAnalysis | None:
-    """The file's tests and markers, or None when it does not parse (callers fall back)."""
-    try:
-        tree = ast.parse(text)
-    except (SyntaxError, ValueError, RecursionError):
-        return None
-    helpers: dict[str, _FuncDef] = {
+class Sources:
+    """Reads Python modules at one revision, so a test's imported helpers are analysed as they
+    were at the same revision as the test (base text for the base, the candidate tree for the
+    candidate). `is_test` says whether a path is inside the test paths: only those resolve."""
+
+    def __init__(
+        self,
+        read: Callable[[str], str | None],
+        is_test: Callable[[str], bool],
+        listing: Callable[[], set[str]] | None = None,
+    ) -> None:
+        self.read = read
+        self.is_test = is_test
+        self._listing = listing
+        self._files: set[str] | None = None
+        self._parsed: dict[str, ast.Module | None] = {}
+
+    def module(self, path: str) -> ast.Module | None:
+        if path not in self._parsed:
+            if self._listing is not None and self._files is None:
+                self._files = self._listing()  # one `git ls-tree` instead of a read per guess
+            text = None if self._files is not None and path not in self._files else self.read(path)
+            tree: ast.Module | None = None
+            if text is not None and self.is_test(path):
+                try:
+                    tree = ast.parse(text)
+                except (SyntaxError, ValueError, RecursionError):
+                    tree = None
+            self._parsed[path] = tree
+        return self._parsed[path]
+
+
+def _roots(path: str) -> list[str]:
+    """Directories an absolute import in the test file may resolve against: its own directory and
+    every parent up to the repository root, then the conventional `tests` and `test` roots."""
+    out: list[str] = []
+    here = posixpath.dirname(path)
+    while True:
+        out.append(here)
+        if not here:
+            break
+        here = posixpath.dirname(here)
+    out.extend(r for r in ("tests", "test") if r not in out)
+    return out
+
+
+def _resolve_module(
+    path: str, module: str, level: int, sources: Sources
+) -> tuple[str, ast.Module] | None:
+    """The test-path module `module` (dotted, `level` leading dots) names, seen from `path`."""
+    rel = module.replace(".", "/") if module else ""
+    if level:
+        base = posixpath.dirname(path)
+        for _ in range(level - 1):
+            base = posixpath.dirname(base)
+        roots = [base]
+    else:
+        roots = _roots(path)
+    for root in roots:
+        stem = posixpath.join(root, rel) if rel else root
+        names = (f"{stem}.py", posixpath.join(stem, "__init__.py")) if rel else ()
+        for candidate in names or (posixpath.join(stem, "__init__.py"),):
+            tree = sources.module(candidate)
+            if tree is not None:
+                return candidate, tree
+    return None
+
+
+def _top_functions(tree: ast.Module) -> dict[str, _FuncDef]:
+    """The module's functions by name; the last definition of a name is the one in force."""
+    return {
         n.name: n
         for n in tree.body
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and not n.name.startswith("test")
     }
+
+
+def _import_helpers(path: str, tree: ast.Module, sources: Sources, helpers: _Helpers) -> set[str]:
+    """Add the functions of the test-path modules `tree` imports to `helpers`, under the name the
+    test calls them by (`check`, `h.check`, `helpers.check`). Returns the modules' paths."""
+    used: set[str] = set()
+
+    def add_module(local: str, found: tuple[str, ast.Module]) -> None:
+        funcs = _top_functions(found[1])
+        used.add(found[0])
+        for name, fn in funcs.items():
+            key = f"{local}.{name}"
+            helpers.setdefault(key, fn)
+            helpers.scopes.setdefault(key, funcs)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            found = _resolve_module(path, module, node.level, sources)
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                if found is not None:
+                    funcs = _top_functions(found[1])
+                    if alias.name in funcs:
+                        used.add(found[0])
+                        helpers.setdefault(local, funcs[alias.name])
+                        helpers.scopes.setdefault(local, funcs)
+                        continue
+                sub = _resolve_module(
+                    path, f"{module}.{alias.name}" if module else alias.name, node.level, sources
+                )
+                if sub is not None:  # `from tests import helpers`
+                    add_module(local, sub)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                found = _resolve_module(path, alias.name, 0, sources)
+                if found is not None:
+                    add_module(alias.asname or alias.name, found)
+    return used
+
+
+class _Returned(ast.NodeVisitor):
+    """The values a function returns or yields, not looking into nested functions."""
+
+    def __init__(self) -> None:
+        self.values: list[ast.expr] = []
+
+    def visit_Return(self, node: ast.Return) -> None:
+        if node.value is not None:
+            self.values.append(node.value)
+
+    def visit_Yield(self, node: ast.Yield) -> None:
+        if node.value is not None:
+            self.values.append(node.value)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+
+def _fixture_decorator(fn: _FuncDef) -> ast.expr | None:
+    for dec in fn.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if dotted(target).rsplit(".", 1)[-1] == "fixture":
+            return dec
+    return None
+
+
+def _fixtures(path: str, body: Sequence[ast.stmt], scope: str, out: dict[str, Fixture]) -> None:
+    """The `@pytest.fixture` functions of a module or class body, and of the classes in it."""
+    last = _last_bindings(body)
+    for node in body:
+        if isinstance(node, ast.ClassDef):
+            _fixtures(path, node.body, f"{scope}{node.name}::", out)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            dec = _fixture_decorator(node)
+            if dec is None or last.get(node.name) is not node:
+                continue
+            autouse = isinstance(dec, ast.Call) and any(
+                k.arg == "autouse" and isinstance(k.value, ast.Constant) and k.value.value is True
+                for k in dec.keywords
+            )
+            returned = _Returned()
+            for stmt in node.body:
+                returned.visit(stmt)
+            out[f"{scope}{node.name}"] = Fixture(
+                path,
+                f"{scope}{node.name}",
+                node.lineno,
+                autouse,
+                [ast.dump(v) for v in returned.values if _is_literal(v)],
+                _body_hash(node),
+                scope,
+                node,
+            )
+
+
+def analyse_python(path: str, text: str, sources: Sources | None = None) -> FileAnalysis | None:
+    """The file's tests and markers, or None when it does not parse (callers fall back).
+    With `sources`, functions imported from modules inside the test paths are credited like the
+    file's own helpers."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    helpers = _Helpers()
+    helpers.update(_top_functions(tree))
     for cls in tree.body:
         if isinstance(cls, ast.ClassDef):
             for n in cls.body:
@@ -1338,6 +1597,10 @@ def analyse_python(path: str, text: str) -> FileAnalysis | None:
                 ):
                     helpers.setdefault(n.name, n)
     analysis = FileAnalysis(path, "python", tree=tree)
+    if sources is not None:
+        analysis.imports = _import_helpers(path, tree, sources, helpers)
+    helpers.swallowers = {k for k, fn in helpers.items() if _fn_swallows(fn)}
+    _fixtures(path, tree.body, "", analysis.fixtures)
     _collect_units(
         path, tree.body, "", helpers, analysis.units, disabled=_test_disabled(tree.body) is not None
     )

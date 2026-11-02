@@ -8,6 +8,7 @@ patches the same test did not already contain at the base.
 from __future__ import annotations
 
 import ast
+import posixpath
 import re
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
@@ -17,7 +18,7 @@ from greenproof.changeset import ChangeSet
 from greenproof.findings import Finding
 from greenproof.rules._common import finding
 from greenproof.rules.tests_lines import mask_source
-from greenproof.rules.tests_model import FileAnalysis, Unit
+from greenproof.rules.tests_model import FileAnalysis, Fixture, Unit
 from greenproof.rules.tests_python import dotted
 
 _HINT = (
@@ -135,11 +136,15 @@ def _asserted_calls(fn: ast.AST) -> list[str]:
     return names
 
 
-def _same_callable(patched: str, call: str, imports: _Imports) -> bool:
+def _same_callable(
+    patched: str, call: str, imports: _Imports, call_imports: _Imports | None = None
+) -> bool:
+    """Whether the call is to the patched callable; `imports` resolves the patch target, and
+    `call_imports` (default: the same) the name the call is written with."""
     if patched == call:
         return True
     want, _ = _resolve(patched, imports)
-    got, relative = _resolve(call, imports)
+    got, relative = _resolve(call, call_imports or imports)
     return want == got or (relative and want.endswith(f".{got}"))
 
 
@@ -162,6 +167,105 @@ def _python(
         hit = next((c for c in calls if _same_callable(patched, c, imports)), None)
         if hit is not None:
             yield line, patched, f"{hit}(...)"
+
+
+def _fixture_patches(fn: ast.AST) -> list[tuple[str, str, int]]:
+    """The patches in a fixture: `_patches`, plus a plain assignment to a module attribute
+    (`shop.refund = lambda a: a`)."""
+    out = _patches(fn)
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and (qual := dotted(target.value)):
+                    out.append((qual, target.attr, node.lineno))
+    return out
+
+
+def _fixture_scope(fx: Fixture, files: Mapping[str, FileAnalysis]) -> list[Unit]:
+    """The collected Python tests an autouse fixture applies to: those of its own file (its class,
+    for a class fixture), or for a conftest.py every test at or below its directory."""
+    here = posixpath.dirname(fx.path)
+    if posixpath.basename(fx.path) == "conftest.py":
+        paths = [p for p in sorted(files) if not here or p.startswith(here + "/")]
+    else:
+        paths = [fx.path]
+    units: list[Unit] = []
+    for path in paths:
+        analysis = files.get(path)
+        if analysis is None or not analysis.engine.startswith("python") or not analysis.collected:
+            continue
+        units.extend(u for u in analysis.units if u.node is not None and u.key.startswith(fx.scope))
+    return units
+
+
+def check_autouse_fixtures(
+    base_files: Mapping[str, FileAnalysis], cand_files: Mapping[str, FileAnalysis]
+) -> list[Finding]:
+    """An added or changed autouse fixture (conftest.py or a test file) patches a callable that
+    tests in its scope call in their assertions: every such test runs against the mock."""
+    out: list[Finding] = []
+    imports: dict[str, _Imports] = {}
+
+    def imports_of(path: str) -> _Imports | None:
+        analysis = cand_files.get(path)
+        if analysis is None or analysis.tree is None:
+            return None
+        if path not in imports:
+            imports[path] = _imports(analysis.tree)
+        return imports[path]
+
+    for path, analysis in cand_files.items():
+        if not analysis.engine.startswith("python"):
+            continue
+        for name, fx in analysis.fixtures.items():
+            if not fx.autouse or fx.node is None:
+                continue
+            before = base_files.get(path)
+            old = before.fixtures.get(name) if before is not None else None
+            if old is not None and old.body_hash == fx.body_hash:
+                continue
+            fx_imports = imports_of(path)
+            if fx_imports is None:
+                continue
+            seen: set[tuple[str, str]] = set()
+            if old is not None and old.node is not None:
+                seen.update((q, n) for q, n, _ in _fixture_patches(old.node))
+            units = _fixture_scope(fx, cand_files)
+            asserted = {id(u): _asserted_calls(u.node) for u in units if u.node is not None}
+            for qual, attr, line in _fixture_patches(fx.node):
+                if (qual, attr) in seen:
+                    continue
+                patched = f"{qual}.{attr}"
+                hit = ""
+                names: list[str] = []
+                for u in units:
+                    call = next(
+                        (
+                            c
+                            for c in asserted.get(id(u), [])
+                            if _same_callable(patched, c, fx_imports, imports_of(u.path))
+                        ),
+                        None,
+                    )
+                    if call is not None:
+                        hit = hit or call
+                        names.append(u.name)
+                if names:
+                    shown = ", ".join(names[:3]) + (
+                        f" and {len(names) - 3} more" if len(names) > 3 else ""
+                    )
+                    out.append(
+                        finding(
+                            "tests.self_mocked",
+                            path,
+                            line,
+                            f"autouse fixture {fx.name.rsplit('::', 1)[-1]} patches {patched} and "
+                            f"the tests in its scope assert on {hit}(...) ({shown}); "
+                            "they test the mock",
+                            _HINT,
+                        )
+                    )
+    return out
 
 
 # ---- JS / TS ------------------------------------------------------------------------------
