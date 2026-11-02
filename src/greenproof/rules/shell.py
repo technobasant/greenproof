@@ -79,7 +79,9 @@ SELECT_FLAGS: dict[str, frozenset[str]] = {
         | {"--findRelatedTests", "--shard", "--testPathPattern", "--selectProjects"}
         | {"--project", "--changed", "--related"}
     ),
-    "cargo": frozenset({"--skip"}),
+    # `--doc` runs the doctests only and `-- --ignored` the ignored tests only; `--include-ignored`
+    # runs more than the default, so it is not here.
+    "cargo": frozenset({"--skip", "--doc", "--ignored"}),
     "mocha": frozenset({"--grep", "-g", "--invert"}),
     "playwright": frozenset(
         {"--grep", "-g", "--grep-invert", "--project", "--only-changed", "--last-failed"}
@@ -106,8 +108,11 @@ SELECT_FLAGS: dict[str, frozenset[str]] = {
 # Flags after which the runner runs no test, or passes with none. `-x test` (gradle) is a flag
 # and its value, written as one name.
 NOOP_FLAGS: dict[str, frozenset[str]] = {
-    "pytest": frozenset({"--co", "--collect-only"}),
-    "js": frozenset({"--passWithNoTests"}),
+    "pytest": frozenset(
+        {"--co", "--collect-only", "--setup-plan", "--setup-only", "--fixtures", "--markers"}
+    ),
+    "go": frozenset({"-list", "-test.list", "-c"}),
+    "js": frozenset({"--passWithNoTests", "--listTests", "--testFailureExitCode"}),
     "mvn": frozenset({"-DskipTests", "-Dmaven.test.skip"}),
     "gradle": frozenset({"-x test"}),
     "nextest": frozenset({"--no-run"}),
@@ -1448,10 +1453,11 @@ def selection_uses(
                 args = tokens[start:]
                 found.extend(
                     (family, n, seg.text)
-                    for t in args
+                    for k, t in enumerate(args)
                     if (n := _flag_name(t, flags))
                     and not (retry and n in RERUN_FLAGS)
                     and not (n in _VALUED_NOOP and re.search(r"=(?:false|0|no)$", t, re.IGNORECASE))
+                    and not (n in _ZERO_VALUED and not _is_zero(t, args[k + 1 : k + 2]))
                 )
                 if "-x test" in flags:
                     found.extend(
@@ -1470,6 +1476,13 @@ def selection_uses(
 
 
 _VALUED_NOOP = frozenset({"-DskipTests", "-Dmaven.test.skip"})
+# `--testFailureExitCode=0` makes jest exit 0 whatever fails; any other code keeps the check.
+_ZERO_VALUED = frozenset({"--testFailureExitCode"})
+
+
+def _is_zero(token: str, following: Sequence[str]) -> bool:
+    value = token.partition("=")[2] if "=" in token else (following[0] if following else "")
+    return value.strip("'\"") == "0"
 
 
 def selection_flags(command: str, defs: Mapping[str, str] | None = None) -> list[tuple[str, str]]:

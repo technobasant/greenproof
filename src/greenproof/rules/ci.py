@@ -1299,6 +1299,9 @@ def _line_of(lines: list[str], start: int, stop: int, needle: str) -> int:
     return start
 
 
+_NEXTEST = re.compile(r"\bcargo\s+(?:\S+\s+)*?nextest\b")
+
+
 def _github_step_reasons(text: str, world: _World) -> list[Reason]:
     out: list[Reason] = []
     lines = split_lines(text)
@@ -1351,6 +1354,8 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
             for family, flag, stmt in selection_uses(body.text, retries_ok=True, defs=body.defs):
                 if (family, flag) in base_flags:
                     continue
+                if flag == "--doc" and _NEXTEST.search(text):
+                    continue  # nextest runs no doctest: `cargo test --doc` completes it
                 noop = any(flag in flags for flags in NOOP_FLAGS.values())
                 if not noop and not world.base_has_tests:
                     continue
