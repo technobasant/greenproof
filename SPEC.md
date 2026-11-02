@@ -97,9 +97,11 @@ greenproof --version
       the base is `git merge-base HEAD @{upstream}`: the commits not yet pushed are part of
       the change under test, and so are uncommitted changes. When HEAD equals its upstream
       (CI on a push) the base is `HEAD`, and only uncommitted changes are compared. When the
-      branch has no upstream the base is `HEAD` and the report carries the note "no upstream
-      on `<branch>`, so only uncommitted changes were compared; pass `--base REF` to compare
-      commits".
+      branch has no upstream the base is `HEAD` and the report carries the note "on the
+      default branch with no upstream: only uncommitted changes are checked; pass --base REF
+      to include commits" (`gitops.NO_UPSTREAM_NOTE`). When an upstream exists but shares no
+      history with HEAD (`merge-base` fails, as in a shallow clone), that is not "no upstream":
+      it is exit 4 with the fix (`fetch-depth: 0`), never a silent fall back to `HEAD`.
    Base not resolvable (e.g. shallow clone) → exit 4 with the fix (`fetch-depth: 0`).
 4. **Load policy from the base**: `git show <base>:.greenproof.toml`. If the base has no
    policy file (first adoption), use the candidate's and record `policy.source = "candidate"`.
@@ -204,8 +206,8 @@ covering at least one true positive and one legitimate change that must NOT fire
 | `tests.weakened` | block | for a test present on both sides: fewer assertions, a strong assertion replaced by a weaker one, tolerance widened, parametrize cases reduced, an assertion made vacuous, tautological or unreachable, or an assertion wrapped in a swallowing `try/except` (see 5.4) |
 | `tests.expected_changed` | warn | a literal in an assertion's expected side changed in a kept test (same number of expected literals), or a modified expected-output data file (5.4), whether or not non-test code changed. With no non-test code change it is the "edit the test to match what the code returns" pattern, which commands and revert cannot see (the suite passes and revert has no source change to undo); the message says which case it is. Legitimate when the old value was wrong or the spec changed, so warn. It also fires when a `@pytest.fixture` function in a `conftest.py` or test file returns or yields a different literal (number, string, tuple, list, dict) than at the base; the message names the fixture and file, and every test using the fixture compares against that value |
 | `suppress.added` | warn | an added line introduces a type/lint/coverage suppression (see 5.5) |
-| `runner.tampered` | block | a change narrows or neuters how checks run: test selection, thresholds, strictness, test scripts, a script or file a policy command runs, a Go `TestMain` that no longer runs the tests (see 5.6) |
-| `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `if: false`, a swallowed failure in a test or lint step (`|| true`, `|| echo ...`, `; exit 0`, `; true`, an `exit 0` after the check, `set +e` that never reads the status), a selection flag on a test command (`-k`, `-m`, `--deselect`, `--ignore`, `-run`, `-short`, `-t`, `--testNamePattern`, `--skip`, `--grep`), a trigger that runs on fewer events or paths (see 5.6), or changes the greenproof step itself. The greenproof step is a line, outside a YAML comment, that runs `greenproof check` (any prefix such as `uvx`, `uv run` or a path, any `@version`) or `uses:` the greenproof action; other mentions (`greenproof --version` in a packaging job) do not count. Only those lines count, and a workflow whose base version has none gaining them is adoption, not a change (a new workflow file included); commenting out or deleting an existing greenproof line still fires. A ref-only version bump of the greenproof action (same inputs) is `warn` |
+| `runner.tampered` | block | a change narrows or neuters how checks run: test selection, thresholds, strictness, test scripts, a script or file a policy command runs, a Go `TestMain` that always exits 0 or no longer runs the tests (see 5.6) |
+| `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `if: false`, a swallowed failure in a test or lint step (`|| true`, `|| echo ...`, `; exit 0`, `; true`, an `exit 0` after the check, `set +e` that never reads the status, each only after a check command; under GitHub's default `bash -e`, `; exit 0` and `; true` swallow nothing), `--collect-only` or `--passWithNoTests`, an `exit 0` before the first check, a selection flag on a test command (`-k`, `-m`, `--deselect`, `--ignore`, `-run`, `-short`, `-t`, `--testNamePattern`, `--skip`, `--grep`), a trigger that runs on fewer events or paths (see 5.6), or changes the greenproof step itself. The greenproof step is a line, outside a YAML comment, that runs `greenproof check` (any prefix such as `uvx`, `uv run` or a path, any `@version`) or `uses:` the greenproof action; other mentions (`greenproof --version` in a packaging job) do not count. Only those lines count, and a workflow whose base version has none gaining them is adoption, not a change (a new workflow file included); commenting out or deleting an existing greenproof line still fires. A ref-only version bump of the greenproof action (same inputs) is `warn` |
 | `static.parse_error` | warn | a changed file in a parsed language (Python, TOML, JSON, INI) does not parse; that file falls back to the line-level checks |
 | `tests.self_mocked` | warn | an added or changed test patches (`monkeypatch.setattr`, `mock.patch`, `jest.mock`, `vi.mock`) the same callable its assertions call, so it tests the mock (5.8) |
 | `code.hardcoded` | warn | non-test code gains a literal table (≥ 8 entries) or an `if x == <literal>` branch whose literal also appears in added lines of a test file changed in this diff (5.8; Python AST only in v0.1) |
@@ -507,27 +509,41 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `[tool.ruff.lint]` (`ignore`/`extend-ignore`/`per-file-ignores` added);
 - `pytest.ini`, `setup.cfg`, `tox.ini`, `noxfile.py` equivalents;
 - `package.json` `scripts` whose names appear in the base policy's commands, plus
-  `test`, `lint`, `typecheck`, and the scripts those call through `npm run NAME` (one level
-  deep); `jest.config.*`/`vitest.config.*` (`testPathIgnorePatterns`,
+  `test`, `lint`, `typecheck`, and the scripts those call through `npm run NAME`, `run-s`,
+  `run-p` or `npm-run-all` (one level deep; `npm run a && npm run b` and `run-s a b` are the
+  same steps); `jest.config.*`/`vitest.config.*` (`testPathIgnorePatterns`,
   `exclude`, `coverageThreshold` lowered, `passWithNoTests`); `tsconfig*.json` (`strict`
   or `noImplicitAny` set false, `skipLibCheck` is ignored);
-- `Makefile`/`justfile` targets referenced by the base policy's commands;
-- a swallowed failure in any of those scripts or recipes, found by the shared shell reader
-  (`|| true`, `|| :`, `|| echo ...`, `; true`, `; exit 0`, an `exit 0` after the check with no
-  `set -e` or status read, `set +e` that is never undone or read). A fallback counts only
-  when its left side runs a check (a test runner, a linter, or a policy command; a script
-  with no recognisable runner is treated as all check). Only swallows the base did not
-  already have are reported. The selection-flag table (`-k`, `-m`, `--deselect`, `--ignore`,
-  `-run`, `-short`, `-t`, `--testNamePattern`, `--skip`, `--grep` and their relatives, by
-  runner) is shared with `ci.tampered`; a flag before the runner (`python -m pytest`) does
-  not count;
+- `Makefile`/`justfile` targets referenced by the base policy's commands (all targets are
+  read, `define ... endef` bodies are not targets; a recipe emptied while gaining
+  prerequisites is judged by the recipes of those prerequisites, up to four deep). A `-`
+  prefix on a line blocks only when the line is a check (`-rm -rf build` is fine);
+- a swallowed failure in any of those scripts or recipes, found by the shared shell reader.
+  A *check* is a statement whose command, in command position (after environment
+  assignments and wrappers such as `uv run`, `python -m`, `npx`, `time`, `sudo`), is a known
+  test runner, linter, type checker, or a policy command; a runner name that is only an
+  argument (`pip install pytest-xdist`, `grep pytest`, `echo pytest`), `--version` and
+  `--help`, and `make` with `-C` or `-f` are not checks. A swallow blocks only on a check:
+  `|| true`, `|| :`, `|| echo ...` after it, `; true`, and `; exit 0` or an unconditional
+  `exit 0` after it when the shell is not running with errexit, and `set +e` before it, up
+  to the next `set -e`, when its status is never read. So `rm -rf build || true` and
+  `pip install -e . || pip install .` are not swallows. A script with no recognised check is
+  opaque: its statements from the base count as checks, so a base line that gains a swallow
+  blocks, and a new line carrying one does not. Heredoc bodies are data. Only swallows the
+  base did not already have are reported. The selection-flag table (`-k`, `-m`,
+  `--deselect`, `--ignore`, `-run`, `-short`, `-t`, `--testNamePattern`, `--skip`,
+  `--grep` and their relatives, by runner) is shared with `ci.tampered`; a flag before the
+  runner (`python -m pytest`) does not count. Detection is linear in the script: 8000 checks
+  and 2000 `exit 0` lines are read in under 3 seconds;
 - a file a base policy command runs (`sh scripts/test.sh`, `python scripts/run_tests.py`,
   `./ci/check`), and the files those run, one level deep: deleted, emptied, replaced by a
   no-op, given a swallow, a new selection flag or an unconditional `exit 0` before its
   checks, or (for a non-shell script) given a top-level `sys.exit(0)`. Test files named as
   arguments (`pytest tests/test_a.py`) are not scripts and are left to the test rules;
-- a Go `TestMain(m *testing.M)` that gains a body which never calls `m.Run()` or calls
-  `os.Exit(0)`, unless the base already had the same flaw;
+- a Go `TestMain(<name> *testing.M)` (the parameter name is the one in the signature, and
+  strings, raw strings, runes and comments are skipped when matching braces) that gains a
+  body which never calls `<name>.Run()` or calls `os.Exit(0)` unconditionally: a block,
+  unless the base already had the same flaw. A conditional `os.Exit(0)` is a `warn`;
 - `conftest.py` or a local pytest plugin gaining a hook that can rewrite outcomes or
   collection (`pytest_runtest_makereport`, `pytest_runtest_call`, `pytest_runtest_protocol`,
   `pytest_pyfunc_call`, `pytest_report_teststatus`, `pytest_ignore_collect`,
@@ -535,17 +551,42 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `os._exit(` or `sys.exit(0)` added to a test or conftest file.
 When structural parsing fails, fall back to a file-level `warn` naming the file.
 
-`ci.tampered` reads GitHub Actions workflows (`.github/workflows/*.yml`) by indentation, with no
-YAML library. In a step that runs a test or lint command, it reports a swallow the base step
-did not have, with the same detector and the same rule that a fallback counts only when the
-left side is a check (an `|| pip install .` in an install step is not a swallow), and a
-selection flag the base step did not have. It reads the `on:` section (scalar, flow or block
-form) and reports a workflow that loses `push` or `pull_request`, gains `paths` or
-`branches-ignore` where the base had none, loses a `paths` entry, or gains a `paths-ignore`
-entry that is not documentation-like (`docs/**`, `*.md`, `LICENSE`); swapping `pull_request`
-for `pull_request_target`, adding events, matrix changes and new jobs are not narrowing. A
-trigger change in a workflow with no test or lint step is left alone. Other CI files
-(GitLab, CircleCI, Jenkins and so on) keep the line-level swallow check on added lines.
+`ci.tampered` reads CI files by indentation, with no YAML library; every workflow file is
+read together, so a change is judged against the whole CI, not one file.
+
+*Steps.* In a GitHub `run:` step (`run: |` and `>`, `>-`, `>+` folded scalars, folded as
+YAML does), a swallow of a check the base step did not have blocks, by the shared detector
+and its definition of a check. A GitHub `run:` step starts with errexit on (`bash -e`), so
+`pytest; exit 0` swallows nothing there, unless the step's `shell:` is a custom string
+holding `{0}` and no `-e` (`bash {0}`) or its shell is not a POSIX shell; GitLab `script:`
+lines are errexit-on too. Also blocked: a selection flag the base step did not have,
+`--co`/`--collect-only` and `--passWithNoTests`, an `exit 0` before the first check,
+`continue-on-error: true`, and `if: false`. `continue-on-error: ${{ ... }}` and a selection
+flag whose value is a `${{ matrix.* }}` expression are `warn`.
+
+*Step kinds.* Test and lint steps are counted by kind (pytest, jest, go test, ruff, ...) over
+the `run:` bodies of all workflow files, by the same check test. A kind that vanishes from
+every candidate workflow blocks; fewer steps of a kind that still exists is `warn`. A kind
+that vanishes is also only a `warn` when the candidate tree holds a CI system this rule does
+not read (`.travis.yml`, `azure-pipelines.yml`, `Jenkinsfile`, ...) or a surviving
+`make test`, `npm test` or `tox`/`nox` step that may run it.
+
+*Triggers.* The `on:` section (scalar, flow or block form) is read; anchors, aliases, an
+unclosed flow collection or anything else unreadable make it unknown, and the rule says
+nothing about triggers. An event removed from a workflow is fine when another candidate
+workflow triggered on that event calls it (`uses: ./.github/workflows/<file>`) or runs every
+test-step kind it ran; otherwise it blocks, as does a workflow with a test step that loses
+`push` and `pull_request`. A `paths` or `paths-ignore` filter is evaluated for the base and
+the candidate with GitHub's glob rules (`*` does not cross `/`, `**` does, the last matching
+pattern wins, `!` negates) against the candidate tree: it blocks only when a test or source
+file that triggered the workflow under the base filter does not under the candidate's.
+Excluding documentation or meta files (`mkdocs.yml`, `.vscode/**`, `*.md`) and renaming a
+directory block nothing. An added or narrowed `branches`, `branches-ignore`, `tags`,
+`tags-ignore` or `types` filter is `warn`. Swapping `pull_request` for
+`pull_request_target`, adding events, matrix changes and new jobs are not narrowing.
+
+Other CI files (GitLab, CircleCI, Jenkins and so on) get the line-level swallow check on
+added lines, with errexit assumed on.
 
 A linter or type-checker configuration that does not exist at the base (a new
 `[tool.ruff]`/`[tool.ruff.lint]` or `[tool.mypy]` table, a new `ruff.toml`, `.ruff.toml`,

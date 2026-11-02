@@ -139,19 +139,23 @@ _RULES = [
         "A change narrows or neuters how checks run: test selection or collection patterns, "
         "coverage thresholds (lowered or removed), type-checker or linter strictness, the "
         "scripts that run the tests (including a swallowed failure such as `|| true` or "
-        "`; exit 0`, and scripts or files a policy command runs, one level deep), a conftest or "
-        "plugin hook that can rewrite outcomes or collection, a Go TestMain that never runs the "
-        "tests, or os._exit / sys.exit(0) added to a test file.",
+        "`; exit 0` after a test, lint or type-check command, and scripts or files a policy "
+        "command runs, one level deep), a conftest or plugin hook that can rewrite outcomes or "
+        "collection, a Go TestMain that always exits 0 or never runs the tests (a conditional "
+        "exit is a warning), or os._exit / sys.exit(0) added to a test file.",
     ),
     RuleInfo(
         "ci.tampered",
         BLOCK,
-        "A CI workflow change removes or neuters a test or lint step, adds continue-on-error "
-        "or if: false, swallows a test step's failure (|| true, || echo, ; exit 0, set +e), "
-        "adds a selection flag (-k, -m, --deselect, -run, -short, -t), narrows the triggers "
-        "(fewer events, added path filters, branches-ignore or paths-ignore that exclude "
-        "tests), or changes the greenproof step itself. A ref-only version bump of the "
-        "greenproof action is a warning.",
+        "A CI workflow change removes or neuters a test or lint step (judged across all "
+        "workflow files), adds continue-on-error: true or if: false, swallows a check's failure "
+        "(|| true, || echo, ; exit 0, set +e), runs a check with --collect-only or "
+        "--passWithNoTests, exits 0 before the first check, adds a selection flag (-k, -m, "
+        "--deselect, -run, -short, -t), narrows the triggers (fewer events, or a paths or "
+        "paths-ignore filter that hides a test or source file), or changes the greenproof "
+        "step itself. Narrowed branch, tag or type filters, a matrix-chosen selection flag, "
+        "continue-on-error with an expression, fewer steps of a kind that still exists, and a "
+        "ref-only version bump of the greenproof action are warnings.",
     ),
     RuleInfo(
         "static.parse_error",

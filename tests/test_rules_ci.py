@@ -73,16 +73,27 @@ def test_removed_or_neutered_test_step_fires(tmp_path: Path) -> None:
 
 
 def test_paths_ignore_excluding_tests_fires(tmp_path: Path) -> None:
+    # The filter is judged against the files of the tree: a pattern that matches no test or
+    # source file hides nothing.
+    def with_tree(root: Path, text: str):
+        repo = make(root)
+        repo.write("tests/test_a.py", "def test_a():\n    assert 1 + 1 == 2\n")
+        repo.write("docs/conf.py", "project = 'x'\n")
+        repo.commit("tree")
+        repo.write(PATH, text)
+        return static_findings(repo)
+
     new = WORKFLOW.replace(
         "  pull_request:\n", "  pull_request:\n    paths-ignore:\n      - 'tests/**'\n"
     )
-    found = changed(tmp_path, new)
+    found = with_tree(tmp_path / "t", new)
     assert rule_ids(found) == ["ci.tampered"]
     assert "tests/**" in found[0].message
     docs = WORKFLOW.replace(
         "  pull_request:\n", "  pull_request:\n    paths-ignore:\n      - 'docs/**'\n"
     )
-    assert changed(tmp_path / "docs", docs) == []
+    assert with_tree(tmp_path / "docs", docs) == []
+    assert changed(tmp_path / "empty", new) == []
 
 
 def test_changing_the_greenproof_step_fires(tmp_path: Path) -> None:
@@ -136,9 +147,12 @@ GP_RUN = "      - name: greenproof\n        run: uvx greenproof check --mode ci\
 NO_GP = WORKFLOW.replace(GP_RUN, "")
 
 
-def adopted(tmp_path: Path, base: str, new: str):
+def adopted(tmp_path: Path, base: str, new: str, tree: bool = False):
     repo = init_repo(tmp_path / "r")
     repo.write(PATH, base)
+    if tree:  # the files the path filters are judged against
+        for name in ("src/app.py", "lib/util.py", "tests/test_app.py", "docs/index.md"):
+            repo.write(name, "x = 1\n")
     repo.commit("base")
     repo.write(PATH, new)
     return static_findings(repo)
@@ -231,14 +245,23 @@ def ci_only(findings):
 
 
 def test_failure_swallowing_in_a_test_step_fires(tmp_path: Path) -> None:
-    for i, tail in enumerate(
-        ("|| echo ok", "|| true", "|| :", "|| exit 0", "; exit 0", "; true", "; :")
-    ):
+    # A GitHub `run:` step starts with errexit on, so only `||` can swallow a failure there.
+    for i, tail in enumerate(("|| echo ok", "|| true", "|| :", "|| exit 0")):
         found = changed(
             tmp_path / str(i), WORKFLOW.replace("run: pytest -q", f"run: pytest -q {tail}")
         )
         assert len(ci_only(found)) == 1, tail
         assert ci_only(found)[0].line == WORKFLOW.splitlines().index("        run: pytest -q") + 1
+    # `; exit 0` and `; true` are never reached when pytest fails under errexit ...
+    for i, tail in enumerate(("; exit 0", "; true", "; :")):
+        new = WORKFLOW.replace("run: pytest -q", f"run: pytest -q {tail}")
+        assert ci_only(changed(tmp_path / f"e{i}", new)) == [], tail
+    # ... but they do swallow it once the step's shell has no `-e`.
+    for i, tail in enumerate(("; exit 0", "; true", "; :")):
+        new = WORKFLOW.replace(
+            "        run: pytest -q", f"        shell: bash {{0}}\n        run: pytest -q {tail}"
+        )
+        assert len(ci_only(changed(tmp_path / f"s{i}", new))) == 1, tail
 
 
 def test_set_plus_e_without_reading_the_status_fires(tmp_path: Path) -> None:
@@ -368,10 +391,10 @@ def test_scalar_and_flow_triggers_narrowed_by_a_filter_fire(tmp_path: Path) -> N
         )
     ):
         new = TRIGGERED.replace("on:\n  push:\n    branches: [main]\n  pull_request:", narrowed)
-        assert "ci.tampered" in rule_ids(adopted(tmp_path / str(i), flow, new)), narrowed
+        assert "ci.tampered" in rule_ids(adopted(tmp_path / str(i), flow, new, True)), narrowed
     scalar = flow.replace("[push, pull_request]", "push")
     new = scalar.replace("on: push", "on:\n  push:\n    paths: ['src/**']")
-    assert "ci.tampered" in rule_ids(adopted(tmp_path / "scalar", scalar, new))
+    assert "ci.tampered" in rule_ids(adopted(tmp_path / "scalar", scalar, new, True))
 
 
 def test_changed_path_lists_fire_in_the_right_direction(tmp_path: Path) -> None:
@@ -380,13 +403,13 @@ def test_changed_path_lists_fire_in_the_right_direction(tmp_path: Path) -> None:
     )
     fewer = base.replace("      - 'lib/**'\n", "")
     more = base.replace("      - 'lib/**'\n", "      - 'lib/**'\n      - 'pkg/**'\n")
-    assert "ci.tampered" in rule_ids(adopted(tmp_path / "fewer", base, fewer))
-    assert adopted(tmp_path / "more", base, more) == []
+    assert "ci.tampered" in rule_ids(adopted(tmp_path / "fewer", base, fewer, True))
+    assert adopted(tmp_path / "more", base, more, True) == []
     ignored = TRIGGERED.replace(
         "  pull_request:\n", "  pull_request:\n    paths-ignore:\n      - 'docs/**'\n"
     )
     wider = ignored.replace("      - 'docs/**'\n", "      - 'docs/**'\n      - 'src/**'\n")
-    found = adopted(tmp_path / "ignore", ignored, wider)
+    found = adopted(tmp_path / "ignore", ignored, wider, True)
     assert rule_ids(found) == ["ci.tampered"] and "src/**" in found[0].message
 
 

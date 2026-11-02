@@ -14,7 +14,7 @@ import re
 import shlex
 import tomllib
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from typing import Any
@@ -25,7 +25,11 @@ from greenproof.rules._common import finding, split_lines, warn_finding
 from greenproof.rules.collect import DEFAULT_CLASSES, DEFAULT_FILES, DEFAULT_FUNCTIONS
 from greenproof.rules.shell import (
     SELECT_FLAGS,
+    check_kind,
+    command_tokens,
+    early_exit,
     find_swallows,
+    scripts_in,
     selection_flags,
     split_segments,
 )
@@ -307,17 +311,60 @@ def _first_line_with(text: str, needle: str) -> int | None:
     return None
 
 
+_RECIPE_PREFIX = re.compile(r"^[@+-]+\s*")
+_RUN_ALL = {"run-s", "run-p", "npm-run-all", "npm-run-all2"}
+_RUN_ALL_VALUE_OPTS = {"--max-parallel", "--npm-path"}
+MakeCheck = Callable[[str], bool | None]
+
+
+class _Warn(str):
+    """A reason that warns instead of blocking."""
+
+
+def _statements(lines: Sequence[str], script: bool) -> list[str]:
+    """The statements of a script, or of each recipe line on its own (make runs a shell each)."""
+    if script:
+        return [seg.text for seg in split_segments("\n".join(lines))]
+    return [seg.text for ln in lines for seg in split_segments(_RECIPE_PREFIX.sub("", ln, count=1))]
+
+
+class _Ctx:
+    """What decides whether a statement is a check: policy commands, their scripts, make targets."""
+
+    def __init__(self, extra: Sequence[str], make_check: MakeCheck | None = None) -> None:
+        self.literals = [e for e in extra if len(e) >= 6]
+        self.scripts: Collection[str] = frozenset(p for e in extra for p in scripts_in(e, ""))
+        self.make_check = make_check
+
+    def is_check(self, statement: str) -> bool:
+        return (
+            check_kind(
+                statement,
+                literals=self.literals,
+                scripts=self.scripts,
+                make_check=self.make_check,
+            )
+            is not None
+        )
+
+    def has_check(self, lines: Sequence[str], script: bool) -> bool:
+        return any(self.is_check(st) for st in _statements(lines, script))
+
+
 def neutering_reason(
     base_lines: list[str],
     cand_lines: list[str],
     *,
     script: bool = False,
     extra: Sequence[str] = (),
+    make_check: MakeCheck | None = None,
 ) -> str | None:
     """Whether a command (a script or recipe) was emptied, no-opped, narrowed or shortened.
 
     `script` is for a whole shell file (no make-style `-` prefix, and fewer steps is not a
-    reason: scripts are refactored); `extra` are policy commands that also count as a check.
+    reason: scripts are refactored); `extra` are policy commands that also count as a check and
+    `make_check` says whether a `make X` target holds a check. A statement counts as a check only
+    when its command is one; with no recognised check at all, every statement the base had does.
     """
     base_c = [ln.strip() for ln in base_lines if ln.strip()]
     cand_c = [ln.strip() for ln in cand_lines if ln.strip()]
@@ -334,21 +381,58 @@ def neutering_reason(
         and not all(_NOOP.match(ln) for ln in base_c)
     ):
         return "it was replaced by a no-op"
-    before = Counter(tok for ln in base_c for tok in _tokens(ln))
-    after = Counter(tok for ln in cand_c for tok in _tokens(ln))
+    ctx = _Ctx(extra, make_check)
+    known = [ctx.has_check(lines, script) for lines in (base_c, cand_c)]
+    base_texts = set(_statements(base_c, script))
+    before = _check_tokens(base_c, script, ctx, known[0], None)
+    after = _check_tokens(cand_c, script, ctx, known[1], base_texts)
     if added := sorted(set((after - before).keys()) & _NARROW_TOKENS):
         return f"it now passes {added[0]}"
     if flag := _new_selection_flag(base_c, cand_c):
         return f"it now passes {flag}"
-    if swallowed := _new_swallow(base_c, cand_c, script, extra):
+    if swallowed := _new_swallow(base_c, cand_c, script, ctx, known, base_texts):
         return f"a failure is now swallowed (`{swallowed}`)"
-    if script and _early_exit(cand_c) and not _early_exit(base_c):
+    if script and early_exit("\n".join(cand_c)) and not early_exit("\n".join(base_c)):
         return "it now exits 0 before its checks run"
-    dash = [any(re.match(r"^@?-", ln) for ln in lines) for lines in (cand_c, base_c)]
-    if not script and dash[0] and not dash[1]:
-        return "a recipe line now ignores its exit status"
+    if not script and (why := _dash_reason(base_c, cand_c, ctx, known[1], base_texts)):
+        return why
     if not script and _steps(cand_c) < _steps(base_c):
         return "it runs fewer steps than before"
+    return None
+
+
+def _counts(statement: str, ctx: _Ctx, known: bool, base_texts: Collection[str] | None) -> bool:
+    """Whether a statement counts as a check (every base statement does when none is known)."""
+    if ctx.is_check(statement):
+        return True
+    return not known and (base_texts is None or statement in base_texts)
+
+
+def _check_tokens(
+    lines: list[str], script: bool, ctx: _Ctx, known: bool, base_texts: Collection[str] | None
+) -> Counter[str]:
+    """The tokens of the check statements: `ls -t` or `tar --exclude` are not narrowing a run."""
+    return Counter(
+        tok
+        for st in _statements(lines, script)
+        if _counts(st, ctx, known, base_texts)
+        for tok in _tokens(st)
+    )
+
+
+def _dash_reason(
+    base: list[str], cand: list[str], ctx: _Ctx, known: bool, base_texts: Collection[str]
+) -> str | None:
+    """A recipe line that is a check and now ignores its exit status (a `-` prefix)."""
+    before = Counter(_RECIPE_PREFIX.sub("", ln, count=1) for ln in base if re.match(r"^@?-", ln))
+    for ln in cand:
+        if not re.match(r"^@?-", ln):
+            continue
+        body = _RECIPE_PREFIX.sub("", ln, count=1)
+        if before[body] > 0:
+            before[body] -= 1
+        elif any(_counts(seg.text, ctx, known, base_texts) for seg in split_segments(body)):
+            return "a recipe line now ignores its exit status"
     return None
 
 
@@ -362,39 +446,41 @@ def _new_selection_flag(base: list[str], cand: list[str]) -> str | None:
 
 
 def _swallow_counts(
-    lines: list[str], script: bool, extra: Sequence[str]
+    lines: list[str],
+    script: bool,
+    ctx: _Ctx,
+    known: bool,
+    base_texts: Collection[str] | None,
 ) -> Counter[tuple[str, str]]:
     """Swallows in a script, or in each recipe line on its own (make runs a shell per line)."""
-    chunks = ["\n".join(lines)] if script else [re.sub(r"^[@+-]+\s*", "", ln) for ln in lines]
+    chunks = ["\n".join(lines)] if script else [_RECIPE_PREFIX.sub("", ln, count=1) for ln in lines]
     return Counter(
-        (w.kind, w.text) for chunk in chunks for w in find_swallows(chunk, extra, opaque=True)
+        (w.kind, w.text)
+        for chunk in chunks
+        for w in find_swallows(
+            chunk,
+            ctx.literals,
+            opaque=True,
+            scripts=ctx.scripts,
+            make_check=ctx.make_check,
+            base_segments=base_texts,
+            known=known,
+        )
     )
 
 
 def _new_swallow(
-    base: list[str], cand: list[str], script: bool, extra: Sequence[str]
+    base: list[str],
+    cand: list[str],
+    script: bool,
+    ctx: _Ctx,
+    known: list[bool],
+    base_texts: Collection[str],
 ) -> str | None:
-    gained = _swallow_counts(cand, script, extra) - _swallow_counts(base, script, extra)
+    gained = _swallow_counts(cand, script, ctx, known[1], base_texts) - _swallow_counts(
+        base, script, ctx, known[0], None
+    )
     return next(iter(gained))[1] if gained else None
-
-
-_BLOCK_OPEN = re.compile(r"^(?:if|case|for|while|until|select)\b|^(?:function\s+)?\w+\s*\(\)|\{$")
-_BLOCK_CLOSE = re.compile(r"^(?:fi|esac|done|\})\b")
-
-
-def _early_exit(lines: list[str]) -> bool:
-    """An unconditional `exit 0` (or bare `exit`) with more commands after it in a shell file."""
-    depth = 0
-    for n, ln in enumerate(lines):
-        if ln.startswith("#"):
-            continue
-        if _BLOCK_CLOSE.match(ln):
-            depth = max(0, depth - 1)
-        elif _BLOCK_OPEN.search(ln) and not re.search(r"\bfi\b|\bdone\b|\besac\b", ln):
-            depth += 1
-        elif depth == 0 and re.fullmatch(r"exit(?:\s+0)?", ln):
-            return any(not later.startswith("#") for later in lines[n + 1 :])
-    return False
 
 
 def _tokens(line: str) -> list[str]:
@@ -404,8 +490,33 @@ def _tokens(line: str) -> list[str]:
         return line.split()
 
 
+def _run_all_names(statement: str) -> list[str] | None:
+    """The scripts `run-s a b`, `run-p a b` or `npm-run-all a b` runs; None for other commands."""
+    toks = command_tokens(statement)
+    if not toks or posixpath.basename(toks[0]) not in _RUN_ALL:
+        return None
+    names: list[str] = []
+    skip = False
+    for tok in toks[1:]:
+        if skip:
+            skip = False
+        elif tok == "--":
+            break
+        elif tok in _RUN_ALL_VALUE_OPTS:
+            skip = True
+        elif not tok.startswith("-"):
+            names.append(tok)
+    return names
+
+
 def _steps(lines: list[str]) -> int:
-    return sum(len([s for s in re.split(r"&&|;|\|\|", ln) if s.strip()]) for ln in lines)
+    """The commands a recipe or script runs: `run-s a b` runs two, like `npm run a && npm run b`."""
+    total = 0
+    for ln in lines:
+        for seg in split_segments(ln):
+            names = _run_all_names(seg.text)
+            total += max(len(names), 1) if names is not None else 1
+    return total
 
 
 # -- package.json, tsconfig, jest/vitest, make/just ---------------------------------------
@@ -427,6 +538,8 @@ def _package_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[
         body = old_scripts.get(name)
         if isinstance(body, str):
             wanted.update(re.findall(r"(?:run|run-script)\s+([\w:.-]+)", body))
+            for seg in split_segments(body):  # or `"test": "run-s unit e2e"`
+                wanted.update(_run_all_names(seg.text) or [])
     extra = list(commands.values())
     for name, old in old_scripts.items():
         if name not in wanted or not isinstance(old, str):
@@ -539,21 +652,81 @@ def _jest_reasons(f: ChangedFile, is_package: bool) -> list[tuple[int | None, st
     return out
 
 
-def _targets(text: str | None, names: set[str]) -> dict[str, list[str]]:
-    found: dict[str, list[str]] = {}
-    current: str | None = None
+@dataclass
+class _Target:
+    lines: list[str] = field(default_factory=list)
+    prereqs: list[str] = field(default_factory=list)
+
+
+_RULE = re.compile(r"^([A-Za-z_][\w.-]*)\s*(?:[^=:\n]*)?:(?![=:])(.*)$")
+_DEFINE = re.compile(r"^\s*define\s")
+_ENDEF = re.compile(r"^\s*endef\b")
+_MAX_DEPTH = 4
+
+
+def _targets(text: str | None) -> dict[str, _Target]:
+    """Every rule of a Makefile with its recipe lines and prerequisites. A `define ... endef`
+    body is a macro, not a recipe, and is skipped."""
+    found: dict[str, _Target] = {}
+    current: _Target | None = None
+    in_define = 0
     for raw in split_lines(text or ""):
-        m = re.match(r"^([A-Za-z_][\w.-]*)\s*(?:[^=:\n]*)?:(?!=)", raw)
-        if m and not raw.startswith((" ", "\t")):
-            current = m.group(1) if m.group(1) in names else None
-            if current is not None:
-                found[current] = []
+        if _DEFINE.match(raw):
+            in_define += 1
             continue
-        if current is not None and raw.startswith((" ", "\t")) and raw.strip():
-            found[current].append(raw.strip())
+        if in_define:
+            in_define -= 1 if _ENDEF.match(raw) else 0
+            continue
+        m = _RULE.match(raw)
+        if m and not raw.startswith((" ", "\t")):
+            head, _, inline = m.group(2).partition(";")
+            current = _Target(
+                prereqs=[
+                    t for t in re.sub(r"#.*$", "", head).split() if re.fullmatch(r"[\w.-]+", t)
+                ]
+            )
+            found[m.group(1)] = current
+            if inline.strip():
+                current.lines.append(inline.strip())
+        elif current is not None and raw.startswith((" ", "\t")) and raw.strip():
+            current.lines.append(raw.strip())
         elif current is not None and raw.strip() and not raw.startswith(("#", ".")):
             current = None
     return found
+
+
+def _effective(targets: Mapping[str, _Target], name: str, depth: int = 0) -> list[str]:
+    """A target's recipe lines followed by those of its prerequisites in the same Makefile."""
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    def walk(target: str, level: int) -> None:
+        node = targets.get(target)
+        if node is None or target in seen or level > _MAX_DEPTH:
+            return
+        seen.add(target)
+        for pre in node.prereqs:
+            walk(pre, level + 1)
+        lines.extend(node.lines)
+
+    walk(name, depth)
+    return lines
+
+
+def _make_resolver(targets: Mapping[str, _Target], extra: Sequence[str]) -> MakeCheck:
+    """Whether target X of this Makefile holds a check; None when there is no such target."""
+    memo: dict[str, bool | None] = {}
+
+    def resolve(target: str) -> bool | None:
+        if target not in targets:
+            return None
+        if target not in memo:
+            memo[target] = False  # a cycle through this target adds nothing
+            ctx = _Ctx(extra, resolve)
+            memo[target] = ctx.has_check(_effective(targets, target), False)
+        return memo[target]
+
+    return resolve
 
 
 def _make_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int | None, str]]:
@@ -562,13 +735,21 @@ def _make_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int
         m = re.search(r"\b(?:make|just)\b(.*)", cmd)
         if m:
             names.update(t for t in re.findall(r"[\w.-]+", m.group(1)) if not t.startswith("-"))
-    old, new = _targets(f.old_text, names), _targets(f.new_text, names)
+    old, new = _targets(f.old_text), _targets(f.new_text)
     extra = list(commands.values())
+    resolve = _make_resolver(new, extra)
     out: list[tuple[int | None, str]] = []
-    for name, old_body in old.items():
+    for name in sorted(names):
+        if name not in old:
+            continue
         if name not in new:
             out.append((None, f"target `{name}` was removed from {posixpath.basename(f.path)}"))
-        elif why := neutering_reason(old_body, new[name], extra=extra):
+            continue
+        base_lines, cand_lines = old[name].lines, new[name].lines
+        if not cand_lines and new[name].prereqs:  # the recipe moved into the prerequisites
+            base_lines = _effective(old, name)
+            cand_lines = _effective(new, name)
+        if why := neutering_reason(base_lines, cand_lines, extra=extra, make_check=resolve):
             out.append(
                 (
                     _first_line_with(f.new_text or "", f"{name}:"),
@@ -658,57 +839,8 @@ def _python_reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
 
 
 # -- scripts and files the policy commands run ---------------------------------------------
-_INTERPRETERS = re.compile(
-    r"^(?:sh|bash|zsh|dash|ksh|python[\d.]*|node|nodejs|deno|ruby|perl|php|source|\.)$"
-)
-_WRAPPERS = {"env", "exec", "time", "sudo", "nohup", "command", "nice", "xvfb-run"}
-_RUN_WRAPPERS = {"uv", "poetry", "pipenv", "pdm", "hatch", "rye", "pipx", "npx", "bunx"}
-_SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".php")
 _SHELL_EXT = (".sh", ".bash", ".zsh")
 _MAX_INVOKED = 24
-
-
-def _script_of(tokens: list[str]) -> str | None:
-    """The script file a statement runs, when its command is a script or an interpreter's."""
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        is_assignment = (
-            "=" in tok
-            and not tok.startswith(("-", "/", "."))
-            and tok.partition("=")[0].isidentifier()
-        )
-        if is_assignment or tok in _WRAPPERS or tok in _RUN_WRAPPERS or tok == "run":
-            i += 1
-        elif _INTERPRETERS.match(tok):
-            rest = [t for t in tokens[i + 1 :] if not t.startswith("-")]
-            if tokens[i + 1 : i + 2] == ["-m"] or tokens[i + 1 : i + 2] == ["-c"]:
-                return None
-            return rest[0] if rest else None
-        else:
-            return tok if "/" in tok or tok.endswith(_SCRIPT_EXT) else None
-    return None
-
-
-def _scripts_in(text: str, here: str) -> list[str]:
-    """Repo-relative paths of the scripts the statements of `text` run."""
-    found: list[str] = []
-    for seg in split_segments(text):
-        try:
-            tokens = shlex.split(seg.text)
-        except ValueError:
-            tokens = seg.text.split()
-        tok = _script_of(tokens)
-        if tok is None or tok.startswith(("/", "~", "$")) or "$" in tok:
-            continue
-        norm = posixpath.normpath(tok)
-        if not norm.startswith(".."):
-            found.append(norm)
-        if here:
-            sibling = posixpath.normpath(posixpath.join(here, tok))
-            if sibling != norm and not sibling.startswith(".."):
-                found.append(sibling)
-    return found
 
 
 def _invoked_files(changes: ChangeSet, commands: Mapping[str, str]) -> dict[str, str]:
@@ -716,7 +848,7 @@ def _invoked_files(changes: ChangeSet, commands: Mapping[str, str]) -> dict[str,
     out: dict[str, str] = {}
     queue: list[tuple[str, str, int]] = []  # path, the policy command, depth
     for command in commands.values():
-        for path in _scripts_in(command, ""):
+        for path in scripts_in(command, ""):
             queue.append((path, command, 0))
     while queue and len(out) < _MAX_INVOKED:
         path, command, depth = queue.pop(0)
@@ -725,7 +857,7 @@ def _invoked_files(changes: ChangeSet, commands: Mapping[str, str]) -> dict[str,
             continue
         out[path] = command
         if depth == 0 and len(text) < 200_000:
-            queue.extend((p, command, 1) for p in _scripts_in(text, posixpath.dirname(path)))
+            queue.extend((p, command, 1) for p in scripts_in(text, posixpath.dirname(path)))
     return out
 
 
@@ -779,35 +911,90 @@ def _program_neutering(base: list[str], cand: list[str]) -> str | None:
 
 
 # -- Go: TestMain ------------------------------------------------------------------------
-def _test_main_body(text: str | None) -> str | None:
+_TEST_MAIN = re.compile(r"^func\s+TestMain\s*\(\s*(\w+)\s+\*testing\.M\s*\)\s*\{", re.MULTILINE)
+_OS_EXIT = re.compile(r"\bos\.Exit\(\s*(\S[^)]*?)\s*\)")
+
+
+def _go_code(text: str) -> str:
+    """`text` with comments, strings, raw strings and runes blanked, so braces and calls that
+    are only text do not count. Newlines and offsets are kept."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        two = text[i : i + 2]
+        c = text[i]
+        if two == "//":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif two == "/*":
+            end = text.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:end]))
+            i = end
+        elif c in "\"'`":
+            j = i + 1
+            while j < n and text[j] != c:
+                if c != "`" and text[j] == "\n":  # unterminated: stop at the line end
+                    break
+                j += 2 if text[j] == "\\" and c != "`" else 1
+            j = min(j, n)
+            out.append(c + "".join(ch if ch == "\n" else " " for ch in text[i + 1 : j]) + c)
+            i = min(j + 1, n)
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _test_main(text: str | None) -> tuple[str, str] | None:
+    """The `*testing.M` parameter's name and the code of TestMain's body (blanked, see above)."""
     if not text:
         return None
-    m = re.search(r"^func\s+TestMain\s*\(\s*\w+\s+\*testing\.M\s*\)\s*\{", text, re.MULTILINE)
+    code = _go_code(text)
+    m = _TEST_MAIN.search(code)
     if not m:
         return None
     depth, i = 1, m.end()
-    while i < len(text) and depth:
-        depth += {"{": 1, "}": -1}.get(text[i], 0)
+    while i < len(code) and depth:
+        depth += {"{": 1, "}": -1}.get(code[i], 0)
         i += 1
-    return text[m.end() : i - 1]
+    return m.group(1), code[m.end() : i - 1]
 
 
-def _test_main_flaw(body: str) -> str | None:
-    code = "\n".join(re.sub(r"//.*$", "", ln) for ln in body.splitlines())
-    if "m.Run()" not in code:
-        return "TestMain never calls m.Run(), so no test runs"
-    if re.search(r"\bos\.Exit\(\s*0\s*\)", code):
-        return "TestMain exits 0 whatever the tests did"
+def _test_main_flaw(param: str, body: str) -> str | None:
+    if not re.search(rf"\b{re.escape(param)}\.Run\(\)", body):
+        return f"TestMain never calls {param}.Run(), so no test runs"
+    depth = 0
+    guarded = False
+    conditional = False
+    for part in re.split(r"([{}])", body):
+        if part == "{":
+            depth += 1
+        elif part == "}":
+            depth -= 1
+        else:
+            for m in _OS_EXIT.finditer(part):
+                if m.group(1).strip() != "0":
+                    guarded = True
+                elif depth == 0 and not guarded:
+                    return "TestMain exits 0 whatever the tests did"
+                elif depth > 0:
+                    conditional = True
+    if conditional:
+        return _Warn(
+            "TestMain can exit 0 under a condition (`os.Exit(0)`): check it runs the tests"
+        )
     return None
 
 
 def _go_reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
-    body = _test_main_body(f.new_text)
-    if body is None:
+    found = _test_main(f.new_text)
+    if found is None:
         return []
-    flaw = _test_main_flaw(body)
-    old_body = _test_main_body(f.old_text)
-    if flaw is None or (old_body is not None and _test_main_flaw(old_body) == flaw):
+    flaw = _test_main_flaw(*found)
+    before = _test_main(f.old_text)
+    if flaw is None or (before is not None and _test_main_flaw(*before) == flaw):
         return []
     return [(_first_line_with(f.new_text or "", "func TestMain"), flaw)]
 
@@ -841,7 +1028,7 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
         if name.endswith(".py"):
             reasons = [*reasons, *_python_reasons(f)]
         for line, why in reasons:
-            make = warn_finding if why.endswith(_ADOPTION) else finding
+            make = warn_finding if why.endswith(_ADOPTION) or isinstance(why, _Warn) else finding
             out.append(make("runner.tampered", f.path, line, f"{f.path}: {why}", _HINT))
     return out
 

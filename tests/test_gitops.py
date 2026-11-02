@@ -175,6 +175,38 @@ def test_base_on_the_default_branch_without_an_upstream_notes_the_limit(repo: Re
     assert "no upstream" in base.note and "--base REF" in base.note
 
 
+def test_base_on_a_shallow_clone_whose_upstream_has_no_shared_history_is_an_error(
+    tmp_path: Path,
+) -> None:
+    origin = make_repo(tmp_path / "origin", branch="main")
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(origin.path), str(bare)], check=True)
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth", "1", f"file://{bare}", str(shallow)], check=True
+    )
+    work = Repo(shallow)
+    work.git("config", "user.name", "Test")
+    work.git("config", "user.email", "t@example.com")
+    # The remote moves on by several commits; a depth-1 fetch brings only the new tip, which
+    # shares no commit with the local HEAD that the shallow history can see.
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", str(bare), str(other)], check=True)
+    pusher = Repo(other)
+    pusher.git("config", "user.name", "Test")
+    pusher.git("config", "user.email", "t@example.com")
+    for n in range(3):
+        pusher.write(f"f{n}.py", f"x = {n}\n")
+        pusher.commit(f"remote {n}")
+    pusher.git("push", "-q", "origin", "main")
+    work.git("fetch", "-q", "--depth", "1", "origin", "main")
+    work.write("a.py", "a = 1\n")
+    work.commit("local, on a stale shallow history")
+    with pytest.raises(UsageError, match="no merge base") as exc:
+        gitops.resolve_base(work.path, None, {})
+    assert "fetch-depth: 0" in str(exc.value)
+
+
 def test_base_on_the_default_branch_with_a_dangling_upstream_is_head(tmp_path: Path) -> None:
     work, _ = _clone_on_default(tmp_path)
     work.git("config", "branch.main.merge", "refs/heads/gone")

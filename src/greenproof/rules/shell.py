@@ -4,53 +4,64 @@ One detector for the CI rule (a workflow `run:` body) and the runner rule (a pac
 script, a Makefile recipe, a script a policy command runs). It reads text, never executes it:
 a small splitter turns a script into statements, then a few patterns look at them.
 
-A script swallows a failure when the check can fail and the script still exits 0:
+A statement is a *check* only when its command, in command position, is a test runner, a
+linter or a type checker, or a command the caller names (a policy command, a script it runs).
+Command position is the first word after environment assignments and wrappers (`uv run`,
+`python -m`, `npx`, `time`, `timeout 5`, ...): `pip install pytest-xdist || true` and
+`pkill -f pytest || true` do not run pytest.
+
+A script swallows a failure when a check can fail and the script still exits 0:
 
 - `check || <anything but a failing exit>` (`|| true`, `|| :`, `|| echo ok`, `|| exit 0`);
-- `check; exit 0`, `check; true`, `check; :` ending a line, or an unconditional `exit 0` after
-  a check ran;
-- `set +e` / `set +o errexit` before a check when the status is never read afterwards.
+- `check; exit 0`, `check; true`, `check; :` or an unconditional `exit 0` after a check ran,
+  when the shell is not running with errexit (`set -e`, a GitHub Actions `run:` step);
+- `set +e` / `set +o errexit` before a check, up to the next `set -e`, when the check's status
+  is never read afterwards.
 
-A fallback only counts when the left side runs a check (a test runner, a linter, or a command
-the caller names): `rm -rf build || true` and `pip install -e . || pip install .` are not
-swallowed failures. A script with no recognisable check at all (an opaque policy command) is
-treated as all check.
+`rm -rf build || true` and `pip install -e . || pip install .` swallow nothing a check did. A
+script with no recognisable check at all (an opaque policy command) is treated as all check,
+or, given the statements it had at the base, as those statements only.
 """
 
 from __future__ import annotations
 
+import posixpath
 import re
 import shlex
-from collections.abc import Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 
-RUNNER_PATTERNS = (
-    r"\bpytest\b",
-    r"\bpy\.test\b",
-    r"\bunittest\b",
-    r"\b(?:tox|nox)\b",
-    r"\bgo\s+test\b",
-    r"\bcargo\s+(?:test|nextest)\b",
-    r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b",
-    r"\b(?:jest|vitest|mocha)\b",
-    r"\bmake\s+(?:test|check)\b",
-    r"\brspec\b",
-    r"\brake\b",
-    r"\bphpunit\b",
-    r"\bmvn\s+(?:\S+\s+)*?(?:test|verify)\b",
-    r"\b(?:gradle|gradlew)\s+(?:\S+\s+)*?(?:test|check)\b",
-    r"\bctest\b",
-    r"\bdotnet\s+test\b",
-    r"\bgreenproof\b",
-)
-LINT_PATTERNS = (
-    r"\b(?:ruff|mypy|pyright|flake8|pylint|eslint|biome|tsc|golangci-lint)\b",
-    r"\bcargo\s+(?:clippy|fmt)\b",
-    r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:lint|typecheck)\b",
-    r"\b(?:make|just)\s+lint\b",
-)
-RUNNER_RX = re.compile("|".join(RUNNER_PATTERNS))
-CHECK_RX = re.compile("|".join(RUNNER_PATTERNS + LINT_PATTERNS))
+# What a command-position word is, by the kind of check it runs.
+_SIMPLE_CHECKERS = {
+    "pytest": "pytest",
+    "py.test": "pytest",
+    "unittest": "unittest",
+    "tox": "tox/nox",
+    "nox": "tox/nox",
+    "jest": "jest/vitest",
+    "vitest": "jest/vitest",
+    "mocha": "jest/vitest",
+    "rspec": "rspec",
+    "rake": "rake",
+    "phpunit": "phpunit",
+    "ctest": "ctest",
+    "greenproof": "greenproof",
+    "ruff": "ruff",
+    "mypy": "mypy",
+    "pyright": "mypy",
+    "flake8": "flake8",
+    "pylint": "pylint",
+    "eslint": "eslint",
+    "biome": "eslint",
+    "tsc": "eslint",
+    "golangci-lint": "clippy",
+}
+_INFO_FLAGS = frozenset({"--version", "-V", "--help", "-h"})
+_MAKE_NAMES = frozenset({"test", "check", "lint"})
+_MAKERS = {"make", "gmake", "just", "$(MAKE)", "${MAKE}", "$MAKE"}
+_PKG_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
+_PKG_VALUE_OPTS = {"--filter", "-F", "--cwd", "-C", "--prefix", "--workspace", "-w"}
+_PKG_SCRIPT = re.compile(r"^(?P<kind>test|lint|typecheck)(?::.*)?$")
 
 # Flags that select or narrow what a runner runs, by runner family. `-k`, `-m` and the like are
 # how a candidate runs fewer tests than the base while the command still looks the same.
@@ -66,12 +77,14 @@ SELECT_FLAGS: dict[str, frozenset[str]] = {
     "cargo": frozenset({"--skip"}),
     "mocha": frozenset({"--grep", "-g", "--invert"}),
 }
-_FAMILY_RUNNER = {
-    "pytest": re.compile(r"(?:^|/)(?:pytest|py\.test)$"),
-    "go": re.compile(r"^test$"),  # after `go`
-    "js": re.compile(r"(?:^|/)(?:jest|vitest)$"),
-    "cargo": re.compile(r"^(?:test|nextest)$"),  # after `cargo`
-    "mocha": re.compile(r"(?:^|/)mocha$"),
+# Flags after which the runner runs no test, or passes with none.
+NOOP_FLAGS: dict[str, frozenset[str]] = {
+    "pytest": frozenset({"--co", "--collect-only"}),
+    "js": frozenset({"--passWithNoTests"}),
+}
+_ALL_FLAGS = {
+    family: SELECT_FLAGS.get(family, frozenset()) | NOOP_FLAGS.get(family, frozenset())
+    for family in set(SELECT_FLAGS) | set(NOOP_FLAGS)
 }
 
 
@@ -85,7 +98,7 @@ class Seg:
 @dataclass(frozen=True)
 class Swallow:
     line: int
-    kind: str  # "or", "exit0", "true", "set+e"
+    kind: str  # "or", "exit0", "true", "set+e", "early"
     text: str
     reason: str
 
@@ -99,11 +112,15 @@ def _skip_expansion(text: str, i: int) -> int:
     return i + 1
 
 
+_HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?([A-Za-z_][\w.-]*))")
+
+
 def split_segments(script: str) -> list[Seg]:
     """Top-level commands of a script, split at `;`, newlines, `&&`, `||` and `&`.
 
     Quotes, `$(...)`, `( ... )` and `{ ...; }` groups keep their contents in one segment, a
-    trailing backslash joins lines, and `#` starts a comment.
+    trailing backslash joins lines, `#` starts a comment, and a here-document's body is data
+    that is skipped.
     """
     text = script.replace("\r\n", "\n").replace("\r", "\n")
     segs: list[Seg] = []
@@ -113,6 +130,7 @@ def split_segments(script: str) -> list[Seg]:
     seg_line = 1
     paren = brace = 0
     quote = ""
+    heredocs: list[tuple[str, bool]] = []  # (delimiter, tabs stripped) read after this line
     i, n = 0, len(text)
 
     def flush(next_sep: str) -> None:
@@ -127,6 +145,20 @@ def split_segments(script: str) -> list[Seg]:
             sep = ""
         buf.clear()
         seg_line = line
+
+    def skip_heredocs(j: int) -> int:
+        """`j` starts the line after a newline: the index after the bodies of pending here-docs."""
+        nonlocal line
+        for delim, tabs in heredocs:
+            while j < n:
+                end = text.find("\n", j)
+                body_line = text[j : n if end < 0 else end]
+                j = n if end < 0 else end + 1
+                line += 1
+                if (body_line.lstrip("\t") if tabs else body_line) == delim:
+                    break
+        heredocs.clear()
+        return j
 
     while i < n:
         c = text[i]
@@ -163,6 +195,14 @@ def split_segments(script: str) -> list[Seg]:
                 i = j
                 continue
             buf.append(c)
+        elif c == "<" and not paren and text.startswith("<<", i) and text[i + 2 : i + 3] != "<":
+            m = _HEREDOC.match(text, i)
+            if m:
+                heredocs.append((m[2] or m[3] or m[4], bool(m[1])))
+                buf.append(m[0])
+                i = m.end()
+                continue
+            buf.append(c)
         elif c == "(":
             paren += 1
             buf.append(c)
@@ -179,10 +219,15 @@ def split_segments(script: str) -> list[Seg]:
             buf.append(c)
             if c == "\n":
                 line += 1
+                if heredocs:
+                    i = skip_heredocs(i + 1) - 1
         elif c == "\n":
             flush("\n")
             line += 1
             seg_line = line
+            if heredocs:
+                i = skip_heredocs(i + 1) - 1
+                seg_line = line
         elif c == ";":
             flush(";")
         elif c == "&" and text[i + 1 : i + 2] == "&":
@@ -200,6 +245,258 @@ def split_segments(script: str) -> list[Seg]:
     return segs
 
 
+# -- command position --------------------------------------------------------------------
+_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+# Words that open a statement without being its command.
+_LEADING = {"if", "then", "elif", "else", "while", "until", "do", "!", "{", "(", "}", ")"}
+_PLAIN_WRAPPERS = {"time", "exec", "command", "nohup", "stdbuf"}
+# Wrapper -> the options that take a value.
+_OPT_VALUES: dict[str, frozenset[str]] = {
+    "env": frozenset({"-u", "-C", "-S"}),
+    "sudo": frozenset({"-u", "-g", "-C", "-h", "-p", "-r", "-t", "-T", "-U"}),
+    "nice": frozenset({"-n"}),
+    "timeout": frozenset({"-s", "-k", "--signal", "--kill-after"}),
+    "xvfb-run": frozenset({"-s", "-n", "-f", "-e", "-p", "-l", "--server-args", "--server-num"}),
+    "stdbuf": frozenset({"-i", "-o", "-e"}),
+    "time": frozenset({"-o", "-f"}),
+}
+_RUN_VALUE_OPTS = frozenset(
+    {"--with", "--extra", "--python", "-p", "--group", "--package", "--project", "--directory"}
+    | {"--env-file", "--with-requirements", "--from", "--with-editable", "--only-group", "--index"}
+    | {"-w", "-e", "--cwd", "--env"}
+)
+_RUN_TOOLS = {"uv", "poetry", "pipenv", "pdm", "hatch", "rye"}
+_RUNX = {"uvx", "npx", "bunx", "pnpx"}
+
+
+def _tokens(statement: str) -> list[str]:
+    try:
+        return shlex.split(statement, posix=True)
+    except ValueError:
+        return statement.split()
+
+
+def _skip_opts(toks: list[str], values: Collection[str], positional: int = 0) -> list[str]:
+    """`toks` without its leading options (a value-taking option also drops its value), then
+    without `positional` plain words (`timeout 5`)."""
+    i = 0
+    while i < len(toks) and toks[i].startswith("-") and toks[i] != "--":
+        i += 2 if toks[i] in values else 1
+    if i < len(toks) and toks[i] == "--":
+        i += 1
+    return toks[min(i + positional, len(toks)) :]
+
+
+def _strip(tokens: list[str]) -> list[str]:
+    """Drop what comes before the command: assignments, `if`/`then`/`!`, and wrappers."""
+    toks = list(tokens)
+    while toks:
+        tok = toks[0]
+        base = posixpath.basename(tok)
+        nxt = toks[1] if len(toks) > 1 else ""
+        if _ASSIGN.match(tok) or tok in _LEADING:
+            toks = toks[1:]
+        elif base in _OPT_VALUES or base in _PLAIN_WRAPPERS:
+            rest = _skip_opts(toks[1:], _OPT_VALUES.get(base, frozenset()), int(base == "timeout"))
+            if base == "env":
+                while rest and _ASSIGN.match(rest[0]):
+                    rest = rest[1:]
+            toks = rest
+        elif base in _RUN_TOOLS and nxt == "run":
+            toks = _skip_opts(toks[2:], _RUN_VALUE_OPTS)
+            if base == "hatch" and toks and re.match(r"^[\w.-]*:", toks[0]):
+                toks[0] = toks[0].partition(":")[2]
+        elif base == "uv" and toks[1:3] == ["tool", "run"]:
+            toks = _skip_opts(toks[3:], _RUN_VALUE_OPTS)
+        elif base == "pipx" and nxt == "run":
+            toks = _skip_opts(toks[2:], _RUN_VALUE_OPTS)
+        elif base in _RUNX:
+            toks = _skip_opts(toks[1:], _RUN_VALUE_OPTS | {"-p", "--package"})
+        elif base in _PKG_MANAGERS and nxt in ("exec", "dlx", "x"):
+            toks = _skip_opts(toks[2:], _PKG_VALUE_OPTS)
+        else:
+            break
+    return toks
+
+
+_PYTHON = re.compile(r"^(?:python[\d.]*|pypy[\d.]*|py)$")
+
+
+def _collapse(toks: list[str]) -> list[str]:
+    """`python -m X ...` and `coverage run -m X ...` are `X ...`."""
+    if not toks:
+        return toks
+    base = posixpath.basename(toks[0])
+    if _PYTHON.match(base):
+        j = 1
+        while j < len(toks) and toks[j].startswith("-") and toks[j] != "-m":
+            j += 2 if toks[j] in ("-W", "-X") else 1
+        if j < len(toks) and toks[j] == "-m":
+            return toks[j + 1 :]
+    elif base in ("coverage", "coverage3") and toks[1:2] == ["run"] and "-m" in toks:
+        return toks[toks.index("-m") + 1 :]
+    return toks
+
+
+def command_tokens(text: str) -> list[str]:
+    """The words of a statement from its command on: the wrappers are gone, `python -m X` is X."""
+    toks = _tokens(text)
+    previous: list[str] | None = None
+    while toks != previous:
+        previous = toks
+        toks = _strip(_collapse(_strip(toks)))
+    return toks
+
+
+def _group_inner(text: str) -> str | None:
+    t = text.strip()
+    if t.startswith("("):
+        return t[1:-1] if t.endswith(")") else t[1:]
+    if t.startswith("{") and t[1:2] in (" ", "\n"):
+        inner = t[1:].rstrip()
+        return inner[:-1] if inner.endswith("}") else inner
+    return None
+
+
+def _is_info_only(rest: list[str]) -> bool:
+    return any(a in _INFO_FLAGS for a in rest)
+
+
+def _package_script(rest: list[str]) -> list[str]:
+    """The words of an `npm|pnpm|yarn|bun` call from its script (or command) word on."""
+    for _ in range(2):
+        rest = _skip_opts(rest, _PKG_VALUE_OPTS)
+        if rest and rest[0] in ("run", "run-script"):
+            rest = rest[1:]
+    return _skip_opts(rest, _PKG_VALUE_OPTS)
+
+
+def classify(toks: list[str], make_check: Callable[[str], bool | None] | None = None) -> str | None:
+    """The kind of check a command is (`pytest`, `go test`, `ruff`, ...), None when it is none.
+
+    `make_check(target)` says whether a target of the same Makefile holds a check (None when
+    the target is unknown); without it `make test|check|lint` is a check by name.
+    """
+    if not toks:
+        return None
+    cmd = posixpath.basename(toks[0])
+    rest = toks[1:]
+    if "|" in rest:
+        rest = rest[: rest.index("|")]
+    if cmd in _SIMPLE_CHECKERS:
+        return None if _is_info_only(rest) else _SIMPLE_CHECKERS[cmd]
+    if cmd == "go":
+        return "go test" if rest[:1] == ["test"] else None
+    if cmd == "cargo":
+        rest = [a for a in rest if not a.startswith("+")]
+        sub = rest[0] if rest else ""
+        if sub in ("test", "nextest"):
+            return "cargo test"
+        return "clippy" if sub in ("clippy", "fmt") else None
+    if cmd == "dotnet":
+        return "dotnet test" if rest[:1] == ["test"] else None
+    if cmd in ("mvn", "mvnw"):
+        return "mvn" if any(a in ("test", "verify") for a in rest) else None
+    if cmd in ("gradle", "gradlew"):
+        return "gradle" if any(a in ("test", "check") for a in rest) else None
+    if cmd in _MAKERS:
+        return _make_kind(rest, make_check)
+    if cmd in _PKG_MANAGERS:
+        words = _package_script(rest)
+        if not words:
+            return None
+        if m := _PKG_SCRIPT.match(words[0]):
+            return "package test" if m["kind"] == "test" else "package lint"
+        return (
+            classify(words, make_check)
+            if posixpath.basename(words[0]) in _SIMPLE_CHECKERS
+            else None
+        )
+    return None
+
+
+def _make_kind(rest: list[str], make_check: Callable[[str], bool | None] | None) -> str | None:
+    for arg in rest:
+        if arg in ("-C", "-f", "--directory", "--file", "--justfile", "--makefile") or (
+            arg.startswith(("-C", "-f", "--directory=", "--file=", "--justfile=", "--makefile="))
+        ):
+            return None  # another Makefile: opaque
+    for target in (a for a in rest if not a.startswith("-") and "=" not in a):
+        known = make_check(target) if make_check is not None else None
+        if known if known is not None else target in _MAKE_NAMES:
+            return "make test"
+    return None
+
+
+def check_kind(
+    text: str,
+    *,
+    literals: Sequence[str] = (),
+    scripts: Collection[str] = (),
+    make_check: Callable[[str], bool | None] | None = None,
+) -> str | None:
+    """The kind of check a statement runs in command position, None when it is not a check.
+
+    `literals` are policy commands (a statement containing one is a check), `scripts` the
+    repo-relative paths of scripts a policy command runs.
+    """
+    inner = _group_inner(text)
+    if inner is not None:
+        for seg in split_segments(inner):
+            kind = check_kind(seg.text, literals=literals, scripts=scripts, make_check=make_check)
+            if kind:
+                return kind
+        return None
+    toks = command_tokens(text)
+    if kind := classify(toks, make_check):
+        return kind
+    if literals and any(lit in text for lit in literals):
+        return "policy"
+    if scripts and (script := script_of(_tokens(text))) is not None:
+        norm = posixpath.normpath(script)
+        if norm in scripts:
+            return "policy"
+    return None
+
+
+# -- scripts a statement runs --------------------------------------------------------------
+_INTERPRETERS = re.compile(
+    r"^(?:sh|bash|zsh|dash|ksh|python[\d.]*|node|nodejs|deno|ruby|perl|php|source|\.)$"
+)
+_SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".php")
+
+
+def script_of(tokens: list[str]) -> str | None:
+    """The script file a statement runs, when its command is a script or an interpreter's."""
+    toks = _strip(tokens)
+    if not toks:
+        return None
+    tok = toks[0]
+    if _INTERPRETERS.match(tok):
+        rest = [t for t in toks[1:] if not t.startswith("-")]
+        if toks[1:2] in (["-m"], ["-c"]):
+            return None
+        return rest[0] if rest else None
+    return tok if "/" in tok or tok.endswith(_SCRIPT_EXT) else None
+
+
+def scripts_in(text: str, here: str) -> list[str]:
+    """Repo-relative paths of the scripts the statements of `text` run."""
+    found: list[str] = []
+    for seg in split_segments(text):
+        tok = script_of(_tokens(seg.text))
+        if tok is None or tok.startswith(("/", "~", "$")) or "$" in tok:
+            continue
+        norm = posixpath.normpath(tok)
+        if not norm.startswith(".."):
+            found.append(norm)
+        if here:
+            sibling = posixpath.normpath(posixpath.join(here, tok))
+            if sibling != norm and not sibling.startswith(".."):
+                found.append(sibling)
+    return found
+
+
 # -- patterns --------------------------------------------------------------------------
 _EXIT = re.compile(r"^(?P<word>exit|return)(?:\s+(?P<code>\S+))?$")
 _SET_PLUS_E = re.compile(r"^set\s+(?:\+[A-Za-z]*e[A-Za-z]*|\+o\s+errexit)(?:\s|$)")
@@ -210,6 +507,7 @@ _STATUS_READ = re.compile(
 )
 _CONDITION = re.compile(r"^(?:if|elif|while|until)\b|^\[|^test\b")
 _KEYWORD = re.compile(r"^(?P<kw>then|else|do)\b\s*(?P<rest>.*)$", re.DOTALL)
+_BARE_EXIT = re.compile(r"^exit(?:\s+0+)?$")
 
 
 def _unquote(code: str) -> str:
@@ -239,22 +537,99 @@ def _short(text: str) -> str:
     return " ".join(text.split())[:80]
 
 
-def find_swallows(script: str, extra: Sequence[str] = (), *, opaque: bool = True) -> list[Swallow]:
+def _first_word(text: str) -> str:
+    parts = text.split(None, 1)
+    return parts[0] if parts else ""
+
+
+def _top_level(segs: Sequence[Seg]) -> list[bool]:
+    """For each segment: whether it runs unconditionally, at the top level of the script.
+
+    Statements inside `if`/`case`/`for`/`while`, after `then`/`else`/`do`, and after `&&` or
+    `||` are conditional. `if true; then ...; fi` and `if :; then ...; fi` are not.
+    """
+    stack: list[bool] = []  # per open block: whether it always runs
+    out: list[bool] = []
+    for seg in segs:
+        text = seg.text
+        kw = _KEYWORD.match(text)
+        if kw:
+            text = kw["rest"]
+        word = _first_word(text)
+        if word in ("fi", "esac", "done") and stack:
+            stack.pop()
+        always = all(stack)
+        if kw:
+            always = always and bool(stack) and stack[-1] and kw["kw"] != "else"
+        out.append(always and seg.sep in ("", ";", "\n") and not (kw and not stack))
+        if word in ("if", "case", "for", "while", "until"):
+            stack.append(word == "if" and text[len(word) :].strip() in ("true", ":"))
+    return out
+
+
+def early_exit(script: str) -> bool:
+    """An unconditional `exit 0` (or bare `exit`) with more commands after it."""
+    segs = split_segments(script)
+    top = _top_level(segs)
+    for i, seg in enumerate(segs):
+        text = _KEYWORD.sub(r"\g<rest>", seg.text) if _KEYWORD.match(seg.text) else seg.text
+        if top[i] and _BARE_EXIT.match(text.strip()):
+            return i + 1 < len(segs)
+    return False
+
+
+def find_swallows(
+    script: str,
+    extra: Sequence[str] = (),
+    *,
+    opaque: bool = True,
+    errexit: bool = False,
+    early: bool = False,
+    scripts: Collection[str] = (),
+    make_check: Callable[[str], bool | None] | None = None,
+    base_segments: Collection[str] | None = None,
+    known: bool | None = None,
+) -> list[Swallow]:
     """The places where `script` can fail a check and still exit 0 (see the module docstring).
 
-    `extra` are literal command strings that also count as a check (a policy command);
-    `opaque` treats a script with no recognisable check as all check.
+    `extra` are literal command strings that also count as a check (a policy command), and
+    `scripts` the scripts such a command runs. `opaque` treats a script with no recognisable
+    check as all check, or, with `base_segments`, as those statements only. `errexit` is whether
+    the shell starts with `set -e` (a GitHub Actions step); `early` also reports an `exit 0`
+    that comes before a check. `known` overrides whether the script holds a recognised check
+    (a Makefile recipe is judged as a whole, a line at a time).
     """
     segs = split_segments(script)
     literals = [e for e in extra if len(e) >= 6]
+    is_check = [
+        check_kind(s.text, literals=literals, scripts=scripts, make_check=make_check) is not None
+        for s in segs
+    ]
+    has_check = any(is_check) if known is None else known
 
-    def is_runner(text: str) -> bool:
-        return bool(CHECK_RX.search(text)) or any(lit in text for lit in literals)
+    def check(i: int) -> bool:
+        if is_check[i]:
+            return True
+        if opaque and not has_check:
+            return base_segments is None or segs[i].text in base_segments
+        return False
 
-    known = any(is_runner(s.text) for s in segs)
-
-    def check(text: str) -> bool:
-        return is_runner(text) or (opaque and not known)
+    top = _top_level(segs)
+    chain_of: list[int] = []
+    chain_guard: list[bool] = []
+    chain_members: list[list[int]] = []
+    for i, seg in enumerate(segs):
+        if not chain_members or seg.sep in ("", ";", "\n"):
+            chain_members.append([])
+            chain_guard.append(False)
+        chain_of.append(len(chain_members) - 1)
+        chain_members[-1].append(i)
+        if seg.sep == "||" and _is_failing_exit(seg.text):
+            chain_guard[-1] = True
+    reads = [bool(_STATUS_READ.search(s.text)) for s in segs]
+    next_read = [-1] * (len(segs) + 1)  # the first statement at or after each one that reads
+    for i in range(len(segs) - 1, -1, -1):
+        next_read[i] = i if reads[i] else next_read[i + 1]
 
     out: list[Swallow] = []
     seen: set[tuple[int, str]] = set()
@@ -264,82 +639,61 @@ def find_swallows(script: str, extra: Sequence[str] = (), *, opaque: bool = True
             seen.add((seg.line, kind))
             out.append(Swallow(seg.line, kind, _short(seg.text), reason))
 
-    chains: list[list[int]] = []
-    chain_of: dict[int, list[int]] = {}
-    runs: list[tuple[int, bool]] = []  # (segment index, errexit on when it ran)
-    errexit = False
-    depth = 0
-
-    def unguarded(at: int, upto: int, use_errexit: bool) -> bool:
-        """Whether some check before `upto` could fail with nothing turning that into a failure."""
-        for r, errexit_then in runs:
-            if r >= upto:
-                break
-            if use_errexit and errexit_then:
-                continue
-            if any(segs[j].sep == "||" and _is_failing_exit(segs[j].text) for j in chain_of[r]):
-                continue
-            if _STATUS_READ.search(" ".join(s.text for s in segs[r + 1 : upto])):
-                continue
-            return True
-        return False
-
+    state_errexit = errexit
+    last_ok = -1  # the last check that could fail with nothing turning that into a failure
+    last_read = -1  # the last statement before the current one that reads a status
+    first_exit: Seg | None = None
+    exit_reported = False
     for i, seg in enumerate(segs):
-        if not chains or seg.sep in ("", ";", "\n"):
-            chains.append([])
-        chains[-1].append(i)
-        chain_of[i] = chains[-1]
         text = seg.text
-        word = text.split(None, 1)[0] if text.split() else ""
-        conditional = False
         if kw := _KEYWORD.match(text):
-            conditional, text = True, kw["rest"]
-            word = text.split(None, 1)[0] if text.split() else ""
-        if word in ("fi", "esac", "done"):
-            depth = max(0, depth - 1)
-        head = segs[chains[-1][0]].text
-        if seg.sep == "||" and not _CONDITION.match(head):
+            text = kw["rest"]
+        if seg.sep == "||" and not _CONDITION.match(segs[chain_members[chain_of[i]][0]].text):
             rhs = [text]
-            for nxt in segs[i + 1 :]:
-                if nxt.sep != "&&":
+            for k in range(i + 1, len(segs)):
+                if segs[k].sep != "&&":
                     break
-                rhs.append(nxt.text)
-            left = " ".join(segs[j].text for j in chains[-1] if j < i)
-            if check(left) and not any(_is_failing_exit(r) for r in rhs):
+                rhs.append(segs[k].text)
+            if any(check(j) for j in chain_members[chain_of[i]] if j < i) and not any(
+                _is_failing_exit(r) for r in rhs
+            ):
                 add(seg, "or", f"a failure is swallowed by `|| {_short(text)}`")
-        elif _is_zero_exit(text) and seg.sep in ("", ";", "\n") and not conditional and not depth:
-            same_line = len(chains) > 1 and segs[chains[-2][-1]].line == seg.line
-            if unguarded(i, i, use_errexit=not same_line):
+        elif _is_zero_exit(text) and top[i]:
+            if last_ok >= 0 and last_ok >= last_read:
                 add(seg, "exit0", "`exit 0` after the checks ran, whatever their result")
-        elif text in ("true", ":") and seg.sep == ";" and len(chains) > 1:
+        elif text in ("true", ":") and seg.sep == ";" and chain_of[i] > 0:
             nxt_sep = segs[i + 1].sep if i + 1 < len(segs) else "\n"
-            before = " ".join(segs[j].text for j in chains[-2])
-            if nxt_sep in ("\n", "") and check(before):
+            before = chain_members[chain_of[i] - 1]
+            if nxt_sep in ("\n", "") and not state_errexit and any(check(j) for j in before):
                 add(seg, "true", f"`; {text}` after a check discards its status")
         elif _SET_PLUS_E.match(text):
-            errexit = False
-            later = segs[i + 1 :]
-            if any(check(s.text) for s in later) and not _STATUS_READ.search(
-                " ".join(s.text for s in later)
-            ):
-                add(seg, "set+e", "`set +e` and the exit status is never read afterwards")
+            state_errexit = False
+            end = next(
+                (k for k in range(i + 1, len(segs)) if _SET_MINUS_E.match(segs[k].text)), len(segs)
+            )
+            for c in range(i + 1, end):
+                if not check(c) or _is_zero_exit(segs[c].text):
+                    continue
+                joined = c + 1 < len(segs) and segs[c + 1].sep in ("||", "&&")
+                if next_read[c] < 0 and not joined:
+                    add(seg, "set+e", "`set +e` and the exit status is never read afterwards")
+                    break
         elif _SET_MINUS_E.match(text):
-            errexit = True
-        if word in ("if", "case", "for", "while", "until"):
-            depth += 1
-        if check(text) and not _is_zero_exit(text):
-            runs.append((i, errexit))
+            state_errexit = True
+        if early and top[i] and _is_zero_exit(text):
+            if first_exit is None:
+                first_exit = seg
+        elif early and first_exit is not None and not exit_reported and check(i):
+            exit_reported = True
+            add(first_exit, "early", "`exit 0` comes before the checks, so none of them runs")
+        if check(i) and not _is_zero_exit(text) and not (state_errexit or chain_guard[chain_of[i]]):
+            last_ok = i
+        if reads[i]:
+            last_read = i
     return out
 
 
 # -- selection flags -------------------------------------------------------------------
-def _tokens(statement: str) -> list[str]:
-    try:
-        return shlex.split(statement, posix=True)
-    except ValueError:
-        return statement.split()
-
-
 def _flag_name(token: str, flags: frozenset[str]) -> str | None:
     """The selection flag `token` is (`-k`, `-k=x`, `-kx`, `--grep=x`), else None."""
     if token in flags:
@@ -352,46 +706,65 @@ def _flag_name(token: str, flags: frozenset[str]) -> str | None:
     return None
 
 
+def _is_tox(token: str) -> bool:
+    return posixpath.basename(token) in ("tox", "nox")
+
+
+def _runner_end(family: str, tokens: list[str]) -> int | None:
+    """The index just after the family's runner word, or None when the command is not it."""
+    if not tokens:
+        return None
+    head = posixpath.basename(tokens[0])
+    if family == "pytest":
+        return 1 if head in ("pytest", "py.test") else None
+    if family == "mocha":
+        return 1 if head == "mocha" else None
+    if family == "go":
+        return 2 if head == "go" and tokens[1:2] == ["test"] else None
+    if family == "cargo":
+        rest = [t for t in tokens[1:] if not t.startswith("+")]
+        return (
+            len(tokens) - len(rest) + 1
+            if head == "cargo" and rest[:1] in (["test"], ["nextest"])
+            else None
+        )
+    if head in ("jest", "vitest"):
+        return 1
+    if head in _PKG_MANAGERS:
+        for i, tok in enumerate(tokens[1:4], start=1):
+            if tok == "test":
+                return i + 1
+    return None
+
+
+def selection_uses(command: str) -> list[tuple[str, str, str]]:
+    """`(runner family, flag, the statement)` for each narrowing flag a runner is run with."""
+    found: list[tuple[str, str, str]] = []
+    for seg in split_segments(command):
+        tokens = command_tokens(seg.text)
+        if "|" in tokens:
+            tokens = tokens[: tokens.index("|")]
+        for family, flags in _ALL_FLAGS.items():
+            start = _runner_end(family, tokens)
+            if start is not None:
+                found.extend(
+                    (family, n, seg.text) for t in tokens[start:] if (n := _flag_name(t, flags))
+                )
+        if "--" in tokens and tokens and _is_tox(tokens[0]):
+            pytest_flags = _ALL_FLAGS["pytest"]
+            found.extend(
+                ("pytest", n, seg.text)
+                for t in tokens[tokens.index("--") + 1 :]
+                if (n := _flag_name(t, pytest_flags))
+            )
+    return found
+
+
 def selection_flags(command: str) -> list[tuple[str, str]]:
     """`(runner family, flag)` for each narrowing flag a test runner is invoked with.
 
     Flags before the runner (`python -m pytest`: the `-m`) do not count; for `tox` and `nox`
-    the arguments after `--` are the runner's.
+    the arguments after `--` are the runner's. `--collect-only` and `--passWithNoTests` count:
+    the run then passes without running a test.
     """
-    found: list[tuple[str, str]] = []
-    for seg in split_segments(command):
-        tokens = _tokens(seg.text)
-        for family, flags in SELECT_FLAGS.items():
-            start = _runner_end(family, tokens)
-            if start is not None:
-                found.extend((family, n) for t in tokens[start:] if (n := _flag_name(t, flags)))
-        if "--" in tokens and any(_is_tox(t) for t in tokens):
-            pytest_flags = SELECT_FLAGS["pytest"]
-            found.extend(
-                ("pytest", n)
-                for t in tokens[tokens.index("--") + 1 :]
-                if (n := _flag_name(t, pytest_flags))
-            )
-    return sorted(set(found))
-
-
-def _is_tox(token: str) -> bool:
-    return token in ("tox", "nox") or token.endswith(("/tox", "/nox"))
-
-
-_PKG_RUNNERS = ("npm", "pnpm", "yarn", "bun", "run")
-
-
-def _runner_end(family: str, tokens: list[str]) -> int | None:
-    """The index just after the family's runner token, or None when the command is not it."""
-    rx = _FAMILY_RUNNER[family]
-    for i, tok in enumerate(tokens):
-        if family in ("go", "cargo"):
-            tool = "go" if family == "go" else "cargo"
-            if tok == tool and i + 1 < len(tokens) and rx.match(tokens[i + 1]):
-                return i + 2
-        elif rx.search(tok) or (
-            family == "js" and tok == "test" and i >= 1 and tokens[i - 1] in _PKG_RUNNERS
-        ):
-            return i + 1
-    return None
+    return sorted({(family, flag) for family, flag, _ in selection_uses(command)})
