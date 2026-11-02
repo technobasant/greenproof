@@ -39,6 +39,10 @@ class ChangeSet:
     skipped_binary: list[str] = field(default_factory=list)
     # Reads any file as it was at the base revision (None when absent), changed or not.
     read_base: Callable[[str], bytes | None] | None = None
+    # The same for the candidate tree, and directory listings (file paths) at both revisions.
+    read_cand: Callable[[str], bytes | None] | None = None
+    list_base: Callable[[str], list[str]] | None = None
+    list_cand: Callable[[str], list[str]] | None = None
 
     def base_text(self, path: str) -> str | None:
         """The file's text at the base revision, or None when it did not exist there."""
@@ -49,6 +53,28 @@ class ChangeSet:
             if (f.old_path or f.path) == path:
                 return f.old_text
         return None
+
+    def siblings(self, path: str, suffix: str, base: bool) -> dict[str, str]:
+        """The other files of `path`'s directory ending in `suffix`, as {path: text}, at the base
+        revision or in the candidate tree. Without tree access, only the changed files."""
+        directory = posixpath.dirname(path)
+        lister = self.list_base if base else self.list_cand
+        reader = self.read_base if base else self.read_cand
+        out: dict[str, str] = {}
+        if lister is not None and reader is not None:
+            for name in lister(directory):
+                if name != path and name.endswith(suffix):
+                    blob = reader(name)
+                    if blob is not None:
+                        out[name] = blob.decode(errors="replace")
+            return out
+        for f in self.files:
+            name = (f.old_path or f.path) if base else f.path
+            text = f.old_text if base else f.new_text
+            same_dir = posixpath.dirname(name) == directory
+            if name != path and name.endswith(suffix) and same_dir and text is not None:
+                out[name] = text
+        return out
 
     def tests(self) -> list[ChangedFile]:
         return [f for f in self.files if f.is_test or f.was_test]
@@ -135,4 +161,11 @@ def build_changeset(
                 was_test=entry.status != "A" and is_test_path(old_path, test_patterns),
             )
         )
-    return ChangeSet(files, skipped, lambda p: gitops.read_blob(repo, base_sha, p))
+    return ChangeSet(
+        files,
+        skipped,
+        lambda p: gitops.read_blob(repo, base_sha, p),
+        lambda p: gitops.read_blob(repo, tree, p),
+        lambda d: gitops.list_dir(repo, base_sha, d),
+        lambda d: gitops.list_dir(repo, tree, d),
+    )

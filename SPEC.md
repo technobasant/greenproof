@@ -197,7 +197,7 @@ covering at least one true positive and one legitimate change that must NOT fire
 | `tests.skipped` | block | a skip/xfail/ignore/todo marker is added to a test that exists at base, or at module/class/conftest scope (see 5.3). On a brand-new test an unconditional skip/xfail is `warn` and a conditional one (`skipif(<condition>)`, `importorskip`) does not fire: neither hides existing verification |
 | `tests.focused` | block | a focus marker is added (`it.only`, `fit`, `describe.only`, `test.only`), which silently skips the rest |
 | `tests.weakened` | block | for a test present on both sides: fewer assertions, a strong assertion replaced by a weaker one, tolerance widened, parametrize cases reduced, an assertion made vacuous, tautological or unreachable, or an assertion wrapped in a swallowing `try/except` (see 5.4) |
-| `tests.expected_changed` | warn | a literal in an assertion's expected side changed in a kept test (same number of expected literals), whether or not non-test code changed. With no non-test code change it is the "edit the test to match what the code returns" pattern, which commands and revert cannot see (the suite passes and revert has no source change to undo); the message says which case it is. Legitimate when the old value was wrong or the spec changed, so warn |
+| `tests.expected_changed` | warn | a literal in an assertion's expected side changed in a kept test (same number of expected literals), or a modified expected-output data file (5.4), whether or not non-test code changed. With no non-test code change it is the "edit the test to match what the code returns" pattern, which commands and revert cannot see (the suite passes and revert has no source change to undo); the message says which case it is. Legitimate when the old value was wrong or the spec changed, so warn |
 | `suppress.added` | warn | an added line introduces a type/lint/coverage suppression (see 5.5) |
 | `runner.tampered` | block | a change narrows or neuters how checks run: test selection, thresholds, strictness, test scripts (see 5.6) |
 | `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `|| true`, `if: false`, path filters excluding tests, or changes the greenproof step itself. The greenproof step is a line, outside a YAML comment, that runs `greenproof check` (any prefix such as `uvx`, `uv run` or a path, any `@version`) or `uses:` the greenproof action; other mentions (`greenproof --version` in a packaging job) do not count. Only those lines count, and a workflow whose base version has none gaining them is adoption, not a change (a new workflow file included); commenting out or deleting an existing greenproof line still fires. A ref-only version bump of the greenproof action (same inputs) is `warn` |
@@ -214,6 +214,12 @@ covering at least one true positive and one legitimate change that must NOT fire
   module or class scope, `pytestmark` gaining a skip/xfail.
 - JS/TS: `.skip(`, `xit(`, `xdescribe(`, `xtest(`, `.todo(`, `test.fails(` added.
 - Go: `t.Skip(`, `t.SkipNow(`, `t.Skipf(`. Rust: `#[ignore]`.
+- Go build constraints: a `//go:build <expr>` or `// +build <tags>` line above the package
+  clause of a `_test.go` file that is added or whose expression changed is `tests.skipped`
+  (block), naming the constraint: with it `go test ./...` no longer compiles the file. A
+  `//go:build` line takes precedence over `// +build` when both are present. An unchanged
+  constraint gives nothing, and neither does a constraint on a brand-new test file (it
+  hides no existing verification, the same rule as a conditional skip on a new test).
 
 ### 5.4 Weakening heuristics
 
@@ -306,6 +312,45 @@ matchers are removed while weak ones are added: JS/TS strong `toEqual`, `toBe(`,
 `.is_some())`, `.is_ok())`, `.is_empty())`, and `assert!(` lines containing `>`, `<`
 or `!=`. An `expect(<literal>)` (number, string, `true`/`false`/`null`/`undefined`) is
 vacuous and not counted, so `expect(add(1, 2)).toBe(3)` → `expect(3).toBe(3)` drops the count.
+
+Line-engine detections added in 0.3.0 (JS/TS, Go, Rust), all matched on comment-free text with
+string contents blanked, so brackets inside strings do not count:
+- **Unreachable after a return.** A bare `return` (Go, Rust), or `return;` / `return` followed
+  by a newline (JS/TS), at the top level of a test body makes every later check in the test
+  unreachable: uncounted, and `tests.weakened` when the count of unreachable checks rises.
+  A `return` inside a branch, a closure or a callback is not an early return, and neither is
+  `return expect(...)`, `return promise.then(...)` or `return request(...)`, which return
+  the check itself.
+- **Always-false conditions.** Go `if … && false {`, `if false && … {`, `if false {`; JS/TS
+  `if (false)`, `if (… && false)`, `if (false && …)`; Rust `if false {`, `&& false`.
+  Checks inside the block are unreachable; an `else` branch is live. `x || false` and
+  `x && y` are ordinary conditions.
+- **Self-equality is vacuous.** JS `expect(X).toBe/toEqual/toStrictEqual(X)`; Node
+  `assert.equal/strictEqual/deepEqual/deepStrictEqual(X, X)`; Go `assert.Equal(t, X, X)`,
+  `require.Equal(t, X, X)` (also `EqualValues`, `Exactly`) and `if X != X {`; Rust
+  `assert_eq!(X, X)` and `assert!(X == X)`. Operands are compared with whitespace removed.
+  An `X` that calls a nondeterministic source (`random`, `Date`, `now(`, `uuid`, `nanoid`,
+  `rand`, `Instant`, `SystemTime`) is exempt. A vacuous check is not counted and raises the
+  vacuous count, so it blocks only when it appears in a test that exists on both sides.
+- **Table rows.** `it.each`, `test.each` and `describe.each` with a literal array of arrays
+  or objects, or a tagged-template table, count their rows as parametrize cases (a
+  `describe.each` multiplies the tests inside it). Fewer rows than at base is `tests.weakened`
+  ("parametrize cases reduced from N to M"); adding rows is fine. A table that is not a
+  literal (`it.each(cases)`) is not counted.
+- **Helper credit.** JS/TS: a function declared in the same file outside any `it`/`test`
+  (top level or inside a `describe`) whose body contains an assertion counts as one check
+  per call inside a test. Go: the assertion helpers above are read from every `_test.go`
+  file in the directory at the same revision as the test file (base text for the base side,
+  the candidate tree for the candidate side), and when a changed `_test.go` file declares
+  helpers, unchanged same-directory test files that call them are re-analysed as if they
+  had changed, so a helper that loses its checks weakens its callers. A helper without an
+  assertion earns nothing.
+- **Expected-output data files.** A modified (not added, not deleted) non-code file with
+  extension `.json`, `.yaml`, `.yml`, `.txt`, `.csv`, `.snap`, `.golden`, `.out`,
+  `.expected`, `.html` or `.xml` under a test path, or under `testdata`, `fixtures`,
+  `golden` or `__snapshots__`, gives one `tests.expected_changed` (warn), "expected-output
+  file changed: PATH". Files another rule owns (runner configuration such as
+  `package.json` and `tsconfig*.json`, and CI workflows) are not reported here.
 
 Line-engine assertion vocabulary also includes: JS/TS `expectTypeOf(`, `assertType(` and
 a testing-library query that throws when the element is missing (`getBy…(`,

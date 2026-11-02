@@ -82,3 +82,5 @@ class FileAnalysis:
     markers: list[Marker] = field(default_factory=list)
     collected: bool = True  # whether the runner's file patterns pick this file up
     tree: ast.Module | None = field(default=None, repr=False, compare=False)  # Python only
+    # Go only: assertion helpers this file declares (SPEC 5.4), so callers can be re-analysed.
+    helpers: frozenset[str] = frozenset()
