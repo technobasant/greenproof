@@ -354,6 +354,21 @@ def read_blob(repo: Path, rev: str, path: str) -> bytes | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
+def list_dir(repo: Path, rev: str, directory: str) -> list[str]:
+    """Paths of the files directly inside `directory` ("" is the root) at `rev` (a commit or a
+    tree); empty when the directory does not exist there."""
+    spec = f"{rev}:{directory}" if directory else f"{rev}:"
+    proc = git(repo, "ls-tree", "-z", spec, check=False)
+    if proc.returncode != 0:
+        return []
+    out: list[str] = []
+    for entry in proc.stdout.decode(errors="surrogateescape").split("\0"):
+        meta, _, name = entry.partition("\t")
+        if name and meta.split(" ")[1:2] == ["blob"]:
+            out.append(f"{directory}/{name}" if directory else name)
+    return out
+
+
 class _Interrupted(SystemExit):
     """Raised from a signal handler so `finally` blocks run before the process exits."""
 
