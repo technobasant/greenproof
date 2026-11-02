@@ -17,7 +17,7 @@ from collections import ChainMap, Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
-from typing import Any
+from typing import Any, NamedTuple
 
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import Finding
@@ -47,7 +47,7 @@ from greenproof.rules.tasks import Opaque, Reader, task_reader
 _HINT = "Restore the original configuration; fix the code or the test instead of the check."
 _ADOPTION = " (a new linter or type-checker configuration: adoption, not a loosening)"
 _SELECT_FLAGS = set(SELECT_FLAGS["pytest"])
-_NOOP = re.compile(r"^(?:@?-?\s*)?(?:true|:|exit\s+0|echo\b.*)\s*$")
+_NOOP = re.compile(r"^(?:true|:|exit\s+0|echo\b.*)\s*$")
 # Flags that narrow a run, by tool: `-k` selects tests only for pytest, and `-t` is a name pattern
 # for jest and vitest but mocha's timeout. A tool not listed here (a policy script, `ng`, `node
 # --test`) is read for the long, unambiguous flags only; `make -k` keeps going and narrows nothing.
@@ -632,6 +632,26 @@ def _statements(lines: Sequence[str], script: bool) -> list[str]:
     if script:
         return [seg.text for seg in split_segments("\n".join(lines))]
     return [seg.text for ln in lines for seg in split_segments(_RECIPE_PREFIX.sub("", ln, count=1))]
+
+
+def _is_noop(line: str) -> bool:
+    """Whether every statement of a line does nothing: `echo start; pytest` is not a no-op, the
+    check is its last statement."""
+    segs = split_segments(_RECIPE_PREFIX.sub("", line, count=1))
+    return bool(segs) and all(_NOOP.match(seg.text.strip()) for seg in segs)
+
+
+class _Mode(NamedTuple):
+    """How the shell that runs a recipe line or a package.json script treats a failing command:
+    `errexit` (it stops at the first failure: `.SHELLFLAGS` has `-e`), `pipefail` (a pipeline's
+    status is its first failure), `strict` (its status is the last command's, so a check followed
+    by another command is lost), and `credit` (a masked check is not a swallow when the recipe
+    runs the same check unmasked on another line)."""
+
+    errexit: bool = False
+    pipefail: bool = False
+    strict: bool = False
+    credit: bool = False
 
 
 class _Ctx:
@@ -1663,7 +1683,7 @@ def removal_reason(statement: str, found: str) -> str:
             f"it now writes `{found}` (`{statement}`), a file the test runner loads: greenproof "
             "cannot see its contents at run time, and it may skip or add tests"
         )
-    why = f"it now {_HOW[how]} (`{statement}` {how} `{found}`, which holds the project's tests)"
+    why = f"it now {_HOW[how]} (`{statement}` {how} `{found}`, part of the project's test tree)"
     return _Warn(why) if how in ("appends to", "copies into") else why
 
 
@@ -1722,6 +1742,7 @@ def neutering_reason(
     recipe: bool = False,
     exports: tuple[Mapping[str, str], Mapping[str, str]] | None = None,
     tasks: tuple[Reader, Reader] | None = None,
+    modes: tuple[_Mode, _Mode] | None = None,
 ) -> str | None:
     """Whether a command (a script or recipe) was emptied, no-opped, narrowed or shortened.
 
@@ -1737,7 +1758,8 @@ def neutering_reason(
     variables (`PYTEST_ADDOPTS`, `GOFLAGS`) the base and the candidate Makefile export. `tasks`
     read `concurrently`, `turbo run x`, `nx run-many -t x` and `lerna run x` of each tree into the
     commands they run (see tasks.py); one that cannot be read stays as it is, and the candidate
-    running fewer steps then is a warning.
+    running fewer steps then is a warning. `modes` say how the shell of each side runs a recipe
+    line or a package.json script (see `_Mode`): without them a line is read as a script.
     """
     base_c = [ln.strip() for ln in base_lines if ln.strip()]
     cand_c = [ln.strip() for ln in cand_lines if ln.strip()]
@@ -1748,7 +1770,7 @@ def neutering_reason(
         return "it was emptied"
     base_e = _with_exports(base_c, script, exports[0] if exports else None)
     cand_e = _with_exports(cand_c, script, exports[1] if exports else None)
-    if base_c == cand_c and base_e == cand_e:
+    if base_c == cand_c and base_e == cand_e and (modes is None or modes[0] == modes[1]):
         return None
     unread = False
     narrow_base, narrow_cand = _statements(base_e, script), _statements(cand_e, script)
@@ -1757,11 +1779,7 @@ def neutering_reason(
         cand_c, unread = _read_tasks(cand_c, tasks[1])
         base_e = _with_exports(base_c, script, exports[0] if exports else None)
         cand_e = _with_exports(cand_c, script, exports[1] if exports else None)
-    if (
-        cand_c
-        and all(_NOOP.match(ln) for ln in cand_c)
-        and not all(_NOOP.match(ln) for ln in base_c)
-    ):
+    if cand_c and all(_is_noop(ln) for ln in cand_c) and not all(_is_noop(ln) for ln in base_c):
         return "it was replaced by a no-op"
     ctx = _Ctx(extra, make_check, script_check, set(names[0]) | set(names[1]) if names else ())
     known = [ctx.has_check(lines, script) for lines in (base_c, cand_c)]
@@ -1783,7 +1801,7 @@ def neutering_reason(
         gone = _removed_tests(base_c, cand_c, tests, cwds, recipe=recipe and not script)
         if gone and not isinstance(gone, _Warn):
             return gone
-    if swallowed := _new_swallow(base_c, cand_c, script, ctx, known, base_texts):
+    if swallowed := _new_swallow(base_c, cand_c, script, ctx, known, base_texts, modes):
         return f"a failure is now swallowed (`{swallowed}`)"
     if script and early_exit("\n".join(cand_c)) and not early_exit("\n".join(base_c)):
         return "it now exits 0 before its checks run"
@@ -1989,19 +2007,57 @@ def _new_selection_flag(base: list[str], cand: list[str]) -> str | None:
     return None
 
 
+def _plain_check(statement: str) -> tuple[str, ...]:
+    """A check statement as its words, without redirections (`> log`, `2>&1`) and a trailing
+    `| tee ...`: what is run, and on what, and nothing about where its output goes."""
+    toks = _split_words(statement)
+    words: list[str] = []
+    skip = False
+    for tok in toks:
+        if skip:
+            skip = False
+        elif m := re.fullmatch(r"(?:\d*|&)(?:>>?|<)\|?(.*)", tok):
+            skip = not m[1]
+        elif not re.fullmatch(r"\d*>&\d+|\d*>&-", tok):
+            words.append(tok)
+    if "|" in words:
+        at = words.index("|")
+        if words[at + 1 : at + 2] == ["tee"] and "|" not in words[at + 1 :]:
+            words = words[:at]
+    return tuple(words)
+
+
+def _ignores_status(line: str) -> bool:
+    """Whether a recipe line has a `-` prefix: make goes on whatever it exits with."""
+    m = _RECIPE_PREFIX.match(line)
+    return m is not None and "-" in m[0]
+
+
+def _line_checks(line: str, ctx: _Ctx) -> Counter[tuple[str, ...]]:
+    """The checks of one recipe line, each as `_plain_check` reads it."""
+    return Counter(
+        _plain_check(seg.text)
+        for seg in split_segments(_RECIPE_PREFIX.sub("", line, count=1))
+        if ctx.is_check(seg.text)
+    )
+
+
 def _swallow_counts(
     lines: list[str],
     script: bool,
     ctx: _Ctx,
     known: bool,
     base_texts: Collection[str] | None,
+    mode: _Mode | None = None,
 ) -> Counter[tuple[str, str]]:
-    """Swallows in a script, or in each recipe line on its own (make runs a shell per line)."""
+    """Swallows in a script, or in each recipe line on its own (make runs a shell per line). With
+    a `mode`, the shell is read as it is (see `_Mode`). A line that swallows is let off when
+    `mode.credit` and another line runs the same check with nothing swallowed: make stops at the
+    first line that fails, so the masked copy hides nothing."""
+    mode = mode or _Mode()
     chunks = ["\n".join(lines)] if script else [_RECIPE_PREFIX.sub("", ln, count=1) for ln in lines]
-    return Counter(
-        (w.kind, w.text)
-        for chunk in chunks
-        for w in find_swallows(
+    per_chunk = [
+        find_swallows(
             chunk,
             ctx.literals,
             opaque=True,
@@ -2009,8 +2065,22 @@ def _swallow_counts(
             make_check=ctx.make_check,
             base_segments=base_texts,
             known=known,
+            errexit=mode.errexit,
+            pipefail=mode.pipefail,
+            strict_status=mode.strict,
         )
-    )
+        for chunk in chunks
+    ]
+    if mode.credit and not script and any(per_chunk):
+        clean = [
+            _line_checks(ln, ctx)
+            for ln, found in zip(lines, per_chunk, strict=True)
+            if not found and not _ignores_status(ln)
+        ]
+        for i, found in enumerate(per_chunk):
+            if found and (mine := _line_checks(lines[i], ctx)) and mine in clean:
+                per_chunk[i] = []
+    return Counter((w.kind, w.text) for found in per_chunk for w in found)
 
 
 def _new_swallow(
@@ -2020,9 +2090,11 @@ def _new_swallow(
     ctx: _Ctx,
     known: list[bool],
     base_texts: Collection[str],
+    modes: tuple[_Mode, _Mode] | None = None,
 ) -> str | None:
-    gained = _swallow_counts(cand, script, ctx, known[1], base_texts) - _swallow_counts(
-        base, script, ctx, known[0], None
+    before, after = modes or (None, None)
+    gained = _swallow_counts(cand, script, ctx, known[1], base_texts, after) - _swallow_counts(
+        base, script, ctx, known[0], None, before
     )
     return next(iter(gained))[1] if gained else None
 
@@ -2507,6 +2579,9 @@ def _task_readers(changes: ChangeSet | None, path: str) -> tuple[Reader, Reader]
     )
 
 
+_NPM_SHELL = _Mode(strict=True)  # a script body runs under `sh -c`: no errexit, no pipefail
+
+
 def _package_reasons(
     f: ChangedFile,
     commands: Mapping[str, str],
@@ -2550,6 +2625,7 @@ def _package_reasons(
                 tests=tests,
                 cwds=cwds,
                 tasks=tasks,
+                modes=(_NPM_SHELL, _NPM_SHELL),
             ):
                 out.append((line, _carry(why, f"package.json script `{name}` changed and {why}")))
         elif name in after and isinstance(new, str) and new != old and new not in old_bodies:
@@ -2563,6 +2639,7 @@ def _package_reasons(
                 names=(old_scripts.keys(), new_scripts.keys()),
                 tests=tests,
                 cwds=cwds,
+                modes=(_NPM_SHELL, _NPM_SHELL),
             ):
                 out.append(
                     (
@@ -2826,11 +2903,17 @@ class _Targets(dict[str, _Target]):
     (`SHELL` is bash and `.SHELLFLAGS` has `-o pipefail`), `shell` (the last value `SHELL` was
     given, None when it never was), `default` (the target `make` builds with no goal named) and
     `stopped` (why the Makefile could not be read, "" when it could; the rules are empty then).
-    `cut` is set when following prerequisites ran into a limit."""
+    `cut` is set when following prerequisites ran into a limit. `ignore_all`, `ignore` and
+    `flags_ignore` say where make is told to go on after a failing line (`.IGNORE:`, `.IGNORE:
+    name`, `MAKEFLAGS` with `-i`), and `variables` is what the Makefile assigns."""
 
     def __init__(self) -> None:
         super().__init__()
         self.phony: set[str] = set()
+        self.ignore_all = False
+        self.ignore: set[str] = set()
+        self.flags_ignore = False
+        self.variables: Mapping[str, str] = {}
         self.oneshell = False
         self.errexit = False
         self.pipefail = False
@@ -3123,6 +3206,8 @@ def _read_rules(
 ) -> None:
     flags = variables.get(".SHELLFLAGS", "")
     found.errexit = bool(re.search(r"(?:^|\s)-[A-Za-z]*e|errexit", flags))
+    found.variables = variables
+    found.flags_ignore = make_ignores(variables.get("MAKEFLAGS", ""))
     shell = variables.get("SHELL")
     found.shell = None if shell is None else _expand_vars(shell, variables, 0, budget).strip()
     # a recipe runs under `/bin/sh -c`: its pipelines keep the last stage's status unless SHELL
@@ -3149,6 +3234,10 @@ def _read_rules(
             found.phony |= _phony_names(m[1], variables, budget)
         elif not indented and re.match(r"^\.ONESHELL\s*:", line):
             found.oneshell = True
+        elif not indented and (m := re.match(r"^\.IGNORE\s*:(.*)$", line)):
+            names = _phony_names(m[1], variables, budget)
+            found.ignore |= names
+            found.ignore_all = found.ignore_all or not names
         elif not indented and (m := _ASSIGN.match(line)):
             if m[2] == ".DEFAULT_GOAL":
                 goal = _expand_vars(re.sub(r"\s+#.*$", "", m[4]), variables, 0, budget).split()
@@ -3281,6 +3370,33 @@ def _make_resolver(
     return resolve
 
 
+_VALUE_FLAGS = "CfIjloW"  # short make options whose value follows (`-C dir`, `-j4`)
+
+
+def make_ignores(flags: str) -> bool:
+    """Whether a `MAKEFLAGS` value turns on `-i`: the `--ignore-errors` word, or an `i` in a
+    cluster of short options (`-i`, `-ik`, or the bare letters of the first word, `ik`). A long
+    option is matched whole (`--no-print-directory` holds an `i` and is not `-i`), and a short
+    option that takes a value ends its cluster (`-j4i` is `-j 4i`)."""
+    for k, word in enumerate(flags.split()):
+        if word == "--ignore-errors":
+            return True
+        if word.startswith("--"):
+            continue
+        if word.startswith("-"):
+            cluster = word[1:]
+        elif k == 0 and "=" not in word:
+            cluster = word
+        else:
+            continue
+        for ch in cluster:
+            if ch == "i":
+                return True
+            if ch in _VALUE_FLAGS:
+                break
+    return False
+
+
 _MAKE_HEADS = frozenset({"make", "gmake", "$(MAKE)", "${MAKE}", "$MAKE"})
 _MAKE_FILE_OPTS = ("-C", "-f", "--directory", "--file", "--makefile")
 
@@ -3356,6 +3472,63 @@ def _oneshell_reason(old: _Targets, new: _Targets, name: str, ctx: _Ctx) -> str 
     return None
 
 
+_MAKE_FUNCTIONS = frozenset(
+    {"call", "eval", "shell", "foreach", "if", "or", "and", "subst", "patsubst", "strip"}
+    | {"findstring", "filter", "filter-out", "sort", "word", "wordlist", "words", "firstword"}
+    | {"lastword", "join", "dir", "notdir", "suffix", "basename", "addsuffix", "addprefix"}
+    | {"wildcard", "realpath", "abspath", "value", "origin", "flavor", "file", "let"}
+    | {"error", "warning", "info"}
+)
+_FUNCTION_CALL = re.compile(r"(\$+)[({]\s*([a-z][a-z-]*)\s")
+
+
+def _unread_call(line: str) -> tuple[str, str] | None:
+    """A make function call left in an expanded recipe line (`$(call run,x)`, `$(shell ...)`):
+    the reader does not evaluate functions, so what the line runs is not known. Returns the call
+    (cut short) and the name a `call` runs, "" for the other functions. `$$(date)` is the
+    shell's."""
+    for m in _FUNCTION_CALL.finditer(line):
+        if len(m[1]) % 2 and m[2] in _MAKE_FUNCTIONS:
+            call = line[m.end(1) - 1 :]
+            named = re.match(r"\S+\s+([\w.-]+)", call[2:]) if m[2] == "call" else None
+            return call[:40].rstrip(), named[1] if named else ""
+    return None
+
+
+def _unread_reasons(
+    old: _Targets, new: _Targets, reached: Collection[str]
+) -> list[tuple[str, str]]:
+    """For each target the goal runs, the first recipe line the change touched that still holds a
+    function call after reading (see `_unread_call`), as `(target, call)`. A line the base had, with
+    the function it calls (`call name`) defined as before, is not new: it was as unread then."""
+    out: list[tuple[str, str]] = []
+    for name in reached:
+        node, before = new[name], old.get(name)
+        for line in node.lines:
+            found = _unread_call(line)
+            if found is None:
+                continue
+            call, fn = found
+            same = before is not None and line in before.lines
+            if same and (not fn or old.variables.get(fn) == new.variables.get(fn)):
+                continue
+            out.append((name, call))
+            break
+    return out
+
+
+def _policy_ignores(commands: Collection[str]) -> bool:
+    """Whether a policy command runs make with `-i` or `MAKEFLAGS` carrying it."""
+    for cmd in commands:
+        if (m := _BARE_MAKE.search(cmd)) and make_ignores(
+            " ".join(w for w in m[1].split() if w.startswith("-"))
+        ):
+            return True
+        if (m := re.search(r"\bMAKEFLAGS=(\S+)", cmd)) and make_ignores(m[1].strip("'\"")):
+            return True
+    return False
+
+
 def _make_reasons(
     f: ChangedFile,
     commands: Mapping[str, str],
@@ -3389,6 +3562,8 @@ def _make_reasons(
     if bare and old.default and not (old.default == new.default and old.default in names):
         goals.append((new.default or old.default, old.default, new.default or ""))
     ctx = _Ctx(extra, resolve)
+    ignoring = new.ignore_all or new.flags_ignore or _policy_ignores(extra)
+    unread: set[str] = set()
     for name, old_name, new_name in goals:
         if old_name not in old:
             continue
@@ -3407,6 +3582,15 @@ def _make_reasons(
             cwds=(posixpath.dirname(f.path),),
             recipe=True,
             exports=exported,
+            modes=(
+                _Mode(old.errexit, old.pipefail, True),
+                _Mode(
+                    new.errexit,
+                    new.pipefail,
+                    True,
+                    not ((new.oneshell and not new.errexit) or ignoring or new.ignore),
+                ),
+            ),
         )
         if why and not cand_lines and _effective(new, new_name):
             why = _SHADOW_WHY
@@ -3416,6 +3600,19 @@ def _make_reasons(
                 (
                     _first_line_with(f.new_text or "", f"{new_name}:"),
                     _carry(why, f"target `{name}` changed and {why}"),
+                )
+            )
+        ran = {id(n) for n in _chain(new, new_name, new_shadow)}
+        reached = [t for t, node in new.items() if id(node) in ran and t not in unread]
+        for target, call in _unread_reasons(old, new, reached):
+            unread.add(target)
+            out.append(
+                (
+                    _first_line_with(f.new_text or "", f"{target}:"),
+                    _Warn(
+                        f"target `{target}` runs `{call}`, a function call greenproof cannot read "
+                        "here: check what it runs"
+                    ),
                 )
             )
     if names or bare:

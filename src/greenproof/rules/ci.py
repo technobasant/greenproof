@@ -472,6 +472,10 @@ class _Walk:
     def tree(self, directory: str) -> set[str]:
         return _tree_names(self.world.changes, directory, self.base)
 
+    def base_text(self, path: str) -> str | None:
+        """A file as the base has it (for the candidate's walk, to tell what the change touched)."""
+        return _read(self.world, path, True)
+
     def render(self, text: str, cwd: str, scope: Scope, src: str = "") -> tuple[str, str]:
         """A script read with its functions (those of the files it sources too) and arguments:
         what runs whatever a `case` word is, and what may run. Why reading stopped short is
@@ -518,10 +522,22 @@ class _Walk:
             if not toks:
                 continue
             try:
-                children = make_children(toks, stmt, body.defs, cwd, self.read, self.tree)
+                unread: list[str] = []
+                children = make_children(
+                    toks,
+                    stmt,
+                    body.defs,
+                    cwd,
+                    self.read,
+                    self.tree,
+                    None if self.base else self.base_text,
+                    unread,
+                )
             except MakeUnreadable as e:
                 self.cut(f"`{stmt[:60]}`: {e}")
                 continue
+            for why in unread:
+                self.cut(why)
             if children is None:
                 children = pm_children(stmt, toks, cwd, self.read)
             if children is None:

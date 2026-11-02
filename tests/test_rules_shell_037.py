@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from greenproof.rules.ci_expand import _ignores
+from greenproof.rules.runner import make_ignores as _ignores
 from greenproof.rules.shell import Scope, find_swallows, functions_in, split_segments
 from tests.test_rules_ci_031 import scene
 from tests.test_rules_ci_035 import MAKE_CI, TEST, WF, flow, fresh, messages, verdict
