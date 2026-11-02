@@ -29,6 +29,7 @@ from greenproof.rules.shell import (
     command_tokens,
     early_exit,
     find_swallows,
+    is_non_check,
     scripts_in,
     selection_flags,
     split_segments,
@@ -77,6 +78,7 @@ _PM_VALUE_OPTS = {"--prefix", "--workspace", "-w", "--filter", "-F", "--cwd", "-
 class _Settings:
     select: Counter[str] = field(default_factory=Counter)  # narrowing pytest options
     plugins_off: Counter[str] = field(default_factory=Counter)  # `-p no:X` in addopts
+    autoload_off: bool = False  # `--disable-plugin-autoload` in addopts
     error_filter: bool = False  # warnings are errors: `filterwarnings = error`, `-W error`
     testpaths: set[str] = field(default_factory=set)
     cov_fail_under: float | None = None
@@ -134,6 +136,8 @@ def _addopts(settings: _Settings, value: Any) -> None:
             i += 1
         elif tok.startswith("-pno:"):
             settings.plugins_off[tok[5:]] += 1
+        elif tok == "--disable-plugin-autoload":
+            settings.autoload_off = True
         elif tok == "-W" and i + 1 < len(tokens) and tokens[i + 1].startswith("error"):
             settings.error_filter = True
             i += 1
@@ -313,6 +317,13 @@ def _plugin_reasons(base: _Settings | None, cand: _Settings) -> list[str]:
             out.append(f"{option} (warnings are errors in this configuration, and now are not)")
         else:
             out.append(_Warn(f"{option} (it turns off a plugin: check what it was doing)"))
+    if cand.autoload_off and not (base and base.autoload_off):
+        out.append(
+            _Warn(
+                "pytest option `--disable-plugin-autoload` added (no installed plugin loads "
+                "unless named with `-p`: check what they were doing)"
+            )
+        )
     return out
 
 
@@ -430,6 +441,16 @@ class _Ctx:
             self.script_check(name) for name in _script_refs(statement, self.names)
         )
 
+    def kind(self, statement: str) -> str | None:
+        """The kind of check a statement is (`pytest`, `eslint`, ...), None when it is none."""
+        for text in (statement, _unwrap(statement)):
+            kind = check_kind(
+                text, literals=self.literals, scripts=self.scripts, make_check=self.make_check
+            )
+            if kind is not None:
+                return kind
+        return None
+
     def has_check(self, lines: Sequence[str], script: bool) -> bool:
         return any(self.is_check(st) for st in _statements(lines, script))
 
@@ -444,6 +465,7 @@ def neutering_reason(
     script_check: Callable[[str], bool] | None = None,
     base_pool: Sequence[str] = (),
     names: tuple[Collection[str], Collection[str]] | None = None,
+    expanders: tuple[Expander, Expander] | None = None,
 ) -> str | None:
     """Whether a command (a script or recipe) was emptied, no-opped, narrowed or shortened.
 
@@ -453,7 +475,9 @@ def neutering_reason(
     package.json script does. A statement counts as a check only when its command is one; with no
     recognised check at all, every statement the base had does (`base_pool` adds statements the
     base ran from elsewhere, for a script that is new). Only the steps that are checks count
-    towards "fewer steps": a cleanup line or a `pretest` split off is not a lost check.
+    towards "fewer steps": a cleanup line or a `pretest` split off is not a lost check. A kind of
+    check the base ran and the candidate no longer does (`jest` became `eslint`) is a reason, with
+    `expanders` reading `npm run x` or `make x` into the body they run.
     """
     base_c = [ln.strip() for ln in base_lines if ln.strip()]
     cand_c = [ln.strip() for ln in cand_lines if ln.strip()]
@@ -485,11 +509,74 @@ def neutering_reason(
         return "it now exits 0 before its checks run"
     if not script and (why := _dash_reason(base_c, cand_c, ctx, known[1], base_texts)):
         return why
+    if not script and (lost := _lost_kind(base_c, cand_c, ctx, expanders)):
+        return f"it no longer runs {lost}"
     side = names or ((), ())
     if not script and _check_steps(cand_c, ctx, known[1], base_texts, side[1]) < _check_steps(
         base_c, ctx, known[0], None, side[0]
     ):
         return "it runs fewer steps than before"
+    return None
+
+
+Expander = Callable[[str], "list[str] | None"]
+_LINT_KINDS = frozenset({"ruff", "mypy", "flake8", "pylint", "eslint", "clippy", "package lint"})
+# Kinds that wrap another command: they stand for whatever test runner is behind them.
+_WRAPPER_KINDS = frozenset({"make test", "package test", "tox/nox"})
+
+
+def _kinds(
+    lines: Sequence[str], ctx: _Ctx, expand: Expander | None, depth: int = 0
+) -> tuple[Counter[str], bool]:
+    """The kinds of check a recipe or script runs, with `npm run x` and `make x` read into their
+    bodies; and whether a statement is one the rule cannot classify (it might run any check)."""
+    found: Counter[str] = Counter()
+    opaque = False
+    for st in _statements(lines, False):
+        body = expand(st) if expand is not None and depth < _MAX_DEPTH else None
+        if body is not None:
+            inner, inner_opaque = _kinds(body, ctx, expand, depth + 1)
+            found.update(inner)
+            opaque = opaque or inner_opaque
+            continue
+        kind = ctx.kind(st)
+        if kind == "policy":
+            continue
+        if kind is not None:
+            found[kind] += 1
+        elif not (_housekeeping(st) or is_non_check(st)):
+            opaque = True
+    return found, opaque
+
+
+def _category(kind: str) -> str:
+    return "lint" if kind in _LINT_KINDS else kind
+
+
+def _lost_kind(
+    base: Sequence[str],
+    cand: Sequence[str],
+    ctx: _Ctx,
+    expanders: tuple[Expander, Expander] | None,
+) -> str | None:
+    """A kind of check the base ran that the candidate no longer does. Only judged when every
+    statement of the candidate is classified (an unknown script might run it) and it runs some
+    check; the lint kinds are one category, a wrapper (`make test`) stands for any test runner."""
+    before, _ = _kinds(base, ctx, expanders[0] if expanders else None)
+    after, opaque = _kinds(cand, ctx, expanders[1] if expanders else None)
+    if opaque or not after:
+        return None
+    present = {_category(k) for k in after}
+    for kind in sorted(before):
+        category = _category(kind)
+        if category in present:
+            continue
+        others = present - {"lint"}
+        if kind in _WRAPPER_KINDS and others:
+            continue
+        if category != "lint" and present & _WRAPPER_KINDS:
+            continue
+        return f"`{kind}`"
     return None
 
 
@@ -632,10 +719,24 @@ _GENERIC_HEADS = frozenset(
 )
 
 
+# The word after a tool's name that says what it does: `ng test` and `ng lint` are two steps.
+_SUBCOMMANDS = frozenset(
+    {"test", "lint", "check", "build", "run", "e2e", "typecheck", "format", "verify", "ci"}
+    | {"coverage", "spec", "unit", "integration", "serve", "start", "watch"}
+)
+
+
+def _subcommand(words: Sequence[str]) -> str | None:
+    """The first argument that is not a flag, when it is one of the `_SUBCOMMANDS`."""
+    first = next((w for w in words[1:] if not w.startswith("-")), None)
+    return first if first in _SUBCOMMANDS else None
+
+
 class _Known(Collection[str]):
     """The statements of the base. A candidate statement is one of them when it extends one or is
     one it extends (`ng test` became `ng test --no-watch`), or runs the same tool with other
-    arguments (`prettier "src/**" --check` became `prettier . --check`): the same step, edited."""
+    arguments (`prettier "src/**" --check` became `prettier . --check`): the same step, edited. A
+    tool's subcommand is part of the step: `ng test` becoming `ng lint` is another one."""
 
     def __init__(self, texts: Sequence[str]) -> None:
         self.texts = {t for t in texts if not _housekeeping(t)}
@@ -648,7 +749,11 @@ class _Known(Collection[str]):
         return bool(words) and any(
             b[: len(words)] == words
             or words[: len(b)] == b
-            or (b[0] == words[0] and words[0] not in _GENERIC_HEADS)
+            or (
+                b[0] == words[0]
+                and words[0] not in _GENERIC_HEADS
+                and _subcommand(b) == _subcommand(words)
+            )
             for b in self._words
         )
 
@@ -682,23 +787,259 @@ def _is_pattern(name: str) -> bool:
     return (len(name) > 2 and name[0] == "/" and name[-1] == "/") or any(c in name for c in "*?")
 
 
+# A script-name pattern is matched by a small automaton, never by `re`: the pattern comes from the
+# candidate, and `/^(a+)+$/` would hang a backtracking engine. The safe subset is literal text,
+# `^`, `$`, `.`, character classes, `*`, `+` and `?` on a single atom, and `|` between literals
+# (one group of them at most). Anything else is "unknown", and unknown matches every script.
+_MAX_PATTERN = 200
+_MAX_BRANCHES = 64
+_MAX_WORK = 200_000  # pattern items times the characters of the script names matched against
+_Atom = tuple[str, str]  # ("lit", char) | ("any", "") | ("cls", "^a-z:" style body)
+_Item = tuple[_Atom, str]  # the atom and its quantifier: "", "*", "?"
+
+
+@dataclass(frozen=True)
+class _Pattern:
+    branches: tuple[tuple[_Item, ...], ...]
+    start: bool  # anchored with ^
+    end: bool  # anchored with $
+
+
+def _class_atom(body: str) -> _Atom | None:
+    """A character class body (between the brackets) as an atom, None when it is not plain."""
+    negate = body.startswith("^")
+    chars = body[1:] if negate else body
+    if not chars or "[" in chars:
+        return None
+    out: list[str] = []
+    i = 0
+    while i < len(chars):
+        c = chars[i]
+        if c == "\\":
+            if i + 1 >= len(chars) or chars[i + 1].isalnum():
+                return None
+            out.append(chars[i + 1])
+            i += 2
+        elif i + 2 < len(chars) and chars[i + 1] == "-":
+            lo, hi = c, chars[i + 2]
+            if lo > hi:
+                return None
+            out.append(f"{lo}-{hi}")
+            i += 3
+        else:
+            out.append(c)
+            i += 1
+    return ("cls", ("^" if negate else "") + "\0".join(out))
+
+
+def _atom_matches(atom: _Atom, ch: str) -> bool:
+    kind, body = atom
+    if kind == "any":
+        return True
+    if kind == "lit":
+        return ch == body
+    negate = body.startswith("^")
+    hit = False
+    for part in (body[1:] if negate else body).split("\0"):
+        if len(part) == 3 and part[1] == "-":
+            hit = hit or part[0] <= ch <= part[2]
+        else:
+            hit = hit or ch == part
+    return hit != negate
+
+
+def _branch_items(text: str) -> tuple[_Item, ...] | None:
+    items: list[_Item] = []
+    i = 0
+    while i < len(text):
+        c = text[i]
+        atom: _Atom
+        if c == "\\":
+            if i + 1 >= len(text) or text[i + 1].isalnum():
+                return None
+            atom, i = ("lit", text[i + 1]), i + 2
+        elif c == "[":
+            j = i + 1
+            while j < len(text) and text[j] != "]":
+                j += 2 if text[j] == "\\" else 1
+            if j >= len(text) or (cls := _class_atom(text[i + 1 : j])) is None:
+                return None
+            atom, i = cls, j + 1
+        elif c == ".":
+            atom, i = ("any", ""), i + 1
+        elif c in "*+?{}()^$|":
+            return None
+        else:
+            atom, i = ("lit", c), i + 1
+        quant = ""
+        if i < len(text) and text[i] in "*+?":
+            quant, i = text[i], i + 1
+            if i < len(text) and text[i] in "*+?":
+                return None  # lazy, possessive or doubled: not the plain subset
+        if quant == "+":
+            items.extend([(atom, ""), (atom, "*")])
+        else:
+            items.append((atom, quant))
+    return tuple(items)
+
+
+def _split_top(text: str) -> list[str] | None:
+    """`text` split at the `|` outside brackets and parentheses; None for nested groups."""
+    parts: list[str] = []
+    depth, cls, last, i = 0, False, 0, 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if cls:
+            cls = c != "]"
+        elif c == "[":
+            cls = True
+        elif c == "(":
+            depth += 1
+            if depth > 1:
+                return None
+        elif c == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif c == "|" and depth == 0:
+            parts.append(text[last:i])
+            last = i + 1
+        i += 1
+    parts.append(text[last:])
+    return None if depth or cls else parts
+
+
+_LITERAL_RUN = re.compile(r"[\w:./@ -]*")
+
+
+def _expand_group(text: str) -> list[str] | None:
+    """A branch with at most one `(a|b)` or `(?:a|b)` group of literals, as one branch per
+    alternative."""
+    m = re.search(r"\(", text)
+    if m is None:
+        return [text]
+    end = text.find(")", m.end())
+    if end < 0 or "(" in text[m.end() : end] or text[end + 1 : end + 2] in ("*", "+", "?", "{"):
+        return None
+    inner = text[m.end() : end].removeprefix("?:")
+    alternatives = inner.split("|")
+    if not all(_LITERAL_RUN.fullmatch(a) for a in alternatives) or "(" in text[end + 1 :]:
+        return None
+    return [text[: m.start()] + a + text[end + 1 :] for a in alternatives]
+
+
+def _parse_pattern(source: str) -> _Pattern | None:
+    """The pattern as an automaton description, None when it is outside the safe subset."""
+    if len(source) > _MAX_PATTERN:
+        return None
+    anchored_start = source.startswith("^")
+    body = source[1:] if anchored_start else source
+    anchored_end = body.endswith("$") and not body.endswith("\\$")
+    body = body[:-1] if anchored_end else body
+    branches: list[tuple[_Item, ...]] = []
+    for part in _split_top(body) or []:
+        expanded = _expand_group(part)
+        if expanded is None:
+            return None
+        for text in expanded:
+            if (items := _branch_items(text)) is None:
+                return None
+            branches.append(items)
+    if not branches or len(branches) > _MAX_BRANCHES:
+        return None
+    return _Pattern(tuple(branches), anchored_start, anchored_end)
+
+
+def _branch_matches(items: tuple[_Item, ...], text: str, start: bool, end: bool) -> bool:
+    """Whether the items match `text` (anywhere unless anchored). The states are bits of an int,
+    so each character costs at most one step per item."""
+    n = len(items)
+    # eps[k]: state k and every state reachable from it by skipping optional items.
+    eps = [0] * (n + 1)
+    eps[n] = 1 << n
+    for k in range(n - 1, -1, -1):
+        eps[k] = (1 << k) | (eps[k + 1] if items[k][1] in ("*", "?") else 0)
+    accept = 1 << n
+    current = eps[0]
+    if current & accept and (not end or not text):
+        return True
+    for pos, ch in enumerate(text):
+        nxt, bits = 0, current & ~accept
+        while bits:
+            low = bits & -bits
+            bits ^= low
+            k = low.bit_length() - 1
+            if _atom_matches(items[k][0], ch):
+                nxt |= eps[k] if items[k][1] == "*" else eps[k + 1]
+        current = nxt if start else nxt | eps[0]
+        if current & accept and (not end or pos == len(text) - 1):
+            return True
+        if not current:
+            return False
+    return False
+
+
+def _parse_script_pattern(name: str, glob: bool) -> _Pattern | None:
+    """A `/regex/` (pnpm run) or `test:*` glob (run-s) script pattern, None when it is outside
+    the safe subset."""
+    if len(name) > 2 and name[0] == "/" and name[-1] == "/":
+        source = name[1:-1]
+    elif glob and _is_pattern(name):
+        if len(name) > _MAX_PATTERN:
+            return None
+        source = "^" + "".join(
+            "[^:]*" if c == "*" else "." if c == "?" else re.escape(c) for c in name
+        )
+        # The glob's own `*` and `?` are already translated; `re.escape` made the rest literal.
+        source += "$"
+    else:
+        return None
+    return _parse_pattern(source)
+
+
+def _pattern_matcher(
+    name: str, glob: bool, universe: Collection[str] = ()
+) -> Callable[[str], bool] | None:
+    """A matcher for a script pattern; None when the pattern is outside the safe subset, or when
+    matching it against `universe` would cost more than `_MAX_WORK` (callers then treat it as
+    matching every script). Matching is linear, but a gate that runs past its hook's timeout
+    lets the agent stop anyway."""
+    pattern = _parse_script_pattern(name, glob)
+    if pattern is None:
+        return None
+    items = sum(len(b) + 1 for b in pattern.branches)
+    if items * sum(len(u) + 1 for u in universe) > _MAX_WORK:
+        return None
+    return lambda text: any(
+        _branch_matches(items, text, pattern.start, pattern.end) for items in pattern.branches
+    )
+
+
+def _is_matching(name: str, glob: bool) -> bool:
+    """Whether `name` is read as a pattern at all (a `/regex/`, or a glob under run-s)."""
+    return (len(name) > 2 and name[0] == "/" and name[-1] == "/") or (glob and _is_pattern(name))
+
+
+def _unknown_pattern(name: str, glob: bool, universe: Collection[str] = ()) -> bool:
+    """A script pattern outside the safe subset, or too costly to match against `universe` (it
+    matches every script)."""
+    return _is_matching(name, glob) and _pattern_matcher(name, glob, universe) is None
+
+
 def _expand(names: Sequence[str], universe: Collection[str], glob: bool) -> list[str]:
     """Script names with `/regex/` (pnpm run) and `test:*` (run-s) patterns replaced by the
-    scripts they match, among `universe`."""
+    scripts they match, among `universe`. A pattern outside the safe subset matches them all."""
     out: list[str] = []
     for name in names:
-        if len(name) > 2 and name[0] == "/" and name[-1] == "/":
-            pattern = name[1:-1]
-        elif glob and _is_pattern(name):
-            pattern = "^" + re.escape(name).replace(r"\*", "[^:]*").replace(r"\?", ".") + "$"
-        else:
+        if not _is_matching(name, glob):
             out.append(name)
-            continue
-        try:
-            rx = re.compile(pattern)
-        except re.error:
-            continue
-        out.extend(u for u in universe if rx.search(u))
+        elif (match := _pattern_matcher(name, glob, universe)) is None:
+            out.extend(universe)
+        else:
+            out.extend(u for u in universe if match(u))
     return out
 
 
@@ -756,6 +1097,15 @@ def _check_steps(
         if not (run_all or any(_is_pattern(n) for n in raw)):
             total += int(counts)
             continue
+        # A pattern outside the safe subset (SPEC 5.6) matches every script, which says nothing
+        # about what runs. Unchanged from the base it counts as the base did; new, it counts for
+        # nothing, so the step it replaced is missing.
+        if (
+            base_texts is not None
+            and any(_unknown_pattern(n, run_all, universe) for n in raw)
+            and st not in (base_texts.texts if isinstance(base_texts, _Known) else base_texts)
+        ):
+            continue
         names = _expand(raw, universe, run_all)
         each = [ctx.is_check(f"npm run {n}") for n in names]
         total += sum(each) if known or any(each) else len(names) * int(counts)
@@ -811,6 +1161,18 @@ def _script_resolver(
     return resolve
 
 
+def _script_expander(scripts: Mapping[str, Any]) -> Expander:
+    """`npm run x` read into the bodies of script x of this package.json."""
+
+    def expand(statement: str) -> list[str] | None:
+        refs = [r for r in _script_refs(statement, scripts) if r in scripts]
+        if not refs:
+            return None
+        return [ln for r in refs for ln in _script_lines(scripts, r)]
+
+    return expand
+
+
 def _package_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int | None, str]]:
     base = json.loads(f.old_text) if f.old_text else {}
     cand = json.loads(f.new_text or "{}")
@@ -843,6 +1205,7 @@ def _package_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[
                 script_check=resolve,
                 base_pool=pool,
                 names=(old_scripts.keys(), new_scripts.keys()),
+                expanders=(_script_expander(old_scripts), _script_expander(new_scripts)),
             ):
                 out.append((line, f"package.json script `{name}` changed and {why}"))
         elif name in after and isinstance(new, str) and new != old and new not in old_bodies:
@@ -967,15 +1330,74 @@ class _Target:
 _RULE = re.compile(r"^([A-Za-z_][\w.-]*)\s*(?:[^=:\n]*)?:(?![=:])(.*)$")
 _DEFINE = re.compile(r"^\s*define\s")
 _ENDEF = re.compile(r"^\s*endef\b")
+_ASSIGN = re.compile(r"^(?:(?:export|override)\s+)*([A-Za-z_][\w.-]*)\s*(::=|:=|\?=|\+=|=)\s*(.*)$")
+_VAR_REF = re.compile(r"(?<!\$)\$[({]([A-Za-z_][\w.]*)[)}]")
 _MAX_DEPTH = 4
+_MAX_VAR_DEPTH = 6
+
+
+def _expand_vars(text: str, variables: Mapping[str, str], depth: int = 0) -> str:
+    """`$(NAME)` and `${NAME}` replaced by what the Makefile assigns NAME, recursively (to a depth
+    limit). A name the Makefile does not define, or a function call, is left as it is."""
+    if depth >= _MAX_VAR_DEPTH or "$" not in text:
+        return text
+
+    def value(m: re.Match[str]) -> str:
+        found = variables.get(m[1])
+        return m[0] if found is None else _expand_vars(found, variables, depth + 1)
+
+    return _VAR_REF.sub(value, text)
+
+
+def _joined(text: str) -> list[str]:
+    """The lines of a Makefile with backslash continuations folded into one line."""
+    return split_lines(re.sub(r"\\\n[ \t]*", " ", text))
+
+
+def _variables(text: str | None) -> dict[str, str]:
+    """The variables a Makefile assigns at the top level (`=`, `:=`, `::=`, `?=`, `+=`), by the
+    order of the file: a later `=` wins, `?=` keeps an earlier value, `+=` appends."""
+    out: dict[str, str] = {}
+    in_define = 0
+    for raw in _joined(text or ""):
+        if _DEFINE.match(raw):
+            in_define += 1
+            continue
+        if in_define:
+            in_define -= 1 if _ENDEF.match(raw) else 0
+            continue
+        m = _ASSIGN.match(raw) if not raw.startswith((" ", "\t")) else None
+        if m is None:
+            continue
+        name, op, value = m[1], m[2], re.sub(r"\s+#.*$", "", m[3]).strip()
+        if op in (":=", "::="):
+            out[name] = _expand_vars(value, out)
+        elif op == "?=":
+            out.setdefault(name, value)
+        elif op == "+=" and name in out:
+            out[name] = f"{out[name]} {value}".strip()
+        else:
+            out[name] = value
+    return out
+
+
+def _phony(text: str | None) -> set[str]:
+    names: set[str] = set()
+    for raw in _joined(text or ""):
+        m = re.match(r"^\.PHONY\s*:(.*)$", raw)
+        if m:
+            names.update(re.sub(r"#.*$", "", m[1]).split())
+    return names
 
 
 def _targets(text: str | None) -> dict[str, _Target]:
-    """Every rule of a Makefile with its recipe lines and prerequisites. A `define ... endef`
-    body is a macro, not a recipe, and is skipped."""
+    """Every rule of a Makefile with its recipe lines and prerequisites, the Makefile's own
+    variables expanded in both. A `define ... endef` body is a macro, not a recipe, and is
+    skipped."""
     found: dict[str, _Target] = {}
     current: _Target | None = None
     in_define = 0
+    variables = _variables(text)
     for raw in split_lines(text or ""):
         if _DEFINE.match(raw):
             in_define += 1
@@ -985,7 +1407,7 @@ def _targets(text: str | None) -> dict[str, _Target]:
             continue
         m = _RULE.match(raw)
         if m and not raw.startswith((" ", "\t")):
-            head, _, inline = m.group(2).partition(";")
+            head, _, inline = _expand_vars(m.group(2), variables).partition(";")
             current = _Target(
                 prereqs=[
                     t for t in re.sub(r"#.*$", "", head).split() if re.fullmatch(r"[\w.-]+", t)
@@ -995,14 +1417,38 @@ def _targets(text: str | None) -> dict[str, _Target]:
             if inline.strip():
                 current.lines.append(inline.strip())
         elif current is not None and raw.startswith((" ", "\t")) and raw.strip():
-            current.lines.append(raw.strip())
+            current.lines.append(_expand_vars(raw.strip(), variables))
         elif current is not None and raw.strip() and not raw.startswith(("#", ".")):
             current = None
     return found
 
 
-def _effective(targets: Mapping[str, _Target], name: str, depth: int = 0) -> list[str]:
-    """A target's recipe lines followed by those of its prerequisites in the same Makefile."""
+def _shadowed(text: str | None, targets: Mapping[str, _Target], tree: Collection[str]) -> set[str]:
+    """The targets whose recipe make never runs: not `.PHONY`, not forced, and a file or directory
+    of the same name exists beside the Makefile, so make takes the target as up to date."""
+    phony = _phony(text)
+    return {
+        name
+        for name, target in targets.items()
+        if name in tree and name not in phony and "FORCE" not in target.prereqs
+    }
+
+
+def _tree_names(changes: ChangeSet, directory: str, base: bool) -> set[str]:
+    """The names of the files and directories directly inside `directory`, at the base or in the
+    candidate tree; empty when the tree cannot be listed (no target is then taken as shadowed)."""
+    lister = changes.listing(base)
+    prefix = f"{directory}/" if directory else ""
+    return {
+        p[len(prefix) :].split("/")[0] for p in (lister() if lister else ()) if p.startswith(prefix)
+    }
+
+
+def _effective(
+    targets: Mapping[str, _Target], name: str, shadow: Collection[str] = ()
+) -> list[str]:
+    """A target's recipe lines followed by those of its prerequisites in the same Makefile. A
+    target in `shadow` runs nothing (its prerequisites still run)."""
     lines: list[str] = []
     seen: set[str] = set()
 
@@ -1013,13 +1459,16 @@ def _effective(targets: Mapping[str, _Target], name: str, depth: int = 0) -> lis
         seen.add(target)
         for pre in node.prereqs:
             walk(pre, level + 1)
-        lines.extend(node.lines)
+        if target not in shadow:
+            lines.extend(node.lines)
 
-    walk(name, depth)
+    walk(name, 0)
     return lines
 
 
-def _make_resolver(targets: Mapping[str, _Target], extra: Sequence[str]) -> MakeCheck:
+def _make_resolver(
+    targets: Mapping[str, _Target], extra: Sequence[str], shadow: Collection[str] = ()
+) -> MakeCheck:
     """Whether target X of this Makefile holds a check; None when there is no such target."""
     memo: dict[str, bool | None] = {}
 
@@ -1029,13 +1478,43 @@ def _make_resolver(targets: Mapping[str, _Target], extra: Sequence[str]) -> Make
         if target not in memo:
             memo[target] = False  # a cycle through this target adds nothing
             ctx = _Ctx(extra, resolve)
-            memo[target] = ctx.has_check(_effective(targets, target), False)
+            memo[target] = ctx.has_check(_effective(targets, target, shadow), False)
         return memo[target]
 
     return resolve
 
 
-def _make_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int | None, str]]:
+_MAKE_HEADS = frozenset({"make", "gmake", "$(MAKE)", "${MAKE}", "$MAKE"})
+_MAKE_FILE_OPTS = ("-C", "-f", "--directory", "--file", "--makefile")
+
+
+def _make_expander(targets: Mapping[str, _Target], shadow: Collection[str] = ()) -> Expander:
+    """`make x` read into the recipe lines of target x of this Makefile (None for anything else,
+    including a `make -C dir` that runs another Makefile)."""
+
+    def expand(statement: str) -> list[str] | None:
+        toks = command_tokens(statement)
+        if not toks or posixpath.basename(toks[0]) not in _MAKE_HEADS:
+            return None
+        if any(t.startswith(_MAKE_FILE_OPTS) for t in toks[1:]):
+            return None
+        names = [t for t in toks[1:] if not t.startswith("-") and "=" not in t and t in targets]
+        if not names:
+            return None
+        return [ln for n in names for ln in _effective(targets, n, shadow)]
+
+    return expand
+
+
+_SHADOW_WHY = (
+    "its recipe never runs: a file or directory of the same name exists and the target is not "
+    "in .PHONY"
+)
+
+
+def _make_reasons(
+    f: ChangedFile, commands: Mapping[str, str], changes: ChangeSet | None = None
+) -> list[tuple[int | None, str]]:
     names: set[str] = set()
     for cmd in commands.values():
         m = re.search(r"\b(?:make|just)\b(.*)", cmd)
@@ -1043,7 +1522,13 @@ def _make_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int
             names.update(t for t in re.findall(r"[\w.-]+", m.group(1)) if not t.startswith("-"))
     old, new = _targets(f.old_text), _targets(f.new_text)
     extra = list(commands.values())
-    resolve = _make_resolver(new, extra)
+    old_shadow: set[str] = set()
+    new_shadow: set[str] = set()
+    if changes is not None and posixpath.basename(f.path).lower() in ("makefile", "gnumakefile"):
+        directory = posixpath.dirname(f.path)
+        old_shadow = _shadowed(f.old_text, old, _tree_names(changes, directory, True))
+        new_shadow = _shadowed(f.new_text, new, _tree_names(changes, directory, False))
+    resolve = _make_resolver(new, extra, new_shadow)
     out: list[tuple[int | None, str]] = []
     for name in sorted(names):
         if name not in old:
@@ -1051,11 +1536,18 @@ def _make_reasons(f: ChangedFile, commands: Mapping[str, str]) -> list[tuple[int
         if name not in new:
             out.append((None, f"target `{name}` was removed from {posixpath.basename(f.path)}"))
             continue
-        base_lines, cand_lines = old[name].lines, new[name].lines
-        if old[name].prereqs or new[name].prereqs:  # a recipe can move into its prerequisites
-            base_lines = _effective(old, name)
-            cand_lines = _effective(new, name)
-        if why := neutering_reason(base_lines, cand_lines, extra=extra, make_check=resolve):
+        base_lines = _effective(old, name, old_shadow)
+        cand_lines = _effective(new, name, new_shadow)
+        why = neutering_reason(
+            base_lines,
+            cand_lines,
+            extra=extra,
+            make_check=resolve,
+            expanders=(_make_expander(old, old_shadow), _make_expander(new, new_shadow)),
+        )
+        if why and not cand_lines and _effective(new, name):
+            why = _SHADOW_WHY
+        if why:
             out.append(
                 (
                     _first_line_with(f.new_text or "", f"{name}:"),
@@ -1106,52 +1598,200 @@ def _split_words(line: str) -> list[str]:
         return line.split()
 
 
+_UNRESOLVED = "\0*"  # marks a starred argument that could not be read, followed by its source
+_MUTATORS = frozenset({"append", "extend", "insert", "remove", "pop", "clear", "sort", "reverse"})
+_MAX_RESOLVE_DEPTH = 8
+_Env = dict[str, list[str] | None]
+
+
+def _resolve_words(node: ast.expr, env: _Env, depth: int = 0) -> list[str] | None:
+    """The strings an expression stands for, when that can be told from the file: string and
+    list or tuple literals (starred parts included), names bound once to one of those, `a + b`
+    of them, `"...".split()` and `session.posargs` (what the caller passes: no words of its
+    own). None when it cannot be told."""
+    if depth > _MAX_RESOLVE_DEPTH:
+        return None
+    nxt = depth + 1
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return _split_words(node.value) if " " in node.value else [node.value]
+    if isinstance(node, ast.Attribute) and node.attr == "posargs":
+        return []
+    if isinstance(node, ast.Name):
+        return env.get(node.id)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        out: list[str] = []
+        for e in node.elts:
+            inner = e.value if isinstance(e, ast.Starred) else e
+            part = _resolve_words(inner, env, nxt)
+            if part is None:
+                return None
+            out.extend(part)
+        return out
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _resolve_words(node.left, env, nxt), _resolve_words(node.right, env, nxt)
+        return None if left is None or right is None else left + right
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "split"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str)
+        and not node.keywords
+    ):
+        text = node.func.value.value
+        if not node.args:
+            return text.split()
+        sep = node.args[0]
+        if len(node.args) == 1 and isinstance(sep, ast.Constant) and isinstance(sep.value, str):
+            return text.split(sep.value) if sep.value else None
+    return None
+
+
+def _scope_nodes(body: Sequence[ast.AST]) -> Iterator[ast.AST]:
+    """Every node of a scope, without descending into functions, classes and lambdas."""
+    stack = list(reversed(body))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def _bind(body: Sequence[ast.AST], env: _Env, params: Collection[str] = ()) -> _Env:
+    """`env` extended with a scope's names: one that is assigned once, by a plain assignment, to
+    something readable is bound to its words; a name that is anything else there (assigned
+    twice, extended with `+=` or `.append`, a loop variable, an argument) is unreadable."""
+    out = dict(env)
+    for name in params:
+        out[name] = None
+    nodes = list(_scope_nodes(body))
+    stores: Counter[str] = Counter()
+    for node in nodes:
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            stores[node.id] += 1
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            stores[node.name] += 1
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                stores[(alias.asname or alias.name).partition(".")[0]] += 1
+    mutated = {
+        n.func.value.id
+        for n in nodes
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in _MUTATORS
+        and isinstance(n.func.value, ast.Name)
+    } | {
+        n.value.id
+        for n in nodes
+        if isinstance(n, ast.Subscript)
+        and isinstance(n.ctx, (ast.Store, ast.Del))
+        and isinstance(n.value, ast.Name)
+    }
+    for name in stores:
+        out[name] = None
+    for node in nodes:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            continue
+        name = targets[0].id
+        if stores[name] == 1 and name not in mutated and name not in params:
+            out[name] = _resolve_words(node.value, out)
+    return out
+
+
+def _call_words(elts: Sequence[ast.expr], env: _Env) -> list[str]:
+    """The words of a call's arguments or of a list, a starred part that cannot be read standing
+    in as `_UNRESOLVED` and its source."""
+    words: list[str] = []
+    for e in elts:
+        if isinstance(e, ast.Starred):
+            part = _resolve_words(e.value, env)
+            words.extend(part if part is not None else [_UNRESOLVED + ast.unparse(e.value)])
+        elif isinstance(e, ast.Constant) and isinstance(e.value, str):
+            words.extend(_split_words(e.value) if " " in e.value else [e.value])
+    return words
+
+
+def _python_pytest_arguments(tree: ast.Module) -> list[list[str]]:
+    found: list[list[str]] = []
+
+    def visit(node: ast.AST, env: _Env) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = node.args
+            names = [a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]]
+            names += [a.arg for a in (args.vararg, args.kwarg) if a is not None]
+            body = node.body if isinstance(node.body, list) else [node.body]
+            env = _bind(body, env, names)
+        elif isinstance(node, ast.ClassDef):
+            env = _bind(node.body, env)
+        if isinstance(node, (ast.Call, ast.List, ast.Tuple)):
+            elts = node.args if isinstance(node, ast.Call) else node.elts
+            found.extend(_after_pytest(_call_words(elts, env)))
+        for child in ast.iter_child_nodes(node):
+            visit(child, env)
+
+    visit(tree, _bind(tree.body, {}))
+    return found
+
+
 def _pytest_arguments(name: str, text: str) -> list[list[str]]:
     """The arguments of every pytest command in a noxfile (any call or list of string
-    constants, so a `session.run(...)` spread over lines reads the same) or a tox.ini."""
+    constants, so a `session.run(...)` spread over lines reads the same) or a tox.ini. Starred
+    arguments are read when they are literals, names bound to literals, `+` of those or
+    `"...".split()`; one that cannot be read stays in the words as `_UNRESOLVED`."""
     if name.endswith(".py"):
         try:
             tree = ast.parse(text)
+            return _python_pytest_arguments(tree)
         except (SyntaxError, ValueError, RecursionError):
-            tree = None
-        if tree is not None:
-            found: list[list[str]] = []
-            for node in ast.walk(tree):
-                elts = (
-                    node.args
-                    if isinstance(node, ast.Call)
-                    else node.elts
-                    if isinstance(node, (ast.List, ast.Tuple))
-                    else []
-                )
-                words: list[str] = []
-                for e in elts:
-                    if isinstance(e, ast.Constant) and isinstance(e.value, str):
-                        words.extend(_split_words(e.value) if " " in e.value else [e.value])
-                found.extend(_after_pytest(words))
-            return found
-    found = []
+            pass
+    found: list[list[str]] = []
     for raw in split_lines(re.sub(r"\\\n\s*", " ", text)):
         found.extend(_after_pytest(_split_words(re.sub(r"^\s*[A-Za-z_][\w:]*\s*=\s*", "", raw))))
     return found
 
 
+def _unread(arguments: Sequence[Sequence[str]]) -> Counter[str]:
+    """The pytest commands that were given a starred argument that could not be read, each as
+    its words with the unread part shown as `*source`."""
+    return Counter(
+        " ".join(f"*{w[len(_UNRESOLVED) :]}" if w.startswith(_UNRESOLVED) else w for w in args)
+        for args in arguments
+        if any(w.startswith(_UNRESOLVED) for w in args)
+    )
+
+
 def _noxfile_reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
     """Selecting options a nox or tox pytest command gained. Only the arguments after the
     `pytest` word count (`coverage run -m pytest`: that `-m` is not a marker), and a pair that
-    the base already had does not, so a call reformatted or given `*session.posargs` is the same."""
+    the base already had does not, so a call reformatted or given `*session.posargs` is the same.
+    A starred argument that cannot be read (a function's result, an imported list) warns when the
+    call is new or changed: it may hold `-k`."""
     name = posixpath.basename(f.path)
-    before = Counter(
-        pair for args in _pytest_arguments(name, f.old_text or "") for pair in _select_pairs(args)
-    )
-    after = Counter(
-        pair for args in _pytest_arguments(name, f.new_text or "") for pair in _select_pairs(args)
-    )
+    old_args = _pytest_arguments(name, f.old_text or "")
+    new_args = _pytest_arguments(name, f.new_text or "")
+    before = Counter(pair for args in old_args for pair in _select_pairs(args))
+    after = Counter(pair for args in new_args for pair in _select_pairs(args))
     out: list[tuple[int | None, str]] = []
     for flag, _value in sorted(after - before):
         added = next((n for n, ln in _added_lines(f.old_text, f.new_text) if flag in ln), None)
         number = added or _first_line_with(f.new_text or "", flag)
         out.append((number, f"pytest option `{flag}` added to a test command"))
+    for call in sorted(_unread(new_args) - _unread(old_args)):
+        source = next(w for w in call.split() if w.startswith("*"))
+        out.append(
+            (
+                _first_line_with(f.new_text or "", source[1:]),
+                _Warn(
+                    f"pytest is run with `{source}`, which could not be read from the file: "
+                    "check that it does not hold `-k`, `-m` or a path"
+                ),
+            )
+        )
     return out
 
 
@@ -1394,14 +2034,208 @@ def _go_reasons(f: ChangedFile) -> list[tuple[int | None, str]]:
 
 
 # -- which package.json a policy command reaches ---------------------------------------------
-_RECURSIVE = re.compile(
-    r"(?:^|\s)(?:-r|--recursive|--workspaces|-ws)(?=\s|$)|\b(?:turbo|lerna)\s+run\b"
-    r"|\bnx\s+run-many\b|\bpnpm\b.*?\s(?:--filter|-F)\b|\bworkspaces\s+foreach\b"
+# A nested package.json is only a warning when it is known that no policy command runs it. That
+# is known in two shapes. Every policy command is a plain package-manager run at the root
+# (`npm test`, `pnpm run x`) and the root scripts it reaches stay in the root: no `cd`, no
+# workspace, filter, prefix or directory option, no monorepo tool, no script file, no make. Or the
+# only options that leave the root are workspace selectors (`-r`, `--filter`, `--workspace`),
+# which reach workspace members and nothing else, and the package is not a member. Anything
+# else (a make target, a script, a `cd`, lerna, a file that cannot be read) keeps the block.
+_PM_BUILTINS = frozenset({"ci", "install", "i", "add", "rebuild"})
+_DIR_ESCAPES = frozenset({"--prefix", "--dir", "--cwd"})
+_WS_ESCAPES = frozenset(
+    {"--workspace", "--workspaces", "--recursive", "--filter", "--include-workspace-root"}
+    | {"--workspace-root"}
 )
-_DIR_REF = re.compile(
-    r"(?:\bcd\s+|--prefix[ =]\s*|(?<![\w-])-C[ =]?\s*|--dir[ =]\s*|--cwd[ =]\s*)"
-    r"[\"']?([^\s\"'&;|]+)"
+_DIR_SHORT = frozenset({"-C"})
+_WS_SHORT = frozenset({"-w", "-ws", "-r", "-F"})
+_MONOREPO_FILES = ("lerna.json", "nx.json", "turbo.json", "rush.json")
+_DIR_WORDS = re.compile(
+    r"(?<![\w.-])(?:cd|pushd|make|gmake|just|lerna|nx|turbo|rush|bolt)(?![\w.-])"
 )
+_WS_WORDS = re.compile(r"\byarn\s+workspaces?\b")
+
+
+@dataclass
+class _Leaves:
+    """How far a command can leave the package root: `opaque` for anything unknown (a directory
+    change, a script, another tool), `workspaces` for the workspace selectors alone."""
+
+    opaque: bool = False
+    workspaces: bool = False
+
+    def add(self, other: _Leaves) -> None:
+        self.opaque = self.opaque or other.opaque
+        self.workspaces = self.workspaces or other.workspaces
+
+
+def _option_leaves(tokens: Sequence[str], package_manager: bool) -> _Leaves:
+    out = _Leaves()
+    for tok in tokens:
+        flag = tok.partition("=")[0]
+        if flag in _DIR_ESCAPES or (package_manager and flag in _DIR_SHORT):
+            out.opaque = True
+        elif flag in _WS_ESCAPES or (package_manager and flag in _WS_SHORT):
+            out.workspaces = True
+    return out
+
+
+def _plain_run(statement: str, scripts: Mapping[str, Any]) -> tuple[list[str], _Leaves] | None:
+    """The root scripts a policy statement runs and how far it leaves the root, when it is a
+    package-manager run; None for anything else."""
+    toks = command_tokens(statement)
+    if not toks or posixpath.basename(toks[0]) not in _PM:
+        return None
+    rest = toks[1:]
+    if "--" in rest:
+        rest = rest[: rest.index("--")]
+    leaves = _option_leaves(rest, True)
+    words = [t for t in rest if not t.startswith("-")]
+    head = posixpath.basename(toks[0])
+    if not words:
+        return None
+    if words[0] in ("workspace", "workspaces"):
+        leaves.workspaces = True
+        return [], leaves
+    if words[0] in ("run", "run-script"):
+        words = words[1:]
+        return (words[:1], leaves) if words and not _is_pattern(words[0]) else None
+    if words[0] in ("test", "t", "tst"):
+        return ["test"], leaves
+    if words[0] in _PM_BUILTINS:
+        return [], leaves
+    if head in ("yarn", "pnpm", "bun") and words[0] in scripts and not _is_pattern(words[0]):
+        return [words[0]], leaves
+    return None
+
+
+def _body_leaves(body: str) -> _Leaves:
+    """How far a script body can leave the package root."""
+    out = _Leaves(opaque=bool(_DIR_WORDS.search(body)), workspaces=bool(_WS_WORDS.search(body)))
+    for seg in split_segments(body):
+        toks = command_tokens(seg.text) or seg.text.split()
+        head = posixpath.basename(toks[0]) if toks else ""
+        out.add(
+            _option_leaves(toks[1:], head in _PM or head in _RUN_ALL or head in {"npx", "bunx"})
+        )
+    if any("node_modules" not in path for path in scripts_in(body, "")):
+        out.opaque = True
+    return out
+
+
+def _side_globs(changes: ChangeSet, base: bool) -> list[str] | None:
+    """The workspace globs at the base or in the candidate; None when there are none, or the
+    workspace file cannot be read (an inline list is not read here)."""
+    read = changes.base_text if base else changes.cand_text
+    pkg, yaml = read("package.json"), read("pnpm-workspace.yaml")
+    if yaml and (
+        re.search(r"^packages:[ \t]*\S", yaml, re.MULTILINE) or not _workspace_globs([], [yaml])
+    ):
+        return None
+    return _workspace_globs([pkg] if pkg else [], [yaml] if yaml else []) or None
+
+
+def _members(globs: Sequence[str], directories: Collection[str]) -> set[str]:
+    keep = [g for g in globs if not g.startswith("!")]
+    drop = [g[1:] for g in globs if g.startswith("!")]
+    return {
+        d
+        for d in directories
+        if any(_glob_matches(d, g) for g in keep) and not any(_glob_matches(d, g) for g in drop)
+    }
+
+
+def _is_member(changes: ChangeSet, directory: str) -> bool | None:
+    """Whether `directory` is a workspace member at the base or in the candidate (a candidate
+    that excludes it does not make it unreached); None when either side cannot be read."""
+    sides = [_side_globs(changes, base) for base in (True, False)]
+    if any(globs is None for globs in sides):
+        return None
+    return any(directory in _members(globs or [], {directory}) for globs in sides)
+
+
+def _has_check_script(text: str | None) -> bool:
+    try:
+        data = json.loads(text or "")
+    except ValueError:
+        return True
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if not isinstance(scripts, dict):
+        return False
+    return any(
+        name == "test" or name.startswith("test:") or (isinstance(body, str) and check_kind(body))
+        for name, body in scripts.items()
+    )
+
+
+def _dropped_members(changes: ChangeSet) -> list[str]:
+    """Packages with a check script that were workspace members at the base and are not in the
+    candidate: `pnpm -r test` and `npm test --workspaces` no longer run them."""
+    old = _side_globs(changes, True)
+    lister = changes.listing(False)
+    if old is None or lister is None:
+        return []
+    new = _side_globs(changes, False)
+    if new == old:
+        return []
+    directories = {
+        posixpath.dirname(p)
+        for p in lister()
+        if posixpath.basename(p) == "package.json"
+        and posixpath.dirname(p)
+        and "node_modules" not in p.split("/")
+    }
+    gone = _members(old, directories) - (_members(new, directories) if new else set())
+    return [
+        f"{d} is no longer a workspace member, so a recursive run (`pnpm -r`, `--workspaces`) "
+        "skips its checks"
+        for d in sorted(gone)
+        if _has_check_script(changes.cand_text(f"{d}/package.json"))
+    ]
+
+
+def _provably_unreached(changes: ChangeSet, commands: Mapping[str, str], directory: str) -> bool:
+    """Whether no policy command can run the package.json in `directory` (see the comment above)."""
+    if not commands or any(changes.base_text(n) or changes.cand_text(n) for n in _MONOREPO_FILES):
+        return False
+    roots = [t for t in (changes.base_text("package.json"), changes.cand_text("package.json")) if t]
+    if not roots:
+        return False
+    maps: list[Mapping[str, Any]] = []
+    for text in roots:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return False
+        scripts = data.get("scripts") if isinstance(data, dict) else None
+        maps.append(scripts if isinstance(scripts, dict) else {})
+    seeds: set[str] = set()
+    leaves = _Leaves()
+    for command in commands.values():
+        segments = split_segments(command)
+        if not segments:
+            return False
+        for seg in segments:
+            for scripts in maps:
+                found = _plain_run(seg.text, scripts)
+                if found is None:
+                    return False
+                seeds.update(found[0])
+                leaves.add(found[1])
+    for scripts in maps:
+        for name in _reach(scripts, seeds):
+            for body in _script_lines(scripts, name):
+                leaves.add(_body_leaves(body))
+    if leaves.opaque:
+        return False
+    return not leaves.workspaces or _is_member(changes, directory) is False
+
+
+def _reaches_package(changes: ChangeSet, path: str, commands: Mapping[str, str]) -> bool:
+    """Whether a policy command may run the package.json at `path`: the root one, or, unless it
+    is known that none does (`_provably_unreached`), a nested one."""
+    directory = posixpath.dirname(path)
+    return not directory or not _provably_unreached(changes, commands, directory)
 
 
 def _workspace_globs(pkg_texts: Sequence[str], yaml_texts: Sequence[str]) -> list[str]:
@@ -1426,44 +2260,20 @@ def _workspace_globs(pkg_texts: Sequence[str], yaml_texts: Sequence[str]) -> lis
 
 
 def _glob_matches(directory: str, pattern: str) -> bool:
+    """Whether a workspace glob names `directory` (`*` is one path segment, `**` any depth)."""
     pat = pattern.strip().removeprefix("./").rstrip("/")
-    rx = re.escape(pat).replace(r"\*\*/", "(?:.*/)?").replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
-    return re.fullmatch(rx, directory) is not None
-
-
-def _reaches_package(changes: ChangeSet, path: str, commands: Mapping[str, str]) -> bool:
-    """Whether a policy command runs the package.json at `path`: the root one; a workspace member
-    when the root test script runs recursively; or one in a directory a command moves into."""
-    directory = posixpath.dirname(path)
-    if not directory:
+    if len(pat) > _MAX_PATTERN:
         return True
-    roots = [t for t in (changes.base_text("package.json"), changes.cand_text("package.json")) if t]
-    bodies = list(commands.values())
-    for text in roots:
-        try:
-            data = json.loads(text)
-        except ValueError:
-            continue
-        scripts = data.get("scripts") if isinstance(data, dict) else None
-        if isinstance(scripts, dict):
-            for name in _reach(scripts, _script_names(commands) | {"test"}):
-                bodies.extend(_script_lines(scripts, name))
-    yamls = [
-        t
-        for t in (
-            changes.base_text("pnpm-workspace.yaml"),
-            changes.cand_text("pnpm-workspace.yaml"),
-        )
-        if t
-    ]
-    if any(_RECURSIVE.search(b) for b in bodies):
-        globs = _workspace_globs(roots, yamls)
-        if any(_glob_matches(directory, g) for g in globs if not g.startswith("!")) and not any(
-            _glob_matches(directory, g[1:]) for g in globs if g.startswith("!")
-        ):
-            return True
-    refs = {posixpath.normpath(m[1]) for b in bodies for m in _DIR_REF.finditer(b)}
-    return directory in refs
+    parts = [p for p in re.split(r"(\*\*/|\*\*|\*)", pat) if p]
+    items: list[_Item] = []
+    for part in parts:
+        if part in ("**/", "**"):
+            items.append((("any", ""), "*"))
+        elif part == "*":
+            items.append((("cls", "^/"), "*"))
+        else:
+            items.extend((("lit", c), "") for c in part)
+    return _branch_matches(tuple(items), directory, True, True)
 
 
 # -- driver ------------------------------------------------------------------------------
@@ -1497,6 +2307,13 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
         for line, why in reasons:
             make = warn_finding if why.endswith(_ADOPTION) or isinstance(why, _Warn) else finding
             out.append(make("runner.tampered", f.path, line, f"{f.path}: {why}", _HINT))
+    workspace_files = [
+        f.path for f in changes.files if f.path in ("pnpm-workspace.yaml", "package.json")
+    ]
+    if workspace_files:
+        where = min(workspace_files, key=lambda path: path != "pnpm-workspace.yaml")
+        for why in _dropped_members(changes):
+            out.append(finding("runner.tampered", where, None, f"{where}: {why}", _HINT))
     return out
 
 
@@ -1516,7 +2333,7 @@ def _file_reasons(
     if re.match(r"^(?:jest|vitest)\.config\.\w+$", name):
         return _jest_reasons(f, False)
     if name in ("Makefile", "makefile", "GNUmakefile", "justfile", "Justfile"):
-        return _make_reasons(f, commands)
+        return _make_reasons(f, commands, changes)
     if name == "noxfile.py":
         return _noxfile_reasons(f)
     if name.endswith("_test.go"):

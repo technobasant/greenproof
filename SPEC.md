@@ -511,31 +511,58 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `noxfile.py` (read with `ast`, so a reformatted call is the same call) a selection flag
   counts only after the `pytest` token and only when the base's pytest commands did not
   already have it; `coverage run -m pytest` is not a marker flag, and `*session.posargs` is
-  not a selection;
+  not a selection. Arguments are read through starred list or tuple literals
+  (`*["-k", "x"]`), `*"-k x".split()` and names bound once to such lists, `+` joins included
+  (a name assigned twice, mutated, or shadowed by a parameter is unreadable). A starred
+  argument other than `session.posargs` that cannot be read, and is new or changed, is a
+  `warn`;
 - `-p no:<plugin>` in `addopts` is judged by the plugin: harmless ones (`cacheprovider`,
   `randomly`, `xdist`, `logging`, `faulthandler`, `legacypath`, `pastebin`, `junitxml`, `sugar`,
   `instafail`) say nothing, ones that decide outcomes (`python`, `unittest`, `doctest`, `cov`,
   `pytest_cov`, `asyncio`, `anyio`, `trio`) block, `warnings` blocks only where the base turns
   warnings into errors (`filterwarnings` with `error`, `-W error`, `-Werror`), and an unknown
-  plugin is a `warn`;
+  plugin is a `warn`. `--disable-plugin-autoload` added to `addopts` is a `warn` too (every
+  installed plugin stops loading unless named with `-p`);
 - `package.json` `scripts` whose names appear in the base policy's commands, plus
   `test`, `lint`, `typecheck`, and the scripts those call through `npm run NAME`, `run-s`,
   `run-p`, `npm-run-all` or `pnpm run '/regex/'`, followed transitively (`npm run a && npm run
-  b` and `run-s a b` are the same steps). `pre<name>` and `post<name>` run with `<name>`, so a
+  b` and `run-s a b` are the same steps). The regex comes from the candidate, so it is matched
+  by a linear-time automaton over a safe subset (literal text, `^`, `$`, `.`, character classes,
+  `*`, `+` and `?` on one atom, `|` between literals, one group at most, 200 characters); a
+  pattern outside it matches every script, which keeps the block. `pre<name>` and `post<name>` run with `<name>`, so a
   step split off into `pretest` is the same steps. Only checks count towards "fewer steps": a
   cleanup line (`rm -rf`, `echo`, `mkdir`) removed, or moved to a prerequisite, is not a lost
   check. A script the base did not run that the candidate's `test` now runs (a new alias) is
   read as new: a narrowing flag, `--passWithNoTests` or a swallow in it blocks. A swallow added
   to an opaque script (one with no recognised check, such as `ng test`) blocks when the edited
-  statement is one the base had. A nested `package.json` that no policy command reaches (not a
-  workspace member, not entered by `cd`, `--prefix`, `--dir` or `--filter`, not run
-  recursively) is a `warn`, not a block. `jest.config.*`/`vitest.config.*` (`testPathIgnorePatterns`,
+  statement is one the base had. A candidate script that runs a kind of check the base's did
+  not (`jest` became `eslint .`) blocks, whatever the step count: the kinds of check
+  (`check_kind`) are compared with `npm run x` read into its body, lint tools count as one
+  kind, a wrapper (`npm test`, `make test`) stands for any test runner, and a script with a
+  statement that cannot be classified is not judged by kind. Two invocations of the same tool
+  are the same opaque step only when their subcommand matches (`ng test` and `ng lint`
+  differ, `ng test` and `ng test --no-watch` do not; the subcommands are `test`, `lint`,
+  `check`, `build`, `run`, `e2e`, `typecheck`, `format`, `verify`, `ci`, `coverage`, `spec`,
+  `unit`, `integration`, `serve`, `start`, `watch`). A nested `package.json` is a `warn`, not
+  a block, only when it is known that no policy command reaches it: every policy command is a
+  plain root package-manager run (`npm test`, `pnpm run x`, `yarn test`, `bun test`) with no
+  workspace, filter, prefix or directory option, and the root scripts it reaches contain no
+  `cd`, `--prefix`/`-C`/`--dir`/`--cwd`, workspace or recursive flag, `lerna`/`nx`/`turbo`,
+  script file or `make`; or a workspace selector (`-w`, `--filter`, `-r`) is used and the
+  package is provably not a member of the workspace globs. Anything else, including a
+  `lerna.json`, a make-target policy command or an unreadable file, keeps the block.
+  `jest.config.*`/`vitest.config.*` (`testPathIgnorePatterns`,
   `exclude`, `coverageThreshold` lowered, `passWithNoTests`); `tsconfig*.json` (`strict`
   or `noImplicitAny` set false, `skipLibCheck` is ignored);
 - `Makefile`/`justfile` targets referenced by the base policy's commands (all targets are
   read, `define ... endef` bodies are not targets; a recipe emptied while gaining
   prerequisites, or either side has prerequisites, is judged by the recipes of those
-  prerequisites, up to four deep). A `-`
+  prerequisites, up to four deep). The Makefile's own variables (`=`, `:=`, `::=`, `?=`,
+  `+=`, optional `export`) are expanded in recipes and prerequisites first, recursively to a
+  depth limit, so `PYTEST = true` behind `$(PYTEST) -q` is a no-op; a variable the Makefile
+  does not define is left as written. A target that is not in `.PHONY` (continuations
+  included), has no `FORCE` prerequisite and is named like a file or directory beside the
+  Makefile in the candidate tree never runs its recipe: it counts as running nothing. A `-`
   prefix on a line blocks only when the line is a check (`-rm -rf build` is fine);
 - a swallowed failure in any of those scripts or recipes, found by the shared shell reader.
   A *check* is a statement whose command, in command position (after environment

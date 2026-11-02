@@ -144,7 +144,11 @@ _RULES = [
         "collection, a Go TestMain that always exits 0 or never runs the tests (a conditional "
         "exit is a warning), or os._exit / sys.exit(0) added to a test file. Fewer steps count "
         "checks only, selection flags belong to their tool, `-p no:<plugin>` is judged by the "
-        "plugin, and a nested package.json that no policy command reaches is a warning.",
+        "plugin (`--disable-plugin-autoload` is a warning), a nested package.json is a warning "
+        "only when it is known that no policy command reaches it, Makefile variables are "
+        "expanded before a recipe is read, a script that no longer runs a kind of check the "
+        "base ran blocks, the same tool with another subcommand is another step, and a make "
+        "target named like an existing path and not in .PHONY runs nothing.",
     ),
     RuleInfo(
         "ci.tampered",
