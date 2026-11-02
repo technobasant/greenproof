@@ -21,7 +21,16 @@ from greenproof.findings import WARN, Finding
 from greenproof.rules import workflow
 from greenproof.rules._common import CODE_SUFFIXES, finding, sev_finding, split_lines
 from greenproof.rules.ci_expand import Child, make_children, pm_children
-from greenproof.rules.runner import _BaseTests, _tree_names
+from greenproof.rules.runner import (
+    _FLAG_VARS,
+    _UNREADABLE,
+    _BaseTests,
+    _Dir,
+    _tree_names,
+    _Warn,
+    _with_exports,
+    removal_reason,
+)
 from greenproof.rules.shell import (
     NOOP_FLAGS,
     check_kind,
@@ -418,6 +427,28 @@ class _Walk:
         self.descend(sub, depth + 1)
 
 
+def _env_flags(defs: Defs) -> dict[str, str]:
+    """The flag variables (`PYTEST_ADDOPTS`, `GOFLAGS`) an `env:` gives, those with a value that
+    can be read: a `${{ ... }}` or `$VAR` value is not (`_unreadable_env` reports it)."""
+    return {
+        n: v for n in _FLAG_VARS if (v := defs.get(n, "").strip()) and not _UNREADABLE.search(v)
+    }
+
+
+def _unreadable_env(defs: Defs) -> set[tuple[str, str]]:
+    return {(n, defs[n]) for n in _FLAG_VARS if _UNREADABLE.search(defs.get(n, ""))}
+
+
+def _with_env(body: _Body) -> _Body:
+    """The body with the `env:` flag variables written in front of each runner they reach, as an
+    inline assignment is: a workflow, job or step `env: PYTEST_ADDOPTS: -k fast` selects like
+    `PYTEST_ADDOPTS='-k fast' pytest` on every `run:` line in its scope."""
+    flags = _env_flags(body.defs)
+    if not flags:
+        return body
+    return body._replace(text="\n".join(_with_exports(body.text.split("\n"), False, flags)))
+
+
 def _expand(world: _World, wf: workflow.Workflow, step: workflow.Step, base: bool) -> _Expansion:
     """What a step runs, read once per side: its `run:`, the live `run:` steps of the local
     composite action it uses, and what each of them calls (see `_Walk`). A composite step that is
@@ -453,7 +484,8 @@ def _expand(world: _World, wf: workflow.Workflow, step: workflow.Step, base: boo
             )
             walk.out.append(part)
             walk.descend(part, 0)
-    result = _Expansion(walk.out, frozenset(walk.reads), frozenset(walk.expanded), walk.stop)
+    bodies = [_with_env(b) for b in walk.out]
+    result = _Expansion(bodies, frozenset(walk.reads), frozenset(walk.expanded), walk.stop)
     world.expansions[key] = (wf, result)
     return result
 
@@ -718,6 +750,7 @@ class _World:
     base_job_coe: set[str] = field(default_factory=set)
     base_job_if_false: set[str] = field(default_factory=set)
     base_sigs: Counter[tuple[str, str]] = field(default_factory=Counter)
+    base_env_unreadable: set[tuple[str, str]] = field(default_factory=set)
     base_job_uses: set[str] = field(default_factory=set)
     unknown: list[_Unknown] | None = None
     strict: dict[bool, tuple[Counter[tuple[str, str]], Counter[tuple[object, ...]]]] = field(
@@ -947,6 +980,7 @@ def _world(
         wf = _wf(text)
         for step in wf.steps:
             world.base_sigs[_sig(step)] += 1
+            world.base_env_unreadable |= _unreadable_env(wf.defs_of(step))
             if step.coe is not None and _coe(step.coe):
                 world.base_coe.add(_sig(step))
             if step.if_ is not None and _if_false(step.if_):
@@ -1192,12 +1226,19 @@ _POSITIVE_FILTERS = ("branches", "tags", "types")
 _IGNORE_FILTERS = ("branches-ignore", "tags-ignore")
 
 
-def _filter_warnings(event: str, was: dict[str, list[str]], now: dict[str, list[str]]) -> list[str]:
+def _filter_warnings(
+    event: str, was: dict[str, list[str]], now: dict[str, list[str]], pr_open: bool = False
+) -> list[str]:
+    """What a filter that is new or wider than at the base takes away from `event`. `pr_open`: a
+    `branches` filter newly under `push` costs nothing the tests ran on, since `pull_request`
+    still runs them on every branch."""
     out: list[str] = []
     for key in _POSITIVE_FILTERS:
         if key not in now:
             continue
         if key not in was:
+            if pr_open and event == "push" and key == "branches":
+                continue
             out.append(f"a `{key}` filter was added under `{event}`: fewer runs may test it")
         elif gone := [p for p in was[key] if p not in now[key]]:
             out.append(f"`{key}` under `{event}` no longer includes {', '.join(gone)}")
@@ -1280,7 +1321,9 @@ def _trigger_reasons(
     for event, was in base_t.items():
         now = cand_t.get(event)
         if now is not None:
-            warns.extend(_warn(line, why) for why in _filter_warnings(event, was, now))
+            pr = cand_t.get("pull_request")
+            open_pr = "pull_request" in base_t and pr is not None and not pr
+            warns.extend(_warn(line, why) for why in _filter_warnings(event, was, now, open_pr))
     return blocks, warns
 
 
@@ -1309,7 +1352,17 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
     pending = Counter(world.base_statements)
     autoload = world.base_autoload
     tests = world.tests
+    unreadable = set(world.base_env_unreadable)
     for step in wf.steps:
+        for name, value in sorted(_unreadable_env(wf.defs_of(step)) - unreadable):
+            unreadable.add((name, value))
+            out.append(
+                _warn(
+                    step.line,
+                    f"`{name}` is set from `{value}` in `env:`: greenproof cannot read it, "
+                    "and it may hand the runner a selection flag",
+                )
+            )
         exp = _expand(world, wf, step, False)
         if exp.stop:
             out.append(
@@ -1330,17 +1383,18 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                         "unless named with `-p`: check what they were doing)",
                     )
                 )
+            where = _Dir(body.cwd)  # a `cd` in one statement moves the ones after it
             for stmt in _flat(body.text, body.defs):
-                if pending[stmt] > 0:
-                    pending[stmt] -= 1
-                elif tests is not None and (gone := tests.removes(stmt, body.cwd)) is not None:
-                    why = (
-                        f"it now removes tests (`{stmt[:80]}` removes `{gone}`, "
-                        "which holds the project's tests)"
-                    )
+                known = pending[stmt] > 0
+                pending[stmt] -= known
+                if tests is None:
+                    continue
+                gone, where = tests.scan(stmt, where, not known)
+                if gone is not None:
+                    why = removal_reason(stmt[:80], gone)
                     if (at, why) not in reported:
                         reported.add((at, why))
-                        out.append(_block(at, why))
+                        out.append(_warn(at, why) if isinstance(why, _Warn) else _block(at, why))
         for kind, stmt, at, why in _swallow_keys(wf, step, world):
             if remaining[(kind, stmt)] > 0:
                 remaining[(kind, stmt)] -= 1
