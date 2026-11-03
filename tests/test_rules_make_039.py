@@ -21,6 +21,7 @@ from greenproof.rules.runner import _targets
 from tests.test_rules_runner_032 import scene, verdict
 from tests.test_rules_select_037 import MAKE, PY
 
+API = {"tests/integration/test_api.py": PY}  # a second test file: one file is not all of them
 SHOP = {"shop.py": "def add(a, b):\n    return a + b\n", "tests/test_shop.py": PY}
 EX = "cd examples && python -m pytest ."
 EX_ONE = "cd examples && python -m pytest test_example.py -q"
@@ -57,11 +58,11 @@ ONESHELL_BASE = f".ONESHELL:\n{TOP}\tcd examples\n\tpython -m pytest .\n"
     ],
     ids=["cd", "subshell", "oneshell"],
 )
-def test_one_file_of_a_directory_that_has_one_is_the_same_run(
+def test_one_file_of_a_directory_that_has_one_is_a_pinned_list_not_a_block(
     tmp_path: Path, base: str, old: str, new: str
 ) -> None:
     cand = {"Makefile": base.replace(old, new)}
-    assert judge(tmp_path, {"Makefile": base}, cand, ONE) == "pass"
+    assert judge(tmp_path, {"Makefile": base}, cand, ONE) == "warn"
 
 
 @pytest.mark.parametrize(
@@ -84,7 +85,7 @@ def test_a_makefile_of_the_directory_is_read_from_there(tmp_path: Path) -> None:
     inner = ".PHONY: test\ntest:\n\tpython -m pytest .\n"
     same = {"examples/Makefile": inner.replace("pytest .", "pytest test_example.py -q")}
     base = {"Makefile": TOP, "examples/Makefile": inner}
-    assert judge(tmp_path / "one", base, same, ONE) == "pass"
+    assert judge(tmp_path / "one", base, same, ONE) == "warn"
     assert judge(tmp_path / "two", base, same, TWO) == "block"
 
 
@@ -105,9 +106,49 @@ def test_a_runner_moved_out_of_its_directory_to_one_file_blocks(tmp_path: Path) 
     assert judge(tmp_path, {"Makefile": CD_BASE}, cand, ONE) == "block"
 
 
-def test_a_hand_picked_file_at_the_root_is_still_a_narrowing(tmp_path: Path) -> None:
+def test_a_hand_picked_file_at_the_root_that_leaves_one_out_blocks(tmp_path: Path) -> None:
     cand = {"Makefile": TOP.replace("pytest tests", "pytest tests/test_shop.py")}
-    assert judge(tmp_path, {"Makefile": TOP}, cand) == "block"
+    assert judge(tmp_path, {"Makefile": TOP}, cand, API) == "block"
+
+
+# ---- files named where the base ran a path: every file it selected is a warning, not a block ----
+
+ROOT_DOT = ".PHONY: test\ntest:\n\tpython -m pytest .\n"
+ROOT_DIR = TOP
+CD_DIR = ".PHONY: test\ntest:\n\tcd tests && pytest .\n"
+ONESHELL_DIR = ".ONESHELL:\n.PHONY: test\ntest:\n\tcd tests\n\tpytest .\n"
+PINNED = [
+    (ROOT_DOT, "pytest .", "pytest tests/test_shop.py -q"),
+    (ROOT_DIR, "pytest tests", "pytest tests/test_shop.py -q"),
+    (CD_DIR, "pytest .", "pytest test_shop.py -q"),
+    (ONESHELL_DIR, "pytest .", "pytest test_shop.py -q"),
+]
+IDS = ["root-dot", "root-dir", "cd-dir", "oneshell-dir"]
+
+
+@pytest.mark.parametrize(("base", "old", "new"), PINNED, ids=IDS)
+def test_every_file_of_a_path_named_one_by_one_warns(
+    tmp_path: Path, base: str, old: str, new: str
+) -> None:
+    cand = {"Makefile": base.replace(old, new)}
+    assert judge(tmp_path, {"Makefile": base}, cand) == "warn"
+
+
+@pytest.mark.parametrize(("base", "old", "new"), PINNED, ids=IDS)
+def test_one_file_fewer_than_the_path_held_blocks(
+    tmp_path: Path, base: str, old: str, new: str
+) -> None:
+    more = {"tests/test_other.py": PY}
+    cand = {"Makefile": base.replace(old, new)}
+    assert judge(tmp_path, {"Makefile": base}, cand, more) == "block"
+
+
+@pytest.mark.parametrize(("base", "old", "new"), PINNED, ids=IDS)
+def test_a_test_file_the_change_adds_to_the_path_makes_the_pin_a_block(
+    tmp_path: Path, base: str, old: str, new: str
+) -> None:
+    cand = {"Makefile": base.replace(old, new), "tests/test_added.py": PY}
+    assert judge(tmp_path, {"Makefile": base}, cand) == "block"
 
 
 # ---- K2: target-specific variables are read in one pass -----------------------------------------
@@ -168,14 +209,14 @@ DOUBLING = (
 def test_narrowing_the_goal_under_a_chain_blocks(tmp_path: Path, size: int) -> None:
     base = chain(size)
     cand = base.replace("pytest tests", "pytest tests/test_shop.py")
-    assert judge(tmp_path, {"Makefile": base}, {"Makefile": cand}) == "block"
+    assert judge(tmp_path, {"Makefile": base}, {"Makefile": cand}, API) == "block"
 
 
 @pytest.mark.parametrize("make", [lambda: padded(17500, "pytest tests"), lambda: DOUBLING])
 def test_narrowing_the_goal_in_a_file_past_a_budget_blocks(tmp_path: Path, make: object) -> None:
     base = make()  # type: ignore[operator]
     cand = base.replace("pytest tests", "pytest tests/test_shop.py")
-    assert judge(tmp_path, {"Makefile": base}, {"Makefile": cand}) == "block"
+    assert judge(tmp_path, {"Makefile": base}, {"Makefile": cand}, API) == "block"
 
 
 def test_a_line_the_budget_left_unread_is_a_warning(tmp_path: Path) -> None:

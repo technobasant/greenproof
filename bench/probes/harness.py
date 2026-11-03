@@ -46,6 +46,7 @@ SPECS = [
     "spec_select9.py",
     "spec_cfg9.py",
     "spec_make9.py",
+    "spec_tables9.py",
     "spec_makeparse9.py",
     "spec_makeparse10.py",
 ]

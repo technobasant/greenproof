@@ -1163,6 +1163,11 @@ class _BaseTests:
             )
         return self._selectable
 
+    def added(self) -> list[str]:
+        """The test files the change adds."""
+        changes = self._changes
+        return sorted(f.path for f in changes.files if f.status == "A" and changes.is_test(f.path))
+
     def _build(self) -> None:
         if self._built:
             return
@@ -1966,24 +1971,30 @@ def _rebased(files: TestFiles, directory: str) -> TestFiles:
     )
 
 
-def _same_files(base: Sequence[str], cand: Sequence[str], files: TestFiles) -> bool:
-    """Whether, for every runner family both run, the candidate selects each test file the base
-    did (and the base selected some), when the base named no path but the directory itself: a
-    hand-picked file that is all of what `.` was is the same run, but `tests` becoming one file
-    of `tests` is still a hand-picked list."""
-    if any(
-        w not in (".", "./")
-        for runs in _invocations(base, None).values()
-        for r in runs
-        for w in r.words
-    ):
-        return False
+def _listing_files(names: Sequence[str]) -> str:
+    shown = ", ".join(f"`{n}`" for n in names[:3])
+    return shown + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+
+
+def _pinned_files(
+    base: Sequence[str], cand: Sequence[str], files: TestFiles, added: Sequence[str]
+) -> list[str] | None:
+    """The test files the candidate names where the base named a path, when they are every test
+    file the base's path selected, and no test file was added to the tree (which the named files
+    would not run); None otherwise. A name filter or a node id (`a.py::t`) is not a file."""
+    if added:
+        files = TestFiles([*files.paths, *added], files.go_module, files.mocharc)
+    runs = [r for runs in _invocations(cand, None).values() for r in runs]
+    named = [w.removeprefix("./") for r in runs for w in r.words]
+    if not named or any(w not in files.paths for w in named):
+        return None
     before, after = covered_test_files(base, files), covered_test_files(cand, files)
     common = [family for family in before if family in after]
-    return bool(common) and all(
+    same = bool(common) and all(
         before[family] and after[family] is not None and before[family] <= after[family]  # type: ignore[operator]
         for family in common
     )
+    return named if same else None
 
 
 def _recipe_narrowing(
@@ -2000,9 +2011,16 @@ def _recipe_narrowing(
     after a `cd` that cannot be read are compared as text, when the `cd` is the same on both
     sides; a candidate runner under one the base did not have is a warning.
 
-    In a directory other than the root, a hand-picked file (`pytest test_example.py`) that
-    selects every test file `pytest .` did is not a narrowing."""
+    Files named where the base ran a path (`pytest tests` to `pytest tests/test_shop.py`) that
+    are every test file the path selected are not a narrowing, in any directory: a warning says
+    that test files added later will not run."""
     files = tests.selectable()
+    added = tests.added()
+
+    def added_here(path: str) -> list[str]:
+        prefix = path + "/" if path else ""
+        return [a[len(prefix) :] for a in added if a.startswith(prefix)]
+
     before = _placed(base, tests, start, modes[0].oneshell)
     after = _placed(cand, tests, start, modes[1].oneshell)
     everything = [st for group in after.values() for st in group]
@@ -2034,8 +2052,13 @@ def _recipe_narrowing(
         path = str(key[1])
         rebased = _rebased(files, path)
         narrowed = narrowed_selection(mine, theirs, files=rebased)
-        if narrowed and path and _same_files(mine, theirs, rebased):
-            narrowed = None
+        if narrowed and (pinned := _pinned_files(mine, theirs, rebased, added_here(path))):
+            where = f"`{path}`" if path else "the directory"
+            warn = warn or _Warn(
+                f"it names {_listing_files(pinned)} where the base ran a path that selected "
+                f"every test file: test files added later under {where} will not run"
+            )
+            continue
         if narrowed:
             return narrowed
     return warn

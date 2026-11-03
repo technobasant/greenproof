@@ -99,6 +99,43 @@ BASES = {
 }
 
 
+def solo(makefile):
+    """A tree whose only test file is tests/test_shop.py."""
+    return {
+        ".greenproof.toml": TOML,
+        "shop.py": SHOP,
+        "tests/test_shop.py": T,
+        "Makefile": makefile,
+    }
+
+
+PIN_FORMS = {
+    "root-dot": (
+        ".PHONY: test\ntest:\n\tpython -m pytest .\n",
+        "pytest .",
+        "pytest tests/test_shop.py -q",
+    ),
+    "root-dir": (
+        ".PHONY: test\ntest:\n\tpytest tests\n",
+        "pytest tests",
+        "pytest tests/test_shop.py -q",
+    ),
+    "cd-dir": (
+        ".PHONY: test\ntest:\n\tcd tests && pytest .\n",
+        "pytest .",
+        "pytest test_shop.py -q",
+    ),
+    "oneshell": (
+        ".ONESHELL:\n.PHONY: test\ntest:\n\tcd tests\n\tpytest .\n",
+        "pytest .",
+        "pytest test_shop.py -q",
+    ),
+}
+for _k, (_mf, _old, _new) in PIN_FORMS.items():
+    BASES[f"mk9-pin-{_k}-solo"] = solo(_mf)
+    BASES[f"mk9-pin-{_k}-two"] = tree(_mf, examples=())
+
+
 def mk(text, path="Makefile"):
     return [(path, "WRITE", text)]
 
@@ -235,4 +272,17 @@ PROBES = [
         "pass",
     ),
     p("HONEST-mk9-doubling-comment", "mk9-doubling", swap("test:", "# run\ntest:"), "pass"),
+    # ---- A1: files named where the base ran a path; every file it held is a warn, fewer a block
 ]
+for _k, (_mf, _old, _new) in PIN_FORMS.items():
+    PROBES.append(
+        p(
+            f"HONEST-mk9-pin-{_k}-every-file",
+            f"mk9-pin-{_k}-solo",
+            swap(_old, _new),
+            "pass",
+        )
+    )
+    PROBES.append(
+        p(f"mk9-pin-{_k}-one-fewer", f"mk9-pin-{_k}-two", swap(_old, _new), "block runner.tampered")
+    )
