@@ -43,7 +43,8 @@ def test_doubling_variables_are_read_in_linear_time_and_warn() -> None:
     start = time.monotonic()
     found = _targets(text)
     assert time.monotonic() - start < 3
-    assert found.stopped and not found
+    # round 7: what was read before the budget ran out is kept (the goal is still a target)
+    assert found.stopped and "test" in found
 
 
 def test_recursive_equals_chain_is_bounded() -> None:
