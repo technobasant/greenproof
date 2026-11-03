@@ -178,8 +178,9 @@ _RULES = [
         "a ref-only version bump of the greenproof action are warnings; an unclassifiable "
         "replacement counts only in the same file and job, enabled, with its script present. "
         "Scripts, composite steps and bash -c bodies get the same judgement as a run step, "
-        "and a moved greenproof step keeps its if: and its automatic triggers. Flow-style "
-        "steps, fromJSON runners and make targets that run tests are not read.",
+        "and a moved greenproof step keeps its if: and its automatic triggers. Make "
+        "targets, package.json scripts and local scripts a step runs are followed to depth "
+        "4. Flow-style steps and fromJSON runners are not read.",
     ),
     RuleInfo(
         "static.parse_error",
