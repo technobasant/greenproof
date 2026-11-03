@@ -73,6 +73,22 @@ def _compares(test: ast.expr) -> bool:
     )
 
 
+def _swallowing(handler: ast.ExceptHandler) -> bool:
+    """The handler catches assertion failures and neither raises, fails nor asserts: the swallow
+    test the `tests.weakened` rule uses (tests_python), less a handler that checks something."""
+    from greenproof.rules.tests_python import _handler_swallows
+
+    if not _handler_swallows(handler):
+        return False
+    for stmt in handler.body:
+        for n in ast.walk(stmt):
+            if isinstance(n, (ast.Assert, ast.With)):
+                return False
+            if isinstance(n, ast.Call) and (_tail(n.func) in _FAILS or _tail(n.func) in _RAISES):
+                return False
+    return True
+
+
 class _Walk:
     def __init__(self, fn: ast.FunctionDef | ast.AsyncFunctionDef, names: set[str]) -> None:
         self.names = set(names)
@@ -187,7 +203,7 @@ class _Walk:
         if isinstance(node, ast.Assert):
             if isinstance(node.test, ast.Constant) and not node.test.value:
                 return DEAD
-            return self.assertion(st, node, rescue)
+            return self.assert_cond(node, st, rescue)
         if isinstance(node, ast.Expr):
             v = node.value
             if isinstance(v, ast.Call):
@@ -213,10 +229,8 @@ class _Walk:
         if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
             end = self.body(node.body, st, guards, rescue, depth + 1)
             return st if not (end.u or end.a) else end
-        if isinstance(node, ast.Try):
-            for part in (node.body, *(h.body for h in node.handlers), node.orelse, node.finalbody):
-                st = self.body(part, st, guards, rescue, depth + 1)
-            return st
+        if isinstance(node, (ast.Try, ast.TryStar)):
+            return self.try_(node, st, guards, rescue, depth)
         if isinstance(node, (ast.With, ast.AsyncWith)):
             if self.classify(node) is not None:
                 return self.assertion(st, node, rescue)
@@ -224,6 +238,51 @@ class _Walk:
         if isinstance(node, ast.Match):
             return self.match(node, st, guards, rescue, depth)
         return st
+
+    def assert_cond(self, node: ast.Assert, st: PathState, rescue: bool) -> PathState:
+        """`assert a or b` and `assert x if c else True` check the row value only when the left
+        side (the condition) leaves it to the other side: conditional on a row-dependent test."""
+        test = node.test
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+            left = test.values[0]
+            rest = ast.Assert(test=ast.BoolOp(op=ast.Or(), values=test.values[1:]))
+            if len(test.values) > 1 and self.dep(left)[0] and _has(rest, self.names):
+                after = self.assertion(st, rest, rescue)
+                if after != st:
+                    return join_states(st, after, True, " ".join(ast.unparse(left).split()), "if")
+        if isinstance(test, ast.IfExp) and self.dep(test.test)[0]:
+            cond = " ".join(ast.unparse(test.test).split())
+            body_trivial = isinstance(test.body, ast.Constant) and bool(test.body.value)
+            else_trivial = isinstance(test.orelse, ast.Constant) and bool(test.orelse.value)
+            if body_trivial != else_trivial:
+                real = test.orelse if body_trivial else test.body
+                after = self.assertion(st, ast.Assert(test=real), rescue)
+                if after != st:
+                    x, y = (st, after) if body_trivial else (after, st)
+                    return join_states(x, y, True, cond, "if")
+        return self.assertion(st, node, rescue)
+
+    def try_(
+        self,
+        node: ast.Try | ast.TryStar,
+        st: PathState,
+        guards: list[tuple[str, bool]],
+        rescue: bool,
+        depth: int,
+    ) -> PathState:
+        """An assertion in a `try` whose handler swallows the failure asserts nothing: the body is
+        read for the exits in it, and the path goes on as if it had not asserted."""
+        end = self.body(node.body, st, guards, rescue, depth + 1)
+        if st.u and any(_swallowing(h) for h in node.handlers):
+            end = PathState(
+                st.u,
+                st.a,
+                st.weak,
+                "an assertion sits inside a try/except that swallows the failure",
+            )
+        for part in (*(h.body for h in node.handlers), node.orelse, node.finalbody):
+            end = self.body(part, end, guards, rescue, depth + 1)
+        return end
 
     def dep(self, node: ast.AST) -> tuple[bool, bool]:
         uses = _has(node, self.names)
@@ -257,15 +316,24 @@ class _Walk:
         shown = " ".join(ast.unparse(node.subject).split())
         inner = [*guards, (shown, not uses)] if dep else guards
         res = DEAD
+        catch_all = False
         if not dep:
             self.uniform += 1
         for case in node.cases:
+            arm = f"{shown} matches {' '.join(ast.unparse(case.pattern).split())}"
+            catch_all = catch_all or (
+                case.guard is None
+                and isinstance(case.pattern, ast.MatchAs)
+                and case.pattern.pattern is None
+            )
             res = join_states(
-                res, self.body(case.body, st, inner, rescue, depth + 1), dep, shown, "switch"
+                res, self.body(case.body, st, inner, rescue, depth + 1), dep, arm, "switch"
             )
         if not dep:
             self.uniform -= 1
-        return join_states(res, st, dep, shown, "switch")
+        if catch_all:
+            return res
+        return join_states(res, st, dep, f"{shown} matches a case", "switch")
 
 
 def row_gap(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, bool]:
