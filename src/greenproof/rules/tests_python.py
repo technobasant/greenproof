@@ -15,6 +15,7 @@ from typing import Protocol
 
 from greenproof.rules._common import digest
 from greenproof.rules.tests_model import FileAnalysis, Fixture, Marker, Unit
+from greenproof.rules.tests_pyrows import row_gap
 
 _MARK_SUFFIXES = ("mark.skip", "mark.skipif", "mark.xfail")
 _FULL_KINDS = {
@@ -1198,6 +1199,40 @@ def _parametrize(fn: _FuncDef) -> tuple[int | None, bool, list[str]]:
     return (total if literal else None), literal, forms
 
 
+def _marked(fn: _FuncDef) -> list[tuple[str, tuple[str, ...]]]:
+    """The exact form of each literal row of a parametrize decorator that carries a skip or xfail
+    mark (`pytest.param(..., marks=pytest.mark.skip)`), with the kinds of its marks: such a row
+    never runs, or never counts."""
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for dec in fn.decorator_list:
+        if not (isinstance(dec, ast.Call) and dotted(dec.func).endswith("mark.parametrize")):
+            continue
+        values: ast.AST | None = dec.args[1] if len(dec.args) > 1 else None
+        for kw in dec.keywords:
+            if kw.arg == "argvalues":
+                values = kw.value
+        if not isinstance(values, (ast.List, ast.Tuple)):
+            continue
+        for e in values.elts:
+            if isinstance(e, ast.Call) and dotted(e.func).rsplit(".", 1)[-1] == "param":
+                marks = next((k.value for k in e.keywords if k.arg == "marks"), None)
+                kinds = re.findall(r"\b(skipif|skip|xfail)\b", ast.unparse(marks)) if marks else []
+                if kinds:
+                    out.append((digest(ast.dump(e)), tuple(sorted(set(kinds)))))
+    return out
+
+
+def _mark_kinds(fn: _FuncDef) -> set[str]:
+    """The skip, skipif and xfail marks a test carries as decorators."""
+    kinds = set()
+    for dec in fn.decorator_list:
+        name = dotted(dec.func if isinstance(dec, ast.Call) else dec)
+        for suffix in _MARK_SUFFIXES:
+            if name.endswith(suffix):
+                kinds.add(suffix.rsplit(".", 1)[-1])
+    return kinds
+
+
 _VOCAB_ROOTS = frozenset(
     {"pytest", "unittest", "mock", "mocker", "monkeypatch", "capsys", "capfd", "caplog", "request"}
 )
@@ -1293,6 +1328,7 @@ def _unit(
             stats.swallow_line = stats.swallow_line or dec.lineno
             break
     cases, literal, case_forms = _parametrize(fn)
+    gap, big = row_gap(fn)
     lost = _Stats(helpers)
     for stmt in dropped:
         lost.visit(stmt)
@@ -1311,6 +1347,10 @@ def _unit(
         param_cases=cases,
         param_literal=literal,
         param_forms=case_forms,
+        row_gap=gap,
+        row_big=big,
+        param_marked=_marked(fn),
+        mark_kinds=_mark_kinds(fn),
         subjects=_subjects(live),
         swallowed=stats.swallowed,
         swallow_line=stats.swallow_line,
