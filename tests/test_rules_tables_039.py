@@ -97,10 +97,10 @@ def test_js_row_branch_that_asserts_then_returns_is_a_warning(tmp_path: Path) ->
     assert folded(verdict(tmp_path, JS_PATH, JS_BASE, _js_body(body)))
 
 
-def test_js_error_flag_branch_with_a_bare_matcher_is_a_warning(tmp_path: Path) -> None:
+def test_js_error_branch_with_a_throw_matcher_is_a_warning(tmp_path: Path) -> None:
     body = "  if (want === 0) {\n    expect(() => add(a, b)).toThrow();\n    return;\n  }\n  expect(add(a, b)).toBe(want);\n"
-    # a comparison with a literal is not a flag: the weak matcher does not count here
-    assert blocked(pair(run(tmp_path, JS_PATH, JS_BASE, _js_body(body))))
+    # a throw matcher on a row value is an assertion on that branch, whatever the guard
+    assert folded(verdict(tmp_path, JS_PATH, JS_BASE, _js_body(body)))
     flag = "  if (want) {\n    expect(() => add(a, b)).toThrow();\n    return;\n  }\n  expect(add(a, b)).toBe(want);\n"
     assert folded(verdict(tmp_path / "second", JS_PATH, JS_BASE, _js_body(flag)))
 
@@ -296,6 +296,105 @@ def test_python_plain_parametrize_is_a_warning(tmp_path: Path) -> None:
     assert folded(verdict(tmp_path, PY_PATH, PY_BASE, _py(PY_ROWS, PY_ASSERT)))
 
 
+# ---- Round 7 follow-up: throws, catch-alls, carried marks, swallowed and escaping assertions -----
+
+
+def test_js_throw_matcher_on_a_row_value_is_an_assertion(tmp_path: Path) -> None:
+    body = "  if (want === null) {\n    expect(() => add(a, b)).toThrow();\n  } else {\n    expect(add(a, b)).toBe(want);\n  }\n"
+    assert folded(verdict(tmp_path, JS_PATH, JS_BASE, _js_body(body)))
+
+
+def test_js_switch_with_a_default_asserting_in_every_arm_is_a_warning(tmp_path: Path) -> None:
+    body = "  switch (a) {\n    case 1:\n      expect(add(a, b)).toBe(want);\n      break;\n    default:\n      expect(add(a, b)).toBe(want);\n  }\n"
+    assert folded(verdict(tmp_path, JS_PATH, JS_BASE, _js_body(body)))
+
+
+def test_rust_match_with_a_catch_all_asserting_in_every_arm_is_a_warning(tmp_path: Path) -> None:
+    new = _rs(RS_CASES).replace(
+        "assert_eq!(add(a, b), want);",
+        "match a {\n            1 => assert_eq!(add(a, b), want),\n            other => assert_eq!(add(other, b), want),\n        }",
+    )
+    assert folded(verdict(tmp_path, RS_PATH, RS_BASE, new))
+
+
+def test_js_assertion_swallowed_by_an_empty_catch_blocks(tmp_path: Path) -> None:
+    body = "  try {\n    expect(add(a, b)).toBe(want);\n  } catch (e) {}\n"
+    found = run(tmp_path, JS_PATH, JS_BASE, _js_body(body))
+    assert blocked(pair(found))
+    assert "swallows the failure" in block_text(found)
+
+
+def test_js_catch_that_rethrows_or_a_finally_is_a_warning(tmp_path: Path) -> None:
+    rethrow = "  try {\n    expect(add(a, b)).toBe(want);\n  } catch (e) {\n    throw e;\n  }\n"
+    final = "  try {\n    expect(add(a, b)).toBe(want);\n  } finally {\n    cleanup();\n  }\n"
+    assert folded(verdict(tmp_path, JS_PATH, JS_BASE, _js_body(rethrow)))
+    assert folded(verdict(tmp_path / "second", JS_PATH, JS_BASE, _js_body(final)))
+
+
+def test_python_match_with_a_wildcard_asserting_in_every_arm_is_a_warning(tmp_path: Path) -> None:
+    body = "    match amount:\n        case 100:\n            assert refund(amount) == 99\n        case _:\n            assert refund(amount) == expected"
+    assert folded(verdict(tmp_path, PY_PATH, PY_BASE, _py(PY_ROWS, body)))
+
+
+def test_python_match_without_a_wildcard_names_the_case(tmp_path: Path) -> None:
+    body = "    match amount:\n        case 100:\n            assert refund(amount) == 99\n        case 2:\n            pass"
+    found = run(tmp_path, PY_PATH, PY_BASE, _py(PY_ROWS, body))
+    assert blocked(pair(found))
+    assert "amount matches" in block_text(found)
+
+
+XFAIL_BASE = PY_BASE.replace(
+    "def test_refund_small", '@pytest.mark.xfail(reason="rounding")\ndef test_refund_small'
+).replace("from shop", "import pytest\nfrom shop", 1)
+
+
+def test_python_row_mark_the_folded_test_already_carried_is_not_new(tmp_path: Path) -> None:
+    rows = '(100, 99), pytest.param(2, 1, marks=pytest.mark.xfail(reason="rounding"))'
+    assert kept(verdict(tmp_path, PY_PATH, XFAIL_BASE, _py(rows, PY_ASSERT)))
+
+
+def test_python_row_mark_of_another_kind_is_new(tmp_path: Path) -> None:
+    rows = "(100, 99), pytest.param(2, 1, marks=pytest.mark.skipif(True, reason='x'))"
+    found = run(tmp_path, PY_PATH, XFAIL_BASE, _py(rows, PY_ASSERT))
+    assert blocked(pair(found))
+    assert "a row marked skip or xfail never asserts" in block_text(found)
+
+
+def test_python_assertion_swallowed_by_a_handler_blocks(tmp_path: Path) -> None:
+    body = "    try:\n        assert refund(amount) == expected\n    except AssertionError:\n        pass"
+    found = run(tmp_path, PY_PATH, PY_BASE, _py(PY_ROWS, body))
+    assert blocked(pair(found))
+    assert "swallows the failure" in block_text(found)
+
+
+def test_python_handlers_that_raise_fail_or_assert_and_finally_are_warnings(tmp_path: Path) -> None:
+    bodies = (
+        "    try:\n        assert refund(amount) == expected\n    except AssertionError:\n        raise",
+        "    try:\n        assert refund(amount) == expected\n    except AssertionError:\n        pytest.fail('no')",
+        "    try:\n        assert refund(amount) == expected\n    finally:\n        print('done')",
+        "    try:\n        got = refund(amount)\n    except ValueError:\n        got = 0\n    assert got == expected",
+    )
+    for n, body in enumerate(bodies):
+        assert folded(verdict(tmp_path / str(n), PY_PATH, PY_BASE, _py(PY_ROWS, body))), body
+
+
+def test_python_assert_or_escape_blocks_and_says_when(tmp_path: Path) -> None:
+    body = "    assert amount < 10 or refund(amount) == expected"
+    found = run(tmp_path, PY_PATH, PY_BASE, _py(PY_ROWS, body))
+    assert blocked(pair(found))
+    assert "the assertion runs only when not `amount < 10`" in block_text(found)
+
+
+def test_python_assert_conditional_expression_blocks(tmp_path: Path) -> None:
+    body = "    assert (refund(amount) == expected) if amount > 10 else True"
+    assert blocked(pair(run(tmp_path, PY_PATH, PY_BASE, _py(PY_ROWS, body))))
+
+
+def test_python_or_inside_a_value_is_a_warning(tmp_path: Path) -> None:
+    body = "    got = refund(amount) or 0\n    assert got == expected"
+    assert folded(verdict(tmp_path, PY_PATH, PY_BASE, _py(PY_ROWS, body)))
+
+
 # ---- Speed: the path reader is linear ----------------------------------------------------------
 
 
@@ -317,6 +416,15 @@ def _js_switch_arms(n: int) -> str:
     )
 
 
+def _js_tries(n: int) -> str:
+    return _js_body(
+        "".join(
+            f"  try {{\n    expect(add(a, b)).toBe(want);\n  }} catch (e) {{\n    throw e;\n  }} finally {{\n    done({i});\n  }}\n"
+            for i in range(n)
+        )
+    )
+
+
 def _py_cpu(n: int) -> float:
     body = "".join(
         f"    if amount > {i}:\n        assert refund(amount) == expected\n    else:\n        assert refund(amount) == expected\n"
@@ -331,7 +439,7 @@ def _py_cpu(n: int) -> float:
 
 def test_path_reading_is_linear() -> None:
     """Four times the branches cost about four times as much, never sixteen, and each stays small."""
-    for make, n in ((_js_branches, 150), (_js_switch_arms, 300)):
+    for make, n in ((_js_branches, 150), (_js_switch_arms, 300), (_js_tries, 200)):
         _cpu("js", make(n))
         base = max(_cpu("js", make(n)), 0.02)
         big = _cpu("js", make(4 * n))

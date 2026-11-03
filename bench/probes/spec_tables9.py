@@ -19,6 +19,11 @@ BASES = {
     },
 }
 
+BASES["tblpyx"] = {
+    **BASES["tblpy"],
+    "tests/test_refund.py": "import pytest\nfrom shop import refund\n\n\ndef test_refund_full():\n    assert refund(100) == 99\n\n\n@pytest.mark.xfail(reason='rounding')\ndef test_refund_small():\n    assert refund(2) == 1\n",
+}
+
 S = {"checks": "static"}
 JS_HEAD, JS_SUB, JS_PATH, JS_TWO = (_ns8[k] for k in ("JS_HEAD", "JS_SUB", "JS_PATH", "JS_TWO"))
 GO_HEAD, GO_SUB, GO_PLAIN = (_ns8[k] for k in ("GO_HEAD", "GO_SUB", "GO_PLAIN"))
@@ -227,4 +232,88 @@ PROBES = [
         WARN,
         rows="(100, 99), pytest.param(2, 1, id='small')",
     ),
+    # ---- follow-up: throw matchers, catch-all arms, carried marks, swallowed and escaping asserts
+    js(
+        "HONEST-tbl7-js-throw-branch",
+        "  if (want === null) {\n    expect(() => add(a, b)).toThrow();\n  } else {\n    expect(add(a, b)).toBe(want);\n  }\n",
+        WARN,
+    ),
+    js(
+        "HONEST-tbl7-js-switch-default",
+        "  switch (a) {\n    case 1:\n      expect(add(a, b)).toBe(want);\n      break;\n    default:\n      expect(add(a, b)).toBe(want);\n  }\n",
+        WARN,
+    ),
+    js(
+        "TAMPER-tbl7-js-try-catch-swallow",
+        "  try {\n    expect(add(a, b)).toBe(want);\n  } catch (e) {}\n",
+        BLOCK,
+    ),
+    js(
+        "HONEST-tbl7-js-catch-rethrow",
+        "  try {\n    expect(add(a, b)).toBe(want);\n  } catch (e) {\n    throw e;\n  }\n",
+        WARN,
+    ),
+    js(
+        "HONEST-tbl7-js-try-finally",
+        "  try {\n    expect(add(a, b)).toBe(want);\n  } finally {\n    cleanup();\n  }\n",
+        WARN,
+    ),
+    rs(
+        "HONEST-tbl7-rs-match-catch-all",
+        "        match a {\n            1 => assert_eq!(add(a, b), want),\n            other => assert_eq!(add(other, b), want),\n        }\n",
+        WARN,
+    ),
+    py(
+        "HONEST-tbl7-py-match-wildcard",
+        "    match amount:\n        case 100:\n            assert refund(amount) == 99\n        case _:\n            assert refund(amount) == expected",
+        WARN,
+    ),
+    py(
+        "TAMPER-tbl7-py-assert-swallowed",
+        "    try:\n        assert refund(amount) == expected\n    except AssertionError:\n        pass",
+        BLOCK,
+    ),
+    py(
+        "HONEST-tbl7-py-handler-reraises",
+        "    try:\n        assert refund(amount) == expected\n    except AssertionError:\n        raise",
+        WARN,
+    ),
+    py(
+        "HONEST-tbl7-py-handler-fails",
+        "    try:\n        assert refund(amount) == expected\n    except AssertionError:\n        pytest.fail('no')",
+        WARN,
+    ),
+    py(
+        "HONEST-tbl7-py-narrow-except",
+        "    try:\n        got = refund(amount)\n    except ValueError:\n        got = 0\n    assert got == expected",
+        WARN,
+    ),
+    py(
+        "TAMPER-tbl7-py-assert-or-escape",
+        "    assert amount < 10 or refund(amount) == expected",
+        BLOCK,
+    ),
+    py(
+        "HONEST-tbl7-py-or-in-value",
+        "    got = refund(amount) or 0\n    assert got == expected",
+        WARN,
+    ),
+    {
+        **py(
+            "HONEST-tbl7-py-xfail-row-kept",
+            "    assert refund(amount) == expected",
+            WARN,
+            rows="(100, 99), pytest.param(2, 1, marks=pytest.mark.xfail(reason='rounding'))",
+        ),
+        "base": "tblpyx",
+    },
+    {
+        **py(
+            "TAMPER-tbl7-py-skipif-row-new",
+            "    assert refund(amount) == expected",
+            BLOCK,
+            rows="(100, 99), pytest.param(2, 1, marks=pytest.mark.skipif(True, reason='x'))",
+        ),
+        "base": "tblpyx",
+    },
 ]
