@@ -114,7 +114,10 @@ def nothing_to_verify_report(opts: CheckOptions, candidate: Candidate) -> Report
         base=candidate.base,
         tree=candidate.tree,
         dirty=candidate.tree != gitops.head_tree(candidate.repo),
-        notes=["nothing to verify: the candidate tree equals the base tree"],
+        notes=[
+            "nothing to verify: the candidate tree equals the base tree",
+            *([candidate.base.note] if candidate.base.note else []),
+        ],
     )
     return report.finish()
 
@@ -160,6 +163,8 @@ def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
         policy_source=loaded.source,
         policy_sha256=loaded.sha256,
     )
+    if base.note:
+        report.notes.append(base.note)
     if readonly:
         report.notes.append(READONLY_NOTE)
 
@@ -199,7 +204,7 @@ def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
             skipped_note: str | None = None
             failed = False
             if check == "static":
-                changes = changes or build_changeset(repo, base.sha, tree, policy.test_paths)
+                changes = changes or _changeset(stack, repo, base.sha, tree, policy)
                 found = apply_severities(_static_findings(loaded, opts, changes), policy.rules)
                 failed = _record(report, found, available)
                 # In hook mode a blocking static finding skips the rest to keep the loop fast.
@@ -209,7 +214,7 @@ def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
                 report.commands.extend(results)
                 failed = any(r.failed for r in results)
             elif check == "revert":
-                changes = changes or build_changeset(repo, base.sha, tree, policy.test_paths)
+                changes = changes or _changeset(stack, repo, base.sha, tree, policy)
                 outcome = _run_revert(repo, base.sha, tree, changes, policy, tail_lines)
                 skipped_note = outcome.note if outcome.skipped else None
                 found = apply_severities([outcome.finding] if outcome.finding else [], policy.rules)
@@ -230,6 +235,13 @@ def run_check(opts: CheckOptions, candidate: Candidate | None = None) -> Report:
     if report.exit_code == 0 and use_cache and not readonly:  # nothing is written under .git
         cache.record_pass(key, [asdict(c) for c in report.checks])
     return report
+
+
+def _changeset(stack: ExitStack, repo: Path, base_sha: str, tree: str, policy: Policy) -> ChangeSet:
+    """The change set, whose git reader process ends when the check's stack closes."""
+    changes = build_changeset(repo, base_sha, tree, policy.test_paths)
+    stack.callback(changes.close)
+    return changes
 
 
 def _record(report: Report, found: list[Finding], available: Mapping[str, Acceptance]) -> bool:

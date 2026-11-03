@@ -21,7 +21,35 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SPECS = ["spec_py.py", "spec_other.py", "spec_more.py"]
+SPECS = [
+    "spec_py.py",
+    "spec_other.py",
+    "spec_more.py",
+    "spec_ci2.py",
+    "spec_runner2.py",
+    "spec_ci3.py",
+    "spec_ci4.py",
+    "spec_runner3.py",
+    "spec_runner4.py",
+    "spec_ci5.py",
+    "spec_runner5.py",
+    "spec_runner6.py",
+    "spec_runtime7.py",
+    "spec_sh7.py",
+    "spec_tables7.py",
+    "spec_select7.py",
+    "spec_cfg7.py",
+    "spec_make7.py",
+    "spec_sh8.py",
+    "spec_make8.py",
+    "spec_tables8.py",
+    "spec_select9.py",
+    "spec_cfg9.py",
+    "spec_make9.py",
+    "spec_tables9.py",
+    "spec_makeparse9.py",
+    "spec_makeparse10.py",
+]
 VERDICT = {0: "pass", 1: "BLOCK", 2: "cmd-fail", 3: "smoke", 4: "usage", 5: "internal"}
 
 

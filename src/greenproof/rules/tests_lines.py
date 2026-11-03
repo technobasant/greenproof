@@ -7,13 +7,20 @@ indentation, and assertions are counted with regular expressions.
 
 from __future__ import annotations
 
+import functools
 import re
+from bisect import bisect_right
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from greenproof.rules._common import digest, split_lines
-from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
+from greenproof.rules.tests_model import FileAnalysis, Marker, Table, Unit
+from greenproof.rules.tests_tables import go_unit, js_table, rust_unit, tokens
 
 _NUM = r"-?\d+(?:\.\d+)?"
+# A Rust char literal (`'}'`, `'"'`, `'\n'`): masked like a string so its bracket or quote is not
+# code. A lifetime (`'a`) has no closing quote one character later and is left alone.
+_RUST_CHAR = re.compile(r"'(?:\\.|[^\\'])'")
 
 
 @dataclass(frozen=True)
@@ -107,7 +114,7 @@ _EXPECTED: dict[str, re.Pattern[str]] = {
 _JS_UNIT = re.compile(r"^\s*(?:it|test|xit|fit|xtest)(?:\.\w+)*\s*\(\s*(['\"`])(.*?)\1")
 _JS_DESCRIBE = re.compile(r"^\s*(?:describe|xdescribe|fdescribe)(?:\.\w+)*\s*\(\s*(['\"`])(.*?)\1")
 _GO_UNIT = re.compile(r"^func\s+(Test\w*|Fuzz\w*)\s*\(")
-_RUST_ATTR = re.compile(r"^\s*#\[\s*(?:\w+::)*test\b")
+_RUST_ATTR = re.compile(r"^\s*#\[\s*(?:\w+::)*(?:test|rstest|test_case)\b")
 _RUST_FN = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)")
 _PY_DEF = re.compile(r"^(\s*)(?:async\s+)?def\s+(test\w*)\s*\(")
 _PY_CLASS = re.compile(r"^(\s*)class\s+(\w+)")
@@ -178,6 +185,13 @@ def mask_source(text: str, lang: str) -> tuple[list[str], list[str]]:
             c.append(ch * 3)
             i += 3
             continue
+        if lang == "rust" and ch == "'":
+            cm = _RUST_CHAR.match(text, i)
+            if cm is not None:
+                m.append("''")
+                c.append(cm.group())
+                i = cm.end()
+                continue
         if ch in quotes:
             state, quote = "str", ch
             m.append(ch)
@@ -236,26 +250,679 @@ class _Span:
     name_line: int
     # Column range of the test's own name on `name_line` (Go/Rust function name, JS/TS title).
     name_cols: tuple[int, int] | None = None
+    # JS/TS table rows (`it.each`, or an enclosing `describe.each`): count and exact row forms.
+    cases: int | None = None
+    forms: tuple[str, ...] = ()
+    # The literal table this test runs and the literals of its own body (JS/TS, Go, Rust).
+    table: Table | None = None
+    literals: tuple[str, ...] | None = None
+    # Rust: the line of the `fn` (the span starts at the first test attribute).
+    fn_line: int = -1
 
 
-def _find_spans(lang: str, raw: list[str], masked: list[str], code: list[str]) -> list[_Span]:
+_QUOTES = {"js": "\"'`", "go": "\"'`", "rust": '"', "python-lines": "\"'"}
+
+
+def _blank_strings(text: str, lang: str) -> str:
+    """`text` with the inside of every string literal replaced by spaces (newlines kept), so the
+    result has the same length and offsets and its brackets are real code brackets."""
+    quotes = _QUOTES[lang]
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if lang == "rust" and ch == "'":
+            cm = _RUST_CHAR.match(text, i)
+            if cm is not None:
+                out.append("'" + " " * (cm.end() - i - 2) + "'")
+                i = cm.end()
+                continue
+        if ch not in quotes:
+            out.append(ch)
+            i += 1
+            continue
+        j = i + 1
+        raw = lang == "go" and ch == "`"
+        while j < n:
+            c = text[j]
+            if c == "\\" and not raw:
+                j += 2
+                continue
+            if c == ch:
+                j += 1
+                break
+            if c == "\n" and ch != "`":
+                break
+            j += 1
+        j = min(j, n)
+        seg = text[i:j]
+        closed = len(seg) > 1 and seg[-1] == ch
+        inner = seg[1:-1] if closed else seg[1:]
+        out.append(ch + "".join("\n" if c == "\n" else " " for c in inner) + (ch if closed else ""))
+        i = j
+    return "".join(out)
+
+
+@dataclass
+class _Src:
+    """One file as offsets: `text` is the comment-free code, `shadow` the same with string
+    contents blanked, `starts` the offset of each line. Brackets are matched on `shadow`."""
+
+    lang: str
+    masked: list[str]
+    code: list[str]
+    text: str
+    shadow: str
+    starts: list[int]
+
+    @classmethod
+    def build(cls, lang: str, masked: list[str], code: list[str]) -> _Src:
+        text = "\n".join(code)
+        starts = [0]
+        for line in code[:-1]:
+            starts.append(starts[-1] + len(line) + 1)
+        return cls(lang, masked, code, text, _blank_strings(text, lang), starts)
+
+    def line_of(self, offset: int) -> int:
+        return bisect_right(self.starts, offset) - 1
+
+    def close(self, open_at: int) -> int:
+        """Offset of the bracket closing the one at `open_at`, or -1."""
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        stack: list[str] = []
+        s = self.shadow
+        for i in range(open_at, len(s)):
+            c = s[i]
+            if c in pairs:
+                stack.append(pairs[c])
+            elif c in ")]}":
+                if not stack or stack.pop() != c:
+                    return -1
+                if not stack:
+                    return i
+        return -1
+
+    def split(self, a: int, b: int, sep: str) -> list[str]:
+        """The code text of `[a, b)` split on `sep` outside brackets and strings."""
+        s = self.shadow
+        parts: list[str] = []
+        depth, start, i = 0, a, a
+        while i < b:
+            c = s[i]
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+            elif depth == 0 and s.startswith(sep, i) and _sep_ok(s, i, sep):
+                parts.append(self.text[start:i])
+                i += len(sep)
+                start = i
+                continue
+            i += 1
+        parts.append(self.text[start:b])
+        return parts
+
+    def args(self, open_at: int) -> list[str] | None:
+        """The arguments of the call whose `(` is at `open_at` (a trailing comma is dropped)."""
+        close = self.close(open_at)
+        if close < 0:
+            return None
+        parts = self.split(open_at + 1, close, ",")
+        if parts and not parts[-1].strip():
+            parts.pop()
+        return parts
+
+
+def _sep_ok(s: str, i: int, sep: str) -> bool:
+    if sep in ("==", "!="):
+        before = s[i - 1] if i else ""
+        after = s[i + 2] if i + 2 < len(s) else ""
+        return before not in "<>!=" and after != "="
+    return True
+
+
+def _norm(expr: str) -> str:
+    return "".join(expr.split())
+
+
+# Generators whose two calls legitimately differ: comparing a call with itself is not vacuous.
+_NONDETERMINISTIC = re.compile(
+    r"random|\bDate\b|\bnow\s*\(|uuid|nanoid|\brand\b|Instant|SystemTime", re.I
+)
+
+
+def _same(a: str, b: str) -> bool:
+    """Both sides are the same call-free expression. A call may be a real test of memoization or
+    determinism (`expect(select(s)).toBe(select(s))`), so only plain operands are vacuous."""
+    x = _norm(a)
+    return bool(x) and x == _norm(b) and "(" not in x and _NONDETERMINISTIC.search(a) is None
+
+
+def _same_call(a: str, b: str) -> bool:
+    """Both sides are the same deterministic expression and it contains a call."""
+    x = _norm(a)
+    return bool(x) and x == _norm(b) and "(" in x and _NONDETERMINISTIC.search(a) is None
+
+
+@dataclass
+class _SelfEq:
+    """What `_self_equal_lines` found in a test: lines with a call-free self-comparison (vacuous,
+    {line: count}); self-comparisons whose operand has a call, which are vacuous only when they
+    replace a real comparison at the base, as (normalised operand, line); and the normalised
+    operands of every comparison of two different expressions."""
+
+    vacuous: dict[int, int]
+    calls: list[tuple[str, int]]
+    compared: set[str]
+
+
+_JS_EXPECT_SELF = re.compile(r"\s*\.\s*(?:toBe|toEqual|toStrictEqual)\s*\(")
+_JS_NODE_EQ = re.compile(r"\bassert\s*\.\s*(?:equal|strictEqual|deepEqual|deepStrictEqual)\s*\(")
+_GO_EQUAL = re.compile(r"\b(?:assert|require)\s*\.\s*(?:Equal|EqualValues|Exactly)f?\s*\(")
+_RUST_ASSERT_EQ = re.compile(r"\bassert_eq!\s*\(")
+_RUST_ASSERT = re.compile(r"\bassert!\s*\(")
+
+
+def _self_equal_lines(src: _Src, a: int, b: int, skip: dict[int, str]) -> _SelfEq:
+    """Comparisons of an expression with its own text in `[a, b)` (offsets): `expect(X).toBe(X)`,
+    `assert.equal(X, X)`, `assert_eq!(X, X)` (SPEC 5.4), and the operands of the others."""
+    found: dict[int, int] = {}
+    calls: list[tuple[str, int]] = []
+    compared: set[str] = set()
+    s = src.shadow
+
+    def pair(left: str, right: str, offset: int) -> None:
+        line = src.line_of(offset)
+        if line in skip:
+            return
+        if _same(left, right):
+            found[line] = found.get(line, 0) + 1
+        elif _same_call(left, right):
+            calls.append((_norm(left), line + 1))
+        else:
+            compared.update((_norm(left), _norm(right)))
+
+    if src.lang == "js":
+        for m in _JS_EXPECT_OPEN.finditer(s, a, b):
+            close = src.close(m.end() - 1)
+            nm = _JS_EXPECT_SELF.match(s, close + 1) if close > 0 else None
+            if nm is None:
+                continue
+            args = src.args(nm.end() - 1)
+            if args is not None and len(args) == 1:
+                pair(src.text[m.end() : close], args[0], m.start())
+        for m in _JS_NODE_EQ.finditer(s, a, b):
+            args = src.args(m.end() - 1)
+            if args is not None and len(args) >= 2:
+                pair(args[0], args[1], m.start())
+    elif src.lang == "go":
+        for m in _GO_EQUAL.finditer(s, a, b):
+            args = src.args(m.end() - 1)
+            if args is None:
+                continue
+            if args and args[0].strip() in ("t", "b", "tb") and len(args) >= 3:
+                args = args[1:]
+            if len(args) >= 2:
+                pair(args[0], args[1], m.start())
+    elif src.lang == "rust":
+        for m in _RUST_ASSERT_EQ.finditer(s, a, b):
+            args = src.args(m.end() - 1)
+            if args is not None and len(args) >= 2:
+                pair(args[0], args[1], m.start())
+        for m in _RUST_ASSERT.finditer(s, a, b):
+            close = src.close(m.end() - 1)
+            if close < 0:
+                continue
+            if len(src.split(m.end(), close, "&&")) > 1 or len(src.split(m.end(), close, "||")) > 1:
+                continue
+            sides = src.split(m.end(), close, "==")
+            if len(sides) == 2:
+                pair(sides[0], sides[1], m.start())
+    return _SelfEq(found, calls, compared)
+
+
+def _strip_parens(expr: str) -> str:
+    e = expr.strip()
+    while e.startswith("(") and e.endswith(")") and _wrapped(e):
+        e = e[1:-1].strip()
+    return e
+
+
+def _wrapped(e: str) -> bool:
+    depth = 0
+    for i, c in enumerate(e):
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0 and i != len(e) - 1:
+                return False
+    return depth == 0
+
+
+def _always(src: _Src, a: int, b: int, lit: str) -> bool:
+    """The condition at `[a, b)` is the literal `lit` (`false` or `true`): the literal alone,
+    or joined to anything else by the operator it absorbs (`false && x`, `x || true`). The
+    other operator makes the condition unprovable, so it is not reported."""
+    absorbing, other = ("&&", "||") if lit == "false" else ("||", "&&")
+    if len(src.split(a, b, other)) > 1:
+        return False
+    for part in src.split(a, b, absorbing):
+        inner = _strip_parens(part)
+        if inner == lit:
+            return True
+        if part.strip().startswith("(") and inner != part.strip():
+            off = src.text.find(inner, a, b)
+            if off >= 0 and _always(src, off, off + len(inner), lit):
+                return True
+    return False
+
+
+def _always_false(src: _Src, a: int, b: int) -> bool:
+    """`false`, `false && x`, `x && false` over the condition at `[a, b)`; any `||` makes the
+    condition unprovable, so it is not reported."""
+    return _always(src, a, b, "false")
+
+
+_JS_IF = re.compile(r"\bif\s*\(")
+_BRACE_IF = re.compile(r"\bif\s+(.*?)\s*\{\s*$")
+_BARE_RETURN = {
+    "js": re.compile(r"^\s*return\s*;?\s*$"),
+    "go": re.compile(r"^\s*return\s*$"),
+    "rust": re.compile(r"^\s*return\s*;\s*$"),
+}
+_CLOSER_ONLY = re.compile(r"^\s*\}+[\s)\];,]*$")
+_RET_BODY = {"js": r"return\s*;?", "go": r"return", "rust": r"return\s*;"}
+_JS_IF_OPEN = re.compile(r"\s*if\s*\(")
+_BRACE_IF_RETURN = {
+    lang: re.compile(rf"^\s*if\s+(.*?)\s*\{{\s*{body}\s*\}}\s*$")
+    for lang, body in _RET_BODY.items()
+}
+_HEADER_OPEN = re.compile(r"(?:\}\s*)?(?:else\s+if|if|for|while)\s*\(")
+_ELSE_ONLY = re.compile(r"(?:\}\s*)?else")
+
+
+def _is_header(text: str) -> bool:
+    """`text` is one control header with no body: `if (...)`, `else if (...)`, `for (...)`,
+    `while (...)` whose closing parenthesis ends it, or a bare `else`."""
+    if _ELSE_ONLY.fullmatch(text):
+        return True
+    m = _HEADER_OPEN.match(text)
+    if m is None:
+        return False
+    depth = 0
+    for i in range(m.end() - 1, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i == len(text) - 1
+    return False
+
+
+def _braceless_branch(masked: list[str], k: int, lo: int) -> bool:
+    """The code line before line `k` (not before `lo`) is a control header with no `{`, so the
+    statement on line `k` is that branch's body, not a top-level statement."""
+    p = k - 1
+    while p >= lo and not masked[p].strip():
+        p -= 1
+    for j in range(p, max(lo, p - 8) - 1, -1):
+        if j < p and masked[j].rstrip().endswith((";", "{", "}")):
+            return False
+        if _is_header(" ".join(line.strip() for line in masked[j : p + 1])):
+            return True
+    return False
+
+
+def _true_return(src: _Src, k: int) -> bool:
+    """Line `k` is a one-line `if` on an always-true condition whose whole body is a bare
+    `return`: `if (true) return;`, `if (true) { return; }`, `if true { return }`."""
+    a, b = src.starts[k], src.starts[k] + len(src.code[k])
+    line = src.shadow[a:b]
+    body = _RET_BODY[src.lang]
+    if src.lang == "js":
+        m = _JS_IF_OPEN.match(line)
+        if m is None:
+            return False
+        open_at = a + m.end() - 1
+        close = src.close(open_at)
+        if close < 0 or src.line_of(close) != k:
+            return False
+        if not _always(src, open_at + 1, close, "true"):
+            return False
+        rest = src.shadow[close + 1 : b].strip()
+        return re.fullmatch(rf"{body}|\{{\s*{body}\s*\}}\s*;?", rest) is not None
+    m2 = _BRACE_IF_RETURN[src.lang].match(line)
+    if m2 is None:
+        return False
+    ca, cb = a + m2.start(1), a + m2.end(1)
+    ca = cb - len(src.split(ca, cb, ";")[-1])  # Go's `if init; cond {`
+    return _always(src, ca, cb, "true")
+
+
+def _dead_lines(src: _Src, span: _Span) -> dict[int, str]:
+    """Lines of a test whose checks can never run, as {line: "unreachable"}: after a bare
+    `return` at the top level of the test body (or a one-line `if` on an always-true condition
+    that returns), and inside a block guarded by an always-false condition (`if false`,
+    `x && false`). A `return` that is the body of a brace-less `if`/`else`/`for`/`while` is
+    conditional, not an early return (SPEC 5.4).
+    """
+    dead: dict[int, str] = {}
+    lang = src.lang
+    depth = 0
+    returned = False
+    ret = _BARE_RETURN[lang]
+    for k in range(span.start, span.end + 1):
+        if returned:
+            dead.setdefault(k, "unreachable")
+        elif (
+            depth == 1
+            and (ret.match(src.masked[k]) or _true_return(src, k))
+            and not _braceless_branch(src.masked, k, span.start)
+        ):
+            returned = True
+        depth += src.masked[k].count("{") - src.masked[k].count("}")
+    for k in range(span.start, span.end + 1):
+        if k in dead:
+            continue
+        found = _if_block(src, k)
+        if found is None:
+            continue
+        kind, end = found
+        for j in range(k, end + 1):
+            if j < end or _CLOSER_ONLY.match(src.masked[j]) or k == end:
+                dead.setdefault(j, kind)
+    return dead
+
+
+def _if_block(src: _Src, k: int) -> tuple[str, int] | None:
+    """(kind, last line) for an `if` on line `k` that never runs its block, else None."""
+    a, b = src.starts[k], src.starts[k] + len(src.code[k])
+    line = src.shadow[a:b]
+    if src.lang == "js":
+        for m in _JS_IF.finditer(line):
+            open_at = a + m.end() - 1
+            close = src.close(open_at)
+            if close < 0 or src.line_of(close) != k:
+                continue
+            if not _always_false(src, open_at + 1, close):
+                continue
+            rest = src.shadow[close + 1 : b].strip()
+            if rest.startswith("{"):
+                end = src.close(close + 1 + src.shadow[close + 1 : b].index("{"))
+                return "unreachable", src.line_of(end) if end >= 0 else k
+            return ("unreachable", k) if rest else None
+        return None
+    m2 = _BRACE_IF.search(line)
+    if m2 is None:
+        return None
+    ca, cb = a + m2.start(1), a + m2.end(1)
+    segs = src.split(ca, cb, ";")  # Go's `if init; cond {`
+    ca = cb - len(segs[-1])
+    brace = a + line.rindex("{")
+    end = src.close(brace)
+    last = src.line_of(end) if end >= 0 else k
+    if _always_false(src, ca, cb):
+        return "unreachable", last
+    return None
+
+
+_JS_EACH = re.compile(
+    r"^\s*(describe|xdescribe|fdescribe|it|test|xit|fit|xtest)(?:\.\w+)*?\.each\b"
+)
+_JS_TITLE = re.compile(r"\s*(['\"`])(.*?)\1", re.DOTALL)
+
+
+@dataclass
+class _Desc:
+    """A JS/TS `describe` block: its first and last line, title and, for `describe.each`, rows."""
+
+    start: int
+    end: int
+    title: str
+    each: bool = False
+    cases: int | None = None
+    forms: tuple[str, ...] = ()
+    # `describe.each`: raw rows (None when not literal), callback range, whether it is skipped.
+    rows: tuple[str, ...] | None = None
+    cb: tuple[int, int] = (0, 0)
+    live: bool = True
+    why: str = ""  # what makes a block not live (`.skip`, `xdescribe`, `.todo`, `.failing`)
+
+
+@dataclass
+class _Each:
+    describe: bool
+    end: int
+    title: str
+    title_line: int
+    title_cols: tuple[int, int] | None
+    cases: int | None
+    forms: tuple[str, ...]
+    rows: tuple[str, ...] | None
+    cb: tuple[int, int]
+    live: bool
+    why: str = ""
+
+
+_JS_OFF = re.compile(r"\.(skip|todo|failing)\b")
+
+
+def _js_off(head: str) -> str:
+    """What makes a `describe`/`it`/`test` call not live (its tests do not pass for real), else
+    "": an `x` prefix, `.skip`, `.todo`, and `.failing` (which passes only when the test fails)."""
+    m = re.match(r"\s*(\w+)", head)
+    if m is not None and m.group(1).startswith("x"):
+        return m.group(1)
+    off = _JS_OFF.search(head)
+    return f".{off.group(1)}" if off else ""
+
+
+def _parse_each(src: _Src, i: int, m: re.Match[str]) -> _Each | None:
+    """`it.each([rows])(title, fn)` or ``it.each`header\n rows`(title, fn)``: the number of rows
+    (None when the table is not a literal array or template) and where the call ends."""
+    s, t = src.shadow, src.text
+    p = src.starts[i] + m.end()
+    while p < len(s) and s[p].isspace():
+        p += 1
+    cases: int | None = None
+    forms: tuple[str, ...] = ()
+    raw: tuple[str, ...] | None = None
+    if p >= len(s):
+        return None
+    if s[p] == "`":
+        q = s.find("`", p + 1)
+        if q < 0:
+            return None
+        rows = [r.strip() for r in t[p + 1 : q].split("\n") if r.strip()]
+        forms = tuple(_norm(r) for r in rows[1:])
+        cases = len(forms)
+        raw = tuple(rows[1:])
+        p = q + 1
+    elif s[p] == "(":
+        c = src.close(p)
+        if c < 0:
+            return None
+        a = p + 1
+        while a < c and s[a].isspace():
+            a += 1
+        if a < c and s[a] == "[" and s[src.close(a) + 1 : c].strip() == "":
+            elems = [e for e in src.split(a + 1, src.close(a), ",") if e.strip()]
+            if not any(e.lstrip().startswith("...") for e in elems):  # a spread: not a literal
+                cases = len(elems)
+                forms = tuple(_norm(e) for e in elems)
+                raw = tuple(elems)
+        p = c + 1
+    else:
+        return None
+    while p < len(s) and s[p].isspace():
+        p += 1
+    if p >= len(s) or s[p] != "(":
+        return None
+    c2 = src.close(p)
+    if c2 < 0:
+        return None
+    args = src.split(p + 1, c2, ",")
+    tm = _JS_TITLE.match(args[0])
+    if tm is None:
+        return None
+    off = p + 1 + tm.start(2)
+    line = src.line_of(off)
+    cols = (
+        None
+        if "\n" in tm.group(2)
+        else (off - src.starts[line], off - src.starts[line] + len(tm.group(2)))
+    )
+    # The callback is the second argument; a skipped or todo table does not run.
+    cb_start = p + 1 + len(args[0]) + 1
+    tag = _js_off(m.group(0))
+    marked = f"the table is marked {tag}" if tag else ""
+    return _Each(
+        m.group(1).endswith("describe"),
+        src.line_of(c2),
+        tm.group(2),
+        line,
+        cols,
+        cases,
+        forms,
+        raw,
+        (cb_start, c2),
+        not tag,
+        marked,
+    )
+
+
+def _each_parts(enclosing: list[_Desc], own: _Each | None) -> tuple[int | None, tuple[str, ...]]:
+    """Rows of the tests under `describe.each` and `it.each`: the product, the forms joined."""
+    parts = [(d.cases, d.forms) for d in enclosing if d.each]
+    if own is not None:
+        parts.append((own.cases, own.forms))
+    if not parts or any(c is None for c, _ in parts):
+        return None, ()
+    total = 1
+    forms: list[str] = []
+    for c, f in parts:
+        total *= c or 0
+        forms.extend(f)
+    return total, tuple(forms)
+
+
+def _rust_fn_line(src: _Src, code: list[str], i: int) -> int | None:
+    """The line of the `fn` that the attributes starting on line `i` belong to, however many
+    attributes (`#[case(..)]` rows of a table) sit between: the first thing after them."""
+    s = src.shadow
+    p = src.starts[i]
+    while True:
+        p = len(s) - len(s[p:].lstrip())
+        if not s.startswith("#[", p):
+            break
+        close = src.close(p + 1)
+        if close < 0:
+            return None
+        p = close + 1
+    if p >= len(s):
+        return None
+    j = src.line_of(p)
+    return j if _RUST_FN.match(code[j]) else None
+
+
+def _find_spans(
+    lang: str, raw: list[str], masked: list[str], code: list[str], src: _Src | None = None
+) -> list[_Span]:
     """Test spans. Declarations are matched on `code` (comments removed), so a test inside a
     block comment does not exist; `raw` only measures indentation for Python."""
     spans: list[_Span] = []
-    describes: list[tuple[int, int, str]] = []
+    describes: list[_Desc] = []
     class_stack: list[tuple[int, str]] = []
     i = 0
     while i < len(raw):
         line = code[i]
         if lang == "js":
+            em = _JS_EACH.match(line) if src is not None else None
+            if em is not None and src is not None:
+                each = _parse_each(src, i, em)
+                if each is not None:
+                    enc = [d for d in describes if d.start < i <= d.end]
+                    if each.describe:
+                        describes.append(
+                            _Desc(
+                                i,
+                                each.end,
+                                each.title,
+                                True,
+                                each.cases,
+                                each.forms,
+                                each.rows,
+                                each.cb,
+                                each.live,
+                                each.why,
+                            )
+                        )
+                    else:
+                        cases, forms = _each_parts(enc, each)
+                        titles = [d.title for d in enc] + [each.title]
+                        off = each.why or next((d.why for d in enc if not d.live), "")
+                        table, lits = js_table(
+                            src,
+                            None if any(d.each for d in enc) else each.rows,
+                            each.cb,
+                            not off,
+                            None,
+                            off,
+                        )
+                        spans.append(
+                            _Span(
+                                i,
+                                each.end,
+                                " > ".join(titles),
+                                each.title_line,
+                                each.title_cols,
+                                cases,
+                                forms,
+                                table,
+                                lits,
+                            )
+                        )
+                i += 1
+                continue
             dm = _JS_DESCRIBE.match(line)
             if dm:
-                describes.append((i, _brace_end(masked, i), dm.group(2)))
+                tag = _js_off(line[: dm.start(1)])
+                why = f"an enclosing describe is marked {tag}" if tag else ""
+                describes.append(
+                    _Desc(i, _brace_end(masked, i), dm.group(2), live=not tag, why=why)
+                )
             um = _JS_UNIT.match(line)
             if um:
                 end = _brace_end(masked, i)
-                titles = [t for s, e, t in describes if s < i <= e] + [um.group(2)]
-                spans.append(_Span(i, end, " > ".join(titles), i, (um.start(2), um.end(2))))
+                enc = [d for d in describes if d.start < i <= d.end]
+                titles = [d.title for d in enc] + [um.group(2)]
+                cases, forms = _each_parts(enc, None)
+                table = None
+                sources = [d for d in enc if d.each]
+                if src is not None and len(sources) == 1 and sources[0].rows is not None:
+                    d = sources[0]
+                    reads = (src.starts[i], src.starts[end] + len(code[end]))
+                    tag = _js_off(line[: um.start(1)])
+                    off = (
+                        f"the test inside the describe.each table is marked {tag}"
+                        if tag
+                        else next((e.why for e in enc if not e.live), "")
+                    )
+                    table = js_table(src, d.rows, d.cb, not off, reads, off)[0]
+                spans.append(
+                    _Span(
+                        i,
+                        end,
+                        " > ".join(titles),
+                        i,
+                        (um.start(2), um.end(2)),
+                        cases,
+                        forms,
+                        table,
+                    )
+                )
         elif lang == "go":
             gm = _GO_UNIT.match(line)
             if gm:
@@ -263,14 +930,18 @@ def _find_spans(lang: str, raw: list[str], masked: list[str], code: list[str]) -
                 spans.append(_Span(i, end, gm.group(1), i, (gm.start(1), gm.end(1))))
         elif lang == "rust":
             if _RUST_ATTR.match(line):
-                j = i + 1
-                while j < len(raw) and j < i + 8 and not _RUST_FN.match(code[j]):
-                    j += 1
-                if j < len(raw) and j < i + 8:
+                j = _rust_fn_line(src, code, i) if src is not None else None
+                if j is None:
+                    j = i + 1
+                    while j < len(raw) and j < i + 8 and not _RUST_FN.match(code[j]):
+                        j += 1
+                    if j >= len(raw) or j >= i + 8:
+                        j = None
+                if j is not None:
                     fm = _RUST_FN.match(code[j])
                     assert fm is not None
                     end = _brace_end(masked, j)
-                    spans.append(_Span(i, end, fm.group(1), j, (fm.start(1), fm.end(1))))
+                    spans.append(_Span(i, end, fm.group(1), j, (fm.start(1), fm.end(1)), fn_line=j))
                     i = max(i + 1, spans[-1].end + 1)
                     continue
         else:
@@ -383,9 +1054,8 @@ _GO_FUNC = re.compile(r"^func\s+(\w+)\s*(?:\[[^\]]*\])?\s*\(([^)]*)\)")
 _GO_TESTING_PARAM = re.compile(r"\*\s*testing\.(?:T|B|F)\b|\btesting\.TB\b")
 
 
-def _go_helper_calls(masked: list[str], code: list[str]) -> re.Pattern[str] | None:
-    """Call pattern for the assertion helpers declared in this file (SPEC 5.4): functions taking
-    a testing handle that assert directly or through another helper."""
+def _go_cands(masked: list[str], code: list[str]) -> dict[str, str]:
+    """Functions of one Go file that take a testing handle, with their masked body."""
     cands: dict[str, str] = {}
     for i, line in enumerate(code):
         fm = _GO_FUNC.match(line)
@@ -393,6 +1063,19 @@ def _go_helper_calls(masked: list[str], code: list[str]) -> re.Pattern[str] | No
             continue
         end = _brace_end(masked, i)
         cands[fm.group(1)] = "\n".join([masked[i][fm.end() :], *masked[i + 1 : end + 1]])
+    return cands
+
+
+@functools.lru_cache(maxsize=512)
+def _go_cands_of(text: str) -> tuple[tuple[str, str], ...]:
+    masked, code = mask_source(text, "go")
+    return tuple(_go_cands(masked, code).items())
+
+
+def _helper_closure(
+    cands: dict[str, str], lang: str, call: Callable[[set[str]], re.Pattern[str]]
+) -> set[str]:
+    """Names of the candidates that assert directly or through another helper."""
     helpers: set[str] = set()
     changed = True
     while changed:
@@ -400,15 +1083,88 @@ def _go_helper_calls(masked: list[str], code: list[str]) -> re.Pattern[str] | No
         for name, body in cands.items():
             if name in helpers:
                 continue
-            if _ASSERTS["go"].search(body) or (helpers and _go_call(helpers).search(body)):
+            if _ASSERTS[lang].search(body) or (helpers and call(helpers).search(body)):
                 helpers.add(name)
                 changed = True
-    return _go_call(helpers) if helpers else None
+    return helpers
+
+
+def _go_helper_calls(
+    masked: list[str], code: list[str], siblings: Sequence[str] = ()
+) -> tuple[re.Pattern[str] | None, frozenset[str]]:
+    """Call pattern for the assertion helpers visible to this file (SPEC 5.4): functions taking
+    a testing handle that assert directly or through another helper, declared in this file or
+    in a `_test.go` file of the same directory (`siblings`, same revision). Also the names this
+    file itself declares."""
+    own = _go_cands(masked, code)
+    cands: dict[str, str] = {}
+    for text in siblings:
+        cands.update(_go_cands_of(text))
+    cands.update(own)
+    helpers = _helper_closure(cands, "go", _go_call)
+    mine = frozenset(n for n in helpers if n in own)
+    return (_go_call(helpers) if helpers else None), mine
+
+
+def go_call_pattern(names: set[str] | frozenset[str]) -> re.Pattern[str]:
+    """Matches a call to any of the Go functions `names`."""
+    return _go_call(set(names))
 
 
 def _go_call(names: set[str]) -> re.Pattern[str]:
     alt = "|".join(re.escape(n) for n in sorted(names))
     return re.compile(rf"(?<![\w.])(?:{alt})\s*\(")
+
+
+_JS_FUNC_DECL = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\("
+)
+_JS_FUNC_VAR = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s+)?"
+    r"(?:function\b|(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::[^=>]+)?=>)"
+)
+_JS_NOT_HELPERS = _words(
+    "expect assert it test describe require expectTypeOf assertType beforeEach afterEach"
+)
+
+
+def _js_call(names: set[str]) -> re.Pattern[str]:
+    alt = "|".join(re.escape(n) for n in sorted(names))
+    return re.compile(rf"(?<![\w$.])(?:{alt})\s*\(")
+
+
+def _js_helper_calls(src: _Src, spans: list[_Span]) -> re.Pattern[str] | None:
+    """Call pattern for the assertion helpers declared in this file outside any test (SPEC 5.4):
+    `function f(..) {..}`, `const f = (..) => {..}` or `= function`, at the top level or in a
+    `describe`, whose body asserts directly or through another helper."""
+    inside = {k for sp in spans for k in range(sp.start, sp.end + 1)}
+    cands: dict[str, str] = {}
+    for i, line in enumerate(src.code):
+        if i in inside:
+            continue
+        m = _JS_FUNC_DECL.match(line) or _JS_FUNC_VAR.match(line)
+        if m is None or m.group(1) in _JS_NOT_HELPERS:
+            continue
+        cands[m.group(1)] = "\n".join(src.masked[i : _js_body_end(src, i) + 1])
+    helpers = _helper_closure(cands, "js", _js_call)
+    return _js_call(helpers) if helpers else None
+
+
+def _js_body_end(src: _Src, i: int) -> int:
+    """Last line of the function declared on line `i`: after the parameter list (or `=>`), the
+    first `{` block, else the statement."""
+    line = src.shadow[src.starts[i] : src.starts[i] + len(src.code[i])]
+    pm = re.search(r"\bfunction\b[^(]*\(", line) or re.search(r"=\s*(?:async\s+)?\(", line)
+    if pm is not None:
+        close = src.close(src.starts[i] + pm.end() - 1)
+        if close > 0:
+            rest = src.shadow[close + 1 : close + 400]
+            bm = re.match(r"\s*(?::[^{=;]*)?(?:=>\s*)?\{", rest)
+            if bm is not None:
+                end = src.close(close + 1 + bm.end() - 1)
+                if end > 0:
+                    return src.line_of(end)
+    return _brace_end(src.masked, i)
 
 
 _JS_EXPECT_OPEN = re.compile(r"\bexpect\s*\(")
@@ -448,42 +1204,73 @@ def _read_by_expect(masked: list[str], k: int, end: int) -> bool:
     return any(read.search(masked[j]) for j in range(k + 1, end + 1))
 
 
-def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
-    """`lang` is js, go, rust or python-lines."""
+_GO_BUILD = re.compile(r"^\s*//go:build\s+(\S.*?)\s*$")
+_GO_PLUS_BUILD = re.compile(r"^\s*//\s*\+build\s+(\S.*?)\s*$")
+_GO_PACKAGE = re.compile(r"^\s*package\s")
+
+
+def _go_constraints(raw: list[str]) -> list[Marker]:
+    """Build constraints above the package clause. A `_test.go` file with one is not compiled
+    by a plain `go test ./...`, so adding or changing one skips the file's tests. Every
+    `//go:build` and `// +build` line is a marker whose kind holds the syntax and expression;
+    the rule compares the two revisions' sets (`tests_integrity._build_findings`)."""
+    out: list[Marker] = []
+    for i, line in enumerate(raw):
+        if _GO_PACKAGE.match(line):
+            break
+        gm = _GO_BUILD.match(line)
+        if gm:
+            expr = " ".join(gm.group(1).split())
+            out.append(
+                Marker("", f"go:build {expr}", f"//go:build {expr}", i + 1, "tests.skipped", True)
+            )
+        pm = _GO_PLUS_BUILD.match(line)
+        if pm:
+            expr = " ".join(pm.group(1).split())
+            out.append(
+                Marker("", f"+build {expr}", f"// +build {expr}", i + 1, "tests.skipped", True)
+            )
+    return out
+
+
+def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ()) -> FileAnalysis:
+    """`lang` is js, go, rust or python-lines. `siblings` (Go): the text of the other `_test.go`
+    files of this directory at the same revision, whose assertion helpers this file may call."""
     raw = split_lines(text)
     masked, code = mask_source(text, lang)
     while len(masked) < len(raw):
         masked.append("")
         code.append("")
-    spans = _find_spans(lang, raw, masked, code)
-    helper_call = _go_helper_calls(masked, code) if lang == "go" else None
+    src = _Src.build(lang, masked, code) if lang != "python-lines" else None
+    spans = _find_spans(lang, raw, masked, code, src)
+    helper_call: re.Pattern[str] | None = None
     analysis = FileAnalysis(path, lang)
+    if lang == "go":
+        helper_call, analysis.helpers = _go_helper_calls(masked, code, siblings)
+    elif lang == "js" and src is not None:
+        helper_call = _js_helper_calls(src, spans)
     owner: dict[int, _Span] = {}
     for span in spans:
         for ln in range(span.start, span.end + 1):
             owner.setdefault(ln, span)
     for span in spans:
-        body_masked = "\n".join(masked[span.start : span.end + 1])
-        const_hits = (
-            [len(_JS_CONST_EXPECT.findall(code[k])) for k in range(span.start, span.end + 1)]
-            if lang == "js"
-            else [0] * (span.end - span.start + 1)
+        dead = _dead_lines(src, span) if src is not None else {}
+        lines = range(span.start, span.end + 1)
+        const_hits = {
+            k: len(_JS_CONST_EXPECT.findall(code[k])) if lang == "js" else 0 for k in lines
+        }
+        selfeq = (
+            _self_equal_lines(
+                src, src.starts[span.start], src.starts[span.end] + len(code[span.end]), dead
+            )
+            if src is not None
+            else _SelfEq({}, [], set())
         )
         nested = (
             _inside_open_expect(masked, span.start, span.end)
             if lang == "js"
             else [False] * (span.end - span.start + 1)
         )
-        query_hits = [
-            int(
-                lang == "js"
-                and not nested[k - span.start]
-                and _ASSERTS[lang].search(masked[k]) is None
-                and _JS_QUERY.search(masked[k]) is not None
-                and not _read_by_expect(masked, k, span.end)
-            )
-            for k in range(span.start, span.end + 1)
-        ]
         unit = Unit(
             path=path,
             key=span.key,
@@ -491,20 +1278,50 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
             body_hash=digest(_hash_text(code, span)),
             engine=lang,
             end_line=span.end + 1,
-            asserts=len(_ASSERTS[lang].findall(body_masked))
-            + (len(helper_call.findall(body_masked)) if helper_call else 0)
-            + sum(query_hits)
-            - sum(const_hits),
-            vacuous=sum(const_hits),
-            vacuous_line=next((span.start + i + 1 for i, h in enumerate(const_hits) if h), 0),
+            param_cases=span.cases,
+            param_forms=list(span.forms),
         )
-        for k in range(span.start, span.end + 1):
-            hits = len(_ASSERTS[lang].findall(masked[k])) - const_hits[k - span.start]
-            hits += query_hits[k - span.start]
+        unit.table = span.table
+        if span.literals is not None:
+            unit.literals = span.literals
+        elif lang == "js":
+            unit.literals = tokens(_hash_text(code, span), "js")
+        if src is not None and lang == "go":
+            lo, hi = src.starts[span.start], src.starts[span.end] + len(code[span.end])
+            unit.table, unit.literals = go_unit(src, lo, hi)
+        elif src is not None and lang == "rust" and span.fn_line >= 0:
+            unit.table, unit.literals = rust_unit(src, span.start, span.fn_line)
+        unit.self_calls = selfeq.calls
+        unit.compared = selfeq.compared
+        live: list[str] = []
+        for k in lines:
+            query = int(
+                lang == "js"
+                and not nested[k - span.start]
+                and _ASSERTS[lang].search(masked[k]) is None
+                and _JS_QUERY.search(masked[k]) is not None
+                and not _read_by_expect(masked, k, span.end)
+            )
+            hits = len(_ASSERTS[lang].findall(masked[k])) + query
             if helper_call:
                 hits += len(helper_call.findall(masked[k]))
-            if hits > 0:
-                unit.assertion_forms.extend([digest("".join(code[k].split()))] * hits)
+            vac = const_hits[k] + selfeq.vacuous.get(k, 0)
+            if k in dead:
+                if hits:
+                    unit.unreachable += hits
+                    unit.unreachable_line = unit.unreachable_line or k + 1
+                continue
+            live.append(masked[k])
+            counted = max(hits - vac, 0)
+            unit.asserts += counted
+            if vac and hits:
+                unit.vacuous += min(vac, hits)
+                unit.vacuous_line = unit.vacuous_line or k + 1
+            if counted > 0:
+                unit.assertion_forms.extend([digest("".join(code[k].split()))] * counted)
+        if unit.table is not None and unit.table.implicit and unit.asserts == 0:
+            unit.asserts = 1  # a `test_case` row checks its `=>` value
+        body_masked = "\n".join(live)
         if lang == "js":
             unit.strong = len(_JS_STRONG.findall(body_masked))
             unit.weak = len(_JS_WEAK.findall(body_masked))
@@ -514,16 +1331,23 @@ def analyse_lines(path: str, text: str, lang: str) -> FileAnalysis:
         elif lang == "rust":
             unit.strong = len(_RUST_STRONG.findall(body_masked))
             unit.weak = len(_RUST_WEAK.findall(body_masked)) + sum(
-                1 for k in range(span.start, span.end + 1) if _RUST_COMPARED.search(masked[k])
+                1 for k in lines if k not in dead and _RUST_COMPARED.search(masked[k])
             )
         if lang in _KEYWORDS:
             unit.struct_hash = digest(_struct_text(_hash_text(code, span), lang))
         if lang in _EXPECTED:
-            for k in range(span.start, span.end + 1):
+            for k in lines:
+                if k in dead:
+                    continue
                 for em in _EXPECTED[lang].finditer(code[k]):
                     unit.expected.append((em.group(1), k + 1))
         analysis.units.append(unit)
     module_scope = f"{path}::<module>"
+    if lang == "go" and path.endswith("_test.go"):
+        for cm in _go_constraints(raw):
+            analysis.markers.append(
+                Marker(module_scope, cm.kind, cm.text, cm.line, cm.rule, cm.conditional)
+            )
     for k, line in enumerate(masked):
         for pat in _MARKERS[lang]:
             if pat.regex.search(line):

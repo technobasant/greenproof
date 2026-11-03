@@ -55,7 +55,16 @@ BASES = {
         ".greenproof.toml": 'version = 1\n\n[commands]\ntest = "cargo test"\ntimeout = 120\n\n[modes.local]\nchecks = ["static"]\n',
     },
     "py": _ns["BASES"]["py"],
+    "pymake": _ns["BASES"]["pymake"],
+    "jsci": {
+        **_go["BASES"]["js"],
+        ".github/workflows/ci.yml": "name: ci\non: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: npm ci\n      - name: tests\n        run: npx jest\n",
+    },
 }
+
+CIW = ".github/workflows/ci.yml"
+PYTEST_STEP = "        run: python -m pytest -q\n"
+ST = {"checks": "static"}
 
 BROKEN = ("src/shop.py", "return sum(items)", "return sum(items) + 1")
 BROKEN_REFUND = ("src/shop.py", "return amount - 1", "return amount - 2")
@@ -140,5 +149,155 @@ PROBES = [
         "rust",
         [("tests/calc.rs", "    assert_eq!(mul(2, 3), 6);\n", "    let _ = mul(2, 3);\n")],
         "block tests.weakened",
+    ),
+    # CI and runner rules: honest changes that must pass, tampering that must block
+    p(
+        "HONEST-make-rm-rf-or-true",
+        "py",
+        "pymake",
+        [
+            (
+                "Makefile",
+                "WRITE",
+                f"test:\n\trm -rf build || true\n\t{PY} -m pytest -q -p no:cacheprovider\n",
+            )
+        ],
+        "pass",
+        **ST,
+    ),
+    p(
+        "HONEST-ci-cov-in-run-block",
+        "py",
+        "py",
+        [
+            (
+                CIW,
+                PYTEST_STEP,
+                "        run: |\n          pip install pytest-cov\n          python -m pytest -q --cov=src\n",
+            )
+        ],
+        "pass",
+        **ST,
+    ),
+    p(
+        "HONEST-ci-set-e-window-cleanup",
+        "py",
+        "py",
+        [
+            (
+                CIW,
+                PYTEST_STEP,
+                "        run: |\n          set +e\n          rm -rf build dist\n          set -e\n          python -m pytest -q\n",
+            )
+        ],
+        "pass",
+        **ST,
+    ),
+    p(
+        "HONEST-ci-pip-install-or-true",
+        "py",
+        "py",
+        [
+            (
+                CIW,
+                "      - run: pip install pytest\n",
+                "      - run: pip install pytest\n      - run: pip install pytest-xdist || true\n",
+            )
+        ],
+        "pass",
+        **ST,
+    ),
+    p(
+        "HONEST-ci-paths-ignore-docs-meta",
+        "py",
+        "py",
+        [
+            (
+                CIW,
+                "on: [push, pull_request]",
+                "on:\n  push:\n    paths-ignore: ['mkdocs.yml', '.vscode/**']\n  pull_request:\n    paths-ignore: ['mkdocs.yml', '.vscode/**']",
+            )
+        ],
+        "pass",
+        **ST,
+    ),
+    p(
+        "HONEST-ci-split-into-reusable-workflow",
+        "py",
+        "py",
+        [
+            (
+                CIW,
+                "WRITE",
+                "name: ci\non: [push, pull_request]\njobs:\n  test:\n    uses: ./.github/workflows/tests.yml\n",
+            ),
+            (
+                ".github/workflows/tests.yml",
+                "WRITE",
+                "name: tests\non: workflow_call\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: pip install pytest\n      - name: tests\n        run: python -m pytest -q\n",
+            ),
+        ],
+        "pass",
+        **ST,
+    ),
+    p(
+        "HONEST-go-testmain-param-t",
+        "go",
+        "go",
+        [
+            (
+                "main_test.go",
+                "WRITE",
+                'package calc\n\nimport (\n\t"os"\n\t"testing"\n)\n\nfunc TestMain(t *testing.M) {\n\tos.Exit(t.Run())\n}\n',
+            )
+        ],
+        "pass",
+        **ST,
+    ),
+    p(
+        "ci-collect-only",
+        "py",
+        "py",
+        [(CIW, PYTEST_STEP, "        run: python -m pytest -q --collect-only\n")],
+        "block ci.tampered",
+        **ST,
+    ),
+    p(
+        "ci-pass-with-no-tests",
+        "js",
+        "jsci",
+        [(CIW, "run: npx jest", "run: npx jest --passWithNoTests")],
+        "block ci.tampered",
+        **ST,
+    ),
+    p(
+        "ci-exit0-before-pytest",
+        "py",
+        "py",
+        [(CIW, PYTEST_STEP, "        run: |\n          exit 0\n          python -m pytest -q\n")],
+        "block ci.tampered",
+        **ST,
+    ),
+    p(
+        "ci-folded-scalar-k-filter",
+        "py",
+        "py",
+        [
+            (
+                CIW,
+                PYTEST_STEP,
+                "        run: >-\n          python -m pytest -q\n          -k smoke\n",
+            )
+        ],
+        "block ci.tampered",
+        **ST,
+    ),
+    p(
+        "HONEST-ci-semicolon-exit0-under-errexit",
+        "py",
+        "py",
+        [(CIW, PYTEST_STEP, "        run: python -m pytest -q; exit 0\n")],
+        "pass",
+        **ST,
     ),
 ]

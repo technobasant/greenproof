@@ -362,7 +362,15 @@ PROBES = [
         "ci-semicolon-exit0",
         "ci",
         "py",
-        [(CIF, "run: python -m pytest -q", "run: python -m pytest -q; exit 0")],
+        # GitHub's default shell is `bash -e`, so `pytest; exit 0` already stops on a failing
+        # pytest; the swallow is real only when the step opts out of errexit.
+        [
+            (
+                CIF,
+                "run: python -m pytest -q",
+                "shell: bash {0}\n        run: python -m pytest -q; exit 0",
+            )
+        ],
         "block ci.tampered",
         **S,
     ),

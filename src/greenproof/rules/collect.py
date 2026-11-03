@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import configparser
 import re
-import tomllib
 from collections.abc import Iterable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any
 
 from greenproof.changeset import ChangeSet, matches_glob
+from greenproof.rules import runner_config as rc
 from greenproof.rules.tests_model import Unit
 
 DEFAULT_FILES = ("test_*.py", "*_test.py")
@@ -82,20 +82,8 @@ def _ini_section(text: str, names: tuple[str, ...]) -> dict[str, Any] | None:
 
 def collection_from_base(changes: ChangeSet) -> Collection:
     """The base revision's collection rules; pytest's own precedence between config files."""
-    text = changes.base_text("pytest.ini")
-    if text is not None and (opts := _ini_section(text, ("pytest",))) is not None:
-        return _from_options(opts)
-    text = changes.base_text("pyproject.toml")
-    if text is not None:
-        try:
-            data = tomllib.loads(text)
-        except tomllib.TOMLDecodeError:
-            data = {}
-        opts_toml = data.get("tool", {}).get("pytest", {}).get("ini_options")
-        if isinstance(opts_toml, dict):
-            return _from_options(opts_toml)
-    for name, section in (("tox.ini", ("pytest",)), ("setup.cfg", ("tool:pytest",))):
-        text = changes.base_text(name)
-        if text is not None and (opts := _ini_section(text, section)) is not None:
-            return _from_options(opts)
-    return Collection()
+    try:
+        _, opts = rc.pytest_options(rc.Tree(changes.base_text, ""))
+    except rc.Broken:
+        return Collection()
+    return _from_options(opts) if opts else Collection()

@@ -132,6 +132,95 @@ def test_base_is_head_on_the_default_branch(repo: Repo) -> None:
     assert base.sha == repo.head()
 
 
+def _clone_on_default(tmp_path: Path) -> tuple[Repo, str]:
+    """A clone of a repo whose default branch `main` tracks origin/main; (clone, pushed sha)."""
+    upstream = make_repo(tmp_path / "upstream")
+    pushed = upstream.head()
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(upstream.path), str(clone)], check=True)
+    work = Repo(clone)
+    work.git("config", "user.name", "Test")
+    work.git("config", "user.email", "t@example.com")
+    return work, pushed
+
+
+def test_base_on_the_default_branch_includes_unpushed_commits(tmp_path: Path) -> None:
+    work, pushed = _clone_on_default(tmp_path)
+    work.write("a.py", "a = 1\n")
+    work.commit("committed, not pushed")
+    base = gitops.resolve_base(work.path, None, {})
+    assert (base.ref, base.sha, base.note) == ("origin/main", pushed, "")
+
+
+def test_base_on_the_default_branch_is_head_when_everything_is_pushed(tmp_path: Path) -> None:
+    work, pushed = _clone_on_default(tmp_path)  # what CI sees on a push to main
+    base = gitops.resolve_base(work.path, None, {})
+    assert (base.ref, base.sha) == ("origin/main", pushed) and base.sha == work.head()
+
+
+def test_base_on_the_default_branch_ahead_and_behind_is_the_fork_point(tmp_path: Path) -> None:
+    work, pushed = _clone_on_default(tmp_path)
+    work.write("a.py", "a = 1\n")
+    work.commit("local")
+    other = Repo(tmp_path / "upstream")
+    other.write("b.py", "b = 1\n")
+    other.commit("remote advanced")
+    work.git("fetch", "-q", "origin")
+    assert gitops.resolve_base(work.path, None, {}).sha == pushed
+
+
+def test_base_on_the_default_branch_without_an_upstream_notes_the_limit(repo: Repo) -> None:
+    base = gitops.resolve_base(repo.path, None, {})
+    assert (base.ref, base.sha) == ("HEAD", repo.head())
+    assert "no upstream" in base.note and "--base REF" in base.note
+
+
+def test_base_on_a_shallow_clone_whose_upstream_has_no_shared_history_is_an_error(
+    tmp_path: Path,
+) -> None:
+    origin = make_repo(tmp_path / "origin", branch="main")
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(origin.path), str(bare)], check=True)
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth", "1", f"file://{bare}", str(shallow)], check=True
+    )
+    work = Repo(shallow)
+    work.git("config", "user.name", "Test")
+    work.git("config", "user.email", "t@example.com")
+    # The remote moves on by several commits; a depth-1 fetch brings only the new tip, which
+    # shares no commit with the local HEAD that the shallow history can see.
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", str(bare), str(other)], check=True)
+    pusher = Repo(other)
+    pusher.git("config", "user.name", "Test")
+    pusher.git("config", "user.email", "t@example.com")
+    for n in range(3):
+        pusher.write(f"f{n}.py", f"x = {n}\n")
+        pusher.commit(f"remote {n}")
+    pusher.git("push", "-q", "origin", "main")
+    work.git("fetch", "-q", "--depth", "1", "origin", "main")
+    work.write("a.py", "a = 1\n")
+    work.commit("local, on a stale shallow history")
+    with pytest.raises(UsageError, match="no merge base") as exc:
+        gitops.resolve_base(work.path, None, {})
+    assert "fetch-depth: 0" in str(exc.value)
+
+
+def test_base_on_the_default_branch_with_a_dangling_upstream_is_head(tmp_path: Path) -> None:
+    work, _ = _clone_on_default(tmp_path)
+    work.git("config", "branch.main.merge", "refs/heads/gone")
+    base = gitops.resolve_base(work.path, None, {})
+    assert base.ref == "HEAD" and "no upstream" in base.note
+
+
+def test_base_explicit_still_beats_the_upstream(tmp_path: Path) -> None:
+    work, _pushed = _clone_on_default(tmp_path)
+    work.write("a.py", "a = 1\n")
+    second = work.commit("committed, not pushed")
+    assert gitops.resolve_base(work.path, second, {}).sha == second
+
+
 def test_base_is_merge_base_on_a_feature_branch(repo: Repo) -> None:
     fork_point = repo.head()
     repo.git("checkout", "-q", "-b", "feature")

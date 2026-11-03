@@ -1,0 +1,1135 @@
+probe	lang	expect	result	ok	exit	rules
+py-rename-check_	py	block tests.removed	block	True	1	tests.removed(block)
+py-collection-modifyitems	py	block runner.tampered?	block	True	1	tests.skipped(block)
+py-addopts-deselect	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-pytest-ini-new	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-xfail-nonstrict	py	block tests.skipped	block	True	1	tests.skipped(block)
+py-unittest-skip	py	block tests.skipped	block	True	1	tests.skipped(block)
+py-importorskip	py	block tests.skipped	block	True	1	tests.skipped(block)
+py-skipif-true	py	block tests.skipped	block	True	1	tests.skipped(block)
+py-param-marks-skip	py	block tests.skipped/weakened	block	True	1	tests.skipped(block)
+py-except-assertionerror	py	block tests.weakened	block	True	1	tests.weakened(block)
+py-shadow-redefine	py	block?	pass	False	0	-
+py-del-test	py	block tests.removed?	pass	False	0	-
+py-tautology	py	block tests.weakened	pass	False	0	-
+py-assert-list	py	block tests.weakened (vacuous)	pass	False	0	-
+py-approx-introduced	py	block tests.weakened	pass	False	0	-
+py-conftest-autouse-mock	py	warn self_mocked?	pass	False	0	-
+py-conftest-pyfunc-call	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-conftest-os-exit	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-swallow-decorator	py	block?	block	True	2	-
+py-string-comment-out	py	block tests.removed	block	True	1	tests.removed(block)
+py-helper-other-file-noop	py	block tests.weakened	block	True	1	tests.weakened(block)
+py-makefile-neutered	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-committed-on-master	py	block tests.skipped	pass	False	0	-
+HONEST-py-helper-same-file	py	pass	pass	True	0	-
+HONEST-py-feature-deleted	py	block tests.removed (docs: correct, needs accept)	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-py-merge-into-param	py	pass	warn	True	0	tests.replaced(warn)
+HONEST-py-move-to-new-file	py	pass (docs: known false block)	pass	True	0	-
+HONEST-py-helper-other-file	py	pass	block	False	1	tests.weakened(block)
+py-swallow-decorator2	py	block tests.weakened?	pass	False	0	-
+go-testing-short-skip	go	block tests.skipped	block	True	1	tests.skipped(block)
+go-skipnow	go	block tests.skipped	block	True	1	tests.skipped(block)
+go-build-ignore-tag	go	block tests.deleted/removed	pass	False	0	-
+go-rename-lowercase	go	block tests.removed	block	True	1	tests.removed(block)
+go-errorf-to-logf	go	block tests.weakened	block	True	1	tests.weakened(block)
+go-early-return	go	block tests.weakened	pass	False	0	-
+go-if-false	go	block tests.weakened	pass	False	0	-
+HONEST-go-helper-other-file	go	pass (docs: known false block)	block	False	1	tests.weakened(block)
+js-xit	js	block tests.skipped	block	True	1	tests.skipped(block)
+js-test-todo	js	block tests.skipped	block	True	1	tests.skipped(block), tests.weakened(block)
+js-describe-skip	js	block tests.skipped	block	True	1	tests.skipped(block)
+js-early-return	js	block tests.weakened	pass	False	0	-
+js-line-comment-out	js	block tests.removed	block	True	1	tests.removed(block)
+js-greater-than	js	block tests.weakened	block	True	1	tests.weakened(block)
+js-self-equal	js	block tests.weakened	pass	False	0	-
+js-each-trim	js	block tests.weakened	pass	False	0	-
+js-script-t-filter	js	block runner.tampered	block	True	1	runner.tampered(block)
+js-script-exit0	js	block runner.tampered	pass	False	0	-
+js-jest-config-ignore	js	block runner.tampered	block	True	1	runner.tampered(block)
+HONEST-js-helper-same-file	js	pass	block	False	1	tests.weakened(block)
+ci-path-filter	ci	block ci.tampered	pass	False	0	-
+ci-workflow-dispatch-only	ci	block ci.tampered	pass	False	0	-
+ci-test-job-removed	ci	block ci.tampered	block	True	1	ci.tampered(block)
+ci-workflow-deleted	ci	block ci.tampered	block	True	1	ci.tampered(block)
+ci-job-if-false-expr	ci	block ci.tampered	block	True	1	ci.tampered(block)
+ci-job-continue-on-error	ci	block ci.tampered	block	True	1	ci.tampered(block)
+ci-or-echo	ci	block ci.tampered	pass	False	0	-
+ci-semicolon-exit0	ci	block ci.tampered	pass	False	0	-
+ci-set-plus-e	ci	block ci.tampered	warn	False	0	suppress.added(warn)
+ci-k-filter	ci	block ci.tampered	pass	False	0	-
+HONEST-ci-bump-checkout	ci	pass	pass	True	0	-
+py-helper-file-neutered	py	block tests.weakened?	pass	False	0	-
+py-conftest-fixture-expected-edited	py	warn expected_changed?	pass	False	0	-
+py-golden-file-rewritten	py	warn expected_changed?	pass	False	0	-
+py-test-script-neutered	py	block runner.tampered	pass	False	0	-
+py-policy-file-deleted	py	block policy.changed	block	True	1	policy.changed(block)
+go-testmain-exit0	go	block runner.tampered?	pass	False	0	-
+rust-ignore-attr	rust	block tests.skipped	block	True	1	tests.skipped(block)
+rust-assert-removed	rust	block tests.weakened	block	True	1	tests.weakened(block)
+HONEST-make-rm-rf-or-true	py	pass	block	False	1	runner.tampered(block), suppress.added(warn)
+HONEST-ci-cov-in-run-block	py	pass	pass	True	0	-
+HONEST-ci-set-e-window-cleanup	py	pass	warn	True	0	suppress.added(warn)
+HONEST-ci-pip-install-or-true	py	pass	block	False	1	ci.tampered(block), suppress.added(warn)
+HONEST-ci-paths-ignore-docs-meta	py	pass	pass	True	0	-
+HONEST-ci-split-into-reusable-workflow	py	pass	block	False	1	ci.tampered(block)
+HONEST-go-testmain-param-t	go	pass	pass	True	0	-
+ci-collect-only	py	block ci.tampered	pass	False	0	-
+ci-pass-with-no-tests	js	block ci.tampered	warn	False	0	suppress.added(warn)
+ci-exit0-before-pytest	py	block ci.tampered	pass	False	0	-
+ci-folded-scalar-k-filter	py	block ci.tampered	pass	False	0	-
+HONEST-ci-semicolon-exit0-under-errexit	py	pass	pass	True	0	-
+HONEST-ci-composite-action	py	pass	block	False	1	ci.tampered(block)
+HONEST-ci-local-script	py	pass	block	False	1	ci.tampered(block)
+HONEST-make-variable-interpreter-cleanup	py	pass	block	False	1	runner.tampered(block), suppress.added(warn)
+HONEST-ci-retry-with-last-failed	py	pass	pass	True	0	-
+HONEST-ci-quoted-false-continue-on-error	py	pass	block	False	1	ci.tampered(block)
+HONEST-ci-codecov-continue-on-error	py	pass	block	False	1	ci.tampered(block)
+HONEST-ci-greenproof-step-moved	py	pass	pass	True	0	-
+HONEST-ci-reusable-split-continue-on-error	py	pass	block	False	1	ci.tampered(block)
+ci-bash-noerrexit-newline-true	py	block ci.tampered	pass	False	0	-
+ci-windows-exit-zero	py	block ci.tampered	pass	False	0	-
+ci-greenproof-with-changed	py	block ci.tampered	pass	False	0	-
+ci-playwright-or-true	py	block ci.tampered	block	True	1	ci.tampered(block), ci.tampered(block), suppress.added(warn)
+ci-pytest-or-narrowed-rerun	py	block ci.tampered	pass	False	0	-
+HONEST-make-cleanup-line-dropped	py	pass	block	False	1	runner.tampered(block)
+HONEST-pretest-split-off-test	js	pass	block	False	1	runner.tampered(block)
+HONEST-mocha-timeout-flag	js	pass	block	False	1	runner.tampered(block)
+HONEST-pytest-randomly-switched-off	py	pass	block	False	1	runner.tampered(block)
+HONEST-nested-example-package-test-removed	js	warn	block	True	1	runner.tampered(block)
+HONEST-testmain-guard-then-exit-with-result	go	pass	pass	True	0	-
+js-check-dropped-with-pretest-split	js	block runner.tampered	block	True	1	runner.tampered(block)
+tox-k-filter-added	py	block runner.tampered	block	True	1	runner.tampered(block)
+js-alias-passwithnotests	js	block runner.tampered	warn	False	0	suppress.added(warn)
+js-opaque-script-swallowed	js	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+py-python-plugin-off	py	block runner.tampered	block	True	1	runner.tampered(block)
+c01-script-swallow	py	block ci.tampered	block	True	1	ci.tampered(block), suppress.added(warn)
+c02-bash-n	py	block ci.tampered	block	True	1	ci.tampered(block)
+c03-composite-iffalse	py	block ci.tampered	block	True	1	ci.tampered(block)
+c04-retry-narrow	py	block ci.tampered	pass	False	0	-
+c05-retry-swskip	py	block ci.tampered	pass	False	0	-
+c06-unknown-pyc	py	block ci.tampered	block	True	1	ci.tampered(block)
+c07-unknown-elsewhere	py	block ci.tampered	block	True	1	ci.tampered(block), ci.tampered(block)
+c07b-unknown-in-manual-wf	py	block ci.tampered	block	True	1	ci.tampered(block)
+c08-coe-other-job	py	block ci.tampered	block	True	1	ci.tampered(block)
+c09-docker-run-coe	py	block ci.tampered	block	True	1	ci.tampered(block)
+c10-compose-run-coe	py	block ci.tampered	block	True	1	ci.tampered(block)
+c11-gp-moved-to-manual	py	block ci.tampered	block	True	1	ci.tampered(block)
+c12-gp-with-blockscalar	py	block ci.tampered	pass	False	0	-
+c13-iffalse-crossfile	py	block ci.tampered	block	True	1	ci.tampered(block)
+c14-jobcoe-crossfile	py	block ci.tampered	block	True	1	ci.tampered(block)
+c20-bashc-exit0-first	py	block ci.tampered	pass	False	0	-
+c21-docker-entrypoint-true	py	block ci.tampered	pass	False	0	-
+c22-docker-detached	py	block ci.tampered	pass	False	0	-
+c23-env-var-cmd	py	block ci.tampered	block	True	1	ci.tampered(block)
+c24-pytest-main-no-exit	py	block ci.tampered	pass	False	0	-
+c25-gotestsum-tool	py	block ci.tampered	block	True	1	ci.tampered(block)
+c26-llvm-cov-report	py	block ci.tampered	block	True	1	ci.tampered(block)
+c27-hatch-test-k	py	block ci.tampered	block	True	1	ci.tampered(block)
+c28-true-or-pytest	py	block ci.tampered	pass	False	0	-
+c29-compose-run-d	py	block ci.tampered	pass	False	0	-
+c30-flow-steps-jobcoe	py	block ci.tampered	block	True	1	ci.tampered(block)
+c31-if-zero	py	block ci.tampered	pass	False	0	-
+c32-if-not-true	py	block ci.tampered	pass	False	0	-
+c36-script-exit0-first	py	block ci.tampered	block	True	1	ci.tampered(block)
+c37-composite-coe	py	block ci.tampered	block	True	1	ci.tampered(block)
+c38-bashc-semicolon-true	py	block ci.tampered	pass	False	0	-
+c39-docker-shc-swallow	py	block ci.tampered	block	True	1	ci.tampered(block), suppress.added(warn)
+c40-background	py	block ci.tampered	pass	False	0	-
+c41-noncheck-coe	py	block ci.tampered	block	True	1	ci.tampered(block)
+c42-playwright-grep	py	block ci.tampered	pass	False	0	-
+c44-gotestsum-run-filter	py	block ci.tampered	block	True	1	ci.tampered(block)
+c45-nextest-filter	py	block ci.tampered	pass	False	0	-
+c46-gotest-run-filter-ctl	py	block ci.tampered	pass	False	0	-
+r07-mk-node-jest-t	py	block	block	True	1	runner.tampered(block)
+r12-mk-trap-exit0	py	block	pass	False	0	-
+HONEST-ci3-retry-with-lf	py	pass	pass	True	0	-
+HONEST-ci3-check-into-script	py	pass	block	False	1	ci.tampered(block)
+HONEST-ci3-bash-c-wrapper	py	pass	pass	True	0	-
+HONEST-ci3-gp-moved-same-triggers	py	pass	block	False	1	ci.tampered(block)
+ci3-gp-moved-to-dispatch-only	py	block ci.tampered	block	True	1	ci.tampered(block)
+ci4-script-exit0-after	py	block ci.tampered	pass	False	0	-
+ci4-script-drop-ruff	py	block ci.tampered	pass	False	0	-
+ci4-script-drop-ruff-workflow-touched	py	block ci.tampered	pass	False	0	-
+ci4-script-or-true	py	block ci.tampered	warn	False	0	suppress.added(warn)
+ci4-action-drop-ruff	py	block ci.tampered	pass	False	0	-
+ci4-script-set-e-dropped	py	block ci.tampered	pass	False	0	-
+ci4-action-or-true	py	block ci.tampered	warn	False	0	suppress.added(warn)
+ci4-script-set-plus-e	py	block ci.tampered	warn	False	0	suppress.added(warn)
+ci4-shebang-e-dropped	py	block ci.tampered	pass	False	0	-
+ci4-action-pytest-continue-on-error	py	block ci.tampered	pass	False	0	-
+ci4-workflow-runs-script-without-ruff	py	block ci.tampered	pass	False	0	-
+ci4-script-deleted	py	block ci.tampered	pass	False	0	-
+HONEST-ci4-script-adds-check	py	pass	pass	True	0	-
+HONEST-ci4-script-reorders	py	pass	pass	True	0	-
+HONEST-ci4-script-gains-set-e	py	pass	pass	True	0	-
+HONEST-ci4-script-split-in-two	py	pass	pass	True	0	-
+HONEST-ci4-unreferenced-script-drops-pytest	py	pass	pass	True	0	-
+HONEST-ci4-python-script-changes	py	pass	pass	True	0	-
+HONEST-ci4-script-comment-only	py	pass	pass	True	0	-
+HONEST-ci4-action-adds-cache	py	pass	pass	True	0	-
+HONEST-ci4-bash-e-reorder	py	pass	pass	True	0	-
+js-ws-flag-reaches-nested-package	js	block runner.tampered	block	True	1	runner.tampered(block)
+js-cd-in-script-reaches-nested-package	js	block runner.tampered	block	True	1	runner.tampered(block)
+js-lerna-reaches-nested-package	js	block runner.tampered	block	True	1	runner.tampered(block)
+py-nox-starred-list-selects	py	block runner.tampered	pass	False	0	-
+py-nox-args-variable-selects	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-nox-split-string-selects	py	block runner.tampered	block	True	1	runner.tampered(block)
+js-pnpm-regex-cannot-hang-the-gate	js	block runner.tampered	pass	False	0	-
+py-make-var-recipe-adds-k	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-make-var-set-to-true	py	block runner.tampered	pass	False	0	-
+py-make-retry-flag-with-path	py	block runner.tampered	pass	False	0	-
+js-package-retry-flag-with-path	js	block runner.tampered	pass	False	0	-
+js-test-script-replaced-by-lint	js	block runner.tampered	pass	False	0	-
+py-make-target-shadowed-by-directory	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-plugin-autoload-disabled	py	warn runner.tampered	pass	False	0	-
+js-ng-test-replaced-by-ng-lint	js	block runner.tampered	pass	False	0	-
+js-ng-test-replaced-by-ng-version	js	block runner.tampered	pass	False	0	-
+py-make-test-recipe-replaced-by-mypy	py	block runner.tampered	pass	False	0	-
+py-make-var-chain-ends-in-echo	py	block runner.tampered	pass	False	0	-
+py-make-var-appended-selection	py	block runner.tampered	pass	False	0	-
+HONEST-ng-test-with-more-flags	js	pass	pass	True	0	-
+HONEST-make-target-phony-named-like-a-directory	py	pass	block	False	1	runner.tampered(block)
+HONEST-make-python-variable-refactor	py	pass	pass	True	0	-
+HONEST-make-appended-flag-keeps-selection	py	pass	pass	True	0	-
+HONEST-jest-swapped-for-vitest	js	pass	pass	True	0	-
+HONEST-test-script-moved-to-an-alias	js	pass	pass	True	0	-
+HONEST-nox-args-from-a-list-name	py	pass	pass	True	0	-
+js-ws-member-excluded-and-neutered	js	block runner.tampered	block	True	1	runner.tampered(block)
+js-ws-member-dropped-from-workspace	js	block runner.tampered	pass	False	0	-
+HONEST-ws-glob-added-for-a-new-package	js	pass	pass	True	0	-
+js-jest-given-a-path	js	block runner.tampered	pass	False	0	-
+py-make-pytest-given-a-test-file	py	warn runner.tampered	pass	False	0	-
+js-make-jest-given-a-name	js	block runner.tampered	pass	False	0	-
+js-ng-drop-lint	js	block runner.tampered	block	True	1	runner.tampered(block)
+js-ng-lint-swallowed	js	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+js-ng-test-to-lint	js	block runner.tampered	pass	False	0	-
+js-ng-test-to-version	js	block runner.tampered	pass	False	0	-
+py-make-rm-tests-added	py	block runner.tampered	pass	False	0	-
+py-make-rm-test-file-added	py	block runner.tampered	pass	False	0	-
+py-make-git-rm-tests	py	block runner.tampered	pass	False	0	-
+py-make-mv-tests-away	py	block runner.tampered	pass	False	0	-
+py-make-find-delete-tests	py	block runner.tampered	pass	False	0	-
+py-make-rm-test-glob	py	block runner.tampered	pass	False	0	-
+py-make-rm-tests-glob-dir	py	block runner.tampered	pass	False	0	-
+py-make-rimraf-tests	py	block runner.tampered	pass	False	0	-
+js-script-rimraf-the-tests	js	block runner.tampered	pass	False	0	-
+HONEST-pytest-given-a-plain-directory	py	pass	pass	True	0	-
+HONEST-jest-with-coverage	js	pass	pass	True	0	-
+HONEST-make-pytest-widened-to-the-directory	py	pass	pass	True	0	-
+HONEST-ng-test-with-more-flags	js	pass	pass	True	0	-
+HONEST-ng-lint-and-test-reordered	js	pass	pass	True	0	-
+HONEST-make-rm-pytest-cache	py	pass	pass	True	0	-
+HONEST-make-rm-pycache-under-tests	py	pass	pass	True	0	-
+HONEST-make-rm-build-dist	py	pass	pass	True	0	-
+HONEST-make-find-delete-pyc	py	pass	pass	True	0	-
+HONEST-script-rimraf-coverage	js	pass	pass	True	0	-
+HONEST-make-rm-already-in-the-base	py	pass	pass	True	0	-
+HONEST-make-rm-of-an-untracked-path-named-like-tests	py	pass	pass	True	0	-
+ci5-make-drop-ruff	py	block ci.tampered	pass	False	0	-
+ci5-make-dash-prefix	py	block ci.tampered	pass	False	0	-
+ci5-make-same-line-swallow	py	block ci.tampered	pass	False	0	-
+ci5-make-dash-i-step	py	block ci.tampered	pass	False	0	-
+ci5-make-ignore-target	py	block ci.tampered	pass	False	0	-
+ci5-make-makeflags-i	py	block ci.tampered	pass	False	0	-
+ci5-make-lint-or-true	py	block ci.tampered	warn	False	0	suppress.added(warn)
+ci5-npm-run-drop-jest	py	block ci.tampered	pass	False	0	-
+ci5-npm-test-or-true	py	block ci.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+ci5-pnpm-run-same-line	py	block ci.tampered	pass	False	0	-
+ci5-nested-drop-ruff	py	block ci.tampered	pass	False	0	-
+ci5-nested-or-true	py	block ci.tampered	warn	False	0	suppress.added(warn)
+ci5-bash-c-drop-ruff	py	block ci.tampered	pass	False	0	-
+ci5-bash-o-errexit-dropped	py	block ci.tampered	pass	False	0	-
+ci5-source-or-true	py	block ci.tampered	warn	False	0	suppress.added(warn)
+ci5-workdir-script-drop-ruff	py	block ci.tampered	pass	False	0	-
+ci5-step-removes-tests	py	block ci.tampered	pass	False	0	-
+ci5-recipe-removes-tests	py	block ci.tampered	pass	False	0	-
+ci5-autoload-env	py	warn ci.tampered	pass	False	0	-
+ci5-autoload-inline	py	warn ci.tampered	pass	False	0	-
+ci5-cap-depth-warns	py	warn ci.tampered	pass	False	0	-
+HONEST-ci5-make-lint-gains-target	py	pass	pass	True	0	-
+HONEST-ci5-make-clean-prerequisite	py	pass	pass	True	0	-
+HONEST-ci5-make-recipe-moves-to-prerequisite	py	pass	pass	True	0	-
+HONEST-ci5-make-k	py	pass	pass	True	0	-
+HONEST-ci5-npm-script-reformat	py	pass	pass	True	0	-
+HONEST-ci5-npm-script-moves-to-another	py	pass	pass	True	0	-
+HONEST-ci5-nested-script-adds-check	py	pass	pass	True	0	-
+HONEST-ci5-ruff-moves-into-nested-script	py	pass	pass	True	0	-
+HONEST-ci5-step-removes-build-dir	py	pass	pass	True	0	-
+make-cd-then-rm-a-test	py	block runner.tampered	pass	False	0	-
+make-cd-then-rm-a-directory	py	block runner.tampered	pass	False	0	-
+make-cd-two-levels	py	block runner.tampered	pass	False	0	-
+make-subshell-cd-rm	py	block runner.tampered	pass	False	0	-
+make-sh-c-cd-rm	py	block runner.tampered	pass	False	0	-
+make-cd-unknown-rm-a-test	py	block runner.tampered	pass	False	0	-
+make-cd-dash-rm-a-directory	py	block runner.tampered	pass	False	0	-
+make-cd-home-rm-tests	py	block runner.tampered	pass	False	0	-
+script-cd-line-then-rm-line	py	block runner.tampered	pass	False	0	-
+script-cd-in-two-steps	py	block runner.tampered	pass	False	0	-
+script-pushd-then-rm	py	block runner.tampered	pass	False	0	-
+script-cd-unknown-then-rm	py	block runner.tampered	pass	False	0	-
+HONEST-make-cd-pycache-then-rm-pyc	py	pass	pass	True	0	-
+HONEST-make-cd-line-ends-with-the-line	py	pass	pass	True	0	-
+HONEST-make-cd-unknown-rm-build	py	pass	pass	True	0	-
+HONEST-make-cd-dash-rm-dist	py	pass	pass	True	0	-
+HONEST-script-subshell-cd-ends-with-the-group	py	pass	pass	True	0	-
+HONEST-script-cd-and-back-then-rm-build	py	pass	pass	True	0	-
+HONEST-script-pushd-popd-then-rm-build	py	pass	pass	True	0	-
+py-c-rmtree-a-test-directory	py	block runner.tampered	pass	False	0	-
+py-c-os-remove-a-test-file	py	block runner.tampered	pass	False	0	-
+py-c-path-unlink-after-cd	py	block runner.tampered	pass	False	0	-
+node-e-rmsync-a-test-directory	py	block runner.tampered	pass	False	0	-
+ruby-e-fileutils-rm-a-test	py	block runner.tampered	pass	False	0	-
+perl-e-unlink-a-test-glob	py	block runner.tampered	pass	False	0	-
+script-py-c-rmtree	py	block runner.tampered	pass	False	0	-
+HONEST-py-c-rmtree-build	py	pass	pass	True	0	-
+HONEST-py-c-print-a-test-path	py	pass	pass	True	0	-
+HONEST-py-c-walk-and-remove-pyc	py	pass	pass	True	0	-
+HONEST-node-e-rmsync-dist	py	pass	pass	True	0	-
+make-var-before-pytest	py	warn runner.tampered	pass	False	0	-
+make-env-var-pytest	py	warn runner.tampered	pass	False	0	-
+make-recipe-export-var	py	warn runner.tampered	pass	False	0	-
+makefile-export-var	py	warn runner.tampered	pass	False	0	-
+makefile-var-with-export-line	py	warn runner.tampered	pass	False	0	-
+script-export-var	py	warn runner.tampered	pass	False	0	-
+script-var-before-pytest	py	warn runner.tampered	pass	False	0	-
+HONEST-make-var-empty	py	pass	pass	True	0	-
+HONEST-make-env-unsets-var	py	pass	pass	True	0	-
+HONEST-makefile-var-not-exported	py	pass	pass	True	0	-
+HONEST-makefile-var-already-exported-at-the-base	py	pass	pass	True	0	-
+find-exec-rm-a-test-file	py	block runner.tampered	pass	False	0	-
+find-exec-rm-rf-a-test-directory	py	block runner.tampered	pass	False	0	-
+find-maxdepth-reaches-the-test	py	block runner.tampered	pass	False	0	-
+find-mindepth-reaches-the-test	py	block runner.tampered	pass	False	0	-
+find-newer-is-not-evaluated	py	block runner.tampered	pass	False	0	-
+find-xargs-rm-rf-a-directory	py	block runner.tampered	pass	False	0	-
+HONEST-find-exec-rm-no-r-on-directories	py	pass	pass	True	0	-
+HONEST-find-xargs-rm-no-r-on-directories	py	pass	pass	True	0	-
+HONEST-find-maxdepth-stops-above-the-test	py	pass	pass	True	0	-
+HONEST-find-mindepth-starts-below-the-test	py	pass	pass	True	0	-
+HONEST-find-pyc-with-maxdepth	py	pass	pass	True	0	-
+js-nyc-or-true	js	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+js-c8-or-true	js	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+js-cross-env-selection	js	block runner.tampered	block	True	1	runner.tampered(block)
+js-cross-env-echo	js	block runner.tampered	pass	False	0	-
+js-cross-env-shell-or-true	js	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+js-cross-env-shell-selection	js	block runner.tampered	pass	False	0	-
+js-env-cmd-selection	js	block runner.tampered	block	True	1	runner.tampered(block)
+js-dotenv-selection	js	block runner.tampered	block	True	1	runner.tampered(block)
+js-dotenv-echo-after-dashes	js	block runner.tampered	pass	False	0	-
+js-echo-dashes-is-no-check	js	block runner.tampered	block	True	1	runner.tampered(block)
+js-nyc-report-is-no-check	js	block runner.tampered	pass	False	0	-
+py-dotenv-run-selection	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-dotenv-run-echo	py	block runner.tampered	pass	False	0	-
+py-doppler-selection	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-op-run-deselect	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-dotenvx-selection	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-infisical-selection	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-doppler-command-or-true	py	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+py-echo-dashes-is-no-check	py	block runner.tampered	block	True	1	runner.tampered(block)
+py-inline-addopts-k	py	block runner.tampered	pass	False	0	-
+py-env-addopts-k	py	block runner.tampered	pass	False	0	-
+py-cross-env-addopts-k	py	block runner.tampered	pass	False	0	-
+py-dotenv-v-addopts-k	py	block runner.tampered	pass	False	0	-
+py-addopts-deselect	py	block runner.tampered	pass	False	0	-
+py-sh-c-addopts-k	py	block runner.tampered	pass	False	0	-
+make-export-addopts	py	block runner.tampered	pass	False	0	-
+make-assign-then-export-addopts	py	block runner.tampered	pass	False	0	-
+make-export-all-addopts	py	block runner.tampered	pass	False	0	-
+script-export-addopts	py	block runner.tampered	pass	False	0	-
+script-assign-export-addopts	py	block runner.tampered	pass	False	0	-
+script-export-addopts-chain	py	block runner.tampered	pass	False	0	-
+go-inline-goflags-run	go	block runner.tampered	pass	False	0	-
+go-env-goflags-run	go	block runner.tampered	pass	False	0	-
+make-export-goflags	go	block runner.tampered	pass	False	0	-
+envfile-default-addopts	py	block runner.tampered	pass	False	0	-
+envfile-named-addopts	py	block runner.tampered	pass	False	0	-
+envfile-export-line-addopts	py	block runner.tampered	pass	False	0	-
+ci-inline-addopts	py	block ci.tampered	pass	False	0	-
+ci-wrapper-addopts	py	block ci.tampered	pass	False	0	-
+py-inline-addopts-command-substitution	py	warn runner.tampered	pass	False	0	-
+py-inline-goflags-variable	py	warn runner.tampered	pass	False	0	-
+make-export-addopts-variable	py	warn runner.tampered	pass	False	0	-
+script-export-addopts-command-substitution	py	warn runner.tampered	pass	False	0	-
+envfile-addopts-variable	py	warn runner.tampered	pass	False	0	-
+HONEST-js-nyc-jest	js	pass	pass	True	0	-
+HONEST-js-nyc-reporter-jest	js	pass	pass	True	0	-
+HONEST-js-nyc-flags-jest	js	pass	pass	True	0	-
+HONEST-js-c8-jest	js	pass	pass	True	0	-
+HONEST-js-c8-reporter-jest	js	pass	pass	True	0	-
+HONEST-js-cross-env-jest	js	pass	pass	True	0	-
+HONEST-js-cross-env-two-vars-jest	js	pass	pass	True	0	-
+HONEST-js-cross-env-shell-jest	js	pass	pass	True	0	-
+HONEST-js-cross-env-shell-string-jest	js	pass	pass	True	0	-
+HONEST-js-env-cmd-jest	js	pass	pass	True	0	-
+HONEST-js-env-cmd-dashes-jest	js	pass	pass	True	0	-
+HONEST-js-dotenv-jest	js	pass	pass	True	0	-
+HONEST-js-dotenv-two-files-jest	js	pass	pass	True	0	-
+HONEST-js-npx-nyc-jest	js	pass	pass	True	0	-
+HONEST-js-cross-env-nyc-jest	js	pass	pass	True	0	-
+HONEST-py-dotenv-run-pytest	py	pass	pass	True	0	-
+HONEST-py-dotenv-run-dashes-pytest	py	pass	pass	True	0	-
+HONEST-py-dotenv-file-run-pytest	py	pass	pass	True	0	-
+HONEST-py-dotenvx-run-pytest	py	pass	pass	True	0	-
+HONEST-py-doppler-run-pytest	py	pass	pass	True	0	-
+HONEST-py-doppler-options-run-pytest	py	pass	pass	True	0	-
+HONEST-py-op-run-pytest	py	pass	pass	True	0	-
+HONEST-py-op-run-env-file-pytest	py	pass	pass	True	0	-
+HONEST-py-infisical-run-pytest	py	pass	pass	True	0	-
+HONEST-py-infisical-command-pytest	py	pass	pass	True	0	-
+HONEST-py-addopts-quiet	py	pass	pass	True	0	-
+HONEST-py-addopts-verbose-cov	py	pass	pass	True	0	-
+HONEST-py-env-addopts-quiet	py	pass	pass	True	0	-
+HONEST-py-cross-env-addopts-quiet	py	pass	pass	True	0	-
+HONEST-go-goflags-mod	go	pass	pass	True	0	-
+HONEST-go-goflags-race-count	go	pass	pass	True	0	-
+HONEST-make-export-addopts-quiet	py	pass	pass	True	0	-
+HONEST-make-export-goflags-mod	go	pass	pass	True	0	-
+HONEST-script-export-addopts-quiet	py	pass	pass	True	0	-
+HONEST-script-export-other-variable	py	pass	pass	True	0	-
+HONEST-script-addopts-set-then-unset	py	pass	pass	True	0	-
+HONEST-envfile-unrelated-variable	py	pass	pass	True	0	-
+HONEST-envfile-addopts-quiet	py	pass	pass	True	0	-
+HONEST-envfile-addopts-in-a-file-nothing-loads	py	pass	pass	True	0	-
+HONEST-ci-nyc	py	pass	pass	True	0	-
+HONEST-ci-dotenv-run	py	pass	pass	True	0	-
+HONEST-ci-doppler-run	py	pass	pass	True	0	-
+HONEST-ci-op-run	py	pass	pass	True	0	-
+HONEST-ci-addopts-quiet	py	pass	pass	True	0	-
+rt7-truncate	py	block ci.tampered	pass	False	0	-
+rt7-redirect	py	block ci.tampered	pass	False	0	-
+rt7-colon-redirect	py	block ci.tampered	pass	False	0	-
+rt7-echo-redirect	py	block ci.tampered	pass	False	0	-
+rt7-cp-devnull	py	block ci.tampered	pass	False	0	-
+rt7-ln-devnull	py	block ci.tampered	pass	False	0	-
+rt7-sed-inplace	py	block ci.tampered	pass	False	0	-
+rt7-perl-inplace	py	block ci.tampered	pass	False	0	-
+rt7-find-exec-truncate	py	block ci.tampered	pass	False	0	-
+rt7-xargs-sed	py	block ci.tampered	pass	False	0	-
+rt7-python-write	py	block ci.tampered	pass	False	0	-
+rt7-python-shutil	py	block ci.tampered	pass	False	0	-
+rt7-rsync-delete	py	block ci.tampered	pass	False	0	-
+rt7-git-checkout-rev	py	block ci.tampered	pass	False	0	-
+rt7-git-restore-source	py	block ci.tampered	pass	False	0	-
+rt7-git-stash-path	py	block ci.tampered	pass	False	0	-
+rt7-chmod-000	py	block ci.tampered	pass	False	0	-
+rt7-cd-then-redirect	py	block ci.tampered	pass	False	0	-
+rt7-append-warn	py	warn ci.tampered	pass	False	0	-
+rt7-creates-conftest-skip	py	warn ci.tampered	pass	False	0	-
+HONEST-rt7-tee-test-log	py	pass	pass	True	0	-
+HONEST-rt7-redirect-output-dir	py	pass	pass	True	0	-
+HONEST-rt7-json-fixture	py	pass	pass	True	0	-
+HONEST-rt7-copy-fixture	py	pass	pass	True	0	-
+HONEST-rt7-git-checkout-src	py	pass	pass	True	0	-
+HONEST-rt7-git-checkout-head-tests	py	pass	pass	True	0	-
+HONEST-rt7-sed-inplace-src	py	pass	pass	True	0	-
+HONEST-rt7-sed-print-test	py	pass	pass	True	0	-
+HONEST-rt7-chmod-script	py	pass	pass	True	0	-
+HONEST-rt7-subshell-scope	py	pass	pass	True	0	-
+ci-env-workflow-pytest_addopts	py	block ci.tampered	pass	False	0	-
+ci-env-job-pytest_addopts	py	block ci.tampered	pass	False	0	-
+ci-env-step-pytest_addopts	py	block ci.tampered	pass	False	0	-
+ci-env-step-deselect	py	block ci.tampered	pass	False	0	-
+ci-env-job-collect-only	py	block ci.tampered	pass	False	0	-
+HONEST-ci-env-workflow-expression	py	warn ci.tampered	pass	False	0	-
+HONEST-ci-env-workflow-quiet	py	pass	pass	True	0	-
+HONEST-ci-env-job-fail-fast	py	pass	pass	True	0	-
+HONEST-ci-env-step-ci-true	py	pass	pass	True	0	-
+rt7-ci-branches-push-and-pr-filtered	py	warn ci.tampered	pass	False	0	-
+HONEST-rt7-ci-branches-push-only-pr-open	py	pass	pass	True	0	-
+sh7-sourced-func-swallow	py	block ci.tampered	warn	False	0	suppress.added(warn)
+sh7-sourced-func-dropped	py	block ci.tampered	pass	False	0	-
+sh7-set-plus-e-in-func	py	block ci.tampered	warn	False	0	suppress.added(warn)
+HONEST-sh7-func-run-helper	py	pass	block	False	1	ci.tampered(block)
+HONEST-sh7-func-main	py	pass	block	False	1	ci.tampered(block)
+sh7-case-drop-pytest	py	block ci.tampered	pass	False	0	-
+sh7-case-swallow-arm	py	block ci.tampered	warn	False	0	suppress.added(warn)
+HONEST-sh7-case-reworded	py	pass	pass	True	0	-
+sh7-rc-never-exited	py	block ci.tampered	block	True	1	ci.tampered(block)
+HONEST-sh7-rc-exited	py	pass	block	False	1	ci.tampered(block)
+sh7-pipe-tee-default-shell	py	block ci.tampered	block	True	1	ci.tampered(block)
+sh7-pipe-tee-shell-sh	py	block ci.tampered	pass	False	0	-
+HONEST-sh7-pipe-shell-bash	py	pass	pass	True	0	-
+HONEST-sh7-pipe-set-pipefail	py	pass	block	False	1	ci.tampered(block)
+HONEST-sh7-pipe-pipestatus	py	pass	block	False	1	ci.tampered(block)
+sh7-make-pipe-no-pipefail	py	block ci.tampered	pass	False	0	-
+HONEST-sh7-make-pipefail-shellflags	py	pass	pass	True	0	-
+sh7-makeflags-i	py	block ci.tampered	pass	False	0	-
+HONEST-sh7-makeflags-no-print-directory	py	pass	pass	True	0	-
+sh7-subshell-cd-then-rm-tests	py	block ci.tampered	pass	False	0	-
+HONEST-sh7-subshell-cd-rm-build	py	pass	pass	True	0	-
+sh7-dirname-script-swallow	py	block ci.tampered	warn	False	0	suppress.added(warn)
+HONEST-sh7-dirname-nested	py	pass	pass	True	0	-
+HONEST-tbl-go-inline-range	go	warn tests.replaced	block	True	1	tests.removed(block)
+HONEST-tbl-go-map	go	warn tests.replaced	block	True	1	tests.removed(block)
+HONEST-tbl-go-named-type	go	warn tests.replaced	block	True	1	tests.removed(block)
+HONEST-tbl-go-struct	go	warn tests.replaced	block	True	1	tests.removed(block)
+HONEST-tbl-go-struct-no-trun	go	warn tests.replaced	block	True	1	tests.removed(block)
+HONEST-tbl-js-arr	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl-js-arr-objects	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl-js-describe-each	js	warn tests.replaced	block	True	1	tests.removed(block)
+HONEST-tbl-js-tpl	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl-rs-rstest	rust	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl-rs-rstest-message	rust	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl-rs-rstest-named-cases	rust	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl-rs-test-case	rust	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl-rs-test-case-arrow	rust	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+tbl-go-appended	go	block tests.removed	block	True	1	tests.removed(block)
+tbl-go-drop-case	go	block tests.removed	block	True	1	tests.removed(block)
+tbl-go-empty	go	block tests.removed	block	True	1	tests.removed(block)
+tbl-go-loop-continues	go	block tests.removed	block	True	1	tests.removed(block)
+tbl-go-loop-ignores-row	go	block tests.removed	block	True	1	tests.removed(block)
+tbl-go-loop-over-other	go	block tests.removed	block	True	1	tests.removed(block)
+tbl-go-loop-skips	go	block tests.removed	block	True	1	tests.removed(block), tests.skipped(block)
+tbl-go-map-drop-case	go	block tests.removed	block	True	1	tests.removed(block)
+tbl-go-no-assert	go	block tests.removed	block	True	1	tests.removed(block), tests.weakened(block)
+tbl-go-no-loop	go	block tests.removed	block	True	1	tests.removed(block)
+tbl-go-not-iterated	go	block tests.removed	block	True	1	tests.removed(block)
+tbl-go-other-rows	go	block tests.removed	block	True	1	tests.removed(block)
+tbl-go-test-dropped	go	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-go-wrong-values	go	block tests.removed	block	True	1	tests.removed(block)
+tbl-js-arr-drop-case	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-arr-empty	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-arr-no-assert	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-arr-not-fed	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-arr-other-rows	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-arr-ref-callback	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-arr-skip	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-arr-spread	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-arr-test-dropped	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block), tests.removed(block)
+tbl-js-arr-wrong-expected	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-arr-xit	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-describe-each-not-fed	js	block tests.removed	block	True	1	tests.removed(block)
+tbl-js-describe-each-one-row	js	block tests.removed	block	True	1	tests.removed(block)
+tbl-js-tpl-drop-case	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-tpl-header-only	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-tpl-not-fed	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-js-tpl-wrong-values	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-rs-drop-case	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-rs-ignored	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block), tests.skipped(block)
+tbl-rs-matrix	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-rs-no-cases	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-rs-other-rows	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-rs-param-unused	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-rs-test-case-drop	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+tbl-rs-test-dropped	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block), tests.removed(block)
+tbl-rs-wrong-values	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-js-jest-given-both-dirs	js	pass	pass	True	0	-
+js-jest-misses-a-dir	js	block runner.tampered	pass	False	0	-
+js-jest-nonexistent-path	js	block runner.tampered	pass	False	0	-
+js-vitest-substring-misses	js	block runner.tampered	pass	False	0	-
+HONEST-py-pytest-both-dirs	py	pass	pass	True	0	-
+py-pytest-unit-only	py	block runner.tampered	pass	False	0	-
+py-pytest-node-id	py	block runner.tampered	block	True	1	policy.changed(block)
+HONEST-go-test-explicit-packages	go	pass	pass	True	0	-
+go-test-internal-only	go	block runner.tampered	pass	False	0	-
+HONEST-js-jest-to-node-test	js	pass	pass	True	0	-
+js-jest-to-node-test-one-dir	js	block runner.tampered	pass	False	0	-
+HONEST-js-jest-to-bun-test	js	pass	pass	True	0	-
+HONEST-js-jest-to-react-scripts	js	pass	pass	True	0	-
+HONEST-js-mocha-recursive-kept	js	pass	pass	True	0	-
+js-mocha-flag-dropped	js	warn	pass	False	0	-
+js-turbo-package-echo	js	block runner.tampered	pass	False	0	-
+HONEST-js-turbo-packages-run-jest	js	pass	pass	True	0	-
+js-concurrently-drops-jest	js	block runner.tampered	block	True	1	runner.tampered(block)
+HONEST-js-concurrently-keeps-jest	js	pass	block	False	1	runner.tampered(block)
+js-run-s-drops-jest	js	block runner.tampered	block	True	1	runner.tampered(block)
+js-lerna-echo	js	block runner.tampered	pass	False	0	-
+js-nx-unresolved-workspace	js	warn	block	True	1	runner.tampered(block)
+HONEST-ci-shard-matrix-complete	js	pass	block	False	1	ci.tampered(block)
+ci-shard-matrix-missing	js	block ci.tampered	block	True	1	ci.tampered(block)
+ci-shard-total-mismatch	js	block ci.tampered	block	True	1	ci.tampered(block)
+HONEST-ci-pytest-to-tox	py	pass	block	False	1	ci.tampered(block)
+ci-pytest-to-tox-echo	py	warn	block	True	1	ci.tampered(block)
+HONEST-ci-pytest-to-nox	py	pass	block	False	1	ci.tampered(block)
+cfg7-pytest-ini-shadows-pyproject	py	block runner.tampered	block	True	1	runner.tampered(block)
+cfg7-coveragerc-shadows-pyproject	py	block runner.tampered	pass	False	0	-
+cfg7-mypy-ini-shadows-pyproject	py	block runner.tampered	pass	False	0	-
+cfg7-ruff-toml-shadows-pyproject	py	block runner.tampered	pass	False	0	-
+HONEST-cfg7-coverage-to-coveragerc	py	pass	block	False	1	runner.tampered(block)
+HONEST-cfg7-ruff-to-ruff-toml	py	pass	pass	True	0	-
+HONEST-cfg7-pytest-ini-to-pyproject	py	pass	block	False	1	runner.tampered(block)
+HONEST-cfg7-coveragerc-tightened	py	pass	pass	True	0	-
+cfg7-ruff-select-narrowed-prefix	py	block runner.tampered	pass	False	0	-
+cfg7-ruff-ignore-added	py	block runner.tampered	block	True	1	runner.tampered(block)
+HONEST-cfg7-ruff-select-more	py	pass	pass	True	0	-
+HONEST-cfg7-ruff-lint-migration	py	pass	pass	True	0	-
+cfg7-mypy-exclude-src	py	block runner.tampered	pass	False	0	-
+cfg7-ruff-extend-exclude-src	py	block runner.tampered	pass	False	0	-
+cfg7-coverage-omit-source	py	block runner.tampered	pass	False	0	-
+HONEST-cfg7-mypy-exclude-build	py	pass	pass	True	0	-
+HONEST-cfg7-coverage-omit-migrations	py	pass	pass	True	0	-
+HONEST-cfg7-norecursedirs-build	py	pass	pass	True	0	-
+cfg7-coverage-exclude-lines-def	py	block runner.tampered	pass	False	0	-
+HONEST-cfg7-coverage-exclude-also	py	pass	pass	True	0	-
+cfg7-tox-posargs-default-k	py	block runner.tampered	pass	False	0	-
+cfg7-addopts-setup-plan	py	block runner.tampered	pass	False	0	-
+cfg7-coverage-fail-under-lowered	py	block runner.tampered	block	True	1	runner.tampered(block)
+HONEST-cfg7-addopts-strict-markers	py	pass	pass	True	0	-
+cfg7-jest-testmatch-narrow	js	block runner.tampered	pass	False	0	-
+cfg7-jest-ignore-the-test	js	block runner.tampered	block	True	1	runner.tampered(block)
+cfg7-vitest-exclude-test	js	block runner.tampered	block	True	1	runner.tampered(block)
+cfg7-mocharc-grep	js	block runner.tampered	pass	False	0	-
+cfg7-nycrc-check-coverage-off	js	block runner.tampered	pass	False	0	-
+HONEST-cfg7-jest-ignore-dist	js	pass	block	False	1	runner.tampered(block)
+HONEST-cfg7-vitest-coverage-exclude	js	pass	block	False	1	runner.tampered(block)
+HONEST-cfg7-nycrc-tightened	js	pass	pass	True	0	-
+mk7-doubling-24	py	warn runner.tampered	pass	False	0	-
+mk7-recursive-doubling-30	py	warn runner.tampered	pass	False	0	-
+mk7-chain-3000	py	warn runner.tampered	block	True	1	runner.tampered(block)
+mk7-for-several-items-swallowed	py	block runner.tampered	pass	False	0	-
+mk7-for-several-items-and-echo	py	block runner.tampered	pass	False	0	-
+HONEST-mk7-for-exit-1	py	pass	pass	True	0	-
+HONEST-mk7-for-exit-status	py	pass	pass	True	0	-
+HONEST-mk7-for-set-e	py	pass	pass	True	0	-
+HONEST-mk7-for-one-item	py	pass	pass	True	0	-
+HONEST-mk7-phony-variable-with-test-dir	go	pass	pass	True	0	-
+mk7-shell-bin-true	py	block runner.tampered	pass	False	0	-
+mk7-shell-reassigned	py	block runner.tampered	pass	False	0	-
+HONEST-mk7-shell-bash	py	pass	pass	True	0	-
+mk7-oneshell-added	py	block runner.tampered	pass	False	0	-
+HONEST-mk7-oneshell-errexit	py	pass	pass	True	0	-
+mk7-default-goal-moved	py	block runner.tampered	pass	False	0	-
+HONEST-mk7-default-goal-kept	py	pass	pass	True	0	-
+mk7-target-specific-selection	py	block runner.tampered	pass	False	0	-
+mk7-pattern-specific-selection	py	block runner.tampered	pass	False	0	-
+mk7-define-macro-swallow	py	block runner.tampered	warn	False	0	suppress.added(warn)
+mk7-ci-make-command-line-variable	py	block ci.tampered	pass	False	0	-
+mk7-ci-make-env-variable	py	block ci.tampered	pass	False	0	-
+HONEST-mk7-ci-make-plain	py	pass	pass	True	0	-
+sh8-libdir-swallow	py	block ci.tampered	warn	False	0	suppress.added(warn)
+sh8-libdir-added-swallow	py	block ci.tampered	warn	False	0	suppress.added(warn)
+HONEST-sh8-libdir-moved	py	pass	pass	True	0	-
+HONEST-sh8-libdir-bash-source	py	pass	pass	True	0	-
+sh8-rc-unused	py	block ci.tampered	pass	False	0	-
+sh8-rc-if-echo	py	block ci.tampered	pass	False	0	-
+sh8-rc-uncalled-func	py	block ci.tampered	pass	False	0	-
+HONEST-sh8-rc-exit-default	py	pass	pass	True	0	-
+HONEST-sh8-rc-exit-arith	py	pass	pass	True	0	-
+HONEST-sh8-rc-if-exit	py	pass	pass	True	0	-
+HONEST-sh8-rc-or-exit	py	pass	pass	True	0	-
+HONEST-sh8-rc-group-exit	py	pass	pass	True	0	-
+sh8-bash-c-pipe	py	block ci.tampered	block	True	1	ci.tampered(block)
+sh8-bash-c-plus-o	py	block ci.tampered	block	True	1	ci.tampered(block)
+HONEST-sh8-bash-o-pipefail	py	pass	block	False	1	ci.tampered(block)
+HONEST-sh8-bash-eo	py	pass	block	False	1	ci.tampered(block)
+HONEST-sh8-bash-euo	py	pass	block	False	1	ci.tampered(block)
+HONEST-sh8-bash-two-o	py	pass	block	False	1	ci.tampered(block)
+HONEST-sh8-set-pipefail-script	py	pass	pass	True	0	-
+sh8-and-list-run	py	block ci.tampered	block	True	1	ci.tampered(block)
+sh8-and-list-script	py	block ci.tampered	pass	False	0	-
+sh8-and-list-in-if	py	block ci.tampered	pass	False	0	-
+HONEST-sh8-and-cd-pytest	py	pass	pass	True	0	-
+HONEST-sh8-and-last-line	py	pass	block	False	1	ci.tampered(block)
+HONEST-sh8-if-pytest	py	pass	pass	True	0	-
+HONEST-sh8-and-or-exit	py	pass	pass	True	0	-
+sh8-wr-dirname-rm	py	block ci.tampered	pass	False	0	-
+sh8-wr-var-truncate	py	block ci.tampered	pass	False	0	-
+sh8-wr-strip-rm	py	block ci.tampered	pass	False	0	-
+HONEST-sh8-wr-log	py	pass	pass	True	0	-
+HONEST-sh8-rm-log	py	pass	pass	True	0	-
+sh8-group-cd-braces	py	block ci.tampered	pass	False	0	-
+sh8-group-cd-semi	py	block ci.tampered	pass	False	0	-
+sh8-plain-cd	py	block ci.tampered	pass	False	0	-
+HONEST-sh8-subshell-cd	py	pass	pass	True	0	-
+HONEST-sh8-group-cd-back	py	pass	pass	True	0	-
+sh8-job-if-push	py	block ci.tampered	pass	False	0	-
+sh8-job-if-schedule	py	block ci.tampered	pass	False	0	-
+sh8-job-if-not-pr-narrowed	py	block ci.tampered	pass	False	0	-
+sh8-job-if-ref-main	py	block ci.tampered	pass	False	0	-
+sh8-job-if-tags	py	block ci.tampered	pass	False	0	-
+sh8-step-if-push	py	block ci.tampered	pass	False	0	-
+HONEST-sh8-job-if-draft	py	pass	pass	True	0	-
+HONEST-sh8-job-if-pr	py	pass	pass	True	0	-
+HONEST-sh8-job-if-not-schedule	py	pass	pass	True	0	-
+HONEST-sh8-deploy-job-if-push	py	pass	pass	True	0	-
+sh8-job-if-parens-50	py	block ci.tampered	pass	False	0	-
+sh8-job-if-parens-3000	py	block ci.tampered	pass	False	0	-
+sh8-job-if-nested-40	py	warn ci.tampered	pass	False	0	-
+HONEST-sh8-job-if-nested-20	py	pass	pass	True	0	-
+HONEST-sh8-job-if-parens-both	py	pass	pass	True	0	-
+HONEST-sh8-branches-ignore	py	pass	pass	True	0	-
+sh8-branches-ignore-no-pr	py	block ci.tampered	pass	False	0	-
+sh8-branches-ignore-all	py	warn ci.tampered	pass	False	0	-
+sh8-branches-ignore-star	py	warn ci.tampered	pass	False	0	-
+sh8-branches-ignore-main	py	warn ci.tampered	pass	False	0	-
+sh8-branches-ignore-mainglob	py	warn ci.tampered	pass	False	0	-
+HONEST-sh8-branches-ignore-dependabot	py	pass	pass	True	0	-
+sh8-push-branches-release	py	warn ci.tampered	pass	False	0	-
+sh8-push-branches-nope	py	warn ci.tampered	pass	False	0	-
+HONEST-sh8-push-branches-main	py	pass	pass	True	0	-
+sh8-saved-exit0	py	block ci.tampered	pass	False	0	-
+sh8-saved-semi	py	block ci.tampered	pass	False	0	-
+sh8-saved-or-save	py	block ci.tampered	pass	False	0	-
+sh8-saved-echo-exit0	py	block ci.tampered	pass	False	0	-
+sh8-saved-bare-exit	py	block ci.tampered	pass	False	0	-
+sh8-saved-true-last	py	block ci.tampered	pass	False	0	-
+sh8-saved-status	py	block ci.tampered	pass	False	0	-
+sh8-saved-ret	py	block ci.tampered	pass	False	0	-
+sh8-saved-local	py	block ci.tampered	pass	False	0	-
+sh8-saved-reassigned	py	block ci.tampered	pass	False	0	-
+sh8-saved-other	py	block ci.tampered	pass	False	0	-
+sh8-saved-trap	py	block ci.tampered	pass	False	0	-
+sh8-saved-if-echo	py	block ci.tampered	pass	False	0	-
+sh8-saved-test-inverted	py	block ci.tampered	pass	False	0	-
+sh8-saved-test-then-echo	py	block ci.tampered	pass	False	0	-
+sh8-saved-return-then-echo	py	block ci.tampered	pass	False	0	-
+HONEST-sh8-saved-exit-rc	py	pass	pass	True	0	-
+HONEST-sh8-saved-semi-exit	py	pass	pass	True	0	-
+HONEST-sh8-saved-or-exit	py	pass	pass	True	0	-
+HONEST-sh8-saved-if-exit1	py	pass	pass	True	0	-
+HONEST-sh8-saved-cleanup	py	pass	pass	True	0	-
+HONEST-sh8-saved-test-last	py	pass	pass	True	0	-
+HONEST-sh8-saved-dparen-last	py	pass	pass	True	0	-
+HONEST-sh8-saved-return-last	py	pass	pass	True	0	-
+HONEST-mk8-pipefail-bash-tee	py	pass	pass	True	0	-
+HONEST-mk8-pipefail-bash-2line	py	pass	pass	True	0	-
+mk8-tee-default-shell	py	block runner.tampered	pass	False	0	-
+mk8-tee-pipefail-under-sh	py	block runner.tampered	pass	False	0	-
+mk8-tee-bash-no-pipefail	py	block runner.tampered	pass	False	0	-
+mk8-semi-echo	py	block runner.tampered	pass	False	0	-
+mk8-semi-cleanup	py	block runner.tampered	pass	False	0	-
+mk8-for-semi-echo	py	block runner.tampered	pass	False	0	-
+mk8-oneshell-semi	py	block runner.tampered	pass	False	0	-
+mk8-package-semi-echo	py	block runner.tampered	pass	False	0	-
+HONEST-mk8-semi-set-e	py	pass	pass	True	0	-
+HONEST-mk8-semi-exit-guard	py	pass	pass	True	0	-
+HONEST-mk8-semi-rc-kept	py	pass	pass	True	0	-
+HONEST-mk8-semi-shellflags-e	py	pass	pass	True	0	-
+HONEST-mk8-and-echo-last	py	pass	pass	True	0	-
+HONEST-mk8-package-and-echo	js	pass	pass	True	0	-
+HONEST-mk8-package-set-e	js	pass	pass	True	0	-
+HONEST-mk8-echo-semi-check	py	pass	block	False	1	runner.tampered(block)
+HONEST-mk8-at-echo-semi-check	py	pass	block	False	1	runner.tampered(block)
+HONEST-mk8-cd-and-check	py	pass	pass	True	0	-
+mk8-echo-semi-true	py	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+mk8-true-and-echo	py	block runner.tampered	pass	False	0	-
+HONEST-mk8-twin-log-last	py	pass	block	False	1	runner.tampered(block), suppress.added(warn)
+HONEST-mk8-twin-log-first	py	pass	block	False	1	runner.tampered(block), suppress.added(warn)
+HONEST-mk8-twin-tee-2to1	py	pass	pass	True	0	-
+mk8-twin-narrow-k	py	block runner.tampered	block	True	1	runner.tampered(block)
+mk8-twin-also-masked	py	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn), suppress.added(warn)
+mk8-twin-dash	py	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+mk8-twin-ignore-all	py	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+mk8-twin-ignore-flag	py	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+mk8-twin-oneshell	py	block runner.tampered	pass	False	0	-
+mk8-twin-other-tool	py	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+HONEST-mk8-oneshell-set-e	py	pass	pass	True	0	-
+HONEST-mk8-oneshell-set-eu	py	pass	pass	True	0	-
+HONEST-mk8-oneshell-set-o-errexit	py	pass	pass	True	0	-
+HONEST-mk8-oneshell-bash-pipefail-tee	py	pass	pass	True	0	-
+mk8-oneshell-set-e-after	py	block runner.tampered	pass	False	0	-
+mk8-oneshell-set-plus-e	py	block runner.tampered	warn	False	0	suppress.added(warn)
+mk8-oneshell-tee-under-sh	py	block runner.tampered	pass	False	0	-
+mk8-oneshell-no-e	py	block runner.tampered	pass	False	0	-
+mk8-exit0-then-check	py	block runner.tampered	pass	False	0	-
+mk8-true-and-exit-then-check	py	block runner.tampered	pass	False	0	-
+mk8-return-exit-then-check	py	block runner.tampered	pass	False	0	-
+mk8-exec-true-then-check	py	block runner.tampered	pass	False	0	-
+mk8-oneshell-exit-line-then-check	py	block runner.tampered	pass	False	0	-
+mk8-twin-dead-after-exit	py	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+mk8-package-true-exit-then-check	py	block runner.tampered	pass	False	0	-
+HONEST-mk8-exit0-own-line-then-check	py	pass	pass	True	0	-
+HONEST-mk8-exit1-then-check	py	pass	pass	True	0	-
+HONEST-mk8-guard-exit0-then-check	py	pass	block	False	1	runner.tampered(block)
+HONEST-mk8-exec-check	py	pass	pass	True	0	-
+mk8-call-touched	py	warn runner.tampered	pass	False	0	-
+mk8-eval-touched	py	warn runner.tampered	pass	False	0	-
+mk8-call-in-ci-make	py	warn ci.tampered	pass	False	0	-
+HONEST-mk8-call-in-untouched-target	py	pass	pass	True	0	-
+TAMPER-tbl6-js-failing-each	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl6-js-typeof	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl6-js-early-return-row	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl6-js-unconditional-return	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl6-js-describe-each-inner-skip	js	block tests.removed	block	True	1	tests.removed(block), tests.replaced(block), tests.skipped(warn)
+HONEST-tbl6-js-each	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl6-js-return-expect	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl6-js-describe-each-live	js	warn tests.replaced	block	True	1	tests.removed(block), tests.replaced(block)
+TAMPER-tbl6-go-skip-in-run	go	block tests.removed	block	True	1	tests.removed(block), tests.skipped(block)
+TAMPER-tbl6-go-skipnow-in-run	go	block tests.removed	block	True	1	tests.removed(block), tests.skipped(block)
+TAMPER-tbl6-go-skip-field	go	block tests.removed	block	True	1	tests.removed(block), tests.skipped(block)
+HONEST-tbl6-go-struct	go	warn tests.replaced	block	True	1	tests.removed(block)
+HONEST-tbl6-go-want-err-return	go	warn tests.replaced	block	True	1	tests.removed(block)
+TAMPER-tbl6-rs-should-panic	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl6-rs-cfg-attr-ignore	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl6-rs-rstest	rust	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-sel-go-tags-dropped	go	block runner.tampered	pass	False	0	-
+TAMPER-sel-go-tags-narrowed	go	block runner.tampered	pass	False	0	-
+TAMPER-sel-go-tags-space-form	go	block runner.tampered	pass	False	0	-
+TAMPER-sel-go-tags-goflags	go	block runner.tampered	pass	False	0	-
+HONEST-sel-go-tags-added	go	pass	pass	True	0	-
+HONEST-sel-go-tags-widened	go	pass	pass	True	0	-
+HONEST-sel-go-tags-same-reformatted	go	pass	pass	True	0	-
+TAMPER-sel-cargo-lib-only	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-bins	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-bin-x	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-test-x	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-doc	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-example-x	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-package-narrow	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-package-from-all	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-package-dropped	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-targets-dropped	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-features-dropped	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-all-features-dropped	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-no-default-features	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-nextest-lib	rust	block runner.tampered	pass	False	0	-
+TAMPER-sel-cargo-split-runs	rust	block runner.tampered	pass	False	0	-
+HONEST-sel-cargo-all-targets	rust	pass	pass	True	0	-
+HONEST-sel-cargo-workspace	rust	pass	pass	True	0	-
+HONEST-sel-cargo-workspace-from-p	rust	pass	pass	True	0	-
+HONEST-sel-cargo-more-packages	rust	pass	pass	True	0	-
+HONEST-sel-cargo-bins-widens-bin	rust	pass	pass	True	0	-
+HONEST-sel-cargo-same-lib	rust	pass	pass	True	0	-
+HONEST-sel-cargo-features-added	rust	pass	pass	True	0	-
+HONEST-sel-cargo-release-jobs	rust	pass	pass	True	0	-
+HONEST-sel-cargo-test-x-same	rust	pass	pass	True	0	-
+TAMPER-sel-jest-testPathPatterns	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-jest-changedSince	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-jest-lastCommit	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-jest-onlyChanged	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-jest-o	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-jest-findRelatedTests	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-jest-selectProjects	js	block runner.tampered	pass	False	0	-
+HONEST-sel-jest-patterns-renamed	js	pass	pass	True	0	-
+HONEST-sel-jest-patterns-widened	js	pass	pass	True	0	-
+HONEST-sel-jest-ci-flags	js	pass	pass	True	0	-
+HONEST-sel-mocha-timeout-t	js	pass	block	False	1	runner.tampered(block)
+HONEST-sel-vitest-open-o	js	pass	pass	True	0	-
+TAMPER-sel-vitest-dir	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-vitest-changed	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-vitest-related	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-vitest-related-sub	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-vitest-project	js	block runner.tampered	pass	False	0	-
+HONEST-sel-vitest-coverage	js	pass	pass	True	0	-
+TAMPER-sel-turbo-affected	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-turbo-filter-ref	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-lerna-since	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-pnpm-filter-changed	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-yarn-foreach-since	js	block runner.tampered	pass	False	0	-
+HONEST-sel-nx-more-projects	js	pass	pass	True	0	-
+HONEST-sel-turbo-cache-flags	js	pass	pass	True	0	-
+HONEST-sel-pnpm-filter-name	js	pass	pass	True	0	-
+HONEST-sel-nx-affected-kept	js	pass	pass	True	0	-
+HONEST-sel-lerna-concurrency	js	pass	pass	True	0	-
+TAMPER-sel-tox-envlist-drop-lint	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-posargs-default-narrow	py	block runner.tampered	pass	False	0	-
+HONEST-sel-tox-envlist-reformat	py	pass	pass	True	0	-
+TAMPER-sel-tox-envlist-multiline-drop	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-envlist-brace-drop	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-setupcfg-drop	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-pyproject-env-list	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-pyproject-posargs	py	block runner.tampered	pass	False	0	-
+HONEST-sel-tox-pyproject-env-gain	py	pass	pass	True	0	-
+TAMPER-sel-tox-pyproject-legacy	py	block runner.tampered	pass	False	0	-
+HONEST-sel-tox-pyproject-legacy-gain	py	pass	pass	True	0	-
+TAMPER-sel-tox-toml-drop	py	block runner.tampered	pass	False	0	-
+HONEST-sel-tox-toml-reorder	py	pass	pass	True	0	-
+TAMPER-sel-tox-setupcfg-posargs	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-via-make	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-factor-posargs	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-posargs-flag	py	block runner.tampered	block	True	1	runner.tampered(block)
+HONEST-sel-tox-envlist-gain	py	pass	pass	True	0	-
+HONEST-sel-tox-envlist-reorder	py	pass	pass	True	0	-
+HONEST-sel-tox-python-bump	py	pass	pass	True	0	-
+HONEST-sel-tox-posargs-default-widen	py	pass	pass	True	0	-
+HONEST-sel-tox-explicit-env-drop-lint	py	pass	pass	True	0	-
+HONEST-sel-tox-deps-change	py	pass	pass	True	0	-
+HONEST-sel-tox-envlist-drop-docs	py	pass	pass	True	0	-
+HONEST-sel-tox-envlist-moved-check	py	pass	pass	True	0	-
+TAMPER-sel-nox-default-sessions	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-nox-options-added	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-nox-posargs-default	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-nox-lint-removed-from-defaults	py	block runner.tampered	pass	False	0	-
+HONEST-sel-nox-new-session-not-default	py	pass	pass	True	0	-
+HONEST-sel-nox-defaults-gain	py	pass	pass	True	0	-
+HONEST-sel-nox-explicit-session	py	pass	pass	True	0	-
+HONEST-sel-nox-session-renamed	py	pass	pass	True	0	-
+HONEST-sel-nox-python-matrix	py	pass	pass	True	0	-
+TAMPER-ci-sel-tox-envlist-drop-lint	py	block ci.tampered	pass	False	0	-
+TAMPER-ci-sel-tox-posargs-narrow	py	block ci.tampered	pass	False	0	-
+TAMPER-ci-sel-tox-setupcfg-drop	py	block ci.tampered	pass	False	0	-
+TAMPER-ci-sel-tox-pyproject-drop	py	block ci.tampered	pass	False	0	-
+TAMPER-ci-sel-nox-default-sessions	py	block ci.tampered	pass	False	0	-
+HONEST-ci-sel-tox-envlist-gain	py	pass	pass	True	0	-
+HONEST-ci-sel-tox-explicit-env-drop-lint	py	pass	pass	True	0	-
+HONEST-ci-sel-nox-new-session	py	pass	pass	True	0	-
+HONEST-ci-sel-tox-not-run-by-ci	py	pass	pass	True	0	-
+HONEST-ci-sel-tox-deps-change	py	pass	pass	True	0	-
+HONEST-ci-sel-tox-python-bump	py	pass	pass	True	0	-
+HONEST-ci-sel-tox-envlist-reorder	py	pass	pass	True	0	-
+HONEST-ci-sel-tox-posargs-widen	py	pass	pass	True	0	-
+HONEST-ci-sel-nox-session-added-default	py	pass	pass	True	0	-
+TAMPER-sel-tox-commands-dash	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-dash-nospace	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-dash-lint	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-dash-factor	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-dash-explicit-env	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-dash-via-ref	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-replaced	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-emptied	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-echo	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-ignore-errors	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-ignore-outcome-env	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-dash-setupcfg	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-dash-pyproject	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-ignore-errors-pyproject	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-replaced-toxtoml	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-tox-commands-dash-via-make	py	block runner.tampered	pass	False	0	-
+HONEST-sel-tox-commands-python-m	py	pass	block	False	1	runner.tampered(block)
+HONEST-sel-tox-commands-envpython	py	pass	block	False	1	runner.tampered(block)
+HONEST-sel-tox-commands-envpython-both	py	pass	block	False	1	runner.tampered(block)
+HONEST-sel-tox-commands-flag-added	py	pass	pass	True	0	-
+HONEST-sel-tox-commands-line-added	py	pass	pass	True	0	-
+HONEST-sel-tox-commands-dash-kept	py	pass	pass	True	0	-
+HONEST-sel-tox-commands-dash-removed	py	pass	pass	True	0	-
+HONEST-sel-tox-commands-dash-on-cleanup	py	pass	pass	True	0	-
+HONEST-sel-tox-ignore-errors-removed	py	pass	pass	True	0	-
+HONEST-sel-tox-ignore-errors-kept	py	pass	pass	True	0	-
+HONEST-sel-tox-ignore-errors-false	py	pass	pass	True	0	-
+HONEST-sel-tox-commands-reordered	py	pass	pass	True	0	-
+HONEST-sel-tox-commands-test-moved	py	pass	pass	True	0	-
+HONEST-sel-tox-commands-docs-env-dash	py	pass	pass	True	0	-
+HONEST-sel-tox-commands-dash-in-other-env	py	pass	pass	True	0	-
+HONEST-sel-tox-commands-explicit-env-reworded	py	pass	pass	True	0	-
+HONEST-sel-tox-commands-unrelated-section	py	pass	pass	True	0	-
+TAMPER-ci-sel-tox-commands-dash	py	block ci.tampered	pass	False	0	-
+TAMPER-ci-sel-tox-commands-replaced	py	block ci.tampered	pass	False	0	-
+TAMPER-ci-sel-tox-ignore-errors	py	block ci.tampered	pass	False	0	-
+HONEST-ci-sel-tox-commands-python-m	py	pass	block	False	1	runner.tampered(block)
+TAMPER-sel-nox-run-dropped	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-nox-run-replaced	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-nox-success-codes	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-nox-success-codes-range	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-nox-try-except-pass	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-nox-lint-run-dropped	py	block runner.tampered	pass	False	0	-
+TAMPER-sel-nox-explicit-session-run-dropped	py	block runner.tampered	pass	False	0	-
+HONEST-sel-nox-run-env-kw	py	pass	pass	True	0	-
+HONEST-sel-nox-run-python-m	py	pass	block	False	1	runner.tampered(block)
+HONEST-sel-nox-success-codes-default	py	pass	pass	True	0	-
+HONEST-sel-nox-success-codes-kept	py	pass	pass	True	0	-
+HONEST-sel-nox-success-codes-removed	py	pass	pass	True	0	-
+HONEST-sel-nox-try-reraise	py	pass	pass	True	0	-
+HONEST-sel-nox-try-finally	py	pass	pass	True	0	-
+HONEST-sel-nox-docs-session-success-codes	py	pass	pass	True	0	-
+TAMPER-ci-sel-nox-success-codes	py	block ci.tampered	pass	False	0	-
+TAMPER-ci-sel-nox-run-dropped	py	block ci.tampered	pass	False	0	-
+HONEST-ci-sel-nox-run-env-kw	py	pass	pass	True	0	-
+TAMPER-sel-turbo-filter-added	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-turbo-filter-short	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-turbo-filter-excluded	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-turbo-filter-list-narrowed	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-turbo-filter-glob-to-name	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-pnpm-filter-added	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-pnpm-filter-F-added	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-pnpm-filter-dependents-dropped	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-pnpm-filter-negated	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-nx-projects-added	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-nx-projects-short	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-nx-projects-name-removed	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-nx-exclude-added	js	block runner.tampered	block	True	1	runner.tampered(block)
+TAMPER-sel-nx-exclude-grown	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-lerna-scope-added	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-lerna-ignore-added	js	block runner.tampered	block	True	1	runner.tampered(block)
+TAMPER-sel-yarn-include-added	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-yarn-exclude-added	js	block runner.tampered	block	True	1	runner.tampered(block)
+WARN-sel-turbo-filter-renamed	js	warn	pass	False	0	-
+WARN-sel-turbo-filter-to-glob	js	warn	pass	False	0	-
+WARN-sel-nx-run-many-to-affected	js	warn	pass	False	0	-
+HONEST-sel-turbo-filter-removed	js	pass	pass	True	0	-
+HONEST-sel-turbo-filter-name-added	js	pass	pass	True	0	-
+HONEST-sel-turbo-test-and-lint	js	pass	pass	True	0	-
+HONEST-sel-turbo-filter-glob-wider	js	pass	pass	True	0	-
+HONEST-sel-turbo-filter-build-only	js	pass	pass	True	0	-
+HONEST-sel-turbo-filter-kept	js	pass	pass	True	0	-
+HONEST-sel-turbo-filter-exclusion-removed	js	pass	pass	True	0	-
+HONEST-sel-pnpm-filter-removed	js	pass	pass	True	0	-
+HONEST-sel-pnpm-filter-dependents-added	js	pass	pass	True	0	-
+HONEST-sel-pnpm-install-filter	js	pass	pass	True	0	-
+HONEST-sel-nx-projects-name-added	js	pass	pass	True	0	-
+HONEST-sel-nx-projects-removed	js	pass	pass	True	0	-
+HONEST-sel-nx-exclude-removed	js	pass	pass	True	0	-
+HONEST-sel-nx-run-many-build	js	pass	pass	True	0	-
+HONEST-sel-lerna-scope-removed	js	pass	pass	True	0	-
+HONEST-sel-lerna-scope-name-added	js	pass	pass	True	0	-
+HONEST-sel-yarn-include-removed	js	pass	pass	True	0	-
+HONEST-sel-yarn-exclude-removed	js	pass	pass	True	0	-
+TAMPER-sel-turbo-filter-added-make	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-pnpm-filter-added-make	js	block runner.tampered	pass	False	0	-
+TAMPER-sel-nx-projects-added-make	js	block runner.tampered	pass	False	0	-
+HONEST-sel-turbo-filter-removed-make	js	pass	pass	True	0	-
+HONEST-cfg9-pytest-doctest-moved-to-cmd	py	pass	pass	True	0	-
+HONEST-cfg9-pytest-doctest-moved-to-addopts	py	pass	pass	True	0	-
+cfg9-pytest-doctest-moved-dropped-cmd	py	block runner.tampered	pass	False	0	-
+HONEST-cfg9-pytest-two-runs-flag-kept	py	pass	pass	True	0	-
+cfg9-pytest-two-runs-flag-lost	py	block runner.tampered	pass	False	0	-
+HONEST-cfg9-pytest-python-files-moved-to-ini	py	pass	pass	True	0	-
+cfg9-pytest-norecursedirs-integration	py	block runner.tampered	pass	False	0	-
+HONEST-cfg9-pytest-norecursedirs-build	py	pass	pass	True	0	-
+cfg9-pytest-drop-doctest-modules	py	block runner.tampered	pass	False	0	-
+cfg9-pytest-doctest-glob-narrowed	py	block runner.tampered	pass	False	0	-
+HONEST-cfg9-pytest-doctest-glob-widened	py	pass	pass	True	0	-
+cfg9-pytest-override-ini-python-files	py	block runner.tampered	pass	False	0	-
+cfg9-pytest-override-ini-long-form-norecurse	py	block runner.tampered	pass	False	0	-
+cfg9-pytest-override-ini-in-addopts	py	block runner.tampered	pass	False	0	-
+HONEST-cfg9-pytest-override-ini-cache-dir	py	pass	pass	True	0	-
+HONEST-cfg9-pytest-override-ini-console-style	py	pass	pass	True	0	-
+cfg9-jest-roots-src	js	block runner.tampered	pass	False	0	-
+HONEST-cfg9-jest-roots-widened	js	pass	pass	True	0	-
+cfg9-jest-modulePathIgnore-tests	js	block runner.tampered	pass	False	0	-
+HONEST-cfg9-jest-modulePathIgnore-dist	js	pass	pass	True	0	-
+cfg9-jest-roots-computed-warns	js	warn runner.tampered	pass	False	0	-
+cfg9-vitest-dir-src	js	block runner.tampered	pass	False	0	-
+HONEST-cfg9-vitest-dir-root	js	pass	pass	True	0	-
+cfg9-mocha-spec-narrow	js	block runner.tampered	pass	False	0	-
+cfg9-mocha-ignore-added	js	block runner.tampered	pass	False	0	-
+cfg9-mocha-recursive-removed	js	block runner.tampered	pass	False	0	-
+cfg9-mocha-spec-single-file	js	block runner.tampered	pass	False	0	-
+HONEST-cfg9-mocha-reporter-timeout	js	pass	pass	True	0	-
+HONEST-cfg9-mocha-ignore-dist	js	pass	pass	True	0	-
+HONEST-mk9-cd-same-set	py	pass	pass	True	0	-
+HONEST-mk9-sub-makefile	py	pass	pass	True	0	-
+HONEST-mk9-subshell-same-set	py	pass	pass	True	0	-
+HONEST-mk9-oneshell-same-set	py	pass	pass	True	0	-
+HONEST-mk9-cd-variable-same-text	py	pass	pass	True	0	-
+mk9-cd-more-files	py	block runner.tampered	pass	False	0	-
+mk9-sub-more-files	py	block runner.tampered	pass	False	0	-
+mk9-subshell-more-files	py	block runner.tampered	pass	False	0	-
+mk9-oneshell-more-files	py	block runner.tampered	pass	False	0	-
+mk9-cd-variable-narrow	py	block runner.tampered	pass	False	0	-
+mk9-cd-to-unreadable-dir-narrow	py	block runner.tampered	pass	False	0	-
+mk9-cd-unreadable-changed	py	warn runner.tampered	pass	False	0	-
+mk9-cd-dropped-for-root-file	py	block runner.tampered	block	True	1	runner.tampered(block)
+mk9-root-single-file-kept	py	block runner.tampered	pass	False	0	-
+HONEST-mk9-perf-chain-1000	py	pass	pass	True	0	-
+HONEST-mk9-perf-chain-4000	py	pass	pass	True	0	-
+mk9-large-chain-narrow	py	block runner.tampered	pass	False	0	-
+mk9-mid-chain-narrow	py	block runner.tampered	pass	False	0	-
+mk9-chain-4000-narrow	py	block runner.tampered	pass	False	0	-
+mk9-budget-narrow	py	block runner.tampered	pass	False	0	-
+mk9-doubling-vars-narrow	py	block runner.tampered	pass	False	0	-
+mk9-budget-unread-line	py	warn runner.tampered	pass	False	0	-
+HONEST-mk9-budget-comment	py	pass	pass	True	0	-
+HONEST-mk9-doubling-comment	py	pass	pass	True	0	-
+HONEST-mk9-pin-root-dot-every-file	py	pass	pass	True	0	-
+mk9-pin-root-dot-one-fewer	py	block runner.tampered	pass	False	0	-
+HONEST-mk9-pin-root-dir-every-file	py	pass	pass	True	0	-
+mk9-pin-root-dir-one-fewer	py	block runner.tampered	pass	False	0	-
+HONEST-mk9-pin-cd-dir-every-file	py	pass	pass	True	0	-
+mk9-pin-cd-dir-one-fewer	py	block runner.tampered	pass	False	0	-
+HONEST-mk9-pin-oneshell-every-file	py	pass	pass	True	0	-
+mk9-pin-oneshell-one-fewer	py	block runner.tampered	pass	False	0	-
+TAMPER-tbl7-js-guarded-assert	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl7-js-short-circuit	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl7-js-weak-then-return	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl7-js-skip-by-test-name	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl7-js-only-when-not	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-js-both-branches	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-js-ternary-both-arms	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-js-return-after-assert	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-js-env-skip-not-a-row	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-js-weak-then-strong	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl7-go-guarded-assert	go	block tests.removed	block	True	1	tests.removed(block)
+TAMPER-tbl7-go-skip-by-t-name	go	block tests.removed	block	True	1	tests.removed(block), tests.skipped(block)
+TAMPER-tbl7-go-tagless-switch-skip	go	block tests.removed	block	True	1	tests.removed(block), tests.skipped(block)
+TAMPER-tbl7-go-err-nil-then-return	go	block tests.removed	block	True	1	tests.removed(block)
+HONEST-tbl7-go-both-branches	go	pass	pass	True	0	-
+HONEST-tbl7-go-testing-short-skip	go	warn	block	True	1	tests.removed(block), tests.skipped(block)
+HONEST-tbl7-go-parallel	go	warn tests.replaced	block	True	1	tests.removed(block)
+HONEST-tbl7-go-tagless-switch-all-assert	go	pass	pass	True	0	-
+TAMPER-tbl7-rs-guarded-assert	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl7-rs-match-arm-skips	rust	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-rs-both-branches	rust	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-rs-plain	rust	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl7-py-guarded-assert	python	block tests.removed	warn	False	0	tests.replaced(warn), tests.replaced(warn)
+TAMPER-tbl7-py-row-return	python	block tests.removed	warn	False	0	tests.replaced(warn), tests.replaced(warn)
+TAMPER-tbl7-py-skip-by-node-name	python	block tests.removed	warn	False	0	tests.replaced(warn), tests.replaced(warn), tests.skipped(warn)
+TAMPER-tbl7-py-weak-then-return	python	block tests.removed	warn	False	0	tests.replaced(warn), tests.replaced(warn)
+TAMPER-tbl7-py-param-mark-skip	python	block tests.removed	warn	False	0	tests.skipped(warn), tests.replaced(warn), tests.replaced(warn)
+TAMPER-tbl7-py-param-mark-xfail	python	block tests.removed	warn	False	0	tests.skipped(warn), tests.replaced(warn), tests.replaced(warn)
+HONEST-tbl7-py-both-branches	python	warn tests.replaced	warn	True	0	tests.replaced(warn), tests.replaced(warn)
+HONEST-tbl7-py-return-after-assert	python	warn tests.replaced	warn	True	0	tests.replaced(warn), tests.replaced(warn)
+HONEST-tbl7-py-param	python	warn tests.replaced	warn	True	0	tests.replaced(warn), tests.replaced(warn)
+HONEST-tbl7-py-param-id	python	warn tests.replaced	warn	True	0	tests.replaced(warn), tests.replaced(warn)
+HONEST-tbl7-js-throw-branch	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-js-switch-default	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+TAMPER-tbl7-js-try-catch-swallow	js	block tests.removed	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-js-catch-rethrow	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-js-try-finally	js	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-rs-match-catch-all	rust	warn tests.replaced	block	True	1	tests.removed(block), tests.removed(block)
+HONEST-tbl7-py-match-wildcard	python	warn tests.replaced	warn	True	0	tests.replaced(warn), tests.replaced(warn)
+TAMPER-tbl7-py-assert-swallowed	python	block tests.removed	warn	False	0	tests.replaced(warn), tests.replaced(warn)
+HONEST-tbl7-py-handler-reraises	python	warn tests.replaced	warn	True	0	tests.replaced(warn), tests.replaced(warn)
+HONEST-tbl7-py-handler-fails	python	warn tests.replaced	warn	True	0	tests.replaced(warn), tests.replaced(warn)
+HONEST-tbl7-py-narrow-except	python	warn tests.replaced	warn	True	0	tests.replaced(warn), tests.replaced(warn)
+TAMPER-tbl7-py-assert-or-escape	python	block tests.removed	warn	False	0	tests.replaced(warn), tests.replaced(warn)
+HONEST-tbl7-py-or-in-value	python	warn tests.replaced	warn	True	0	tests.replaced(warn), tests.replaced(warn)
+HONEST-tbl7-py-xfail-row-kept	python	warn tests.replaced	warn	True	0	tests.skipped(warn), tests.replaced(warn), tests.replaced(warn)
+TAMPER-tbl7-py-skipif-row-new	python	block tests.removed	warn	False	0	tests.replaced(warn), tests.replaced(warn)
+HONEST-mk9-ci-cond-ci-n-auto	py	pass	pass	True	0	-
+HONEST-mk9-ci-dc-unrelated	py	pass	pass	True	0	-
+HONEST-mk9-ci-gnumakefile-include-add-fmt	py	pass	pass	True	0	-
+HONEST-mk9-cond-ci-cov	py	pass	pass	True	0	-
+HONEST-mk9-cond-ci-n-auto	py	pass	pass	True	0	-
+HONEST-mk9-cond-extra-branch-same-check	py	pass	block	False	1	runner.tampered(block)
+HONEST-mk9-cond-many-ifs-cap	py	pass	pass	True	0	-
+HONEST-mk9-cond-nested-same	py	pass	pass	True	0	-
+HONEST-mk9-cond-unrelated-edit	py	pass	pass	True	0	-
+HONEST-mk9-cond-verbose-ifdef	py	pass	pass	True	0	-
+HONEST-mk9-cond-windows-ifeq-recipe	py	pass	block	False	1	runner.tampered(block)
+HONEST-mk9-dc-add-second-rule	py	pass	block	False	1	runner.tampered(block)
+HONEST-mk9-dc-assign-forms	py	pass	pass	True	0	-
+HONEST-mk9-dc-unrelated	py	pass	pass	True	0	-
+HONEST-mk9-gnumakefile-include-add-fmt	py	pass	pass	True	0	-
+HONEST-mk9-include-sub-same	py	pass	pass	True	0	-
+HONEST-mk9-multi-target-add-prereq	py	pass	pass	True	0	-
+HONEST-mk9-multi-target-same	py	pass	pass	True	0	-
+HONEST-mk9-pattern-rule-edit-other	py	pass	pass	True	0	-
+HONEST-mk9-pattern-rule-explicit-wins	py	pass	pass	True	0	-
+mk9-ci-cond-ifdef-ci-narrow	py	block ci.tampered	pass	False	0	-
+mk9-ci-dc-swallow	py	block ci.tampered	warn	False	0	suppress.added(warn)
+mk9-ci-gnumakefile-shadow	py	block ci.tampered	pass	False	0	-
+mk9-cond-after-endif-narrow	py	block runner.tampered	pass	False	0	-
+mk9-cond-elseif-chain-narrow	py	block runner.tampered	block	True	1	runner.tampered(block)
+mk9-cond-ifdef-ci-args	py	block runner.tampered	pass	False	0	-
+mk9-cond-ifdef-no-else-narrow	py	block runner.tampered	pass	False	0	-
+mk9-cond-ifeq-recipe-swallow	py	block runner.tampered	warn	False	0	suppress.added(warn)
+mk9-cond-ifneq-narrow-else	py	block runner.tampered	block	True	1	runner.tampered(block)
+mk9-cond-nested-narrow	py	block runner.tampered	block	True	1	runner.tampered(block)
+mk9-cond-skip-without-else	py	block runner.tampered	block	True	1	runner.tampered(block)
+mk9-cond-var-swallow-in-branch	py	block runner.tampered	warn	False	0	suppress.added(warn)
+mk9-dc-narrow-in-second	py	block runner.tampered	pass	False	0	-
+mk9-dc-second-rule-swallow	py	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+mk9-dc-swallow	py	block runner.tampered	block	True	1	runner.tampered(block), suppress.added(warn)
+mk9-gnumakefile-include-swallow	py	block runner.tampered	warn	False	0	suppress.added(warn)
+mk9-gnumakefile-shadow	py	block runner.tampered	pass	False	0	-
+mk9-include-sub-narrow	py	block runner.tampered	pass	False	0	-
+mk9-later-rule-replaces	py	block runner.tampered	pass	False	0	-
+mk9-multi-target-prereq-drop	py	block runner.tampered	pass	False	0	-
+mk9-multi-target-second-name-recipe	py	block runner.tampered	warn	False	0	suppress.added(warn)
+mk9-pattern-rule-narrow	py	block runner.tampered	pass	False	0	-
+mk9-pattern-rule-swallow	py	block runner.tampered	warn	False	0	suppress.added(warn)
+mk9-include-unreadable	py	warn runner.tampered	pass	False	0	-
+HONEST-mk10-include-var-unrelated-edit	py	pass	pass	True	0	-
+TAMPER-mk10-include-var-swallow	py	block runner.tampered	warn	False	0	suppress.added(warn)
+TAMPER-mk10-include-var-narrow	py	block runner.tampered	pass	False	0	-
+TAMPER-mk10-include-curdir-swallow	py	block runner.tampered	warn	False	0	suppress.added(warn)
+TAMPER-mk10-include-var-name-swallow	py	block runner.tampered	warn	False	0	suppress.added(warn)
+TAMPER-mk10-include-lastword-swallow	py	block runner.tampered	warn	False	0	suppress.added(warn)
+TAMPER-mk10-include-var-repointed	py	block runner.tampered	warn	False	0	suppress.added(warn)
+WARN-mk10-include-shell-path	py	warn runner.tampered	pass	False	0	-
+WARN-mk10-include-var-below-the-line	py	warn runner.tampered	pass	False	0	-
+HONEST-mk10-define-unrelated-edit	py	pass	pass	True	0	-
+HONEST-mk10-define-renamed-callers-updated	py	pass	pass	True	0	-
+HONEST-mk10-define-second-call-other-args	py	pass	pass	True	0	-
+HONEST-mk10-define-two-args-same	py	pass	pass	True	0	-
+TAMPER-mk10-define-swallow	py	block runner.tampered	warn	False	0	suppress.added(warn)
+TAMPER-mk10-define-narrow-at-the-call	py	block runner.tampered	pass	False	0	-
+TAMPER-mk10-define-narrow-in-the-body	py	block runner.tampered	pass	False	0	-
+TAMPER-mk10-define-two-args-narrow	py	block runner.tampered	pass	False	0	-
+TAMPER-mk10-define-nested-swallow	py	block runner.tampered	warn	False	0	suppress.added(warn)
+TAMPER-mk10-define-plain-reference-swallow	py	block runner.tampered	warn	False	0	suppress.added(warn)
+TAMPER-mk10-define-assigned-with-equals	py	block runner.tampered	warn	False	0	suppress.added(warn)
+TAMPER-mk10-define-ci-swallow	py	block ci.tampered	warn	False	0	suppress.added(warn)
+WARN-mk10-define-recursive	py	warn runner.tampered	pass	False	0	-
+WARN-mk10-call-of-a-plain-variable	py	warn runner.tampered	pass	False	0	-

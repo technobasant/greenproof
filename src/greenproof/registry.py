@@ -42,7 +42,9 @@ _RULES = [
         "some of its assertions appear in no collected test of the candidate, so the behaviour "
         "it checked is no longer checked. A test moved to a file or name the runner does not "
         "collect counts as gone. Renamed, moved, split or merged tests whose assertions all "
-        "survive are covered and do not fire.",
+        "survive are covered and do not fire. A test folded into a table-driven test (pytest "
+        "parametrize, JS `each`, a Go table, Rust `#[case]` or `#[test_case]`) is covered only "
+        "while a row carries its values and the table runs; a dropped or unused row blocks.",
     ),
     RuleInfo(
         "tests.replaced",
@@ -53,7 +55,10 @@ _RULES = [
         "body is clean, and so is splitting or merging tests that keep every assertion. "
         "Severity is warn when the new tests are at least as strong (a rewrite: they call "
         "every subject the removed tests called, with at least as many checks and no "
-        "weaker check on a compared operand), block otherwise.",
+        "weaker check on a compared operand), block otherwise. A test converted into a row of a "
+        "table-driven test in the same file (JS `each`, a Go table, Rust `#[case]` or "
+        "`#[test_case]`) is a warn when a row carries its values, the table runs and no "
+        "check is lost.",
     ),
     RuleInfo(
         "tests.skipped",
@@ -63,7 +68,12 @@ _RULES = [
         "conftest scope. The test no longer runs, so it can no longer fail. On a brand-new "
         "test an unconditional skip or xfail is only a warning, and a conditional one "
         "(skipif with a condition, importorskip) does not fire: neither hides existing "
-        "verification.",
+        "verification. In Go, a `//go:build` or `// +build` constraint added above "
+        "the package clause of an existing `_test.go` file that had none blocks: `go test ./...` "
+        "no longer compiles it. A constraint that differs from one the file already had is a "
+        "warning. Adding `//go:build` over unchanged `// +build` lines (gofmt's migration) or "
+        "dropping `// +build` lines under an unchanged `//go:build` gives nothing, and neither "
+        "does a constraint on a brand-new test file.",
     ),
     RuleInfo(
         "tests.focused",
@@ -76,18 +86,50 @@ _RULES = [
         BLOCK,
         "A test present on both sides checks less than before: fewer assertions, a strong "
         "assertion replaced by a weaker one, a wider tolerance, fewer parametrize cases, an "
-        "assertion made vacuous (`assert True`, `... or True`, `x == x`) or unreachable (after "
-        "an unconditional return or raise, or under `if False`), or an assertion wrapped in a "
-        "try/except that swallows the failure. Replacing a comparison with its own operand "
+        "assertion made vacuous (`assert True`, `assert [x]`, `... or True`, `x == x`, "
+        "or `f(x) == f(x)` where it replaces a real comparison of `f(x)` in the same test; a "
+        "determinism or singleton check that was already there, or is new, is a real check) "
+        "or unreachable (after an unconditional return or raise, or under "
+        "`if False`; in JS, Go and Rust a bare `return` at the top level of a test, a one-line "
+        "`if (true) return;`, `if true { return }` or `if (x || true) return;` there, or an "
+        "`if false`, `if (false)` or `... && false` block; a `return` that is the body of a "
+        "brace-less `if`, `else`, `for` or `while` is conditional and does not count), an exact "
+        "check loosened to a wide `pytest.approx`/`math.isclose`/`assertAlmostEqual` tolerance, "
+        "or an assertion wrapped in a try/except or a swallowing decorator (one whose wrapper "
+        "calls the test inside a try that catches AssertionError or Exception without "
+        "re-raising; a retry or cleanup decorator is fine) that swallows the failure. In JS, Go "
+        "and Rust, comparing a call-free expression with itself (`expect(X).toBe(X)`, "
+        "`assert.Equal(t, X, X)`, `assert_eq!(X, X)`) is vacuous; an operand with a call "
+        "(`expect(f(s)).toBe(f(s))`, a determinism or memoization check) is vacuous only when "
+        "it replaces a comparison of the same expression with a different one at the base; "
+        "Go's `got != got` NaN check is not vacuous. Rows removed from an `it.each`, "
+        "`test.each` or `describe.each` table count as fewer cases; a table with a spread "
+        "(`[...rows, [3, 4, 7]]`) is not a literal and is not counted. In Python a later def, del "
+        "or rebinding of a test name shadows the earlier test, which Python never collects. A "
+        "helper that checks counts as one check per call (Python: helpers imported from other "
+        "test modules, up to 8 calls deep, and from non-test modules that import pytest, "
+        "unittest or hypothesis or sit under a testing, test_utils or pytest_plugin path; JS: "
+        "same file; Go: same directory), so a helper or conftest that loses its checks "
+        "weakens the tests that use it: only a helper that lost checks pulls in its importers, "
+        "and at most 300 files are read and 200 compared, with no note when that cap is hit. "
+        "Replacing a comparison with its own "
+        "operand "
         "(`assert f() == 1` to `assert f()`) blocks; replacing it with a different expression "
         "is a warning, because that is often a legitimate refactor.",
     ),
     RuleInfo(
         "tests.expected_changed",
         WARN,
-        "The expected value in an assertion changed, whether or not non-test code changed. That is "
+        "The expected value in an assertion, or the literal a `@pytest.fixture` returns, changed, "
+        "whether or not non-test code changed. That is "
         "legitimate when the specification changed, so it is a warning: confirm the new value "
-        "comes from the requirement, not from what the code returns.",
+        "comes from the requirement, not from what the code returns. A modified expected-output "
+        "data file (.json, .yaml, .yml, .txt, .csv, .snap, .golden, .out, .expected, .html, "
+        ".xml) under a test path or a fixture directory (testdata, fixtures, golden, "
+        "__snapshots__), modified or renamed with changed content, is reported the same way, "
+        "once per file. Dependency, container and tool configuration there (requirements*.txt, "
+        "constraints*.txt, *compose*.yml/.yaml, Dockerfile*, .pre-commit*, codecov.yml, .env*) "
+        "is not expected output.",
     ),
     RuleInfo(
         "suppress.added",
@@ -101,15 +143,44 @@ _RULES = [
         BLOCK,
         "A change narrows or neuters how checks run: test selection or collection patterns, "
         "coverage thresholds (lowered or removed), type-checker or linter strictness, the "
-        "scripts that run the tests, a conftest or plugin hook that can rewrite outcomes or "
-        "collection, or os._exit / sys.exit(0) added to a test file.",
+        "scripts that run the tests (including a swallowed failure such as `|| true` or "
+        "`; exit 0` after a test, lint or type-check command, and scripts or files a policy "
+        "command runs, one level deep), a conftest or plugin hook that can rewrite outcomes or "
+        "collection, a Go TestMain that always exits 0 or never runs the tests (a conditional "
+        "exit is a warning), or os._exit / sys.exit(0) added to a test file. Fewer steps count "
+        "checks only, selection flags belong to their tool, `-p no:<plugin>` is judged by the "
+        "plugin (`--disable-plugin-autoload` is a warning), a nested package.json is a warning "
+        "only when it is known that no policy command reaches it, Makefile variables are "
+        "expanded before a recipe is read, a script that no longer runs a kind of check the "
+        "base ran blocks, the same tool with another subcommand is another step, and a make "
+        "target named like an existing path and not in .PHONY runs nothing. Tool "
+        "configuration is compared as each tool reads it (one file wins, nothing merged), so a "
+        "pytest.ini or ruff.toml that shadows pyproject.toml counts and a move between files "
+        "does not; an exclude or omit blocks only when it removes files the base checked, and a "
+        "coverage exclusion that matches ordinary code blocks.",
     ),
     RuleInfo(
         "ci.tampered",
         BLOCK,
-        "A CI workflow change removes or neuters a test or lint step, adds continue-on-error, "
-        "|| true or if: false, adds path filters that exclude tests, or changes the greenproof "
-        "step itself. A ref-only version bump of the greenproof action is a warning.",
+        "A CI workflow change removes or neuters a test or lint step (judged across all "
+        "workflow files, looking through local composite actions, local scripts and launchers "
+        "such as docker compose run or uv run), adds continue-on-error: true or if: false to a "
+        "step that runs a check, swallows a check's failure (|| true, || echo, ; exit 0, "
+        "set +e, or under bash {0}, pwsh and cmd a check whose status is lost), runs a check "
+        "with --collect-only or --passWithNoTests, exits 0 before the first check, adds a "
+        "selection flag (-k, -m, --deselect, -run, -short, -t), narrows the triggers (fewer "
+        "events, or a paths or paths-ignore filter that hides a test or source file), or "
+        "changes the greenproof step, its with: inputs included. The selection-flag, "
+        "collect-only, early exit and set +e checks read GitHub Actions run steps only; "
+        "GitLab CI and CircleCI get the line-level swallow check. Narrowed branch, tag or "
+        "type filters, a matrix-chosen selection flag, continue-on-error with an expression, "
+        "fewer steps of a kind that still exists, a replacement the rule cannot classify, and "
+        "a ref-only version bump of the greenproof action are warnings; an unclassifiable "
+        "replacement counts only in the same file and job, enabled, with its script present. "
+        "Scripts, composite steps and bash -c bodies get the same judgement as a run step, "
+        "and a moved greenproof step keeps its if: and its automatic triggers. Make "
+        "targets, package.json scripts and local scripts a step runs are followed to depth "
+        "4. Flow-style steps and fromJSON runners are not read.",
     ),
     RuleInfo(
         "static.parse_error",
@@ -125,7 +196,8 @@ _RULES = [
         "jest.mock, vi.mock, a mocked spyOn) the same callable its assertions call, so the "
         "assertion checks the mock instead of the code. Patching a collaborator is fine; "
         "patching the subject of the test is not. A patch that was already in the same test "
-        "at the base does not fire.",
+        "at the base does not fire. An added or changed autouse fixture that patches a "
+        "callable the tests in its scope assert on fires too.",
     ),
     RuleInfo(
         "code.hardcoded",

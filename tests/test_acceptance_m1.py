@@ -206,3 +206,11 @@ def test_rule_severity_and_off_apply_to_the_new_rules(tmp_path: Path, run) -> No
     result = run(blocked.path, "check", "--no-cache")
     assert result.code == 1
     assert "tests.deleted" in result.out
+
+
+def test_default_branch_without_upstream_notes_that_only_uncommitted_changes_count(
+    math_repo: Repo, run, tmp_path: Path
+) -> None:
+    math_repo.write("app.py", "def total():\n    return 100  # edited\n")
+    _, _, data = check(run, math_repo, tmp_path)
+    assert any("no upstream" in n and "--base REF" in n for n in data["notes"])

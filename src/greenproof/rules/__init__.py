@@ -20,7 +20,7 @@ def run_static_rules(changes: ChangeSet, commands: Mapping[str, str]) -> list[Fi
         *check_tests(changes),
         *check_suppress(changes),
         *check_runner(changes, commands),
-        *check_ci(changes),
+        *check_ci(changes, commands),
         *check_parse(changes),
         *check_hardcoded(changes),
     ]

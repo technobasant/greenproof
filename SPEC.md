@@ -93,8 +93,15 @@ greenproof --version
       is per worktree (`git rev-parse --git-dir`), so parallel agent sessions in separate
       worktrees do not overwrite each other's base;
    4. `git merge-base HEAD <default branch>` where the default branch is
-      `origin/HEAD`'s target, else `main`, else `master`; if HEAD *is* the default branch,
-      use `HEAD` (only uncommitted changes are compared).
+      `origin/HEAD`'s target, else `main`, else `master`. If HEAD *is* the default branch,
+      the base is `git merge-base HEAD @{upstream}`: the commits not yet pushed are part of
+      the change under test, and so are uncommitted changes. When HEAD equals its upstream
+      (CI on a push) the base is `HEAD`, and only uncommitted changes are compared. When the
+      branch has no upstream the base is `HEAD` and the report carries the note "on the
+      default branch with no upstream: only uncommitted changes are checked; pass --base REF
+      to include commits" (`gitops.NO_UPSTREAM_NOTE`). When an upstream exists but shares no
+      history with HEAD (`merge-base` fails, as in a shallow clone), that is not "no upstream":
+      it is exit 4 with the fix (`fetch-depth: 0`), never a silent fall back to `HEAD`.
    Base not resolvable (e.g. shallow clone) → exit 4 with the fix (`fetch-depth: 0`).
 4. **Load policy from the base**: `git show <base>:.greenproof.toml`. If the base has no
    policy file (first adoption), use the candidate's and record `policy.source = "candidate"`.
@@ -193,14 +200,14 @@ covering at least one true positive and one legitimate change that must NOT fire
 | `policy.changed` | block | the candidate's `.greenproof.toml` differs from the base's |
 | `tests.deleted` | block | a test file is deleted, or renamed to a non-test path |
 | `tests.removed` | block | a test function/case present at base is gone and is not covered (5.7), including a test moved to a file or name the runner does not collect |
-| `tests.replaced` | block | in the same file, a test is removed and a different test is added (delete-and-replace) and the removed test is not covered (5.7); report both names. `warn` when the new tests are at least as strong (5.7, a rewrite) |
+| `tests.replaced` | block | in the same file, a test is removed and a different test is added (delete-and-replace) and the removed test is not covered (5.7); report both names. `warn` when the new tests are at least as strong (5.7, a rewrite), or when several tests are folded into one table-driven test that keeps their checks (5.7) |
 | `tests.skipped` | block | a skip/xfail/ignore/todo marker is added to a test that exists at base, or at module/class/conftest scope (see 5.3). On a brand-new test an unconditional skip/xfail is `warn` and a conditional one (`skipif(<condition>)`, `importorskip`) does not fire: neither hides existing verification |
 | `tests.focused` | block | a focus marker is added (`it.only`, `fit`, `describe.only`, `test.only`), which silently skips the rest |
 | `tests.weakened` | block | for a test present on both sides: fewer assertions, a strong assertion replaced by a weaker one, tolerance widened, parametrize cases reduced, an assertion made vacuous, tautological or unreachable, or an assertion wrapped in a swallowing `try/except` (see 5.4) |
-| `tests.expected_changed` | warn | a literal in an assertion's expected side changed in a kept test (same number of expected literals), whether or not non-test code changed. With no non-test code change it is the "edit the test to match what the code returns" pattern, which commands and revert cannot see (the suite passes and revert has no source change to undo); the message says which case it is. Legitimate when the old value was wrong or the spec changed, so warn |
+| `tests.expected_changed` | warn | a literal in an assertion's expected side changed in a kept test (same number of expected literals), or a modified expected-output data file (5.4), whether or not non-test code changed. With no non-test code change it is the "edit the test to match what the code returns" pattern, which commands and revert cannot see (the suite passes and revert has no source change to undo); the message says which case it is. Legitimate when the old value was wrong or the spec changed, so warn. It also fires when a `@pytest.fixture` function in a `conftest.py` or test file returns or yields a different literal (number, string, tuple, list, dict) than at the base; the message names the fixture and file, and every test using the fixture compares against that value |
 | `suppress.added` | warn | an added line introduces a type/lint/coverage suppression (see 5.5) |
-| `runner.tampered` | block | a change narrows or neuters how checks run: test selection, thresholds, strictness, test scripts (see 5.6) |
-| `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `|| true`, `if: false`, path filters excluding tests, or changes the greenproof step itself. The greenproof step is a line, outside a YAML comment, that runs `greenproof check` (any prefix such as `uvx`, `uv run` or a path, any `@version`) or `uses:` the greenproof action; other mentions (`greenproof --version` in a packaging job) do not count. Only those lines count, and a workflow whose base version has none gaining them is adoption, not a change (a new workflow file included); commenting out or deleting an existing greenproof line still fires. A ref-only version bump of the greenproof action (same inputs) is `warn` |
+| `runner.tampered` | block | a change narrows or neuters how checks run: test selection, thresholds, strictness, test scripts, a script or file a policy command runs, a Go `TestMain` that always exits 0 or no longer runs the tests (see 5.6) |
+| `ci.tampered` | block | a CI workflow change removes or neuters a test/lint step, adds `continue-on-error`, `if: false`, a swallowed failure in a test or lint step (`|| true`, `|| echo ...`, `; exit 0`, `; true`, an `exit 0` after the check, `set +e` that never reads the status, each only after a check command; under GitHub's default `bash -e`, `; exit 0` and `; true` swallow nothing), `--collect-only` or `--passWithNoTests`, an `exit 0` before the first check, a selection flag on a test command (`-k`, `-m`, `--deselect`, `--ignore`, `-run`, `-short`, `-t`, `--testNamePattern`, `--skip`, `--grep`), a trigger that runs on fewer events or paths (see 5.6), or changes the greenproof step itself, `with:` inputs included (see 5.6 for what is read where). The greenproof step is a line, outside a YAML comment, that runs `greenproof check` (any prefix such as `uvx`, `uv run` or a path, any `@version`) or `uses:` the greenproof action; other mentions (`greenproof --version` in a packaging job) do not count. Only those lines count, and a workflow whose base version has none gaining them is adoption, not a change (a new workflow file included); commenting out or deleting an existing greenproof line still fires. A ref-only version bump of the greenproof action (same inputs) is `warn` |
 | `static.parse_error` | warn | a changed file in a parsed language (Python, TOML, JSON, INI) does not parse; that file falls back to the line-level checks |
 | `tests.self_mocked` | warn | an added or changed test patches (`monkeypatch.setattr`, `mock.patch`, `jest.mock`, `vi.mock`) the same callable its assertions call, so it tests the mock (5.8) |
 | `code.hardcoded` | warn | non-test code gains a literal table (≥ 8 entries) or an `if x == <literal>` branch whose literal also appears in added lines of a test file changed in this diff (5.8; Python AST only in v0.1) |
@@ -214,6 +221,18 @@ covering at least one true positive and one legitimate change that must NOT fire
   module or class scope, `pytestmark` gaining a skip/xfail.
 - JS/TS: `.skip(`, `xit(`, `xdescribe(`, `xtest(`, `.todo(`, `test.fails(` added.
 - Go: `t.Skip(`, `t.SkipNow(`, `t.Skipf(`. Rust: `#[ignore]`.
+- Go build constraints: every `//go:build <expr>` and `// +build <tags>` line above the
+  package clause of a `_test.go` file is compared between the base and the candidate
+  version of the file. A file that had no constraint in either syntax and gains one is
+  `tests.skipped` (block), naming the constraint: with it `go test ./...` no longer compiles
+  the file. A file that had a constraint whose constraint lines now differ is
+  `tests.skipped` (warn): widening `//go:build linux` to `linux || darwin` is legitimate,
+  narrowing it is a skip, and the rule cannot tell which. Two edits are no finding: adding a
+  `//go:build` line over `// +build` lines that stay the same and name the same tags
+  (gofmt's automatic migration), and removing `// +build` lines under a `//go:build` line
+  that stays the same (`go fix`). An unchanged constraint gives nothing, and neither does a
+  constraint on a brand-new test file (it hides no existing verification, the same rule as
+  a conditional skip on a new test).
 
 ### 5.4 Weakening heuristics
 
@@ -232,6 +251,16 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   `assertIsNotNone`) or by a broader exception (`Exception`, `BaseException`);
 - `pytest.approx` `rel`/`abs` increased, `assertAlmostEqual` `places` decreased or `delta`
   increased;
+- an exact numeric check loosened to an explicit tolerance: `assert f(x) == 99` (or
+  `assertEqual`) replaced by `pytest.approx(99, rel=..., abs=...)`, `math.isclose(f(x), 99,
+  rel_tol=..., abs_tol=...)` or `assertAlmostEqual(f(x), 99, delta=... | places=...)` is
+  weakened when the band the tolerance allows is at least 1% of the absolute expected
+  value (`rel`/`rel_tol` of 0.01 or more; `abs`/`abs_tol`/`delta` of at least 1% of the
+  expected value; `places` giving `0.5 * 10**-places` that wide). For an expected value of
+  0 the absolute band must be at least 0.01. A bare `pytest.approx(99)`/`math.isclose`
+  (the library defaults) and a tight explicit tolerance are the honest fix for floating
+  point and stay clean. The existing widening check above has no threshold and is
+  unchanged;
 - `@pytest.mark.parametrize` cases removed, unless every removed case (the exact form of
   its argvalues element) appears among the cases the change adds (all cases of new tests,
   plus the cases a paired test gained, as a multiset difference). Splitting cases out
@@ -239,11 +268,27 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
 - an assertion moved inside `try:` whose handler catches `AssertionError`/`Exception`
   without re-raising;
 - an assertion made vacuous or tautological: `assert <truthy constant>` (`assert True`,
-  `assert 1`), `self.assertTrue(True)`, an `or` with a truthy constant operand
-  (`assert x == 3 or True`), or a comparison of an expression with itself, also after
+  `assert 1`, a non-empty string, f-string or bytes literal, a non-zero number, a non-empty
+  list, tuple, set or dict display such as `assert [x]` or `assert (x, "message")`,
+  `assert not []`), `self.assertTrue(True)`, an `or` with a truthy constant operand
+  (`assert x == 3 or True`), or a comparison of an expression with itself (`==`, `is`,
+  `<=`, `>=`; `assertEqual(E, E)`, `assertIs(E, E)`, `assertTrue(E == E)`), also after
   single-assignment locals (assigned exactly once in the test body, before the assertion,
-  from any expression, and not used before it in any other way) are inlined:
-  `expected = refund(100)` then `assert refund(100) == expected` checks nothing;
+  from any expression, and not used before it in any other way) are inlined. An operand with
+  no call (names, attributes, subscripts, literals: `x == x`, `a.b is a.b`) is the same
+  value on both sides and is vacuous, like `assert True`. A comparison where either side
+  contains a call is never vacuous in itself, because a call can return a fresh or a
+  stateful value: `get_settings() is get_settings()` pins a singleton, `Money(5) ==
+  Money(5)` runs `__eq__`, `f(x) == f(x)` pins determinism. It is vacuous only where it
+  replaces a real comparison: the same test at the base had an assertion that compared that
+  call (any call inside the operand, locals alpha-renamed) with a different expression, and
+  the candidate has more self-comparisons of that call than the base and no longer compares
+  it with anything else. So `assert refund(100)
+  == 99` becoming `assert refund(100) == refund(100)` blocks, and a determinism or
+  singleton test that is new, unchanged, or whose call the base never compared passes.
+  Stateful calls (`next`, `pop`, `random`, `uuid`, `time`, `now`, `utcnow`, `today`,
+  `urandom`, `token_hex`, `token_bytes`, `rand`, `randn`, `randint`, `uniform`, `sample`,
+  `shuffle`, `choice`, `await`, `yield` and walrus expressions) never count, in either form;
 - an assertion whose inputs are all constants, so it checks nothing about the code:
   every operand is a literal, a pure builtin (`len`, `abs`, `min`, `max`, `sum`, `sorted`,
   `reversed`, `list`, `tuple`, `set`, `frozenset`, `dict`, `str`, `int`, `float`, `bool`,
@@ -293,6 +338,54 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   `assert isinstance(stream, Iterable)` while every `==` stays is a cleanup more often
   than a tamper; dropping any exact check, or the only check on a target, still blocks.
 
+Python also treats these as weakening:
+- **shadowed and deleted tests.** Python collects only the last binding of a name in a
+  module or class body. A test `def` that is not the last binding of its name (a later `def`
+  of the same name, a later `del name`, or a later non-def rebinding such as `name = None`
+  or an import alias) is not collected and is not a unit; the earlier checks are gone, so
+  the usual removed/weakened comparison applies. An assignment that reads the same name
+  (`test_x = pytest.mark.slow(test_x)`) is a wrapper, not a rebinding. Duplicates that
+  already exist in an unchanged base file produce no finding;
+- a **swallowing decorator** added to a test. The decorator resolves to a function in the
+  same file, or in a test-path or test-support module the file imports (5.4 helpers below).
+  It swallows only when its wrapper (a nested def, at any depth, that may be a decorator
+  factory's inner def) has a `try` whose body calls the wrapped callable (the decorator's
+  own parameter, or a name bound in an enclosing wrapper) and a handler that catches
+  `AssertionError`, `Exception`, `BaseException` or a bare `except` without re-raising. A
+  `raise` anywhere in the wrapper, outside nested defs, means it is not swallowing, and a
+  `try` that does not call the wrapped callable is ignored. So a retry decorator that
+  re-raises after its loop, and a cleanup `finally: try: rmtree() except Exception: pass`
+  around the wrapped call, are clean. The test's checks are treated as swallowed, with the
+  same message as an assertion wrapped in such a `try`;
+- **cross-file helpers.** A test that calls a function imported from a test-path Python
+  module (`from helpers import f`, `from tests.helpers import f`, `from .helpers import f`,
+  `import helpers` with `helpers.f()`) gets the same helper credit as a helper in the test's
+  own file: the helper's own assertions count, and a helper that only does `return a == b`
+  still counts as no check. Credit follows helper calls up to 8 levels deep (`check_order`
+  calls `_check_fields`, which calls `_check_total` and `_check_id`); a cycle is cut where it
+  closes. The module is resolved against the test file's directory, the repository root and
+  the test roots, and read at the same revision as the test file. A module outside the test
+  paths gets the same credit only if it is **test support**: it imports `pytest`,
+  `unittest` or `hypothesis`, or a segment of its path is `testing`, `test_utils`,
+  `testutils`, `pytest_plugin` or `pytest_plugins`. An ordinary application module
+  (`app/service.py` with a defensive `assert`) is never credited, so a test that calls it
+  gets no check from it;
+- **helper and conftest edits.** When a helper module (a test-path or test-support `.py`
+  file with no tests of its own) or a `conftest.py` changes, both sides are analysed and the
+  names (functions, fixtures) compared. A name that lost credited checks (fewer assertions or
+  strong assertions, more weak, broad, vacuous or swallowed ones, a lost exact check, a new
+  swallowing decorator, a call compared with itself in place of a comparison) or was removed
+  pulls in its dependents; a change that loses none (a comment, a rename, an added check)
+  analyses no dependent. The dependents are the unchanged test files that contain one of those
+  names as a word, and for a helper module also the module's stem, and that import the module
+  (before or after the change). For a helper module these are the test-path files anywhere in
+  the tree, so `tests/support/helpers.py` reaches `tests/unit/test_o.py`. A conftest's scope
+  stays its own directory and below, and it needs no import. They are analysed as if they
+  had changed, so a helper that is neutered weakens every test that relied on it. At most 300
+  files are analysed per check and at most 200 compared; greenproof reads the rest as
+  unchanged. Rules return findings only, so a run that hits the caps carries no report
+  note. Files not in the changeset are identical at both revisions and are read once.
+
 JS/TS, Go, Rust (line level, per test file): count of assertion calls drops (`expect(`,
 `assert.`, `t.Error`/`t.Fatal`/`require.`/`assert.`, `assert!`/`assert_eq!`), or strong
 matchers are removed while weak ones are added: JS/TS strong `toEqual`, `toBe(`,
@@ -306,6 +399,67 @@ matchers are removed while weak ones are added: JS/TS strong `toEqual`, `toBe(`,
 `.is_some())`, `.is_ok())`, `.is_empty())`, and `assert!(` lines containing `>`, `<`
 or `!=`. An `expect(<literal>)` (number, string, `true`/`false`/`null`/`undefined`) is
 vacuous and not counted, so `expect(add(1, 2)).toBe(3)` → `expect(3).toBe(3)` drops the count.
+
+Line-engine detections added in 0.3.0 (JS/TS, Go, Rust), all matched on comment-free text with
+string contents blanked, so brackets inside strings do not count:
+- **Unreachable after a return.** A bare `return` (Go, Rust), or `return;` / `return` followed
+  by a newline (JS/TS), at the top level of a test body makes every later check in the test
+  unreachable: uncounted, and `tests.weakened` when the count of unreachable checks rises.
+  A `return` inside a branch, a closure or a callback is not an early return, and neither is
+  `return expect(...)`, `return promise.then(...)` or `return request(...)`, which return
+  the check itself. A bare `return` whose previous code line is a control header with no `{`
+  (`if (...)`, `else if (...)`, `for (...)`, `while (...)` ending in the closing parenthesis,
+  or `else`, also when the condition spans lines) is that branch's body: conditional, not an
+  early return. A one-line `if` on an always-true condition whose only body is a bare
+  `return` at the top level counts as an early return: JS/TS `if (true) return;` and
+  `if (true) { return; }`, Go `if true { return }`, Rust `if true { return; }`. The condition
+  is `true`, or `true` joined to anything by `||` (`x || true`); `x && true` and a
+  `return value;` body are ordinary.
+- **Always-false conditions.** Go `if … && false {`, `if false && … {`, `if false {`; JS/TS
+  `if (false)`, `if (… && false)`, `if (false && …)`; Rust `if false {`, `&& false`.
+  Checks inside the block are unreachable; an `else` branch is live. `x || false` and
+  `x && y` are ordinary conditions.
+- **Self-equality is vacuous.** JS `expect(X).toBe/toEqual/toStrictEqual(X)`; Node
+  `assert.equal/strictEqual/deepEqual/deepStrictEqual(X, X)`; Go `assert.Equal(t, X, X)`,
+  `require.Equal(t, X, X)` (also `EqualValues`, `Exactly`); Rust
+  `assert_eq!(X, X)` and `assert!(X == X)`. Operands are compared with whitespace removed.
+  An `X` that contains a call (any `(`) is not vacuous by itself: `expect(select(state)).toBe(
+  select(state))` checks memoization and `assert_eq!(h("ab"), h("ab"))` checks determinism.
+  Such a call self-comparison is vacuous only when it replaces a real comparison: the base
+  version of the same test compared the same normalised expression with a different one
+  (`expect(add(1, 2)).toBe(3)` → `expect(add(1, 2)).toBe(add(1, 2))`); one already in the base
+  test, in a new test, or on an expression the base did not compare is a real check.
+  Go's `if got != got {` is not vacuous either: it is the NaN check. An `X` that names a
+  nondeterministic source (`random`, `Date`, `now(`, `uuid`, `nanoid`,
+  `rand`, `Instant`, `SystemTime`) is exempt. A vacuous check is not counted and raises the
+  vacuous count, so it blocks only when it appears in a test that exists on both sides.
+- **Table rows.** `it.each`, `test.each` and `describe.each` with a literal array of arrays
+  or objects, or a tagged-template table, count their rows as parametrize cases (a
+  `describe.each` multiplies the tests inside it). Fewer rows than at base is `tests.weakened`
+  ("parametrize cases reduced from N to M"); adding rows is fine. A table that is not a
+  literal (`it.each(cases)`), or whose array has an element starting with `...`
+  (`it.each([...small, [3, 4, 7]])`), is not counted.
+- **Helper credit.** JS/TS: a function declared in the same file outside any `it`/`test`
+  (top level or inside a `describe`) whose body contains an assertion counts as one check
+  per call inside a test. Go: the assertion helpers above are read from every `_test.go`
+  file in the directory at the same revision as the test file (base text for the base side,
+  the candidate tree for the candidate side), and when a changed `_test.go` file declares
+  helpers, unchanged same-directory test files that call them are re-analysed as if they
+  had changed, so a helper that loses its checks weakens its callers. A helper without an
+  assertion earns nothing.
+- **Rust char literals.** A Rust character literal (`'}'`, `'"'`, `'\n'`, `'\''`, matched
+  by `'(?:\\.|[^\\'])'`) is masked like a string, so its brace or quote is not code. A lifetime
+  (`'a`) is left alone.
+- **Expected-output data files.** A modified, or renamed with changed content (not added,
+  not deleted, not a pure rename), non-code file with
+  extension `.json`, `.yaml`, `.yml`, `.txt`, `.csv`, `.snap`, `.golden`, `.out`,
+  `.expected`, `.html` or `.xml` under a test path, or under `testdata`, `fixtures`,
+  `golden` or `__snapshots__`, gives one `tests.expected_changed` (warn), "expected-output
+  file changed: PATH". Files another rule owns (runner configuration such as
+  `package.json` and `tsconfig*.json`, and CI workflows) are not reported here, and neither
+  are files that are configuration rather than expected output: `requirements*.txt`,
+  `constraints*.txt`, `*compose*.yml`, `*compose*.yaml`, `Dockerfile*`, `.pre-commit*`,
+  `codecov.yml` and `.env*`.
 
 Line-engine assertion vocabulary also includes: JS/TS `expectTypeOf(`, `assertType(` and
 a testing-library query that throws when the element is missing (`getBy…(`,
@@ -353,12 +507,198 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `[tool.mypy]` (`strict` off, `ignore_errors`, `disable_error_code` added), `fail_under`
   removed (counts as lowered), `python_files`/`python_functions`/`python_classes` narrowed,
   `[tool.ruff.lint]` (`ignore`/`extend-ignore`/`per-file-ignores` added);
-- `pytest.ini`, `setup.cfg`, `tox.ini`, `noxfile.py` equivalents;
+- `pytest.ini`, `setup.cfg`, `tox.ini`, `noxfile.py` equivalents. In `tox.ini` and
+  `noxfile.py` (read with `ast`, so a reformatted call is the same call) a selection flag
+  counts only after the `pytest` token and only when the base's pytest commands did not
+  already have it; `coverage run -m pytest` is not a marker flag, and `*session.posargs` is
+  not a selection. Arguments are read through starred list or tuple literals
+  (`*["-k", "x"]`), `*"-k x".split()` and names bound once to such lists, `+` joins included
+  (a name assigned twice, mutated, or shadowed by a parameter is unreadable). A starred
+  argument other than `session.posargs` that cannot be read, and is new or changed, is a
+  `warn`. The `commands` of each tox environment (`tox.ini`, `setup.cfg`, `pyproject.toml`,
+  `tox.toml`) and the `session.run` calls of each nox session are judged as well: a `-` prefix on
+  a check, `ignore_errors` or `ignore_outcome` newly true on an environment, a nox
+  `success_codes` widened, a `session.run` inside a `try` whose `except` does not re-raise, a
+  check dropped (`ruff check .` became `echo skipped`) and a nox `session.run` path narrowed
+  block. `{envpython}`, `{toxinidir}` and `{[section]key}` are normalised before the comparison,
+  so `python -m pytest` for `pytest` passes, and a `-` on a command that is no check
+  (`sphinx-build`) is no finding. A bare `tox` or `nox`, also one a workflow step or `make`
+  runs, is judged by what its default environments or sessions run: a shorter `envlist` or
+  session list, or a narrower `{posargs:...}` default, blocks, except for an environment that
+  runs no check or whose check another environment still runs;
+- selection that the flag table does not cover, judged for the base and candidate commands of a
+  policy script or recipe (and, in `ci.tampered`, of a step) by the reader both rules share:
+  Go `-tags` dropped or narrowed; jest and vitest path flags (`--testPathPatterns`, `--dir`) and
+  changed-file flags (`--changedSince`, `--onlyChanged`, `--lastCommit`, `--changed`,
+  `--related`; `-o` is jest's `--onlyChanged` and not vitest's); cargo target kinds (`--lib`,
+  `--bins`, `--bin`, `--test`, `--doc`, `--example`), `--workspace` replaced by `-p`, and a
+  dropped `--features` or `--all-features`; widening passes. Monorepo package filters are
+  selection too: turbo `--filter`/`-F` (including `!x`), pnpm `--filter`/`-F`/`--filter-prod`,
+  nx `run-many` `--projects`/`-p` and `--exclude`, lerna `--scope`/`--ignore`, and yarn
+  `workspaces foreach` `--include`/`--exclude`. A filter added where the base had none, or one
+  that leaves out a package the base ran, blocks; a dropped or widened filter passes; a rename
+  or a glob (`web` to `app-*`) warns. In `runner.tampered`, `nx run-many` becoming
+  `nx affected` warns. A command that names exact test files covering every file the base path
+  selected (`pytest .` to `pytest test_shop.py` when that is the only test file) is a `warn` in
+  any directory, saying that test files added later will not run; fewer files, or a test file
+  added in the same change, blocks;
+- pytest collection keys: `python_files`, `python_classes`, `python_functions`, `testpaths`,
+  `norecursedirs`, `--doctest-modules`, `--doctest-glob`, and `-o`/`--override-ini` of any of
+  them, judged against the base tree's test files; and the jest, vitest and mocha keys that
+  choose or ignore test files (jest `roots`, `rootDir`, `modulePathIgnorePatterns`,
+  `testPathIgnorePatterns`, `testRegex`; vitest `dir`; mocha `spec`, `ignore`, `recursive`).
+  Each pytest run is judged on its own, from the config's `addopts`, then `PYTEST_ADDOPTS`, then
+  the run's own flags (a command-line `-o` beats `addopts`). Runs are followed through `make`
+  (`-C` included), `npm run` and shell scripts. A flag moved between `addopts` and the command
+  line passes, and one dropped from a command line blocks. With more than 8 different runs the
+  runs are not compared one by one: the configuration alone is judged and a change to the runs
+  warns;
+- `-p no:<plugin>` in `addopts` is judged by the plugin: harmless ones (`cacheprovider`,
+  `randomly`, `xdist`, `logging`, `faulthandler`, `legacypath`, `pastebin`, `junitxml`, `sugar`,
+  `instafail`) say nothing, ones that decide outcomes (`python`, `unittest`, `doctest`, `cov`,
+  `pytest_cov`, `asyncio`, `anyio`, `trio`) block, `warnings` blocks only where the base turns
+  warnings into errors (`filterwarnings` with `error`, `-W error`, `-Werror`), and an unknown
+  plugin is a `warn`. `--disable-plugin-autoload` added to `addopts` is a `warn` too (every
+  installed plugin stops loading unless named with `-p`);
 - `package.json` `scripts` whose names appear in the base policy's commands, plus
-  `test`, `lint`, `typecheck`; `jest.config.*`/`vitest.config.*` (`testPathIgnorePatterns`,
+  `test`, `lint`, `typecheck`, and the scripts those call through `npm run NAME`, `run-s`,
+  `run-p`, `npm-run-all` or `pnpm run '/regex/'`, followed transitively (`npm run a && npm run
+  b` and `run-s a b` are the same steps). The regex comes from the candidate, so it is matched
+  by a linear-time automaton over a safe subset (literal text, `^`, `$`, `.`, character classes,
+  `*`, `+` and `?` on one atom, `|` between literals, one group at most, 200 characters); a
+  pattern outside it matches every script, which keeps the block. `pre<name>` and `post<name>` run with `<name>`, so a
+  step split off into `pretest` is the same steps. Only checks count towards "fewer steps": a
+  cleanup line (`rm -rf`, `echo`, `mkdir`) removed, or moved to a prerequisite, is not a lost
+  check. A script the base did not run that the candidate's `test` now runs (a new alias) is
+  read as new: a narrowing flag, `--passWithNoTests` or a swallow in it blocks. A swallow added
+  to an opaque script (one with no recognised check, such as `ng test`) blocks when the edited
+  statement is one the base had. A candidate script that runs a kind of check the base's did
+  not (`jest` became `eslint .`) blocks, whatever the step count: the kinds of check
+  (`check_kind`) are compared with `npm run x` read into its body, lint tools count as one
+  kind, a wrapper (`npm test`, `make test`) stands for any test runner, and a script with a
+  statement that cannot be classified is not judged by kind. Two invocations of the same tool
+  are the same opaque step only when their subcommand matches (`ng test` and `ng lint`
+  differ, `ng test` and `ng test --no-watch` do not; the subcommands are `test`, `lint`,
+  `check`, `build`, `run`, `e2e`, `typecheck`, `format`, `verify`, `ci`, `coverage`, `spec`,
+  `unit`, `integration`, `serve`, `start`, `watch`). Kinds are tool-granular, with one
+  exception: `ng test` and `ng e2e` are the test kind `ng test`, `ng lint` is the lint kind
+  `ng lint` (counted with the other linters), so a `test` script that drops `ng lint` blocks and
+  `ng test --no-watch --browsers=ChromeHeadless` does not. A script or recipe that now runs
+  fewer paths than the base blocks, by the reader `ci.tampered` uses (`narrowed_selection`):
+  with paths at the base, a base path that no candidate path covers (`tests` is covered by
+  `tests`, `.`, a parent; for Go also by `./...`) is the reason, and with none, a candidate
+  where every run of the runner is given a path (`jest` became `jest cart.test`, `pytest`
+  gained `tests/test_shop.py`; for pytest and rspec a plain directory such as `tests` is not
+  one). `pytest tests/unit` becoming `pytest tests` and `go test ./pkg/...` becoming
+  `go test ./...` widen and pass. A statement the candidate added to a check script or recipe
+  (an invoked script, a package.json script, a Makefile recipe) blocks when it removes or
+  moves a path that, at the base, is a test file (SPEC 5.1, or the policy's `tests.paths`) or
+  a directory holding one: `rm`, `git rm` (not `--cached`), `unlink`, `mv` (a source, or the
+  file it overwrites), `find ... -delete` or `-exec rm` or `| xargs rm` (read through its
+  `-name`, `-type`, `-maxdepth` and `-mindepth` filters, depth counted from each start
+  directory; a negation, `-o`, `-path`, `-regex` or any other filter makes it unfiltered; `rm`
+  without `-r`/`-R`/`-rf` takes files, not directories), `rimraf`, `del`, `shx rm`,
+  `sh -c '...'`, an interpreter one-liner (`python -c`, `node -e`, `ruby -e`, `perl -e`) whose
+  code calls a delete or move (`shutil.rmtree`, `os.remove`, `.unlink(`, `fs.rmSync`,
+  `FileUtils.rm`, `unlink`, ...) and holds a string literal that names a test file or a
+  directory holding tests (`.` and `..` are not read as one), and globs and `{a,b}` lists
+  matched against the base paths. Paths resolve from the directory of the file (and, for an
+  invoked script, the repo root), then follow `cd`, `pushd` and `popd`: in a script or a
+  package.json body a `cd` lasts to its end, in a make recipe to the end of its line, in a
+  `( ... )` group to the end of the group (a `{ ...; }` group and `&&`/`;` share the shell). A
+  `cd` that cannot be read (`cd -`, `cd "$X"`, `cd $(...)`, `cd`, `cd /abs`, `cd ..` out of the
+  repo, or one after `||`) leaves the directory unknown, and a relative path then hits when a
+  base test path ends with it on a `/` boundary (a directory when a test sits under it), so
+  `rm -rf build` passes unless a tracked test sits under a `build/` directory. An absolute
+  path or an unexpanded variable names nothing. A path not tracked at
+  the base (`.pytest_cache`, `tests/__pycache__`, `coverage`, `build`) is not a test, and a
+  statement the base already had (compared as written) says nothing. The base tree is listed
+  once per check and only when such a statement is added, globs are matched against the sorted
+  test paths from their literal prefix, and a glob past a fixed work limit counts as matching.
+  A statement is the same as the base's only when it was in the same directory. Known limits:
+  code the one-liner builds its paths from (`os.path.join`, f-strings) is read by its literals,
+  a script file or `-m` module that deletes is not read, an `if`/`else` that `cd`s two ways is
+  read in order, and a removal in a target the policy does not run is not read. Setting
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD` to a value in what a policy command runs is a `warn`, like
+  `--disable-plugin-autoload`: `VAR=1 pytest`, `env VAR=1 pytest`, `export VAR=1` in a script
+  or recipe, or in a Makefile or justfile `export VAR = 1` (also `VAR = 1` with `export VAR`,
+  `.EXPORT_ALL_VARIABLES:`, `set export` or a target-specific `export`); an empty value, `env
+  -u` and an assignment the base already had say nothing, and a CI `env:` is `ci.tampered`'s.
+  Two variables hand a runner flags and are read as them: `PYTEST_ADDOPTS` (to `pytest`) and
+  `GOFLAGS` (to `go test`). An assignment in front of the command (`PYTEST_ADDOPTS='-k fast'
+  pytest`, `env X=...`, `cross-env X=...`, `dotenv -v X=...`) is spliced in after the runner,
+  and the selection-flag and path judgment above then applies to it, so `-k fast` blocks and
+  `-q` or `-mod=mod` passes. An `export` in a script or recipe, and a Makefile or justfile
+  `export VAR = ...` (or `VAR = ...` with `export VAR`), apply to the commands after them in
+  the same body until an `unset`. An env file a dotenv-style wrapper on a policy command loads
+  (`dotenv -e F`, `dotenv -f F run`, `dotenvx run -f F`, `env-cmd -f F`, `op run --env-file F`;
+  `.env` when it names none, and a wrapper that names none is taken to load any `.env*` file
+  that changed) that gains one of the two variables (or the autoload variable) is judged as
+  if its assignment stood in front of the command. A value greenproof cannot read (`$(...)`,
+  backticks, `${VAR}`) that is new or changed is a `warn`. A missing env file is no finding:
+  an env file is read only when it is in the repo. Environment variables considered and not
+  read: `JEST_*`, `NODE_OPTIONS`, `RUSTFLAGS`, `CI`, `PYTEST_PLUGINS`, `PYTEST_CURRENT_TEST`,
+  `COVERAGE_*`, and a CI `env:` block (`ci.tampered`). A nested `package.json` is a `warn`, not
+  a block, only when it is known that no policy command reaches it: every policy command is a
+  plain root package-manager run (`npm test`, `pnpm run x`, `yarn test`, `bun test`) with no
+  workspace, filter, prefix or directory option, and the root scripts it reaches contain no
+  `cd`, `--prefix`/`-C`/`--dir`/`--cwd`, workspace or recursive flag, `lerna`/`nx`/`turbo`,
+  script file or `make`; or a workspace selector (`-w`, `--filter`, `-r`) is used and the
+  package is provably not a member of the workspace globs. Anything else, including a
+  `lerna.json`, a make-target policy command or an unreadable file, keeps the block.
+  `jest.config.*`/`vitest.config.*` (`testPathIgnorePatterns`,
   `exclude`, `coverageThreshold` lowered, `passWithNoTests`); `tsconfig*.json` (`strict`
   or `noImplicitAny` set false, `skipLibCheck` is ignored);
-- `Makefile`/`justfile` targets referenced by the base policy's commands;
+- `Makefile`/`justfile` targets referenced by the base policy's commands (all targets are
+  read, `define ... endef` bodies are not targets; a recipe emptied while gaining
+  prerequisites, or either side has prerequisites, is judged by the recipes of those
+  prerequisites, up to four deep). The Makefile's own variables (`=`, `:=`, `::=`, `?=`,
+  `+=`, optional `export`) are expanded in recipes and prerequisites first, recursively to a
+  depth limit, so `PYTEST = true` behind `$(PYTEST) -q` is a no-op; a variable the Makefile
+  does not define is left as written. Recipes are read in the directory they run
+  in (`cd dir && ...`, `make -C dir`), target-specific variables are read in one pass, and a
+  Makefile that is only partly read still judges the goal's recipe. With `SHELL` set to bash,
+  `set -o pipefail` keeps a pipeline's status; a recipe line that masks a check is credited when
+  another line of the target runs the same check unmasked; a touched line with `$(call ...)` or
+  `$(eval ...)` is a `warn`, once per target. A target that is not in `.PHONY` (continuations
+  included), has no `FORCE` prerequisite and is named like a file or directory beside the
+  Makefile in the candidate tree never runs its recipe: it counts as running nothing. A `-`
+  prefix on a line blocks only when the line is a check (`-rm -rf build` is fine);
+- a swallowed failure in any of those scripts or recipes, found by the shared shell reader.
+  A *check* is a statement whose command, in command position (after environment
+  assignments and wrappers such as `uv run`, `python -m`, `npx`, `time`, `sudo`, and the
+  env and coverage wrappers `cross-env`, `cross-env-shell` (its tail is a shell string),
+  `env-cmd`, `dotenv` (dotenv-cli), `dotenv run`, `dotenvx run`, `doppler run`, `op run`,
+  `infisical run`, `nyc` and `c8`, whose options are skipped, a value-taking one with its
+  value: `nyc --reporter lcov jest` is `jest`, and a word after the options that is no runner
+  makes it no check, so `echo -- pytest` and `cross-env CI=1 echo jest` are not), is a known
+  test runner, linter, type checker, or a policy command; a runner name that is only an
+  argument (`pip install pytest-xdist`, `grep pytest`, `echo pytest`), `--version` and
+  `--help`, and `make` with `-C` or `-f` are not checks. A swallow blocks only on a check:
+  `|| true`, `|| :`, `|| echo ...` after it, `; true`, and `; exit 0` or an unconditional
+  `exit 0` after it when the shell is not running with errexit, and `set +e` before it, up
+  to the next `set -e`, when its status is never read. So `rm -rf build || true` and
+  `pip install -e . || pip install .` are not swallows. A script with no recognised check is
+  opaque: its statements from the base count as checks, so a base line that gains a swallow
+  blocks, and a new line carrying one does not. Heredoc bodies are data. Only swallows the
+  base did not already have are reported. The selection-flag table (`-k`, `-m`,
+  `--deselect`, `--ignore`, `-run`, `-short`, `-t`, `--testNamePattern`, `--skip`,
+  `--grep` and their relatives, by runner) is shared with `ci.tampered`; a flag before the
+  runner (`python -m pytest`) does not count. In `runner.tampered` the flags belong to their
+  tool: `-k` narrows only pytest, `-t` narrows jest and vitest but is mocha's timeout, mocha
+  narrows with `-g`, `--grep`, `-f`, `--fgrep` and `--only`, and `make -k` narrows nothing. Detection is linear in the script: 8000 checks
+  and 2000 `exit 0` lines are read in under 3 seconds;
+- a file a base policy command runs (`sh scripts/test.sh`, `python scripts/run_tests.py`,
+  `./ci/check`), and the files those run, one level deep: deleted, emptied, replaced by a
+  no-op, given a swallow, a new selection flag or an unconditional `exit 0` before its
+  checks, or (for a non-shell script) given a top-level `sys.exit(0)`. Test files named as
+  arguments (`pytest tests/test_a.py`) are not scripts and are left to the test rules;
+- a Go `TestMain(<name> *testing.M)` (the parameter name is the one in the signature, and
+  strings, raw strings, runes and comments are skipped when matching braces) that gains a
+  body which never calls `<name>.Run()` or calls `os.Exit(0)` unconditionally after it: a
+  block, unless the base already had the same flaw. An `os.Exit(1)` inside a setup guard, and
+  an `os.Exit(0)` inside a guard that tests the result of `Run`, are not the flaw. A
+  conditional `os.Exit(0)` is a `warn`;
 - `conftest.py` or a local pytest plugin gaining a hook that can rewrite outcomes or
   collection (`pytest_runtest_makereport`, `pytest_runtest_call`, `pytest_runtest_protocol`,
   `pytest_pyfunc_call`, `pytest_report_teststatus`, `pytest_ignore_collect`,
@@ -366,12 +706,264 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `os._exit(` or `sys.exit(0)` added to a test or conftest file.
 When structural parsing fails, fall back to a file-level `warn` naming the file.
 
+`ci.tampered` reads CI files by indentation, with no YAML library; every workflow file is
+read together, so a change is judged against the whole CI, not one file.
+
+*Steps.* In a GitHub `run:` step (`run: |` and `>`, `>-`, `>+` folded scalars, folded as
+YAML does), a swallow of a check the base step did not have blocks, by the shared detector
+and its definition of a check. Which swallows exist depends on the step's shell, chosen like
+GitHub does: an explicit `shell:`, else the job or workflow `defaults.run.shell`, else bash
+on a Linux or macOS runner and PowerShell on a Windows one (a `runs-on` of `windows-*`, or a
+`${{ matrix.* }}` that resolves to one; a matrix with both kinds is judged under both
+shells, and a finding under either blocks).
+
+- Default bash (and `shell: bash`, `sh`) runs with errexit on, so `pytest; exit 0` and
+  `pytest; true` swallow nothing there. A custom shell string holding `{0}` and no `-e`
+  (`bash {0}`, `sh {0}`) has no errexit: the step's status is the last command's, so `pytest`
+  followed by `true`, on the same line or a later one, swallows the check. Only a swallow the
+  base step did not have blocks.
+- `pwsh`, `powershell` and `cmd` have no errexit either. The status is the last native
+  command's (`$LASTEXITCODE`), so a check that is not the last top-level command and whose
+  status is not propagated is swallowed, and so are `; exit 0`, a trailing `exit 0`,
+  `|| true` and `$LASTEXITCODE = 0` after a check.
+- `shell: python` (and any other interpreter the rule does not model) is not read; the step
+  is skipped rather than guessed at.
+
+The reader looks through launchers and wrappers before it classifies a command: `docker
+compose run`, `docker-compose`, `conda run`, `hatch`, `poetry`, `pdm`, `uv`, `pipenv` and
+`rye run`, `bash -c` and `sh -c` bodies (also scanned for swallows), and interpreter
+variables (`$(PYTHON)`, `${PYTHON}`, `$PYTHON`, `$(VENV)/bin/python`, `.venv/bin/python3`,
+`env/bin/pytest`, `$(BIN)/pytest`); `runner.tampered` shares this reading of Makefiles and
+scripts. `A || B` is not a swallow when B is a check of the same kind with no narrowing flag
+other than the rerun family (`--lf`, `--last-failed`, `--ff`, `--failed-first`, `--sw`,
+`--stepwise`, `--reruns N`), so `pytest || pytest --lf` passes and `pytest || pytest -k
+smoke` blocks.
+
+The next checks apply to GitHub Actions `run:` steps only: a selection flag the base step
+did not have, `--co`/`--collect-only` and `--passWithNoTests`, an `exit 0` before the first
+check, and `set +e` that never reads the status. GitLab CI and CircleCI files get only the
+line-level swallow check (`|| true`, `|| echo`, `; exit 0`, `; true`, with errexit assumed
+on), on added lines.
+
+*Flags.* `continue-on-error: true` and `if: false` on a step or job block, except when the
+step recognisably runs no check: every command is a recognised non-check (`echo`, `true`,
+`:`, `exit 0`, `sleep`, `printf`, `cat`), or the step `uses:` a known auxiliary action
+(`actions/checkout`, `actions/setup-*`, `actions/cache`, `actions/upload-artifact`,
+`actions/download-artifact`, `codecov/codecov-action`, `coverallsapp/github-action`,
+`docker/*`, `peaceiris/actions-gh-pages`, `softprops/action-gh-release`,
+`pypa/gh-action-pypi-publish`). Unknown and local actions and check steps keep blocking. A
+job whose steps include no check is exempt. The flag is also fine when some base workflow
+already had the same step (same normalised `run` body, or the same `uses:` without its ref)
+with `continue-on-error: true`, so moving or splitting a step that was already allowed to
+fail is not new. A quoted or capitalised `"false"`, `'false'` or `False` is false for
+`continue-on-error` (no finding), and `"true"`, `'true'` and `True` are true. For `if:`,
+`false` in any quoting still disables the step and blocks. `continue-on-error: ${{ ... }}`
+and a selection flag whose value is a `${{ matrix.* }}` expression are `warn`.
+
+*Step kinds.* Test and lint steps are counted by kind (pytest, jest, go test, ruff, ...) over
+the `run:` bodies of all workflow files, by the same check test. Beyond the usual unit-test
+runners the list covers `playwright test`, `cypress run`, `rspec`, `rake test`/`spec`,
+`phpunit`, `dotnet test`, `mvn test`/`verify`, `gradle test`/`check`, `ctest`, `bats`, `tox`,
+`nox`, `hatch test`, `ng test`, `karma start`, `ava`, `tap`, `node --test`, `deno test`,
+`bun test`, `swift test`, `mix test`, `cargo nextest` and `cargo llvm-cov`, and `gotestsum`.
+A candidate step also counts for the checks it runs through another file: a local composite
+action (`uses: ./path`, read from `action.yml` or `action.yaml` in the candidate tree, its
+`runs.steps[*].run`) and a local script (`./scripts/test.sh`, `bash scripts/test`,
+`sh x.sh`, `bash -c '...'`, `bash -o errexit x.sh`, `make [-C dir] [-f file] target`, `npm|pnpm|yarn|bun
+test|run X` with its `preX` and `postX`), read to depth 4 (see 'Nested reading' below). The
+same reader is applied to the base and to the candidate. A kind that vanishes from every candidate
+workflow blocks, unless the step that replaced it is something the rule cannot classify
+(`poe test`, `pre-commit run`, `uses: astral-sh/ruff-action@...`, an unknown action) and
+sits in the same workflow file and the same job as the check it replaces, is not disabled
+(`if: false`, `continue-on-error`), is not an inline eval and, when it runs a local script,
+that script exists in the candidate: then it is a `warn`. An unknown step in another job or
+file blocks. Replacing a check with a recognised non-check (`echo`, `true`, `exit 0`)
+still blocks. Fewer steps of a kind that still exists is `warn`. A kind that vanishes is
+also only a `warn` when the candidate tree holds a CI system this rule does not read
+(`.travis.yml`, `azure-pipelines.yml`, `Jenkinsfile`, ...) or a surviving `make test`,
+`npm test` or `tox`/`nox` step that may run it. A YAML anchor on `steps:` (`steps: &name`
+and `steps: *name`) is read; aliased steps report the line of the anchor.
+
+*Expanded bodies.* A local script, a local composite action step and a `bash -c` or `sh -c`
+string get the same analysis as a `run:` step, compared with the base: a swallow (`|| true`,
+`set +e`, an early `exit 0`, a trailing `&`, `trap '... exit 0' EXIT`, `true || check`), an
+inner step with `if: false` or `continue-on-error`, a `bash -n` or `sh -n` (which runs
+nothing), or a script that is missing in the candidate, no longer counts as running the
+check. A script body is read with errexit only when its shebang passes `-e` (`#!/bin/bash -e`,
+`#!/bin/sh -eu`, `#!/usr/bin/env -S bash -e`, `-o errexit`) or the statement that runs it does
+(`bash -e ci.sh`): a script is a shell of its own and does not inherit the step's `bash -e`.
+Without errexit a check followed by another command is a swallow (kind `noerr`) and the finding
+says to add `set -e`; `set -e`, `set -o errexit` and `set +e` inside the body are followed. Swallows
+are compared by `(kind, text)` as for a `run:` step, so a script that never had `set -e` and edits
+a line that was already swallowed blocks. A script whose shebang names another interpreter
+(`python`, `node`, `ruby`, `perl`, `pwsh`, ...) is not shell and is read on neither side. The
+check kinds of the base are counted through the same expansion as the candidate's, with the base
+files read from the base tree, so a check dropped from a script is a removed check whether or
+not the workflow file changed. `A || B` is a retry, and so not a
+swallow, only when B is A plus `--lf`, `--last-failed`, `--ff`, `--failed-first`, `--sw`,
+`--stepwise` or `--reruns N`. A trailing `&` makes the check a swallow. `$VAR`, `${VAR}` and
+`$(VAR)` as a command head are substituted from the step, job or workflow `env:`, then by
+name. `docker run -d`/`--detach` runs no check, and `--entrypoint E` makes the command `E
+args`; `python -c` with `pytest.main` is pytest only when wrapped in `sys.exit`, `raise
+SystemExit` or `exit(...)`; `gotestsum tool ...`, `cargo llvm-cov report|show-env|clean` and
+`--no-run` are not runs. A constant-false `if:` (`false`, `0`, `''`, `!true`, `${{ false }}`)
+disables the step. `continue-on-error` and a false `if:` are matched by step as a multiset
+across the workflow files (a step moved into a reusable workflow with its flag passes), and
+at job level by the sorted signatures of the check steps. Selection narrowing (the same
+runner on fewer paths or names) is judged per runner across all workflows and expanded
+bodies; mocha spec changes only warn.
+
+*Changed scripts and actions.* The rule also runs when no workflow file changed but a changed
+file (its path or old path) is one a GitHub workflow step reads on either side: the
+`action.yml` or `action.yaml` of a local composite action (`uses: ./...`), or a local script
+(`.sh`, `.bash`, `.zsh` or no extension) found the way expanded bodies are: named by the step's
+`run:` or by a step of the action it uses. Each workflow that reaches such a file is judged as
+if touched, with its own text unchanged on both sides, and the finding names the changed file.
+A commit that changes no file of that shape, and no workflow, never reads the CI files.
+Scripts and actions over 64 KiB are not read.
+
+*Nested reading.* A step is read as a tree. Each step has a budget of 32 files and 512 KiB, each
+file at most 64 KiB, and the depth is 4. A cap that cuts the candidate side is a `warn` naming
+where the reader stopped, and a workflow with a cut expansion is judged when a changed file was
+reached by no workflow. The same expansion is used to find the workflows a changed file reaches.
+Paths resolve from the step's `working-directory`, else the job's or the workflow's default; an
+expression resolves from the repo root (documented limit), and `cd X` moves the directory of the
+statements after it.
+- A called script takes errexit from its shebang and the command flags (`-e`, `-o errexit`,
+  `-eo pipefail`); a sourced script inherits the caller's mode.
+- `make`: the recipe lines of the named targets and their prerequisites, or the default goal. Each
+  recipe line is its own `sh -c` without errexit, so a check followed by a command on the same line
+  is a swallow. A `-` prefix, `make -i`, `.IGNORE` and `MAKEFLAGS += -i` swallow; `make -k` does
+  not. `-C`, `-f` and command-line variables (`SHELL`, `.SHELLFLAGS`) are read.
+- `npm test|start|run|run-script X`, `pnpm [run] X`, `yarn [run] X`, `bun run X`: the package.json
+  script with `preX` and `postX`, found from `--prefix`, `-C`, `--dir` or the step's directory.
+- A statement a step adds that removes the project's tests (`rm`, `find -delete`, `git rm`, ...,
+  judged by the runner rule's `removes`, against the base's statements) blocks.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD` set in `env:` or inline is a `warn`.
+- A `make` or package-manager statement counts as expanded only when its target or script is read
+  and holds a recognised check or nothing; otherwise it stays opaque, and a kind that vanishes in
+  its presence keeps the old `warn` excuse.
+
+*Conditions and exit statuses.* An `if:` on a job or step is read with redundant wrapping
+parentheses peeled (any number of pairs; they do not count toward depth). A new or changed `if:`
+on a job or step that runs a check, with more than 32 levels of real `&&`/`||` nesting, is a
+`warn`: "has an `if:` nested too deeply to read". A saved exit status is followed: `rc=$?; ...;
+exit 0` swallows the check, and `exit $rc` (or `exit "$rc"`) keeps it. The shell reader takes
+time linear in its input.
+
+*Known limits.* Flow-style `steps: [...]`, a `runs-on` computed by `fromJSON`, a `make`
+and `always() && false` are not read. Expansion stops at depth 4, 32 files or 512 KiB per step
+(a `warn`); GitLab CI and CircleCI scripts are not followed; a Makefile `include` whose path uses `$(shell ...)`,
+`$(wildcard ...)` or an unset variable, and `npm -w`/`--workspace` are not read (monorepo filters of turbo, pnpm, nx
+`run-many`, lerna and yarn are: see `runner.tampered` above); `cd` is not scoped, so a
+subshell's `cd` carries on; a `working-directory` expression resolves from the repo root; a make
+target or script with content the rule cannot classify stays opaque.
+
+*The greenproof step.* Greenproof steps are compared across all GitHub workflow files as a
+multiset of signatures: the `uses:` without its ref, `with:` (block scalars read; the raw text
+when it cannot be parsed), `if:` of the step and its job, `continue-on-error` and `env:`, and
+whether the workflow has an automatic code event (`push`, `pull_request`,
+`pull_request_target`, `merge_group`) and whether one of them runs on every ref. Moving a step
+unchanged, or to another file or job under the same kind of triggers, passes; moving it to a
+manual or scheduled workflow, or to one whose events are all branch-filtered, blocks. Changing a `with:` input,
+`if:` or `env:` blocks, as does removing the step or deleting the workflow that holds it;
+adding the first greenproof step is adoption. A ref-only bump is `warn`. Non-GitHub files
+compare their greenproof lines per file.
+
+*Triggers.* The `on:` section (scalar, flow or block form) is read; anchors, aliases, an
+unclosed flow collection or anything else unreadable make it unknown, and the rule says
+nothing about triggers. An event removed from a workflow is fine when another candidate
+workflow triggered on that event calls it (`uses: ./.github/workflows/<file>`) or runs every
+test-step kind it ran; otherwise it blocks, as does a workflow with a test step that loses
+`push` and `pull_request`. A `paths` or `paths-ignore` filter is evaluated for the base and
+the candidate with GitHub's glob rules (`*` does not cross `/`, `**` does, the last matching
+pattern wins, `!` negates) against the candidate tree: it blocks only when a test or source
+file that triggered the workflow under the base filter does not under the candidate's.
+Excluding documentation or meta files (`mkdocs.yml`, `.vscode/**`, `*.md`) and renaming a
+directory block nothing. An added or narrowed `branches`, `branches-ignore`, `tags`,
+`tags-ignore` or `types` filter is `warn`, with one exception: a `branches` or `branches-ignore`
+filter newly added under `push` is no finding while `pull_request` stays on and unfiltered,
+unless it takes the default branch off `push` (a `branches` list that selects neither `main` nor
+`master`, a `branches-ignore` pattern that matches either), which warns. A filter never blocks;
+dropping the `pull_request` trigger does, as above. Swapping `pull_request` for
+`pull_request_target`, adding events, matrix changes and new jobs are not narrowing.
+Dropping `push` while keeping `pull_request` is narrowing and blocks; so does splitting
+`-m 'not slow'` and `-m slow` into separate steps, because each step carries a selection
+flag (a known limit: the two halves together run everything, and the rule does not add them up).
+
+Other CI files (GitLab, CircleCI, Jenkins and so on) get the line-level swallow check on
+added lines, with errexit assumed on, and none of the GitHub-only checks above.
+
 A linter or type-checker configuration that does not exist at the base (a new
 `[tool.ruff]`/`[tool.ruff.lint]` or `[tool.mypy]` table, a new `ruff.toml`, `.ruff.toml`,
 `mypy.ini` or `.flake8`) is adoption or a migration: its ignores, per-file ignores and
 disabled error codes are `runner.tampered` **warn**, not block, because there was no
 stricter configuration to loosen. Ignores added to a table that existed at the base
 still block.
+
+*Known limits.* A lint ignore for a rule that is new in a version bump of the linter still
+blocks (httpx `fa03b489f`: the ignore is the honest answer to a bump, and the rule cannot tell
+it from a loosening without the linter's changelog). Coverage floors moved from the pytest
+options into a `codecov` block are read as lowered (httpx `46402dd59`: the rule does not read
+`codecov.yml`).
+
+#### Known limits (0.3.0)
+
+Table folds
+- A fold body past the flow budget (100,000 characters, 2,000 exits, 5,000 regions, nesting
+  200) keeps the warn and says its body is too large to check.
+- Not credited, so the fold blocks as in 0.2.0: `pytest.approx` as the pinned value, asserts in
+  a module helper, unittest `subTest` loops, Rust match arms as rows.
+- Not read: Rust `let-else`, a single `#[case]` with `#[ignore]`, JS `it.each` skipped rows,
+  switch fallthrough, nested-loop `break`/`continue`, Rust `?`, a malformed Go or Rust `for`.
+
+Makefiles
+- A twin inside a true `ifndef` is not credited (0.2.0 blocks it too), nor is a `.ONESHELL`
+  last-line twin.
+- `set -o pipefail` is honoured only when `SHELL` is bash.
+- A target with thousands of recipe commands costs about 1 ms per command (linear).
+- The CI path sees the union of conditional branches, and warns past 32 conditional worlds.
+- A deleted root Makefile is not followed.
+- An `include` whose path uses `$(shell ...)`, `$(wildcard ...)`, `$(realpath ...)` or an unset
+  variable warns; so do more than 16 included files, more than 64 variable-path readings, and
+  macros nested past depth 16. `$(call)` of a recursively expanded (`=`) variable warns.
+- `include .env` inside `ifneq (,$(wildcard ./.env))` is read as the world where the file is
+  absent, so it warns (exit 0).
+- A Makefile of 3,000 double-colon rules takes about 5 s of CPU (linear).
+- `.PHONY +=` is a variable assignment in GNU make, so it is read as one.
+
+Config
+- More than 8 different pytest runs: the runs are not compared one by one (the configuration
+  alone is judged) and a change to them warns.
+- Runs are followed to depth 4, 400 statements and 8 Makefiles; a run built from a computed
+  variable or command substitution is not resolved.
+- A `conftest.py` `collect_ignore` of `setup.py` blocks through `tests.skipped` (0.2.0 too).
+
+Selection
+- `nx run-many` becoming `nx affected` in a workflow step passes silently; in `runner.tampered`
+  it warns. `npm -w`/`--workspace` is not read as selection.
+- Budgets, each a warning when passed: 20,000 tox command lines per file, 200,000 nox syntax
+  nodes per noxfile, 200,000 filter comparisons per dimension.
+- A filter rename or glob only warns.
+- A nox `session.run` whose command is a variable, or a call to another function, is
+  unreadable; it warns only if a check kind was lost. Other `.run(` calls in a session count as
+  unreadable runs.
+
+Shell and CI
+- `ci.tampered` reads a script or action file up to 64 KiB; `runner.tampered` reads a policy
+  script up to 200,000 characters. A check, or the `exit $rc` that keeps its status, past the
+  cut is not seen, so the step blocks as if the check were removed or swallowed, next to a
+  warning that the script was read only up to a point.
+- A step that copies a file into the test tree (`cp ci/settings.py tests/settings.py`) blocks as
+  a test rewrite, even when the file is a settings file or a fixture.
+- A CI step that already rewrote tests, edited (a `sed -i` expression changed), is read as a
+  new rewrite and blocks, though the base rewrote the same files.
+- `pytest | tee out.log` blocks as a swallowed check under the default `run:` shell, which
+  has no `pipefail` (0.2.0 passed it).
+- A single line nested about 400 `{ ... }` deep takes over 2 s of CPU (cost grows with depth
+  times size). On a very large Go test file (about 165 kB) the masking pass takes about 1 s.
+- Very deeply nested input in some readers can hit Python's recursion limit. That exits 5
+  (internal), which fails closed.
 
 ### 5.7 Test identity and covered removals
 
@@ -447,6 +1039,15 @@ in its file it stays `tests.removed` (block). A deleted test file that contained
 units (helpers, fixtures) is not `tests.deleted`; `runner.tampered` still covers conftest
 hooks.
 
+**Table folds.** Folding several tests into one table-driven test (a parametrized Python test,
+`it.each`, a Go table, Rust `#[case]`) keeps the `tests.replaced` warn, which 0.2.0 blocked,
+only when the table runs, no row leaves the body before asserting, and the row values reach an
+assertion. Each of these blocks the fold: an assertion inside a `try`/`except` or `try`/`catch`
+that swallows the failure; `assert a or b` where `a` depends on a row; a `skip`, `skipif` or
+`xfail` row mark of a kind the folded tests did not already carry. These pass: a Python `case _`
+or a Rust catch-all arm that closes a `match`; `expect(() => f(row)).toThrow()` and `.rejects.*`
+as assertions; a kept `xfail` row. The message says which condition failed.
+
 **Absorbing tests.** A paired test in the same file whose effective check count (5.4)
 grew is an absorbing test: removed tests were often folded into it (two tests merged into
 one parametrized test that keeps one of the names). When a file has removed uncovered
@@ -484,6 +1085,17 @@ calls that callable, so the assertion checks the mock.
   `from <qualifier-module> import <name>` (also when the qualifier is that module's alias).
   It still fires when the patch does not reach the from-imported name; an agent that
   patches the subject of its own test intended to.
+- Python autouse fixtures. An added or changed `@pytest.fixture(autouse=True)` in a
+  `conftest.py` or a test file (a patch not already in the same fixture at the base) that
+  patches a callable with the forms above, or by assigning to a module attribute
+  (`shop.refund = ...`), fires when a test in its scope calls that callable inside an
+  assertion: the fixture's own file (its class, for a class fixture), or for a
+  `conftest.py` every collected test at or below its directory. Only files that mention the
+  patched callable's name as a word are read for the scope (the same pre-filter as helper
+  dependents, no alphabetical cut). The patch target is
+  resolved with the fixture file's imports and the call with the test file's. Message:
+  "autouse fixture <name> patches <target> and the tests in its scope assert on <call>(...)
+  (<tests>); they test the mock".
 - JS/TS (line level). An added `jest.mock(P)` or `vi.mock(P)`, or an added
   `jest.spyOn(X, 'n')` / `vi.spyOn(X, 'n')` followed by `.mockReturnValue`,
   `.mockResolvedValue` or `.mockImplementation`, where the same file imports from `P` (or
@@ -1277,10 +1889,13 @@ greenproof and use the dev dependencies; it never needs network access.
 - A test in `tests/` runs `bench/run.py` on all cases (marked slow if it exceeds 60 s with
   xdist) so the benchmark cannot rot.
 
-**Replay harness** `bench/replay.py REPO [--n 200] [--out PATH.tsv] [--details]`: on a
-temporary clone of REPO (never the original), for each of the last N first-parent,
-non-merge commits whose diff touches a file greenproof classifies as a test: check out the
-parent, commit a policy with empty commands as the base, set index and worktree to the
+**Replay harness** `bench/replay.py REPO [--n 200] [--select tests|runner] [--command CMD]
+[--out PATH.tsv] [--details]`: on a temporary clone of REPO (never the original), for each of
+the last N first-parent, non-merge commits whose diff touches a file greenproof classifies as
+a test (with `--select runner`: a CI workflow, a test-runner or tool config, a `package.json`,
+a Makefile or justfile, or a shell script): check out the parent, commit a policy as the base
+(no commands, or `[commands] test = CMD` with `--command`, so the runner rules see the files
+the command runs; static checks never run it), set index and worktree to the
 commit's tree with `git read-tree -u --reset <sha>`, rewrite the same policy file (so the
 base and candidate policies are equal), and run `greenproof check --checks static --base
 HEAD --no-cache --json`. TSV columns: short sha, exit code, sorted `rule(severity)` list,

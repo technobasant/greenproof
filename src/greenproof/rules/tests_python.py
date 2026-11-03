@@ -5,12 +5,17 @@ from __future__ import annotations
 import ast
 import builtins
 import copy
+import math
 import posixpath
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
+from typing import Protocol
 
 from greenproof.rules._common import digest
-from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
+from greenproof.rules.tests_model import FileAnalysis, Fixture, Marker, Unit
+from greenproof.rules.tests_pyrows import row_gap
 
 _MARK_SUFFIXES = ("mark.skip", "mark.skipif", "mark.xfail")
 _FULL_KINDS = {
@@ -126,12 +131,31 @@ def _has_call(node: ast.AST) -> bool:
     return any(isinstance(n, ast.Call) for n in ast.walk(node))
 
 
+def _call_keys(node: ast.AST, stores: set[str]) -> set[str]:
+    """A key for each call inside `node`, locals alpha-renamed, so the same call in two tests
+    (or two revisions of one) gets the same key."""
+    return {
+        digest(ast.dump(_Locals(stores).visit(copy.deepcopy(n))))
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+    }
+
+
 _Same = Callable[[ast.AST, ast.AST], bool]
+
+
+def _empty_display(node: ast.AST) -> bool:
+    """A `[]`, `()`, `{}` display with nothing in it: falsy."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return not node.elts
+    return isinstance(node, ast.Dict) and not node.keys
 
 
 def _always_false(node: ast.AST, same: _Same | None = None) -> bool:
     if isinstance(node, ast.Constant):
         return not node.value
+    if _empty_display(node):
+        return True
     return (
         isinstance(node, ast.UnaryOp)
         and isinstance(node.op, ast.Not)
@@ -139,14 +163,27 @@ def _always_false(node: ast.AST, same: _Same | None = None) -> bool:
     )
 
 
+def _truthy_display(node: ast.AST) -> bool:
+    """A display with at least one element that is not a `*unpack` (which may be empty)."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any(not isinstance(e, ast.Starred) for e in node.elts)
+    return isinstance(node, ast.Dict) and any(k is not None for k in node.keys)
+
+
 def _always_true(node: ast.AST, same: _Same | None = None) -> bool:
-    """A condition that cannot fail: a truthy constant, `x or True`, `x == x`, a non-empty tuple.
+    """A condition that cannot fail: a truthy constant, `x or True`, `x == x`, a non-empty
+    display (the classic `assert (x, "msg")`), a non-empty f-string, `not []`.
     `same` decides whether two sides are the same expression (default: `_same`)."""
     same = same or _same
     if isinstance(node, ast.Constant):
         return bool(node.value) and node.value is not Ellipsis
-    if isinstance(node, ast.Tuple):
-        return bool(node.elts)
+    if _truthy_display(node):
+        return True
+    if isinstance(node, ast.JoinedStr):
+        return any(
+            isinstance(v, ast.Constant) and isinstance(v.value, str) and v.value
+            for v in node.values
+        )
     if isinstance(node, ast.BoolOp):
         parts = [_always_true(v, same) for v in node.values]
         return any(parts) if isinstance(node.op, ast.Or) else all(parts)
@@ -159,15 +196,65 @@ def _always_true(node: ast.AST, same: _Same | None = None) -> bool:
     return False
 
 
+# Calls that give a different answer each time: `next(it) == next(it)` is not a tautology.
+_IMPURE_TAILS = frozenset(
+    {
+        "next",
+        "pop",
+        "popleft",
+        "popitem",
+        "readline",
+        "recv",
+        "random",
+        "randint",
+        "randrange",
+        "choice",
+        "getrandbits",
+        "uuid1",
+        "uuid4",
+        "time",
+        "time_ns",
+        "now",
+        "monotonic",
+        "perf_counter",
+        "get_nowait",
+        "utcnow",
+        "today",
+        "urandom",
+        "token_hex",
+        "token_bytes",
+        "rand",
+        "randn",
+        "uniform",
+        "sample",
+        "shuffle",
+    }
+)
+
+
+def _stateful(node: ast.AST) -> bool:
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr)):
+            return True
+        if isinstance(n, ast.Call):
+            func = n.func
+            tail = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            if tail in _IMPURE_TAILS:
+                return True
+    return False
+
+
 def _same(a: ast.AST, b: ast.AST) -> bool:
-    """The same side-effect-free expression on both sides (calls are not assumed pure)."""
-    return not _has_call(a) and ast.dump(a) == ast.dump(b)
+    """The same expression on both sides, so comparing it with itself checks nothing. An operand
+    with a call is never the same: `get_settings() is get_settings()` pins a singleton and
+    `Money(5) == Money(5)` runs `__eq__`. Names, attributes, subscripts and literals are."""
+    return not _has_call(a) and not _has_call(b) and ast.dump(a) == ast.dump(b) and not _stateful(a)
 
 
 def _vacuous_call(tail: str, node: ast.Call, same: _Same | None = None) -> bool:
     if tail == "assertTrue":
         return bool(node.args) and _always_true(node.args[0], same)
-    if tail in _EQUAL_METHODS and len(node.args) >= 2:
+    if (tail in _EQUAL_METHODS or tail == "assertIs") and len(node.args) >= 2:
         return (same or _same)(node.args[0], node.args[1])
     return False
 
@@ -432,7 +519,11 @@ def _number(node: ast.AST) -> float | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         if isinstance(node.value, bool):
             return None
-        return float(node.value)
+        try:
+            value = float(node.value)
+        except OverflowError:  # an int too large for a float (`0x` and 512 hex digits)
+            return None
+        return value if math.isfinite(value) else None
     if (
         isinstance(node, ast.UnaryOp)
         and isinstance(node.op, ast.USub)
@@ -526,6 +617,103 @@ def _expected_of(node: ast.AST) -> ast.AST | None:
     return None
 
 
+class _Helpers(dict[str, _FuncDef]):
+    """The functions a test may call and get credit for, by the name it calls them with: the
+    file's own top-level helpers and the functions of the test-path modules it imports. `scopes`
+    gives, for an imported function, the helpers of the module it lives in; `swallowers` names
+    those whose body swallows assertion failures (a decorator that does is a tamper)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scopes: dict[str, dict[str, _FuncDef]] = {}
+        self.swallowers: set[str] = set()
+
+
+def _handler_swallows(handler: ast.ExceptHandler) -> bool:
+    caught: list[str] = []
+    if handler.type is None:
+        caught = ["BaseException"]
+    elif isinstance(handler.type, ast.Tuple):
+        caught = [dotted(e) for e in handler.type.elts]
+    else:
+        caught = [dotted(handler.type)]
+    if not any(c.rsplit(".", 1)[-1] in _SWALLOWED for c in caught):
+        return False
+    return not any(isinstance(n, ast.Raise) for s in handler.body for n in ast.walk(s))
+
+
+def _own_nodes(fn: _FuncDef) -> Iterator[ast.AST]:
+    """The nodes of a function body, not descending into nested defs, lambdas or classes."""
+    todo: list[ast.AST] = list(fn.body)
+    while todo:
+        node = todo.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            todo.extend(ast.iter_child_nodes(node))
+
+
+def _param_names(fn: _FuncDef) -> set[str]:
+    a = fn.args
+    names = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    names.update(p.arg for p in (a.vararg, a.kwarg) if p is not None)
+    return names
+
+
+def _calls_any(nodes: Sequence[ast.stmt], names: set[str]) -> bool:
+    """A statement of `nodes` calls one of `names` (`f(...)`, `f.__wrapped__(...)`)."""
+    for stmt in nodes:
+        for n in ast.walk(stmt):
+            if isinstance(n, ast.Call):
+                root = n.func
+                while isinstance(root, (ast.Attribute, ast.Call, ast.Subscript)):
+                    root = root.func if isinstance(root, ast.Call) else root.value
+                if isinstance(root, ast.Name) and root.id in names:
+                    return True
+    return False
+
+
+def _fn_swallows(fn: _FuncDef) -> bool:
+    """The decorator `fn` swallows assertion failures (SPEC 5.4): one of its wrappers has a `try`
+    whose body calls the wrapped callable (a parameter of the decorator) and a handler that
+    catches AssertionError, Exception, BaseException or everything without re-raising. A wrapper
+    with any `raise` outside its nested defs is not swallowing (a retry decorator ends with
+    `raise last`), and a `try` that does not call the wrapped callable (best-effort cleanup) is
+    ignored."""
+
+    def scan(w: _FuncDef, wrapped: set[str]) -> bool:
+        own = list(_own_nodes(w))
+        if not any(isinstance(n, ast.Raise) for n in own):
+            for n in own:
+                if (
+                    isinstance(n, (ast.Try, ast.TryStar))
+                    and _calls_any(n.body, wrapped)
+                    and any(_handler_swallows(h) for h in n.handlers)
+                ):
+                    return True
+        inner = wrapped | _param_names(w)
+        return any(scan(d, inner) for d in _direct_defs(w))
+
+    return scan(fn, _param_names(fn))
+
+
+def _direct_defs(fn: _FuncDef) -> list[_FuncDef]:
+    """The defs nested in `fn` that are not inside another nested def."""
+    out: list[_FuncDef] = []
+    todo: list[ast.AST] = list(fn.body)
+    while todo:
+        node = todo.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.append(node)
+        elif not isinstance(node, (ast.Lambda, ast.ClassDef)):
+            todo.extend(ast.iter_child_nodes(node))
+    return out
+
+
+# How many helpers deep a test's call chain is followed (`check` -> `_check_fields` -> `_check_id`).
+# The stack in `_credit_helper` already stops cycles.
+_HELPER_DEPTH = 8
+
+
 class _Stats(ast.NodeVisitor):
     """Assertion statistics for one test body, crediting same-module helper functions."""
 
@@ -560,16 +748,22 @@ class _Stats(ast.NodeVisitor):
         self.loose_hit: set[str] = set()  # forms of assertions holding a loose check
         self.pinned = 0  # exact checks against a literal or an all-literal parametrize argument
         self.literal_params: set[str] = set()
+        self.call_self: dict[str, int] = {}  # call -> times compared with itself
+        self.call_self_line = 0
+        self.call_compared: set[str] = set()  # calls that were an operand of a real comparison
+        self.cur_line = 0
         self.strong_operands: set[str] = set()  # operands of comparisons
         self.weak_operands: set[str] = (
             set()
         )  # targets of a bare truthiness (or `is not None`) check
         self.first_line = 0
+        # (subject shape, expected number) -> (tightest band, subject source) over the exact and
+        # tolerant numeric comparisons of the body (SPEC 5.4, exact checks loosened).
+        self.numeric: dict[tuple[str, float], tuple[float, str]] = {}
 
     def _same_at(self, line: int) -> _Same:
-        """`_same`, also after inlining the locals assigned once before `line`. An expression with
-        calls is the same only when one side is the other's call written out again (a local
-        assigned from `f(x)` against `f(x)`), not two locals each assigned from a call."""
+        """`_same`, also after inlining the locals assigned once before `line`. An operand that
+        has a call once the locals are inlined is never the same."""
 
         def same(a: ast.AST, b: ast.AST) -> bool:
             if _same(a, b):
@@ -577,14 +771,29 @@ class _Stats(ast.NodeVisitor):
             ia, ib = self.consts.inline(a, 0, line), self.consts.inline(b, 0, line)
             if ast.dump(ia) != ast.dump(ib):
                 return False
-            if not (_has_call(ia)):
-                return True
-            return (ast.dump(ia) == ast.dump(a)) != (ast.dump(ib) == ast.dump(b))
+            return not _has_call(ia)
 
         return same
 
     def _opshape(self, node: ast.AST) -> str:
         return digest(ast.dump(_Locals(self.consts.stores).visit(self.consts.inline(node))))
+
+    def _note_pair(self, a: ast.AST, b: ast.AST, selfop: bool) -> None:
+        """Record a comparison of two operands that have a call: a call compared with itself
+        (when the operator holds for equal operands), or the calls a real comparison used."""
+        ia, ib = (self.consts.inline(x, 0, self.cur_line) for x in (a, b))
+        if not (_has_call(ia) or _has_call(ib)):
+            return
+        stores = self.consts.stores
+        if ast.dump(ia) == ast.dump(ib):
+            if not selfop or _stateful(ia):
+                return
+            keys = _call_keys(ia, stores)
+            for key in keys:
+                self.call_self[key] = self.call_self.get(key, 0) + 1
+            self.call_self_line = self.call_self_line or self.cur_line
+        else:
+            self.call_compared |= _call_keys(ia, stores) | _call_keys(ib, stores)
 
     # -- exact and loose checks (SPEC 5.4) ---------------------------------------------
     def _pinned_side(self, node: ast.expr) -> bool:
@@ -635,12 +844,21 @@ class _Stats(ast.NodeVisitor):
         elif isinstance(test, ast.Compare):
             left = test.left
             for op, right in zip(test.ops, test.comparators, strict=True):
+                self._note_pair(
+                    left, right, not negated and isinstance(op, (ast.Eq, ast.LtE, ast.GtE, ast.Is))
+                )
                 self._compare(left, op, right, src, negated)
                 left = right
         elif isinstance(test, ast.Call) and dotted(test.func) in {"isinstance", "issubclass"}:
             if test.args:
                 self._loosen(test.args[0], src)
         else:
+            if (
+                isinstance(test, ast.Call)
+                and not negated
+                and dotted(test.func).rsplit(".", 1)[-1] == "isclose"
+            ):
+                self._isclose(test)
             self._loosen(test, src)
 
     def _compare(self, left: ast.expr, op: ast.cmpop, right: ast.expr, src: str, neg: bool) -> None:
@@ -652,11 +870,88 @@ class _Stats(ast.NodeVisitor):
             return
         if exact:
             self._pinned_check((left, right))
+            if isinstance(op, ast.Eq) and not neg:
+                self._numeric_pair(left, right)
         for side in (left, right):
             if exact:
                 self._exact(side, src)
             else:
                 self._loosen(side, src)
+
+    # -- numeric tolerance bands ---------------------------------------------------------
+    def _band(self, node: ast.expr) -> tuple[float, float] | None:
+        """(expected, band) of a numeric literal (band 0) or `approx(<literal>, rel=, abs=)`;
+        None for anything else, or when a tolerance is not a literal."""
+        node = self.consts.inline(node)  # type: ignore[assignment]
+        expected = _number(node)
+        if expected is not None:
+            return expected, 0.0
+        if not (
+            isinstance(node, ast.Call)
+            and dotted(node.func).rsplit(".", 1)[-1] == "approx"
+            and len(node.args) == 1
+        ):
+            return None
+        expected = _number(node.args[0])
+        if expected is None:
+            return None
+        tol: dict[str, float] = {}
+        for kw in node.keywords:
+            if kw.arg not in {"rel", "abs"}:
+                continue
+            value = _number(self.consts.inline(kw.value))
+            if value is None:
+                return None
+            tol[kw.arg] = value
+        rel = tol.get("rel", 0.0 if "abs" in tol else 1e-6)
+        return expected, max(rel * abs(expected), tol.get("abs", 1e-12))
+
+    def _note_numeric(self, subject: ast.expr, expected: float, band: float) -> None:
+        if self.consts.is_const(subject):
+            return
+        key = (self._opshape(subject), expected)
+        have = self.numeric.get(key)
+        if have is None or band < have[0]:
+            self.numeric[key] = (band, ast.unparse(self.consts.inline(subject)))
+
+    def _numeric_pair(self, left: ast.expr, right: ast.expr, band: float | None = None) -> None:
+        """`left == right` where one side is a numeric literal or approx of one. `band` overrides
+        the tolerance for a call that carries its own (assertAlmostEqual, math.isclose)."""
+        a, b = self._band(left), self._band(right)
+        if (a is None) == (b is None):
+            return
+        expected, own = a or b or (0.0, 0.0)
+        self._note_numeric(
+            right if a is not None else left, expected, own if band is None else band
+        )
+
+    def _almost_band(self, node: ast.Call) -> float | None:
+        """The band an assertAlmostEqual call allows: `delta`, else half of 10**-places."""
+        places: float | None = 7.0
+        if len(node.args) >= 3:
+            places = _number(node.args[2])
+        for kw in node.keywords:
+            if kw.arg == "delta":
+                return _number(kw.value)
+            if kw.arg == "places":
+                places = _number(kw.value)
+        return None if places is None else 0.5 * 10.0 ** (-places)
+
+    def _isclose(self, node: ast.Call) -> None:
+        tol: dict[str, float] = {}
+        for kw in node.keywords:
+            if kw.arg in {"rel_tol", "abs_tol"}:
+                value = _number(kw.value)
+                if value is None:
+                    return
+                tol[kw.arg] = value
+        if len(node.args) < 2:
+            return
+        for lit, other in ((node.args[1], node.args[0]), (node.args[0], node.args[1])):
+            if (n := _number(self.consts.inline(lit))) is not None:
+                band = max(tol.get("rel_tol", 1e-9) * abs(n), tol.get("abs_tol", 0.0))
+                self._note_numeric(other, n, band)
+                return
 
     # -- assertions ---------------------------------------------------------------------
     def _counted(self, node: ast.AST) -> None:
@@ -664,6 +959,7 @@ class _Stats(ast.NodeVisitor):
         self.first_line = self.first_line or getattr(node, "lineno", 0)
         self.shapes.append(_shape(node))
         self.cur_form = digest(ast.dump(node))
+        self.cur_line = getattr(node, "lineno", 0)
         self.forms.append(self.cur_form)
 
     def visit_Assert(self, node: ast.Assert) -> None:
@@ -704,6 +1000,9 @@ class _Stats(ast.NodeVisitor):
             # A bare truthiness check on a call is weak; type checks pin a concrete fact.
             if dotted(test.func) in {"isinstance", "issubclass"}:
                 self.strong += 1
+            elif dotted(test.func).rsplit(".", 1)[-1] == "isclose" and len(test.args) >= 2:
+                self.strong += 1  # a comparison with a tolerance, like `== approx(...)`
+                self.strong_operands.update(self._opshape(a) for a in test.args[:2])
             else:
                 self.weak += 1
                 self.weak_operands.add(self._opshape(test))
@@ -775,6 +1074,12 @@ class _Stats(ast.NodeVisitor):
     def _method_checks(self, tail: str, node: ast.Call) -> None:
         src = ast.unparse(node)
         args = node.args
+        if (tail in _EQUAL_METHODS or tail == "assertIs") and len(args) >= 2:
+            self._note_pair(args[0], args[1], True)
+        if tail in _EQUAL_METHODS and len(args) >= 2:
+            band = self._almost_band(node) if tail in _ALMOST else None
+            if band is not None or tail not in _ALMOST:
+                self._numeric_pair(args[0], args[1], band)
         if tail in _EXACT_METHODS:
             if tail == "assertIsNone":
                 self.pinned += 1  # `is None`: pinned to the constant None
@@ -803,14 +1108,21 @@ class _Stats(ast.NodeVisitor):
         target: str | None = None
         if isinstance(func, ast.Name):
             target = func.id
-        elif isinstance(func, ast.Attribute) and dotted(func.value) in {"self", "cls"}:
-            target = func.attr
-        if target is None or target not in self.helpers or self.depth >= 2:
+        elif isinstance(func, ast.Attribute):
+            if dotted(func.value) in {"self", "cls"}:
+                target = func.attr
+            elif dotted(func) in self.helpers:  # `helpers.check(...)` on an imported module
+                target = dotted(func)
+        if target is None or target not in self.helpers or self.depth >= _HELPER_DEPTH:
             return
         if target in self.stack:
             return
+        scopes = getattr(self.helpers, "scopes", {})
         sub = _Stats(
-            self.helpers, self.depth + 1, (*self.stack, target), _Consts(self.helpers[target])
+            scopes.get(target, self.helpers),
+            self.depth + 1,
+            (*self.stack, target),
+            _Consts(self.helpers[target]),
         )
         for stmt in self.helpers[target].body:
             sub.visit(stmt)
@@ -824,19 +1136,14 @@ class _Stats(ast.NodeVisitor):
         self.exact_hit |= sub.exact_hit
         self.loose_hit |= sub.loose_hit
         self.vacuous += sub.vacuous
+        for key, count in sub.call_self.items():
+            self.call_self[key] = self.call_self.get(key, 0) + count
+        self.call_self_line = self.call_self_line or sub.call_self_line
+        self.call_compared |= sub.call_compared
 
     # -- swallowing ---------------------------------------------------------------------
     def _swallows(self, handler: ast.ExceptHandler) -> bool:
-        caught: list[str] = []
-        if handler.type is None:
-            caught = ["BaseException"]
-        elif isinstance(handler.type, ast.Tuple):
-            caught = [dotted(e) for e in handler.type.elts]
-        else:
-            caught = [dotted(handler.type)]
-        if not any(c.rsplit(".", 1)[-1] in _SWALLOWED for c in caught):
-            return False
-        return not any(isinstance(n, ast.Raise) for s in handler.body for n in ast.walk(s))
+        return _handler_swallows(handler)
 
     def _count_inside(self, body: Sequence[ast.stmt], line: int) -> None:
         inner = _Stats(self.helpers, self.depth, self.stack)
@@ -890,6 +1197,40 @@ def _parametrize(fn: _FuncDef) -> tuple[int | None, bool, list[str]]:
         else:
             literal = False
     return (total if literal else None), literal, forms
+
+
+def _marked(fn: _FuncDef) -> list[tuple[str, tuple[str, ...]]]:
+    """The exact form of each literal row of a parametrize decorator that carries a skip or xfail
+    mark (`pytest.param(..., marks=pytest.mark.skip)`), with the kinds of its marks: such a row
+    never runs, or never counts."""
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for dec in fn.decorator_list:
+        if not (isinstance(dec, ast.Call) and dotted(dec.func).endswith("mark.parametrize")):
+            continue
+        values: ast.AST | None = dec.args[1] if len(dec.args) > 1 else None
+        for kw in dec.keywords:
+            if kw.arg == "argvalues":
+                values = kw.value
+        if not isinstance(values, (ast.List, ast.Tuple)):
+            continue
+        for e in values.elts:
+            if isinstance(e, ast.Call) and dotted(e.func).rsplit(".", 1)[-1] == "param":
+                marks = next((k.value for k in e.keywords if k.arg == "marks"), None)
+                kinds = re.findall(r"\b(skipif|skip|xfail)\b", ast.unparse(marks)) if marks else []
+                if kinds:
+                    out.append((digest(ast.dump(e)), tuple(sorted(set(kinds)))))
+    return out
+
+
+def _mark_kinds(fn: _FuncDef) -> set[str]:
+    """The skip, skipif and xfail marks a test carries as decorators."""
+    kinds = set()
+    for dec in fn.decorator_list:
+        name = dotted(dec.func if isinstance(dec, ast.Call) else dec)
+        for suffix in _MARK_SUFFIXES:
+            if name.endswith(suffix):
+                kinds.add(suffix.rsplit(".", 1)[-1])
+    return kinds
 
 
 _VOCAB_ROOTS = frozenset(
@@ -979,7 +1320,15 @@ def _unit(
     stats.literal_params = _literal_params(fn)
     for stmt in live.body:
         stats.visit(stmt)
+    swallowers: set[str] = getattr(helpers, "swallowers", set())
+    for dec in fn.decorator_list:
+        # A decorator that swallows assertion failures wraps every check of the test.
+        if dotted(dec.func if isinstance(dec, ast.Call) else dec) in swallowers and stats.asserts:
+            stats.swallowed += stats.asserts
+            stats.swallow_line = stats.swallow_line or dec.lineno
+            break
     cases, literal, case_forms = _parametrize(fn)
+    gap, big = row_gap(fn)
     lost = _Stats(helpers)
     for stmt in dropped:
         lost.visit(stmt)
@@ -998,6 +1347,10 @@ def _unit(
         param_cases=cases,
         param_literal=literal,
         param_forms=case_forms,
+        row_gap=gap,
+        row_big=big,
+        param_marked=_marked(fn),
+        mark_kinds=_mark_kinds(fn),
         subjects=_subjects(live),
         swallowed=stats.swallowed,
         swallow_line=stats.swallow_line,
@@ -1008,11 +1361,15 @@ def _unit(
         loose_forms=sorted(stats.loose_hit - stats.exact_hit),
         vacuous=stats.vacuous,
         vacuous_line=stats.vacuous_line,
+        call_self=stats.call_self,
+        call_self_line=stats.call_self_line,
+        call_compared=stats.call_compared,
         unreachable=lost.asserts,
         unreachable_line=lost.first_line,
         exact_subjects=stats.exact,
         loose_targets=stats.loose,
         pinned=stats.pinned,
+        numeric_bands=stats.numeric,
         strong_operands=stats.strong_operands,
         weak_operands=stats.weak_operands,
         classes=classes,
@@ -1037,6 +1394,49 @@ def _test_disabled(body: Sequence[ast.stmt]) -> ast.stmt | None:
     return None
 
 
+def _reads(node: ast.AST, name: str) -> bool:
+    return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
+
+
+def _last_bindings(body: Sequence[ast.stmt]) -> dict[str, ast.AST | None]:
+    """Python keeps only the last binding of a name in a module or class body. Maps each name to
+    the definition that is its last binding, or None when a later `del`, assignment or import
+    replaced it. An assignment that reads the name (`test_x = decorate(test_x)`) wraps the
+    definition rather than replacing it, so it is not a rebinding. `del TestBase` after the
+    subclasses were defined is an idiom that keeps pytest from collecting the base class; the
+    class is not removed, so a `del` of a class another class of the body subclasses is skipped."""
+    last: dict[str, ast.AST | None] = {}
+    subclassed = {
+        dotted(b).rsplit(".", 1)[-1]
+        for node in body
+        if isinstance(node, ast.ClassDef)
+        for b in node.bases
+    }
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            last[node.name] = node
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and not (
+                    target.id in subclassed and isinstance(last.get(target.id), ast.ClassDef)
+                ):
+                    last[target.id] = None
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    last[alias.asname or alias.name.split(".")[0]] = None
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                names = [target] if isinstance(target, ast.Name) else []
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    names = [e for e in target.elts if isinstance(e, ast.Name)]
+                for name in names:
+                    if not _reads(node.value, name.id):
+                        last[name.id] = None
+    return last
+
+
 def _collect_units(
     path: str,
     body: Sequence[ast.stmt],
@@ -1048,7 +1448,13 @@ def _collect_units(
     disabled: bool = False,
 ) -> None:
     in_class = bool(prefix)
+    last = _last_bindings(body)
     for node in body:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and last.get(node.name) is not node
+        ):
+            continue  # shadowed by a later definition, or deleted or rebound: not collected
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _is_test_name(node.name, in_class):
                 unit = _unit(
@@ -1164,17 +1570,250 @@ def _conftest_markers(path: str, tree: ast.Module) -> list[Marker]:
     return out
 
 
-def analyse_python(path: str, text: str) -> FileAnalysis | None:
-    """The file's tests and markers, or None when it does not parse (callers fall back)."""
+class Sources:
+    """Reads Python modules at one revision, so a test's imported helpers are analysed as they
+    were at the same revision as the test (base text for the base, the candidate tree for the
+    candidate). `is_test` says whether a path is inside the test paths: only those resolve."""
+
+    def __init__(
+        self,
+        read: Callable[[str], str | None],
+        is_test: Callable[[str], bool],
+        listing: Callable[[], set[str]] | None = None,
+    ) -> None:
+        self.read = read
+        self.is_test = is_test
+        self._listing = listing
+        self._files: set[str] | None = None
+        self._parsed: dict[str, ast.Module | None] = {}
+
+    def module(self, path: str) -> ast.Module | None:
+        if path not in self._parsed:
+            if self._listing is not None and self._files is None:
+                self._files = self._listing()  # one `git ls-tree` instead of a read per guess
+            text = None if self._files is not None and path not in self._files else self.read(path)
+            tree: ast.Module | None = None
+            if text is not None and (
+                self.is_test(path) or _SUPPORT_TEXT.search(text) or _support_path(path)
+            ):
+                try:
+                    parsed = ast.parse(text)
+                except (SyntaxError, ValueError, RecursionError):
+                    parsed = None
+                if parsed is not None and (self.is_test(path) or is_test_support(path, parsed)):
+                    tree = parsed
+            self._parsed[path] = tree
+        return self._parsed[path]
+
+
+_SUPPORT_SEGMENT = re.compile(r"(?:testing|test_utils|testutils|pytest_plugins?)")
+_SUPPORT_IMPORTS = frozenset({"pytest", "unittest", "hypothesis"})
+_SUPPORT_TEXT = re.compile(r"\b(?:pytest|unittest|hypothesis)\b")
+
+
+def _support_path(path: str) -> bool:
+    return any(_SUPPORT_SEGMENT.fullmatch(seg.removesuffix(".py")) for seg in path.split("/"))
+
+
+def is_test_support(path: str, tree: ast.Module) -> bool:
+    """A module outside the test paths that exists for tests (SPEC 5.4): it imports pytest,
+    unittest or hypothesis, or a segment of its path is `testing`, `test_utils`, `testutils` or
+    `pytest_plugin(s)`. Ordinary application modules are not: a defensive `assert` in production
+    code is not a test check."""
+    if _support_path(path):
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(a.name.split(".")[0] in _SUPPORT_IMPORTS for a in node.names):
+                return True
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module
+            and node.module.split(".")[0] in _SUPPORT_IMPORTS
+        ):
+            return True
+    return False
+
+
+def is_test_support_text(path: str, text: str | None) -> bool:
+    """`is_test_support` for source text, parsing only a module that could qualify."""
+    if text is None or not (_support_path(path) or _SUPPORT_TEXT.search(text)):
+        return False
     try:
-        tree = ast.parse(text)
+        return is_test_support(path, ast.parse(text))
     except (SyntaxError, ValueError, RecursionError):
-        return None
-    helpers: dict[str, _FuncDef] = {
+        return False
+
+
+def _roots(path: str) -> list[str]:
+    """Directories an absolute import in the test file may resolve against: its own directory and
+    every parent up to the repository root, then the conventional `tests` and `test` roots."""
+    out: list[str] = []
+    here = posixpath.dirname(path)
+    while True:
+        out.append(here)
+        if not here:
+            break
+        here = posixpath.dirname(here)
+    out.extend(r for r in ("tests", "test") if r not in out)
+    return out
+
+
+def _resolve_module(
+    path: str, module: str, level: int, sources: Sources
+) -> tuple[str, ast.Module] | None:
+    """The test-path module `module` (dotted, `level` leading dots) names, seen from `path`."""
+    rel = module.replace(".", "/") if module else ""
+    if level:
+        base = posixpath.dirname(path)
+        for _ in range(level - 1):
+            base = posixpath.dirname(base)
+        roots = [base]
+    else:
+        roots = _roots(path)
+    for root in roots:
+        stem = posixpath.join(root, rel) if rel else root
+        names = (f"{stem}.py", posixpath.join(stem, "__init__.py")) if rel else ()
+        for candidate in names or (posixpath.join(stem, "__init__.py"),):
+            tree = sources.module(candidate)
+            if tree is not None:
+                return candidate, tree
+    return None
+
+
+def _top_functions(tree: ast.Module) -> dict[str, _FuncDef]:
+    """The module's functions by name; the last definition of a name is the one in force."""
+    return {
         n.name: n
         for n in tree.body
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and not n.name.startswith("test")
     }
+
+
+def _import_helpers(path: str, tree: ast.Module, sources: Sources, helpers: _Helpers) -> set[str]:
+    """Add the functions of the test-path modules `tree` imports to `helpers`, under the name the
+    test calls them by (`check`, `h.check`, `helpers.check`). Returns the modules' paths."""
+    used: set[str] = set()
+
+    def add_module(local: str, found: tuple[str, ast.Module]) -> None:
+        funcs = _top_functions(found[1])
+        used.add(found[0])
+        for name, fn in funcs.items():
+            key = f"{local}.{name}"
+            helpers.setdefault(key, fn)
+            helpers.scopes.setdefault(key, funcs)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            found = _resolve_module(path, module, node.level, sources)
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                if found is not None:
+                    funcs = _top_functions(found[1])
+                    if alias.name in funcs:
+                        used.add(found[0])
+                        helpers.setdefault(local, funcs[alias.name])
+                        helpers.scopes.setdefault(local, funcs)
+                        continue
+                sub = _resolve_module(
+                    path, f"{module}.{alias.name}" if module else alias.name, node.level, sources
+                )
+                if sub is not None:  # `from tests import helpers`
+                    add_module(local, sub)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                found = _resolve_module(path, alias.name, 0, sources)
+                if found is not None:
+                    add_module(alias.asname or alias.name, found)
+    return used
+
+
+class _Returned(ast.NodeVisitor):
+    """The values a function returns or yields, not looking into nested functions."""
+
+    def __init__(self) -> None:
+        self.values: list[ast.expr] = []
+
+    def visit_Return(self, node: ast.Return) -> None:
+        if node.value is not None:
+            self.values.append(node.value)
+
+    def visit_Yield(self, node: ast.Yield) -> None:
+        if node.value is not None:
+            self.values.append(node.value)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+
+def _fixture_decorator(fn: _FuncDef) -> ast.expr | None:
+    for dec in fn.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if dotted(target).rsplit(".", 1)[-1] == "fixture":
+            return dec
+    return None
+
+
+def _fixtures(path: str, body: Sequence[ast.stmt], scope: str, out: dict[str, Fixture]) -> None:
+    """The `@pytest.fixture` functions of a module or class body, and of the classes in it."""
+    last = _last_bindings(body)
+    for node in body:
+        if isinstance(node, ast.ClassDef):
+            _fixtures(path, node.body, f"{scope}{node.name}::", out)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            dec = _fixture_decorator(node)
+            if dec is None or last.get(node.name) is not node:
+                continue
+            autouse = isinstance(dec, ast.Call) and any(
+                k.arg == "autouse" and isinstance(k.value, ast.Constant) and k.value.value is True
+                for k in dec.keywords
+            )
+            returned = _Returned()
+            for stmt in node.body:
+                returned.visit(stmt)
+            out[f"{scope}{node.name}"] = Fixture(
+                path,
+                f"{scope}{node.name}",
+                node.lineno,
+                autouse,
+                [ast.dump(v) for v in returned.values if _is_literal(v)],
+                _body_hash(node),
+                scope,
+                node,
+            )
+
+
+def analyse_python(path: str, text: str, sources: Sources | None = None) -> FileAnalysis | None:
+    """The file's tests and markers, or None when it does not parse or nests too deeply to walk
+    (callers fall back to the line engine). With `sources`, functions imported from modules
+    inside the test paths are credited like the file's own helpers."""
+    try:
+        return _analyse_python(path, text, sources)
+    except RecursionError:
+        return None
+
+
+def _module_helpers(
+    path: str, tree: ast.Module, sources: Sources | None
+) -> tuple[_Helpers, set[str]]:
+    """The functions a test of this module may call and get credit for (its own top-level
+    functions and methods, and those of the test-path modules it imports), and the paths of the
+    imported modules."""
+    helpers = _Helpers()
+    helpers.update(_top_functions(tree))
     for cls in tree.body:
         if isinstance(cls, ast.ClassDef):
             for n in cls.body:
@@ -1182,7 +1821,22 @@ def analyse_python(path: str, text: str) -> FileAnalysis | None:
                     "test"
                 ):
                     helpers.setdefault(n.name, n)
+    imports: set[str] = set()
+    if sources is not None:
+        imports = _import_helpers(path, tree, sources, helpers)
+    helpers.swallowers = {k for k, fn in helpers.items() if _fn_swallows(fn)}
+    return helpers, imports
+
+
+def _analyse_python(path: str, text: str, sources: Sources | None) -> FileAnalysis | None:
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    helpers, imports = _module_helpers(path, tree, sources)
     analysis = FileAnalysis(path, "python", tree=tree)
+    analysis.imports = imports
+    _fixtures(path, tree.body, "", analysis.fixtures)
     _collect_units(
         path, tree.body, "", helpers, analysis.units, disabled=_test_disabled(tree.body) is not None
     )
@@ -1192,6 +1846,99 @@ def analyse_python(path: str, text: str) -> FileAnalysis | None:
     if posixpath.basename(path) == "conftest.py":
         analysis.markers.extend(_conftest_markers(path, tree))
     return analysis
+
+
+def call_self_replaced(base: _CallCompares, cand: _CallCompares) -> bool:
+    """A call compared with itself is vacuous only where it replaced a real comparison: the
+    candidate has more self-comparisons of a call than the base, the base compared that call
+    with something else, and the candidate no longer does (SPEC 5.4)."""
+    return any(
+        count > base.call_self.get(key, 0)
+        and key in base.call_compared
+        and key not in cand.call_compared
+        for key, count in cand.call_self.items()
+    )
+
+
+class _CallCompares(Protocol):
+    @property
+    def call_self(self) -> Mapping[str, int]: ...
+
+    @property
+    def call_compared(self) -> AbstractSet[str]: ...
+
+
+@dataclass(frozen=True)
+class HelperEffect:
+    """What one helper function gives the tests that call it (SPEC 5.4)."""
+
+    asserts: int
+    strong: int
+    weak: int
+    broad: int
+    vacuous: int
+    swallowed: int
+    swallows: bool  # used as a decorator, it swallows assertion failures
+    exact: frozenset[str]
+    call_self: Mapping[str, int]
+    call_compared: frozenset[str]
+
+
+def helper_effects(
+    path: str, tree: ast.Module, sources: Sources | None
+) -> dict[str, HelperEffect] | None:
+    """The effect of each top-level function of a helper module or conftest, or None when the
+    module nests too deeply to walk."""
+    try:
+        helpers, _ = _module_helpers(path, tree, sources)
+        out: dict[str, HelperEffect] = {}
+        for name, fn in _top_functions(tree).items():
+            stats = _Stats(helpers, 1, (name,), _Consts(fn))
+            for stmt in fn.body:
+                stats.visit(stmt)
+            out[name] = HelperEffect(
+                stats.asserts,
+                stats.strong,
+                stats.weak,
+                stats.broad,
+                stats.vacuous,
+                stats.swallowed,
+                name in helpers.swallowers,
+                frozenset(stats.exact),
+                stats.call_self,
+                frozenset(stats.call_compared),
+            )
+        return out
+    except RecursionError:
+        return None
+
+
+def lost_helpers(
+    base: dict[str, HelperEffect] | None, cand: dict[str, HelperEffect] | None
+) -> set[str]:
+    """Names of the helpers whose credited checks dropped or weakened, that now swallow, or that
+    are gone: the only ones whose callers need another look. Everything in `base` when the
+    candidate module cannot be read; nothing when the base could not."""
+    if base is None:
+        return set()
+    if cand is None:
+        return set(base)
+    lost: set[str] = set()
+    for name, b in base.items():
+        c = cand.get(name)
+        if c is None or (
+            c.asserts < b.asserts
+            or c.strong < b.strong
+            or c.weak > b.weak
+            or c.broad > b.broad
+            or c.vacuous > b.vacuous
+            or call_self_replaced(b, c)
+            or c.swallowed > b.swallowed
+            or (c.swallows and not b.swallows)
+            or not b.exact <= c.exact
+        ):
+            lost.add(name)
+    return lost
 
 
 # Display names for messages.

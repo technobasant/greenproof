@@ -1,0 +1,9 @@
+repo: /private/tmp/gp-replay-030/httpx
+commits scanned: 96
+blocked: 9 (9.4%)
+blocked commits per rule:
+  runner.tampered: 4
+  tests.removed: 4
+  tests.weakened: 3
+  tests.deleted: 1
+  tests.replaced: 1

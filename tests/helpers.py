@@ -89,7 +89,11 @@ def static_findings(repo: Repo, base: str | None = None, commands: dict[str, str
 
     base_sha = base or repo.head()
     tree = gitops.snapshot_tree(repo.path)
-    return run_static_rules(build_changeset(repo.path, base_sha, tree), commands or {})
+    changes = build_changeset(repo.path, base_sha, tree)
+    try:
+        return run_static_rules(changes, commands or {})
+    finally:
+        changes.close()
 
 
 def rule_ids(findings) -> list[str]:
