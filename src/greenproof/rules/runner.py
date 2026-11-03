@@ -2954,6 +2954,11 @@ class _Vars(dict[str, str]):
     stopped = ""
 
 
+class _Macro(str):
+    """The body of a `define ... endef` variable: `$(call NAME,a,b)` of it is read with `$(1)` and
+    `$(2)` put for the arguments (a variable assigned with `=` or `:=` is not called)."""
+
+
 class _Targets(dict[str, _Target]):
     """The rules of a Makefile, and what else it says about how they run: `phony` (the names
     `.PHONY:` lists), `oneshell` (`.ONESHELL:`), `errexit` (`.SHELLFLAGS` has `-e`), `pipefail`
@@ -3075,28 +3080,85 @@ class _Budget:
             raise _Unreadable(f"its expanded text is over {_MAKE_TOTAL // 1024} KiB")
 
 
+_REF = re.compile(r"(?<!\$)\$([({])(?:call[ \t]+([A-Za-z_.][\w.-]*)|([A-Za-z_][\w.]*)[)}])")
+_ARG_REF = re.compile(r"(?<!\$)\$[({]([0-9])[)}]")
+_BRACKET = re.compile(r"[(){},]")
+_MAX_CALL_TOKENS = 512  # brackets and commas one call is followed through
+_MAX_CALL_ARGS = 9
+
+
+def _call_args(text: str, start: int, opener: str) -> tuple[int, list[str]] | None:
+    """Where the call whose arguments begin at `start` (after its name) ends, and its arguments
+    (split at the commas outside nested brackets), None when it never closes or has more than
+    `_MAX_CALL_TOKENS` brackets and commas."""
+    closer = ")" if opener == "(" else "}"
+    depth, mark, named = 1, start, False
+    args: list[str] = []
+    for count, m in enumerate(_BRACKET.finditer(text, start)):
+        if count >= _MAX_CALL_TOKENS:
+            return None
+        c, at = m[0], m.start()
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                if named:
+                    args.append(text[mark:at])
+                return at + 1, args
+        elif c == "," and depth == 1:
+            if named:  # the first comma ends the name; the text before it is not an argument
+                args.append(text[mark:at])
+            named, mark = True, at + 1
+    return None
+
+
 def _expand_vars(
     text: str, variables: Mapping[str, str], depth: int = 0, budget: _Budget | None = None
 ) -> str:
-    """`$(NAME)` and `${NAME}` replaced by what the Makefile assigns NAME, recursively. A name the
-    Makefile does not define, or a function call, is left as it is. Raises `_Unreadable` when
-    variables nest deeper than `_MAX_VAR_DEPTH` or the expansion outgrows `budget`."""
+    """`$(NAME)` and `${NAME}` replaced by what the Makefile assigns NAME, recursively, and
+    `$(call NAME,a,b)` of a `define` macro by its body with `$(1)`, `$(2)` (and `$(0)`, the
+    name) put in. A name the Makefile does not define, a call of anything but a macro, and any
+    other function call are left as they are. Raises `_Unreadable` when variables or calls nest
+    deeper than `_MAX_VAR_DEPTH` or the expansion outgrows `budget`."""
     if budget is not None:
         budget.spend(text)
     if "$" not in text:
         return text
     if depth >= _MAX_VAR_DEPTH:
         raise _Unreadable(f"its variables nest more than {_MAX_VAR_DEPTH} levels deep")
+    out: list[str] = []
+    pos = 0
+    while m := _REF.search(text, pos):
+        out.append(text[pos : m.start()])
+        pos = m.end()
+        if m[3] is not None:
+            found = variables.get(m[3])
+            if found is None:
+                out.append(m[0])
+                continue
+            if len(found) > _MAKE_VALUE:
+                raise _Unreadable(f"the value of `{m[3]}` is over {_MAKE_VALUE // 1024} KiB")
+            out.append(_expand_vars(found, variables, depth + 1, budget))
+            continue
+        name = m[2] or ""
+        macro = variables.get(name)
+        called = _call_args(text, pos, m[1]) if isinstance(macro, _Macro) else None
+        if called is None or macro is None:
+            out.append(m[0])
+            continue
+        pos, raw = called
+        args = [_expand_vars(a, variables, depth + 1, budget) for a in raw[:_MAX_CALL_ARGS]]
+        if len(macro) > _MAKE_VALUE:
+            raise _Unreadable(f"the value of `{name}` is over {_MAKE_VALUE // 1024} KiB")
 
-    def value(m: re.Match[str]) -> str:
-        found = variables.get(m[1])
-        if found is None:
-            return m[0]
-        if len(found) > _MAKE_VALUE:
-            raise _Unreadable(f"the value of `{m[1]}` is over {_MAKE_VALUE // 1024} KiB")
-        return _expand_vars(found, variables, depth + 1, budget)
+        def arg(a: re.Match[str], name: str = name, args: list[str] = args) -> str:
+            n = int(a[1])
+            return name if n == 0 else args[n - 1] if n <= len(args) else ""
 
-    return _VAR_REF.sub(value, text)
+        out.append(_expand_vars(_ARG_REF.sub(arg, macro), variables, depth + 1, budget))
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _joined(text: str) -> list[str]:
@@ -3330,17 +3392,23 @@ def _variables_flat(
     define_op, define_override, nested = "=", False, 0
     body: list[str] = []
 
-    def assign(name: str, op: str, value: str, override: bool) -> None:
+    def assign(name: str, op: str, value: str, override: bool, macro: bool = False) -> None:
         if name in locked and not override:
             return
+        was = out.get(name)
         if op in (":=", "::="):
             out[name] = _expand_vars(value, out, 0, budget)
         elif op == "?=":
-            out.setdefault(name, value)
-        elif op == "+=" and name in out:
-            out[name] = f"{out[name]} {value}".strip()
+            if name in out:
+                return
+            out[name] = value
+        elif op == "+=" and was is not None:
+            out[name] = f"{was} {value}".strip()
+            macro = macro or isinstance(was, _Macro)
         else:
             out[name] = value
+        if macro:
+            out[name] = _Macro(out[name])
 
     try:
         for word in cli:
@@ -3353,7 +3421,7 @@ def _variables_flat(
                     if nested:
                         nested -= 1
                     else:
-                        assign(define, define_op, "\n".join(body), define_override)
+                        assign(define, define_op, "\n".join(body), define_override, True)
                         define = None
                         continue
                 nested += 1 if _DEFINE.match(raw) else 0
@@ -3372,7 +3440,7 @@ def _variables_flat(
             value = re.sub(r"\s+#.*$", "", m[4]).strip()
             assign(m[2], m[3], value, "override" in m[1])
         if define is not None:
-            assign(define, define_op, "\n".join(body), define_override)
+            assign(define, define_op, "\n".join(body), define_override, True)
     except _Unreadable as e:
         out.stopped = str(e)
     out.pop("\0", None)
@@ -3403,6 +3471,8 @@ def _variables(
                 values[name].append(value)
     for name, found in values.items():
         out[name] = " ".join(found)
+        if any(isinstance(v, _Macro) for v in found):
+            out[name] = _Macro(out[name])
     return out
 
 
@@ -4096,6 +4166,8 @@ def _make_reasons(
 _INCLUDE = re.compile(r"^ *(-include|sinclude|include)[ \t]+(.*)$")
 _MAX_INCLUDE_DEPTH = 4
 _MAX_INCLUDE_FILES = 16
+_MAX_INCLUDE_VARS = 64  # readings of the variables above include lines with a variable in the path
+_THIS_DIR = re.compile(r"\$[({]dir\s+\$[({]lastword\s+\$[({]MAKEFILE_LIST[)}][)}][)}]")
 
 
 def expand_includes(
@@ -4104,27 +4176,67 @@ def expand_includes(
     """A Makefile with each `include`, `-include` and `sinclude` of a literal path replaced by the
     file it names (read through `read`, a path from the repository root; a relative path is
     taken from `directory`, where make runs), as make reads it, to `_MAX_INCLUDE_DEPTH` levels,
-    `_MAX_INCLUDE_FILES` files and `_MAKE_TOTAL` bytes. The second value says what could not be
-    read: a name with a variable, wildcard or `~` in it, a path outside the repository, a file
-    that is not there (not for `-include`, which make skips), a file too deep or past the
-    budget. A Makefile with no include is returned as it is."""
+    `_MAX_INCLUDE_FILES` files and `_MAKE_TOTAL` bytes. A path with a variable in it is read when
+    the Makefile assigns the variable above the `include` line (`MK := mk`, `include
+    $(MK)/common.mk`), with `$(CURDIR)` the directory make runs in and `$(dir $(lastword
+    $(MAKEFILE_LIST)))` the directory of the file the line is in. The second value says what could
+    not be read: a name with a function, a variable the Makefile does not assign there, a wildcard
+    or `~` in it, a path outside the repository, a file that is not there (not for `-include`,
+    which make skips), a file too deep or past the budget. A Makefile with no include is
+    returned as it is."""
     if not re.search(r"^ *(?:-include|sinclude|include)[ \t]", text, re.M):
         return text, []
     notes: list[str] = []
-    files = size = 0
+    out: list[str] = []
+    files = size = expanded = 0
 
-    def walk(body: str, depth: int, chain: tuple[str, ...]) -> list[str]:
+    def named(arg: str, chain: tuple[str, ...]) -> list[str] | None:
+        """`arg` with its variables put in, once for each way the conditionals above the line can
+        go; None when some cannot be."""
+        nonlocal expanded
+        if expanded >= _MAX_INCLUDE_VARS:
+            return None
+        try:
+            worlds, _ = _worlds("\n".join([*out, f"include {arg}"]))
+        except _Unreadable:
+            return None
+        expanded += len(worlds)
+        if expanded > _MAX_INCLUDE_VARS:
+            return None
+        here = posixpath.relpath(
+            (posixpath.dirname(chain[-1]) if chain else directory) or ".", directory or "."
+        )
+        arg = _THIS_DIR.sub(lambda _m: here + "/", arg)
+        found: list[str] = []
+        for variables in (_variables_flat(t) for _, t in worlds):
+            if variables.stopped:
+                return None
+            try:
+                one = _expand_vars(arg, ChainMap({"CURDIR": "."}, variables), 0, _Budget())
+            except _Unreadable:
+                return None
+            if "$" in one:
+                return None
+            if one not in found:
+                found.append(one)
+        return found
+
+    def walk(body: str, depth: int, chain: tuple[str, ...]) -> None:
         nonlocal files, size
-        out: list[str] = []
         for line in _joined(body):
             m = _INCLUDE.match(line)
             if m is None:
                 out.append(line)
                 continue
             optional = m[1] != "include"
-            for tok in re.sub(r"(?:^|\s)#.*$", "", m[2]).split():
+            arg = re.sub(r"(?:^|\s)#.*$", "", m[2]).strip()
+            args = [arg] if "$" not in arg else named(arg, chain)
+            if args is None:
+                notes.append(f"`{m[1]} {arg[:60]}` names a file that cannot be read here")
+                continue
+            for tok in dict.fromkeys(t for a in args for t in a.split()):
                 path = posixpath.normpath(posixpath.join(directory, tok))
-                if re.search(r"[$*?\[%~]", tok) or tok.startswith("/") or path.startswith(".."):
+                if re.search(r"[*?\[%~]", tok) or tok.startswith("/") or path.startswith(".."):
                     notes.append(f"`{m[1]} {tok}` names a file that cannot be read here")
                 elif depth >= _MAX_INCLUDE_DEPTH:
                     notes.append(f"`{tok}` is included more than {_MAX_INCLUDE_DEPTH} deep")
@@ -4141,10 +4253,10 @@ def expand_includes(
                 else:
                     files += 1
                     size += len(sub)
-                    out.extend(walk(sub, depth + 1, (*chain, path)))
-        return out
+                    walk(sub, depth + 1, (*chain, path))
 
-    return "\n".join(walk(text, 0, ())), notes
+    walk(text, 0, ())
+    return "\n".join(out), notes
 
 
 def _make_root(changes: ChangeSet, directory: str, base: bool) -> str | None:
@@ -4970,12 +5082,27 @@ def _glob_matches(directory: str, pattern: str) -> bool:
 _MAX_ROOTS = 8  # Makefiles read for an included file that changed under them
 
 
+def _reads(text: str, directory: str, changes: ChangeSet) -> set[str]:
+    """The files the Makefile `text` in `directory` includes, through a variable in the path
+    (`include $(MK)/common.mk`) or another included file, with the includes read as they are in
+    the candidate."""
+    seen: set[str] = set()
+
+    def read(path: str) -> str | None:
+        seen.add(path)
+        return changes.cand_text(path)
+
+    expand_includes(text, directory, read)
+    return seen
+
+
 def _including_roots(changes: ChangeSet) -> list[ChangedFile]:
     """The Makefiles the change did not touch that `include` a file it did, in the directory of
     that file or above it, each as a change of its own text, so what its targets run is compared
     with the included file read in place. At most `_MAX_ROOTS`."""
     touched = {f.path for f in changes.files} | {f.old_path for f in changes.files if f.old_path}
     roots: dict[str, ChangedFile] = {}
+    reads: dict[str, set[str]] = {}
     for f in changes.files:
         if posixpath.basename(f.path) in ("Makefile", "makefile", "GNUmakefile"):
             continue
@@ -4986,8 +5113,13 @@ def _including_roots(changes: ChangeSet) -> list[ChangedFile]:
             if path is None or path in touched or path in roots or len(roots) >= _MAX_ROOTS:
                 continue
             text = changes.cand_text(path)
-            if text is None or posixpath.basename(f.path) not in text:
+            if text is None:
                 continue
+            if posixpath.basename(f.path) not in text:
+                if path not in reads:
+                    reads[path] = _reads(text, directory, changes)
+                if not reads[path] & {f.path, f.old_path or f.path}:
+                    continue
             old = changes.base_text(path)
             roots[path] = ChangedFile(
                 path, "M", None, None if old is None else old.encode(), text.encode(), False, False

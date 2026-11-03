@@ -44,6 +44,7 @@ SPECS = [
     "spec_make8.py",
     "spec_tables8.py",
     "spec_makeparse9.py",
+    "spec_makeparse10.py",
 ]
 VERDICT = {0: "pass", 1: "BLOCK", 2: "cmd-fail", 3: "smoke", 4: "usage", 5: "internal"}
 
