@@ -389,7 +389,8 @@ class _Parser:
 
     ("S", a, b) a statement; ("RUN", body) a Go `t.Run` closure; ("BLK", body) a block;
     ("IF", ca, cb, then, else) an `if`; ("LOOP", body); ("SW", ha, hb, [(ca, cb, body)]) a
-    switch or match (ca = -1 for `default`). Every offset is into the shadow text."""
+    switch or match (ca = -1 for `default`); ("TRY", body, catch, ca, cb, finally) a try with a
+    catch (the catch text is `ca..cb`). Every offset is into the shadow text."""
 
     def __init__(self, s: str, lang: str, a: int, b: int) -> None:
         self.s = s
@@ -517,15 +518,24 @@ class _Parser:
 
     def try_(self, k: int, b: int, depth: int) -> tuple[tuple[Any, ...], int] | None:
         out, j = self.body(k, b, depth)
+        catch: list[tuple[Any, ...]] | None = None
+        span = (0, 0)
+        final: list[tuple[Any, ...]] = []
         while True:
             m = _WORD_AT.match(self.s, self.skip(j, b), b)
             if not m or m.group(1) not in ("catch", "finally"):
-                return ("BLK", out), j
+                if catch is None:
+                    return ("BLK", [*out, *final]), j
+                return ("TRY", out, catch, span[0], span[1], final), j
             at = self.skip(m.end(), b)
             if at < b and self.s[at] == "(" and at in self.pair:
                 at = self.pair[at] + 1
-            more, j = self.body(at, b, depth)
-            out = out + more
+            more, j2 = self.body(at, b, depth)
+            if m.group(1) == "catch":
+                catch, span = more, (at, j2)
+            else:
+                final = more
+            j = j2
 
     def switch(self, k: int, word: str, b: int, depth: int) -> tuple[tuple[Any, ...], int] | None:
         s = self.s
@@ -660,10 +670,12 @@ _MARKER = re.compile(
 _FLAG = re.compile(r"[!\s]*[\w$]+(?:\s*\.\s*[\w$]+)*\s*")
 _NILCMP = re.compile(r"\s*!?[\w$.]+\s*[!=]=\s*nil\s*|\s*!?[\w$.]+\s*[!=]=\s*nil\s*\)?\s*")
 _CMP = re.compile(r"[=!]==?|(?<![=\-])[<>]=?")
+_CATCH_ALL = re.compile(r"_|[a-z_]\w*")
+_ASSERTS = re.compile(r"\b(?:expect|assert|should)\b")
 _WEAK = {
     "js": re.compile(
         r"\.\s*(?:not\s*\.\s*)?(?:toBeDefined|toBeTruthy|toBeFalsy|toBeUndefined|toBeNull"
-        r"|toBeNaN|toThrow)\s*\(\s*\)"
+        r"|toBeNaN)\s*\(\s*\)"
     ),
     "go": re.compile(
         r"\.(?:NotNil|Nil|True|False|NotEmpty|Empty|NoError|Error|Greater|Less|IsType|Len)\s*\("
@@ -836,7 +848,27 @@ class _Eval:
             return st if not (end.u or end.a) else end
         if kind == "IF":
             return self.if_(node, st, guards, rescue)
+        if kind == "TRY":
+            return self.try_(node, st, guards, rescue)
         return self.switch(node, st, guards, rescue)
+
+    def try_(
+        self, node: tuple[Any, ...], st: _St, guards: list[tuple[str, bool]], rescue: bool
+    ) -> _St:
+        """An assertion in a `try` whose `catch` neither throws, fails nor asserts is swallowed:
+        the body is read for the exits in it, but asserts nothing on that path."""
+        _, body, handler, ca, cb, final = node
+        end = self.nodes(body, st, guards, rescue)
+        text = self.s[ca:cb]
+        if not (_STMT_FAIL[self.lang].search(text) or _ASSERTS.search(text)) and st.u:
+            end = _St(
+                st.u,
+                st.a,
+                st.weak,
+                "an assertion sits inside a try/catch that swallows the failure",
+            )
+        end = self.nodes(handler, end, guards, rescue)
+        return self.nodes(final, end, guards, rescue)
 
     def finish(self, end: _St) -> None:
         if not self.bad and end.u and (end.why or end.weak):
@@ -888,7 +920,7 @@ class _Eval:
         self.ctx.append("sw")
         head = self.s[ha:hb]
         for ca, cb, body in cases:
-            has_default = has_default or ca < 0
+            has_default = has_default or ca < 0 or self.irrefutable(ca, cb)
             label = head if ca < 0 else head + " " + self.s[ca:cb]
             dep = mentions(self.names, label) or bool(_MARKER.search(label))
             shown = (
@@ -916,6 +948,10 @@ class _Eval:
         for end in sink:
             res = self.join(res, end, any_dep, "", "switch")
         return res
+
+    def irrefutable(self, ca: int, cb: int) -> bool:
+        """A Rust `match` arm that takes every value: `_` or a bare binding, with no guard."""
+        return self.lang == "rust" and _CATCH_ALL.fullmatch(self.s[ca:cb].strip()) is not None
 
     def simple(self, a: int, b: int, st: _St, guards: list[tuple[str, bool]], rescue: bool) -> _St:
         s = self.s
