@@ -92,6 +92,113 @@ def test_pytest_keys(tmp_path: Path, base: dict[str, str], new: dict[str, str], 
     assert run(tmp_path, {**PY, **MAKE, **base}, new) == want
 
 
+def two(unit: str, docs: str) -> dict[str, str]:
+    return {"Makefile": f"test: unit docs\nunit:\n\t{unit}\ndocs:\n\t{docs}\n"}
+
+
+CHECK = {"tests/check_prices.py": "def test_prices():\n    assert True\n"}
+TP = "testpaths = tests\n"
+
+# A collection option that moves between the configuration and a command line, judged for each
+# pytest run from the two together: a move that still reaches every run is not a loss, a flag
+# dropped from a run is, and each run keeps its own flags.
+MOVE_CASES = [
+    # --doctest-modules: addopts to the command line, back, and lost on the way
+    (
+        ini(TP + "addopts = --doctest-modules\n"),
+        ini(TP + "addopts = -q\n", "pytest --doctest-modules"),
+        "pass",
+    ),
+    (
+        ini(TP + "addopts = -q\n", "pytest --doctest-modules"),
+        ini(TP + "addopts = --doctest-modules\n"),
+        "pass",
+    ),
+    (ini(TP + "addopts = -q\n", "pytest --doctest-modules"), ini(TP + "addopts = -q\n"), "block"),
+    (ini(TP + "addopts = --doctest-modules\n"), ini(TP + "addopts = -q\n", "pytest -x"), "block"),
+    (
+        ini("addopts = --doctest-glob=*.txt\n") | GUIDE,
+        ini("addopts = -q\n", "pytest --doctest-glob=*.txt") | GUIDE,
+        "pass",
+    ),
+    # two pytest targets: only one has the flag, and keeps it, or loses it
+    (
+        ini("addopts = -q\n") | two("pytest tests", "pytest --doctest-modules"),
+        ini("addopts = -ra\n") | two("pytest tests", "pytest --doctest-modules"),
+        "pass",
+    ),
+    (
+        two("pytest tests", "pytest --doctest-modules"),
+        two("pytest -q tests", "pytest --doctest-modules"),
+        "pass",
+    ),
+    (two("pytest tests", "pytest --doctest-modules"), two("pytest tests", "pytest"), "block"),
+    (
+        ini("addopts = -q\n") | two("pytest tests", "pytest --doctest-modules"),
+        ini("addopts = -ra\n") | two("pytest tests", "pytest"),
+        "block",
+    ),
+    # -o python_files between the command line and the file
+    (
+        ini(TP, "pytest -o 'python_files=test_*.py *_test.py'"),
+        ini(TP + "python_files = test_*.py *_test.py\n"),
+        "pass",
+    ),
+    (
+        ini(TP + "python_files = test_*.py check_*.py\n") | CHECK,
+        ini(TP, "pytest -o 'python_files=test_*.py check_*.py'") | CHECK,
+        "pass",
+    ),
+    (
+        ini(TP, "pytest -o 'python_files=test_*.py check_*.py'") | CHECK,
+        ini(TP + "python_files = test_*.py\n") | CHECK,
+        "block",
+    ),
+    (
+        ini(TP, "pytest -o 'python_files=test_*.py check_*.py'"),
+        ini(TP + "python_files = test_*.py\n"),
+        "pass",
+    ),
+    # the command line and addopts both have the flag: dropping it from one loses nothing
+    (
+        ini("addopts = --doctest-modules\n", "pytest --doctest-modules"),
+        ini("addopts = -q\n", "pytest --doctest-modules"),
+        "pass",
+    ),
+    # PYTEST_ADDOPTS in front of the command is a flag of that run
+    (
+        ini(TP + "addopts = --doctest-modules\n"),
+        ini(TP + "addopts = -q\n", "PYTEST_ADDOPTS=--doctest-modules pytest"),
+        "pass",
+    ),
+    (
+        ini(TP + "addopts = -q\n", "PYTEST_ADDOPTS=--doctest-modules pytest"),
+        ini(TP + "addopts = -q\n"),
+        "block",
+    ),
+]
+
+
+@pytest.mark.parametrize(("base", "new", "want"), MOVE_CASES)
+def test_options_that_move_between_config_and_command(
+    tmp_path: Path, base: dict[str, str], new: dict[str, str], want: str
+) -> None:
+    assert run(tmp_path, {**PY, **MAKE, **base}, new) == want
+
+
+def test_more_runs_than_are_compared_warn(tmp_path: Path) -> None:
+    """Past eight different pytest commands the runs are not compared one by one: a change to
+    them says so, instead of passing as if it had been read."""
+
+    def recipe(first: str) -> str:
+        lines = [f"pytest -o norecursedirs={first}"]
+        lines += [f"pytest -o norecursedirs=x{i}" for i in range(1, 12)]
+        return "test:\n" + "".join(f"\t{ln}\n" for ln in lines)
+
+    base = {**PY, **MAKE, "Makefile": recipe("x0")}
+    assert run(tmp_path, base, {"Makefile": recipe("y0")}) == "warn"
+
+
 JS = {
     "src/cart.js": "exports.add = (a, b) => a + b;\n",
     "src/unit/util.test.js": "test('u', () => { expect(2).toBe(2); });\n",
