@@ -893,3 +893,35 @@ def test_the_nox_commands_reader_is_linear() -> None:
         toxnox.judge(old, new, ["nox"])
 
     assert_linear(make, run, sizes=(500, 2000))
+
+
+def test_the_positional_cover_lookup_matches_the_pairwise_one() -> None:
+    import random
+
+    from greenproof.rules.shell import _covered, _covers, _norm_path
+
+    rng = random.Random(7)
+    parts = ["a", "b", "/", "::", ".", "...", "./", "t.py", "x"]
+
+    def word() -> str:
+        return "".join(rng.choice(parts) for _ in range(rng.randint(0, 4)))
+
+    for family in ("pytest", "go", "jest"):
+        for _ in range(5000):
+            cands = [word() for _ in range(rng.randint(0, 3))]
+            base = word()
+            want = any(_covers(family, c, base) for c in cands)
+            assert _covered(family, {_norm_path(family, c) for c in cands}, base) is want
+
+
+def test_the_selection_comparison_is_linear_in_the_paths() -> None:
+    def make(n: int) -> str:
+        return "".join(f"pytest t{i}\n" for i in range(n))
+
+    def run(text: str) -> None:
+        from greenproof.rules.shell import narrowed_selection
+
+        lines = text.splitlines()
+        narrowed_selection(lines, [ln.replace("t1", "u1") for ln in lines])
+
+    assert_linear(make, run)

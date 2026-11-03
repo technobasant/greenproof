@@ -2790,6 +2790,23 @@ def _covers(family: str, c: str, b: str) -> bool:
     return c == "." or b.startswith((c + "/", c + "::"))
 
 
+def _covered(family: str, cands: set[str], b: str) -> bool:
+    """`any(_covers(family, c, b) for c in cands)` for normalised `cands`, in the time of one
+    word: it looks the word, each parent of it (and for go each `parent/...`) up in the set."""
+    b = _norm_path(family, b)
+    if b in cands or ("." in cands and family != "go"):
+        return True
+    if family == "go":
+        if "./..." in cands or "..." in cands or f"{b}/..." in cands:
+            return True
+        return any(b[: i + 1] + "..." in cands for i, ch in enumerate(b) if ch == "/")
+    return any(
+        b[:i] in cands
+        for i, ch in enumerate(b)
+        if i and (ch == "/" or (ch == ":" and b.startswith("::", i)))
+    )
+
+
 def _restricts(family: str, words: list[str]) -> bool:
     """Whether a run with these positional words runs less than everything."""
     if not words:
@@ -3034,9 +3051,8 @@ def narrowed_selection(
         if base_words:
             if family != "go" and any(not words for words in cand_runs):
                 continue  # a candidate run with no path runs everything
-            lost_words = [
-                b for b in base_words if not any(_covers(family, c, b) for c in cand_words)
-            ]
+            kept = {_norm_path(family, c) for c in cand_words}
+            lost_words = [b for b in base_words if not _covered(family, kept, b)]
             if lost_words:
                 return (
                     f"{family} ran `{lost_words[0]}` before and now runs only"

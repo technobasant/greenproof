@@ -586,8 +586,9 @@ def judge(
                 )
         else:
             kept = _kinds(new, new.active)
+            still = set(new.active)
             for name in dict.fromkeys(old.active):
-                if name in new.active:
+                if name in still:
                     continue
                 if lost := sorted(_kinds(old, [name]) - kept):
                     out.append(
@@ -600,16 +601,21 @@ def judge(
     base_cmds: list[str] = []
     cand_cmds: list[str] = []
     named: list[str] = []  # the environments or sessions a run takes on both sides
+    seen: set[str] = set()
+    old_active, new_active = set(old.active or ()), set(new.active or ())
     for run in mine:
         for n in run.selected or ():
             old.ensure(n)
             new.ensure(n)
         both = [n for n in old.lines if n in new.lines]
         if run.selected is None:
-            both = [n for n in both if n in (old.active or ()) and n in (new.active or ())]
+            both = [n for n in both if n in old_active and n in new_active]
         else:
             both = [n for n in both if _matches(old, n, run.selected)]
-        named.extend(n for n in both if n not in named)
+        for n in both:
+            if n not in seen:
+                seen.add(n)
+                named.append(n)
         if run.extra:
             continue
         base_cmds.extend(ln for n in both for ln in old.lines[n])
@@ -623,7 +629,7 @@ def judge(
         elif unread:
             out.append((unread, True))
     # a bare run also takes the environments the change added
-    taken = [*named, *(n for n in (new.active or ()) if n not in named)]
+    taken = [*named, *(n for n in (new.active or ()) if n not in seen)]
     named_new = taken if any(r.selected is None for r in mine) else named
     out.extend(_command_reasons(old, new, named, named_new))
     return out
