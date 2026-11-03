@@ -1893,6 +1893,14 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                 if noop:
                     why = f"`{flag}` added to a {family} test step: the run passes without a test"
                     out.append(_block(at, why))
+                elif flag == "nx affected":  # an ordinary speed-up: it runs what the diff touches
+                    out.append(
+                        _warn(
+                            at,
+                            f"`{flag}` added to a {family} test step: check that every"
+                            " package is still tested",
+                        )
+                    )
                 elif _MATRIX.search(stmt[stmt.find(flag) :]):
                     why = f"`{flag}` with a matrix value added to a {family} test step"
                     out.append(_warn(at, why + ": it may run fewer tests"))
