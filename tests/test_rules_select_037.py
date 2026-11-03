@@ -88,9 +88,11 @@ def test_pytest_from_a_subdirectory_is_read_from_there(tmp_path: Path) -> None:
         run_make(tmp_path, "cd backend && pytest tests", "cd backend && pytest -q tests", files)
         == "pass"
     )
-    # one test file that is every test file is still a hand-picked list
+    # one test file that is every test file is a hand-picked list: a warning (round 7), not a block
     cand = "cd backend && pytest tests/test_a.py"
-    assert run_make(tmp_path / "p", "cd backend && pytest tests", cand, files) == "block"
+    assert run_make(tmp_path / "p", "cd backend && pytest tests", cand, files) == "warn"
+    more = {**files, "backend/tests/test_b.py": PY}
+    assert run_make(tmp_path / "q", "cd backend && pytest tests", cand, more) == "block"
 
 
 GO = {
