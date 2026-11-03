@@ -42,6 +42,7 @@ from greenproof.rules.shell import (
     is_non_check,
     narrowed_scope,
     narrowed_selection,
+    runs_monorepo_tests,
     scripts_in,
     selection_flags,
     shell_c_body,
@@ -687,7 +688,7 @@ class _Ctx:
             scripts=self.scripts,
             make_check=self.make_check,
         )
-        if kind is not None:
+        if kind is not None or runs_monorepo_tests(statement):
             return True
         if (plain := _unwrap(statement)) != statement and (
             check_kind(
@@ -1800,6 +1801,8 @@ def neutering_reason(
     if added := sorted(after - before):
         return f"it now passes {added[0]}"
     if flag := _new_selection_flag(base_e, cand_e) or _new_selection_flag(*unexpanded):
+        if flag == _AFFECTED:  # an ordinary speed-up, but it runs only what the diff touches
+            return _Warn(f"it now passes {flag}: check that every package is still tested")
         return f"it now passes {flag}"
     scope, scope_unread = narrowed_scope(narrow_base, narrow_cand)
     if scope:
@@ -2018,6 +2021,9 @@ def _dash_reason(
         elif any(_counts(seg.text, ctx, known, base_texts) for seg in split_segments(body)):
             return "a recipe line now ignores its exit status"
     return None
+
+
+_AFFECTED = "nx affected"
 
 
 def _new_selection_flag(base: list[str], cand: list[str]) -> str | None:
