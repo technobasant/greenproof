@@ -8,6 +8,11 @@ runs) is a check removed without a line of the command changing. The same goes f
 default of `{posargs:DEFAULT}` (`session.posargs or [DEFAULT]`): it is the paths of the command
 whenever nothing follows `--`, and it is judged as the paths of a command are.
 
+The commands of an environment or session that a run takes are judged too: a leading `-` on a
+check (tox ignores its exit status), `ignore_errors` or `ignore_outcome` turned on, a nox
+`session.run` in a `try` that swallows the failure or with widened `success_codes`, and a kind of
+check (tests, lint, types) that the commands no longer run.
+
 Everything is read from the text of the file, never run. A list that cannot be read on either
 side (`{env:X}`, a product, a computed `nox.options.sessions`) warns when it changed.
 """
@@ -19,7 +24,8 @@ import itertools
 import posixpath
 import re
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +41,9 @@ from greenproof.rules.shell import (
 CONFIG_NAMES = frozenset({"tox.ini", "setup.cfg", "pyproject.toml", "tox.toml", "noxfile.py"})
 _MAX_ENVS = 256  # a brace product larger than this is not expanded (and so not read)
 _MAX_LINES = 2000
+_MAX_TOTAL = 20_000  # command lines read over all environments of one file
+_MAX_NODES = 200_000  # syntax nodes read in one noxfile
+_FLAG_KEYS = ("ignore_errors", "ignore_outcome")
 _POSARGS = re.compile(r"\{posargs(?::([^{}]*))?\}")
 _REFERENCE = re.compile(r"\{\[([^\]]+)\]([\w.-]+)\}")
 _INLINE_COMMENT = re.compile(r"\s+[#;].*$")
@@ -45,15 +54,50 @@ _SELECTING = {
 
 
 @dataclass
+class Cmd:
+    """One line of a tox `commands`: `swallow` when it starts with `-` (tox goes on whatever it
+    exits with), `when` the factors a `py312:` condition asks for (None for none)."""
+
+    text: str
+    swallow: bool
+    when: tuple[str, ...] | None = None
+
+
+@dataclass
 class Defaults:
     """The default run of a tox or nox configuration: `active` are the names it runs when none
     is asked for (None when the list cannot be read, with its text in `raw`), `lines` the
-    command lines of every environment or session with `{posargs:D}` replaced by `D`."""
+    command lines of every environment or session with `{posargs:D}` replaced by `D`,
+    `swallowed` those of them that go on whatever they exit with, and `flags` the `ignore_errors`
+    and `ignore_outcome` an environment has on. `truncated` when a budget cut the reading short.
+
+    tox environments are read lazily from `cmds`: `""` holds `[testenv]`, which any environment
+    without a section of its own (`-e py312`) runs."""
 
     tool: str
     active: list[str] | None = None
     raw: str = ""
     lines: dict[str, list[str]] = field(default_factory=dict)
+    swallowed: dict[str, list[str]] = field(default_factory=dict)
+    flags: dict[str, set[str]] = field(default_factory=dict)
+    cmds: dict[str, list[Cmd]] = field(default_factory=dict)
+    truncated: bool = False
+    spent: int = 0
+
+    def ensure(self, env: str) -> None:
+        """Read the commands of tox environment `env` (once), within the line budget."""
+        if env in self.lines or "" not in self.cmds:
+            return
+        source = self.cmds.get(env, self.cmds[""])
+        self.spent += len(source)
+        if self.spent > _MAX_TOTAL:
+            self.truncated = True
+            self.lines[env], self.swallowed[env] = [], []
+            return
+        wanted = [c for c in source if _applies(c, env)]
+        self.lines[env] = [c.text for c in wanted]
+        self.swallowed[env] = [c.text for c in wanted if c.swallow]
+        self.flags[env] = self.flags.get(env, self.flags.get("", set()))
 
 
 @dataclass
@@ -163,26 +207,53 @@ def _factors(env: str) -> set[str]:
     return set(env.split("-"))
 
 
-def _tox_lines(value: str, env: str) -> list[str]:
-    out: list[str] = []
+_SUBSTITUTIONS = (
+    (re.compile(r"\{envpython\}"), "python"),
+    (re.compile(r"\{(?:envbindir|toxinidir|envdir)\}/"), ""),
+    (re.compile(r"\{toxinidir\}"), "."),
+)
+
+
+def _command(text: str) -> str:
+    """A tox command with its `{posargs:D}` as D and the paths of the environment as plain words
+    (`{envpython} -m pytest {toxinidir}/tests` is `python -m pytest tests`)."""
+    for pattern, plain in _SUBSTITUTIONS:
+        text = pattern.sub(plain, text)
+    return _posargs_default(text)
+
+
+def _tox_cmds(value: str) -> list[Cmd]:
+    out: list[Cmd] = []
     for raw in value.splitlines():
-        line = raw.strip().removeprefix("-").strip()
+        line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        swallow = line.startswith("-")
+        line = line.removeprefix("-").strip()
+        when = None
         if m := re.match(r"^([\w.,!-]+):\s+(.*)$", line):  # `py312: cmd`: a factor condition
-            wanted = m[1].split(",")
-            if not any(w == env or w in _factors(env) for w in wanted if not w.startswith("!")):
-                continue
-            line = m[2]
-        out.append(_posargs_default(line))
+            when = tuple(w for w in m[1].split(",") if not w.startswith("!"))
+            line = m[2].strip()
+            if line.startswith("-"):
+                swallow, line = True, line[1:].strip()
+        if line:
+            out.append(Cmd(_command(line), swallow, when))
         if len(out) >= _MAX_LINES:
             break
     return out
 
 
+def _applies(cmd: Cmd, env: str) -> bool:
+    return cmd.when is None or any(w == env or w in _factors(env) for w in cmd.when)
+
+
 def _resolve(value: str, ini: Mapping[str, str]) -> str:
     """`{[testenv]commands}` replaced by that key's text, once."""
     return _REFERENCE.sub(lambda m: ini.get(f"{m[1]}.{m[2]}", m[0]), value)
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in ("true", "1", "yes", "on")
 
 
 def _tox_ini_defaults(text: str, head: str) -> Defaults | None:
@@ -193,43 +264,64 @@ def _tox_ini_defaults(text: str, head: str) -> Defaults | None:
     d = Defaults("tox", raw=raw or "")
     names = _env_names(raw) if raw is not None else ["py"]
     d.active = names
-    base = ini.get("testenv.commands", "")
-    for env in names or ():
-        value = ini.get(f"testenv:{env}.commands", base)
-        d.lines[env] = _tox_lines(_resolve(value, ini), env)
-    for key, value in ini.items():  # a dropped environment keeps its own section's commands
-        if key.startswith("testenv:") and key.endswith(".commands"):
-            env = key[len("testenv:") : -len(".commands")]
-            d.lines.setdefault(env, _tox_lines(_resolve(value, ini), env))
+    d.cmds[""] = _tox_cmds(_resolve(ini.get("testenv.commands", ""), ini))
+    d.flags[""] = {k for k in _FLAG_KEYS if _truthy(ini.get(f"testenv.{k}", ""))}
+    for key, value in ini.items():  # an environment of its own keeps its own section's commands
+        if not key.startswith("testenv:"):
+            continue
+        section, _, option = key.rpartition(".")
+        env = section[len("testenv:") :]
+        if option == "commands":
+            d.cmds[env] = _tox_cmds(_resolve(value, ini))
+        if option in _FLAG_KEYS:
+            own = d.flags.setdefault(env, set(d.flags[""]))
+            (own.add if _truthy(value) else own.discard)(option)
+    for env in dict.fromkeys([*(names or ()), *d.cmds]):
+        if env:
+            d.ensure(env)
     return d
 
 
-def _toml_line(item: Any) -> str | None:
-    """A tox.toml command (`["pytest", "{posargs:tests}"]`, or a string) as one line."""
+def _toml_cmd(item: Any) -> Cmd | None:
+    """A tox.toml command (`["pytest", "{posargs:tests}"]`, or a string) as one line; a first
+    word that starts with `-` is tox's way to go on whatever the command exits with."""
     if isinstance(item, str):
-        return _posargs_default(item)
-    if not isinstance(item, list):
-        return None
-    words: list[str] = []
-    for w in item:
-        if isinstance(w, str):
-            words.append(_posargs_default(w))
-        elif isinstance(w, dict) and w.get("replace") == "posargs":
-            default = w.get("default", [])
-            if not isinstance(default, list):
+        words = [_command(item)]
+    elif isinstance(item, list):
+        words = []
+        for w in item:
+            if isinstance(w, str):
+                words.append(_command(w))
+            elif isinstance(w, dict) and w.get("replace") == "posargs":
+                default = w.get("default", [])
+                if not isinstance(default, list):
+                    return None
+                words.extend(str(x) for x in default)
+            else:
                 return None
-            words.extend(str(x) for x in default)
-        else:
-            return None
-    return " ".join(words)
+    else:
+        return None
+    line = " ".join(words).strip()
+    swallow = line.startswith("-")
+    line = line.removeprefix("-").strip()
+    return Cmd(line, swallow) if line else None
 
 
-def _toml_lines(table: Mapping[str, Any] | None) -> list[str]:
-    if not isinstance(table, Mapping):
-        return []
-    cmds = table.get("commands")
-    out = [ln for item in (cmds if isinstance(cmds, list) else []) if (ln := _toml_line(item))]
-    return out[:_MAX_LINES]
+def _toml_cmds(table: Mapping[str, Any] | None) -> list[Cmd] | None:
+    """The commands of a table, None when it sets none."""
+    if not isinstance(table, Mapping) or "commands" not in table:
+        return None
+    cmds = table["commands"]
+    found = (_toml_cmd(item) for item in (cmds if isinstance(cmds, list) else []))
+    return [c for c in found if c is not None][:_MAX_LINES]
+
+
+def _toml_flags(table: Mapping[str, Any] | None, base: set[str]) -> set[str]:
+    out = set(base)
+    for key in _FLAG_KEYS:
+        if isinstance(table, Mapping) and key in table:
+            (out.add if table[key] is True else out.discard)(key)
+    return out
 
 
 def _tox_toml_defaults(text: str, pyproject: bool) -> Defaults | None:
@@ -250,10 +342,14 @@ def _tox_toml_defaults(text: str, pyproject: bool) -> Defaults | None:
         d.active = names
     else:
         d.active = None
-    base = _toml_lines(run_base)
-    for env in {*(d.active or ()), *envs}:
-        own = envs.get(env)
-        d.lines[env] = _toml_lines(own) if isinstance(own, dict) and "commands" in own else base
+    d.cmds[""] = _toml_cmds(run_base) or []
+    d.flags[""] = _toml_flags(run_base, set())
+    for env, own in envs.items():
+        if (cmds := _toml_cmds(own)) is not None:
+            d.cmds[env] = cmds
+        d.flags[env] = _toml_flags(own, d.flags[""])
+    for env in dict.fromkeys([*(d.active or ()), *envs]):
+        d.ensure(env)
     return d
 
 
@@ -279,9 +375,24 @@ def _words(node: ast.AST) -> list[str] | None:
     return None
 
 
+_OPAQUE = "<?>"  # stands in the lines of a session for a `session.run` that cannot be read
+
+
 def _starred_default(value: ast.AST) -> list[str]:
     """What `*session.posargs`, `*(session.posargs or [D])` and `*(session.posargs if
-    session.posargs else [D])` add to a command when nothing follows `--`: D."""
+    session.posargs else [D])` add to a command when nothing follows `--`: D. A literal list
+    or `"a b".split()` adds its words."""
+    if isinstance(value, ast.Call) and not value.args and not value.keywords:
+        f = value.func
+        if (
+            isinstance(f, ast.Attribute)
+            and f.attr == "split"
+            and isinstance(f.value, ast.Constant)
+            and isinstance(f.value.value, str)
+        ):
+            return f.value.value.split()
+    if (literal := _words(value)) is not None:
+        return literal
     if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or) and len(value.values) == 2:
         return _words(value.values[1]) or []
     if isinstance(value, ast.IfExp):
@@ -301,9 +412,57 @@ def _run_line(call: ast.Call) -> str | None:
     return " ".join(words) if words and words[0] != "<?>" else None
 
 
+def _swallows(node: ast.Try) -> bool:
+    """Whether a `try` lets the failure of its body pass: a handler that does not raise again."""
+    return any(not any(isinstance(n, ast.Raise) for n in h.body) for h in node.handlers)
+
+
+def _widened(call: ast.Call) -> bool:
+    """A `session.run` whose `success_codes` is anything but `[0]`: it passes on a failure."""
+    for kw in call.keywords:
+        if kw.arg == "success_codes":
+            return not (
+                isinstance(kw.value, (ast.List, ast.Tuple))
+                and [getattr(e, "value", None) for e in kw.value.elts] == [0]
+            )
+    return False
+
+
+def _session_runs(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef, budget: list[int]
+) -> tuple[list[str], list[str]]:
+    """The `session.run` lines of a session, and those that go on whatever they exit with (in a
+    `try` that swallows the failure, or with widened `success_codes`). `budget` counts the syntax
+    nodes left to read across the file."""
+    lines: list[str] = []
+    swallowed: list[str] = []
+    stack: list[tuple[ast.AST, bool]] = [(n, False) for n in reversed(fn.body)]
+    while stack and budget[0] > 0:
+        node, guarded = stack.pop()
+        budget[0] -= 1
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("run", "run_always")
+        ):
+            line = _run_line(node) or _OPAQUE
+            lines.append(line)
+            if guarded or _widened(node):
+                swallowed.append(line)
+        if isinstance(node, ast.Try):
+            rest = [*node.handlers, *node.orelse, *node.finalbody]
+            stack.extend((n, guarded) for n in reversed(rest))
+            stack.extend((n, guarded or _swallows(node)) for n in reversed(node.body))
+        else:
+            stack.extend((n, guarded) for n in reversed(list(ast.iter_child_nodes(node))))
+    return lines[:_MAX_LINES], swallowed[:_MAX_LINES]
+
+
 def _nox_defaults(text: str) -> Defaults | None:
     tree = ast.parse(text)
     sessions: dict[str, list[str]] = {}
+    swallowed: dict[str, list[str]] = {}
+    budget = [_MAX_NODES]
     listed: list[str] | None = None
     unread = False
     source = ""  # what the options are set to, for a list that cannot be read
@@ -312,16 +471,7 @@ def _nox_defaults(text: str) -> Defaults | None:
             name = _session_name(node)
             if name is None:
                 continue
-            lines: list[str] = []
-            for call in ast.walk(node):
-                if (
-                    isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Attribute)
-                    and call.func.attr in ("run", "run_always")
-                    and (line := _run_line(call))
-                ):
-                    lines.append(line)
-            sessions[name] = lines[:_MAX_LINES]
+            sessions[name], swallowed[name] = _session_runs(node, budget)
         elif isinstance(node, (ast.Assign, ast.AugAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for t in targets:
@@ -338,7 +488,9 @@ def _nox_defaults(text: str) -> Defaults | None:
                     unread = True
     if not sessions and listed is None and not unread:
         return None
-    d = Defaults("nox", raw=source.strip(), lines=sessions)
+    d = Defaults(
+        "nox", raw=source.strip(), lines=sessions, swallowed=swallowed, truncated=budget[0] <= 0
+    )
     d.active = None if unread else (listed if listed is not None else list(sessions))
     return d
 
@@ -434,8 +586,9 @@ def judge(
                 )
         else:
             kept = _kinds(new, new.active)
+            still = set(new.active)
             for name in dict.fromkeys(old.active):
-                if name in new.active:
+                if name in still:
                     continue
                 if lost := sorted(_kinds(old, [name]) - kept):
                     out.append(
@@ -447,14 +600,24 @@ def judge(
                     )
     base_cmds: list[str] = []
     cand_cmds: list[str] = []
+    named: list[str] = []  # the environments or sessions a run takes on both sides
+    seen: set[str] = set()
+    old_active, new_active = set(old.active or ()), set(new.active or ())
     for run in mine:
-        if run.extra:
-            continue
+        for n in run.selected or ():
+            old.ensure(n)
+            new.ensure(n)
         both = [n for n in old.lines if n in new.lines]
         if run.selected is None:
-            both = [n for n in both if n in (old.active or ()) and n in (new.active or ())]
+            both = [n for n in both if n in old_active and n in new_active]
         else:
             both = [n for n in both if _matches(old, n, run.selected)]
+        for n in both:
+            if n not in seen:
+                seen.add(n)
+                named.append(n)
+        if run.extra:
+            continue
         base_cmds.extend(ln for n in both for ln in old.lines[n])
         cand_cmds.extend(ln for n in both for ln in new.lines[n])
     if base_cmds != cand_cmds:
@@ -465,4 +628,72 @@ def judge(
             out.append((f"the {old.tool} commands run less ({scope})", False))
         elif unread:
             out.append((unread, True))
+    # a bare run also takes the environments the change added
+    taken = [*named, *(n for n in (new.active or ()) if n not in seen)]
+    named_new = taken if any(r.selected is None for r in mine) else named
+    out.extend(_command_reasons(old, new, named, named_new))
     return out
+
+
+def _line_kinds(line: str) -> set[str]:
+    return {k for seg in split_segments(line) if (k := check_kind(seg.text))}
+
+
+def _swallowed_kinds(lines: Iterable[str]) -> Counter[str]:
+    """The kinds of check among the commands whose failure `tox` or `nox` goes on after, counted:
+    a swallowed `pytest` that was already swallowed and only got another flag is the same."""
+    return Counter(k for line in lines for k in _line_kinds(line))
+
+
+def _command_reasons(
+    old: Defaults, new: Defaults, names: Sequence[str], now: Sequence[str]
+) -> list[tuple[str, bool]]:
+    """What changed in the commands of `names`, which a run takes before and after (`now` are
+    the ones it takes after): a check that goes on whatever it exits with, `ignore_errors` or
+    `ignore_outcome` turned on, and a kind of check that nothing runs any more."""
+    noun = "environment" if old.tool == "tox" else "session"
+    if old.truncated or new.truncated:
+        return [
+            (
+                f"the {old.tool} commands are too many to read in full: check that every {noun}"
+                " still runs its checks and fails when they do",
+                True,
+            )
+        ]
+    out: list[tuple[str, bool]] = []
+    for n in names:
+        gained = _swallowed_kinds(new.swallowed.get(n, ())) - _swallowed_kinds(
+            old.swallowed.get(n, ())
+        )
+        for line in new.swallowed.get(n, ()):
+            if gained.keys() & _line_kinds(line):
+                out.append((f"`{old.tool}` now goes on whatever `{line}` exits with ({n})", False))
+                break
+        if (turned := new.flags.get(n, set()) - old.flags.get(n, set())) and (
+            _kinds(old, [n]) | _kinds(new, [n])
+        ):
+            out.append(
+                (
+                    f"`{', '.join(sorted(turned))}` is now on for the {noun} `{n}`, which runs a"
+                    " check: its failure no longer fails the run",
+                    False,
+                )
+            )
+    if lost := sorted(_kinds(old, names) - _kinds(new, now)):
+        if any(_OPAQUE in new.lines.get(n, ()) for n in now):  # a command it cannot read may run it
+            out.append(
+                (
+                    f"`{old.tool}` runs a command that cannot be read in {_listing(names)}: check"
+                    f" that it still runs {', '.join(lost)}",
+                    True,
+                )
+            )
+        else:
+            out.append(
+                (f"`{old.tool}` no longer runs {', '.join(lost)} in {_listing(names)}", False)
+            )
+    return out
+
+
+def _listing(names: Sequence[str]) -> str:
+    return ", ".join(f"`{n}`" for n in names[:3]) + (" and more" if len(names) > 3 else "")

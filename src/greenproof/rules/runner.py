@@ -44,6 +44,7 @@ from greenproof.rules.shell import (
     is_non_check,
     narrowed_scope,
     narrowed_selection,
+    runs_monorepo_tests,
     scripts_in,
     selection_flags,
     shell_c_body,
@@ -884,7 +885,7 @@ class _Ctx:
             scripts=self.scripts,
             make_check=self.make_check,
         )
-        if kind is not None:
+        if kind is not None or runs_monorepo_tests(statement):
             return True
         if (plain := _unwrap(statement)) != statement and (
             check_kind(
@@ -2168,11 +2169,11 @@ def neutering_reason(
     cand_e = _with_exports(cand_c, script, exports[1] if exports else None)
     if base_c == cand_c and base_e == cand_e and (modes is None or modes[0] == modes[1]):
         return None
-    unread = False
+    unread = base_unread = False
     narrow_base, narrow_cand = _statements(base_e, script), _statements(cand_e, script)
     unexpanded = base_e, cand_e  # a task runner read into its commands loses `nx affected`
     if tasks is not None:
-        base_c, _ = _read_tasks(base_c, tasks[0])
+        base_c, base_unread = _read_tasks(base_c, tasks[0])
         cand_c, unread = _read_tasks(cand_c, tasks[1])
         base_e = _with_exports(base_c, script, exports[0] if exports else None)
         cand_e = _with_exports(cand_c, script, exports[1] if exports else None)
@@ -2186,6 +2187,8 @@ def neutering_reason(
     if added := sorted(after - before):
         return f"it now passes {added[0]}"
     if flag := _new_selection_flag(base_e, cand_e) or _new_selection_flag(*unexpanded):
+        if flag == _AFFECTED:  # an ordinary speed-up, but it runs only what the diff touches
+            return _Warn(f"it now passes {flag}: check that every package is still tested")
         return f"it now passes {flag}"
     scope, scope_unread = narrowed_scope(narrow_base, narrow_cand)
     if scope:
@@ -2221,6 +2224,13 @@ def neutering_reason(
         if unread:
             return _Warn(_UNREAD_TASKS_WHY)
         return "it runs fewer steps than before"
+    if (
+        unread
+        and not base_unread
+        and not script
+        and any(runs_monorepo_tests(st) for st in _statements(unexpanded[1], script))
+    ):
+        return _Warn(_UNREAD_TASKS_WHY)
     if gone:
         return gone
     if _autoload_sets(_statements(cand_c, script)) > _autoload_sets(_statements(base_c, script)):
@@ -2409,6 +2419,9 @@ def _dash_reason(
         elif any(_counts(seg.text, ctx, known, base_texts) for seg in split_segments(body)):
             return "a recipe line now ignores its exit status"
     return None
+
+
+_AFFECTED = "nx affected"
 
 
 def _new_selection_flag(base: list[str], cand: list[str]) -> str | None:
