@@ -6,13 +6,13 @@ Codex and Cursor, so you do not run `greenproof init` in each repository.
 
 ## What runs, and when
 
-- **On stop**: `uvx greenproof@0.2.0 check --hook AGENT`, in the project. It looks at the change
+- **On stop**: `uvx greenproof@0.3.0 check --hook AGENT`, in the project. It looks at the change
   since the base revision for deleted, skipped or weakened tests and for edits to test,
   runner or CI configuration, then runs the commands in the project's `.greenproof.toml`,
   which are the project's own tests. A failure goes back to the agent as the reason it is
   not done. The hook has a one-hour timeout, because a plugin cannot read the project's
   policy.
-- **On session start**: `uvx greenproof@0.2.0 session-start --hook AGENT`, which writes the
+- **On session start**: `uvx greenproof@0.3.0 session-start --hook AGENT`, which writes the
   session marker under the git directory.
 
 uv downloads greenproof from PyPI on first use and pins the version in the command.
@@ -53,7 +53,7 @@ runs, edit the project's `.greenproof.toml`.
 ## With `greenproof init`
 
 Running `greenproof init --agents ...` in a repository that has the plugin is unnecessary.
-`uvx greenproof@0.2.0 init --agents none` adds only the policy and the AGENTS.md section. If
+`uvx greenproof@0.3.0 init --agents none` adds only the policy and the AGENTS.md section. If
 both are installed, greenproof makes one decision per stop.
 
 ## Source and license

@@ -5,6 +5,12 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-03
+
+Measured against 0.2.0 on the same inputs (MEASUREMENTS.md): of 684 tamper probes, 638 block
+and 46 warn (0.2.0: 187 and 42); of 450 honest probes, 2 block (0.2.0: 87). On real history,
+75 of 698 test-touching commits block (0.2.0: 70), 21 of them false blocks (0.2.0: 20).
+
 ### Added
 
 - `scripts/release_notes.py X.Y.Z`, which prints the GitHub Release notes for a version: the
@@ -320,6 +326,7 @@ First release.
 - The test suite runs in parallel with `pytest-xdist` (`pytest -n auto`) in CI and in the
   documented gate.
 
-[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/technobasant/greenproof/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/technobasant/greenproof/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/technobasant/greenproof/releases/tag/v0.1.0
