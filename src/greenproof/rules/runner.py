@@ -15,7 +15,7 @@ import shlex
 from bisect import bisect_left
 from collections import ChainMap, Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, MutableMapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from typing import Any, NamedTuple
 
@@ -2978,9 +2978,56 @@ class _Targets(dict[str, _Target]):
         self.default: str | None = None
         self.stopped = ""
         self.cut = ""
+        self.patterns: list[tuple[re.Pattern[str], str]] = []
+
+    def _resolve(self, name: str) -> _Target | None:
+        """The rule for `name`: its own, or else the pattern rule (`test-%:`) that matches it with
+        the shortest stem, with `$*` (the stem) and `$@` written in. Taken once, then kept."""
+        node = dict.get(self, name)
+        if node is not None or not self.patterns or "%" in name:
+            return node
+        best: tuple[str, str] | None = None
+        for rx, key in self.patterns:
+            if (m := rx.fullmatch(name)) and (best is None or len(m[1]) < len(best[0])):
+                best = (m[1], key)
+        if best is None:
+            return None
+        stem, key = best
+        pattern = dict.__getitem__(self, key)
+
+        def fill(text: str) -> str:
+            return re.sub(r"(?<!\$)\$[({]?\*[)}]?", lambda _m: stem, text.replace("$@", name))
+
+        node = _Target(
+            [fill(ln) for ln in pattern.lines],
+            [pre for pre in (fill(p.replace("%", stem)) for p in pattern.prereqs)],
+        )
+        dict.__setitem__(self, name, node)
+        return node
+
+    def __contains__(self, name: object) -> bool:
+        return isinstance(name, str) and self._resolve(name) is not None
+
+    def __getitem__(self, name: str) -> _Target:
+        node = self._resolve(name)
+        if node is None:
+            raise KeyError(name)
+        return node
+
+    def get(self, name: str, default: Any = None) -> Any:
+        node = self._resolve(name)
+        return default if node is None else node
+
+    def set_patterns(self) -> None:
+        """Note the rules whose names hold a `%` (and a recipe) as pattern rules."""
+        self.patterns = [
+            (re.compile(re.escape(k).replace("%", "(.+)", 1).replace("%", ".+")), k)
+            for k, v in dict.items(self)
+            if "%" in k and v.lines
+        ]
 
 
-_RULE = re.compile(r"^([A-Za-z_][\w.-]*)\s*(?:[^=:\n]*)?:(?![=:])(.*)$")
+_RULE = re.compile(r"^([A-Za-z_%][^\s:=#]*(?:[ \t]+[^\s:=#]+)*)[ \t]*(::|:)(?![=:])(.*)$")
 _DEFINE = re.compile(r"^\s*define\s")
 _DEFINE_HEAD = re.compile(
     r"^(?:(?:export|override)\s+)*define\s+([A-Za-z_.][\w.-]*)\s*(::=|:=|\?=|\+=|=)?\s*$"
@@ -3057,7 +3104,214 @@ def _joined(text: str) -> list[str]:
     return split_lines(re.sub(r"\\\n[ \t]*", " ", text))
 
 
-def _variables(
+# -- conditionals: every branch is read -----------------------------------------------------------
+_IF_ANY = re.compile(r"^ *(?:ifdef|ifndef|ifeq|ifneq)\b", re.M)
+_IF_LINE = re.compile(r"^ *(?:ifdef|ifndef|ifeq|ifneq)(?=[\s(\"'])(?!\s*[:?+]?=)")
+_ELSE_LINE = re.compile(r"^ *else\b(?!\s*[:?+]?=)(.*)$")
+_ENDIF_LINE = re.compile(r"^ *endif\b")
+_MAX_WORLDS = 32  # the ways a Makefile's conditionals are read at once
+_MAX_COND_DEPTH = 32
+_MAKE_SPECIAL = frozenset({"SHELL", "MAKEFLAGS", "MAKE", "MAKEFILES", "GNUMAKEFLAGS", "VPATH"})
+_Key = tuple[tuple[tuple[str, int], str], ...]
+
+
+class _Block:
+    """One `ifdef`/`ifeq` ... `endif` of a Makefile: the label of each branch (`ifdef CI`, `else`,
+    `else ifdef B`), the lines and blocks in each, and whether it ends in a plain `else`."""
+
+    def __init__(self, ident: tuple[str, int]) -> None:
+        self.ident = ident
+        self.labels = [ident[0]]
+        self.branches: list[list[int | _Block]] = [[]]
+        self.has_else = False
+        self.relevant = True
+
+    @property
+    def options(self) -> int:
+        """The branches, and one more for no branch taken when there is no `else`."""
+        return len(self.branches) + (0 if self.has_else else 1)
+
+
+def _label(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"(?:^|\s)#.*$", "", text)).strip()
+
+
+def _parse_conditionals(lines: list[str]) -> list[int | _Block]:
+    """The lines of a Makefile as a tree: the index of each line that is not a conditional
+    directive (a tab-led recipe line, a continuation line and a `define` body are never one),
+    and a `_Block` for each conditional. An `endif` that is missing ends at the end of the file;
+    one with no conditional is not read."""
+    root: list[int | _Block] = []
+    stack: list[_Block] = []
+    seen: Counter[str] = Counter()
+    in_define = 0
+    cont = False
+    for i, line in enumerate(lines):
+        plain = cont or in_define > 0 or line.startswith("\t")
+        cont = line.endswith("\\")
+        if in_define:
+            in_define += 1 if _DEFINE.match(line) else -1 if _ENDEF.match(line) else 0
+        elif not plain and _DEFINE.match(line):
+            in_define = 1
+            plain = True
+        if not plain:
+            if _IF_LINE.match(line):
+                label = _label(line)
+                seen[label] += 1
+                if len(stack) >= _MAX_COND_DEPTH:
+                    raise _Unreadable(f"its conditionals nest more than {_MAX_COND_DEPTH} deep")
+                block = _Block((label, seen[label]))
+                (stack[-1].branches[-1] if stack else root).append(block)
+                stack.append(block)
+                continue
+            if stack and (m := _ELSE_LINE.match(line)):
+                rest = _label(m[1])
+                stack[-1].has_else = stack[-1].has_else or not _IF_LINE.match(rest)
+                stack[-1].labels.append(f"else {rest}".strip())
+                stack[-1].branches.append([])
+                continue
+            if stack and _ENDIF_LINE.match(line):
+                stack.pop()
+                continue
+            if _ELSE_LINE.match(line) or _ENDIF_LINE.match(line):
+                continue  # no conditional is open
+        if line.strip():
+            (stack[-1].branches[-1] if stack else root).append(i)
+    return root
+
+
+def _mark_relevant(items: Sequence[int | _Block], lines: list[str], text: str) -> bool:
+    """Set `relevant` on each block under `items`: whether choosing a branch of it can change
+    what is read. A block that holds only assignments to variables nothing else mentions (and no
+    `export`, `override`, `SHELL`, `MAKEFLAGS`, flag variable or special `.` name) cannot, and
+    reads as its first branch, so a Makefile with many such blocks does not multiply."""
+    words = Counter(re.findall(r"[A-Za-z_.][\w.-]*", text))
+    assigns: Counter[str] = Counter()
+    for ln in lines:
+        if not ln.startswith("\t") and (m := _ASSIGN.match(ln)):
+            assigns[m[2]] += 1
+    special = _MAKE_SPECIAL | set(_FLAG_VARS) | {_AUTOLOAD_VAR}
+
+    def line_matters(ln: str) -> bool:
+        if ln.startswith("\t"):
+            return True
+        if ln.lstrip().startswith("#"):
+            return False
+        m = _ASSIGN.match(ln)
+        if m is None:
+            return True
+        name = m[2]
+        return bool(m[1] or name in special or name.startswith(".") or words[name] > assigns[name])
+
+    def mark(seq: Sequence[int | _Block]) -> bool:
+        matters = False
+        for it in seq:
+            if isinstance(it, _Block):
+                inner = [mark(b) for b in it.branches]
+                it.relevant = any(inner)
+                matters = matters or it.relevant
+            else:
+                matters = matters or line_matters(lines[it])
+        return matters
+
+    return mark(items)
+
+
+def _count(items: Sequence[int | _Block]) -> int:
+    """How many ways the relevant blocks under `items` can be chosen, stopping past the limit."""
+    total = 1
+    for it in items:
+        if isinstance(it, _Block) and it.relevant:
+            ways = sum(_count(b) for b in it.branches) + (0 if it.has_else else 1)
+            total = min(total * ways, _MAX_WORLDS + 1)
+    return total
+
+
+_Choice = dict[tuple[str, int], int]
+
+
+def _choices(items: Sequence[int | _Block]) -> list[_Choice]:
+    """Every way to choose a branch (or none) of each relevant block under `items`."""
+    out: list[_Choice] = [{}]
+    for it in items:
+        if isinstance(it, _Block) and it.relevant:
+            options: list[_Choice] = []
+            for b, branch in enumerate(it.branches):
+                options.extend({it.ident: b, **sub} for sub in _choices(branch))
+            if not it.has_else:
+                options.append({it.ident: len(it.branches)})
+            out = [{**o, **p} for o in out for p in options]
+    return out
+
+
+def _flips(items: Sequence[int | _Block], path: _Choice, out: list[_Choice]) -> None:
+    """The choices that differ from the first branch of one block (and what leads to it)."""
+    for it in items:
+        if isinstance(it, _Block) and it.relevant:
+            out.extend({**path, it.ident: b} for b in range(1, it.options))
+            for b, branch in enumerate(it.branches):
+                _flips(branch, {**path, it.ident: b}, out)
+
+
+def _render(
+    items: Sequence[int | _Block],
+    choice: _Choice,
+    lines: list[str],
+    out: list[str],
+    key: list[tuple[tuple[str, int], str]],
+) -> None:
+    for it in items:
+        if not isinstance(it, _Block):
+            out[it] = lines[it]
+            continue
+        b = choice.get(it.ident, 0) if it.relevant else 0
+        if it.relevant:
+            key.append((it.ident, it.labels[b] if b < len(it.labels) else "-"))
+        if b < len(it.branches):
+            _render(it.branches[b], choice, lines, out, key)
+
+
+def _worlds(text: str, strict: bool = True) -> tuple[list[tuple[_Key, str]], str]:
+    """The Makefile read once for each way its conditionals can go: each world is the text with
+    every directive line blanked (so line numbers hold) and only the lines of the chosen branch
+    of each conditional (or of none, when there is no `else`), with the key of the choices made.
+    greenproof does not know the environment, so every branch is read. A Makefile with none, or
+    only blocks that cannot matter, is one world: the text itself. Past `_MAX_WORLDS`, `strict`
+    raises `_Unreadable`; otherwise each branch is read on its own and the second value says so."""
+    if not _IF_ANY.search(text):
+        return [((), text)], ""
+    lines = split_lines(text)
+    items = _parse_conditionals(lines)
+    _mark_relevant(items, lines, text)
+    cut = ""
+    if _count(items) <= _MAX_WORLDS:
+        choices = _choices(items)
+    else:
+        if strict:
+            raise _Unreadable(f"its conditionals combine in more than {_MAX_WORLDS} ways")
+        flips: list[_Choice] = []
+        _flips(items, {}, flips)
+        unique = {tuple(sorted(c.items())): c for c in [{}, *flips]}
+        choices = list(unique.values())
+        cut = (
+            f"its conditionals combine in more than {_MAX_WORLDS} ways: each branch was read alone"
+        )
+        if len(choices) > _MAX_WORLDS:
+            choices = choices[:_MAX_WORLDS]
+            cut = (
+                f"its conditionals combine in more than {_MAX_WORLDS} ways:"
+                f" only {_MAX_WORLDS} were read"
+            )
+    worlds: list[tuple[_Key, str]] = []
+    for choice in choices:
+        out = [""] * len(lines)
+        key: list[tuple[tuple[str, int], str]] = []
+        _render(items, choice, lines, out, key)
+        worlds.append((tuple(sorted(key)), "\n".join(out)))
+    return worlds, cut
+
+
+def _variables_flat(
     text: str | None, env: Mapping[str, str] | None = None, cli: Sequence[str] = ()
 ) -> _Vars:
     """The variables a Makefile assigns at the top level (`=`, `:=`, `::=`, `?=`, `+=`, and
@@ -3122,6 +3376,33 @@ def _variables(
     except _Unreadable as e:
         out.stopped = str(e)
     out.pop("\0", None)
+    return out
+
+
+def _variables(
+    text: str | None, env: Mapping[str, str] | None = None, cli: Sequence[str] = ()
+) -> _Vars:
+    """The variables a Makefile assigns, as `_variables_flat` reads them. A variable a
+    conditional assigns has the value of each branch (none taken included): where those differ
+    the value is all of them, space-separated, so a flag any branch sets is in it."""
+    try:
+        worlds, _ = _worlds(text or "")
+    except _Unreadable as e:
+        out = _Vars()
+        out.stopped = str(e)
+        return out
+    if len(worlds) == 1:
+        return _variables_flat(worlds[0][1], env, cli)
+    parts = [_variables_flat(t, env, cli) for _, t in worlds]
+    out = _Vars()
+    values: dict[str, list[str]] = {}
+    for part in parts:
+        out.stopped = out.stopped or part.stopped
+        for name, value in part.items():
+            if value not in values.setdefault(name, []):
+                values[name].append(value)
+    for name, found in values.items():
+        out[name] = " ".join(found)
     return out
 
 
@@ -3238,14 +3519,75 @@ def _overlays(
 def _targets(
     text: str | None, env: Mapping[str, str] | None = None, cli: Sequence[str] = ()
 ) -> _Targets:
+    """Every rule of a Makefile with its recipe lines and prerequisites, as `_targets_flat` reads
+    them. A Makefile with conditionals is read once for each way they can go (`_worlds`), and a
+    target has the recipe lines of every one, in order, each once: a line that swallows a
+    failure or narrows a check in any branch, or under any value a conditional gives a variable,
+    is among them. The result's `stopped` is set when the conditionals combine in more ways than
+    `_MAX_WORLDS`."""
+    try:
+        worlds, _ = _worlds(text or "")
+    except _Unreadable as e:
+        found = _Targets()
+        found.stopped = str(e)
+        return found
+    if len(worlds) == 1:
+        return _targets_flat(worlds[0][1], env, cli)
+    return _merge_targets([_targets_flat(t, env, cli) for _, t in worlds])
+
+
+def _merge_targets(parts: Sequence[_Targets]) -> _Targets:
+    """The rules of several readings of one Makefile as one: a target's recipe lines are those of
+    each reading, each line once; `.ONESHELL` and `-i` hold when any reading has them, `-e` and
+    `pipefail` only when every reading has them, and `SHELL` is the first one that is not a
+    shell, else the first."""
+    out = _Targets()
+    for part in parts:
+        out.stopped = out.stopped or part.stopped
+        out.cut = out.cut or part.cut
+    if out.stopped:
+        return out
+    first = parts[0]
+    out.variables, out.default = first.variables, first.default
+    out.phony = set().union(*(p.phony for p in parts))
+    out.ignore = set().union(*(p.ignore for p in parts))
+    out.ignore_all = any(p.ignore_all for p in parts)
+    out.flags_ignore = any(p.flags_ignore for p in parts)
+    out.oneshell = any(p.oneshell for p in parts)
+    out.errexit = all(p.errexit for p in parts)
+    out.pipefail = all(p.pipefail for p in parts)
+    shells = [p.shell for p in parts if p.shell is not None]
+    out.shell = next(
+        (sh for sh in shells if not sh.split() or posixpath.basename(sh.split()[0]) not in _SHELLS),
+        shells[0] if shells else None,
+    )
+    for part in parts:
+        for name, node in dict.items(part):
+            have = dict.get(out, name)
+            if have is None:
+                out[name] = _Target(list(node.lines), list(node.prereqs))
+                continue
+            known = set(have.lines)
+            have.lines.extend(ln for ln in node.lines if ln not in known)
+            have.prereqs.extend(pre for pre in node.prereqs if pre not in have.prereqs)
+    out.set_patterns()
+    return out
+
+
+def _targets_flat(
+    text: str | None, env: Mapping[str, str] | None = None, cli: Sequence[str] = ()
+) -> _Targets:
     """Every rule of a Makefile with its recipe lines and prerequisites, the Makefile's own
     variables expanded in both (and the environment's, `env`, and the command line's, `cli`; see
-    `_variables`). A `define ... endef` body is a macro, not a recipe, and is skipped, but is
+    `_variables_flat`). A `define ... endef` body is a macro, not a recipe, and is skipped, but is
     read where a recipe line uses it; a recipe line's `for` loops are written out (`_unroll`);
-    target-specific variables apply to a target's recipe and its prerequisites'. The result's
-    `stopped` is set, and it has no rules, when the Makefile outgrows the reader's limits."""
+    target-specific variables apply to a target's recipe and its prerequisites'. A rule with
+    several targets (`ci test: lint`) is each of them, `name::` rules all run (their recipes are
+    the target's, in order), and a name with no rule of its own takes a matching pattern rule
+    (`test-%:`, with `$*` the stem). The result's `stopped` is set, and it has no rules, when the
+    Makefile outgrows the reader's limits."""
     found = _Targets()
-    variables = _variables(text, env, cli)
+    variables = _variables_flat(text, env, cli)
     if variables.stopped:
         found.stopped = variables.stopped
         return found
@@ -3274,9 +3616,9 @@ def _read_rules(
     )
     raw: dict[str, list[str]] = {}
     scoped: list[tuple[str, str, str, str, bool]] = []
-    current: str | None = None
+    current: list[str] = []
     in_define = 0
-    replace = False
+    fresh: set[str] = set()  # targets whose next recipe line replaces the recipe they had
     first: str | None = None
     explicit: str | None = None
     for line in _joined(text):
@@ -3300,32 +3642,43 @@ def _read_rules(
                 goal = _expand_vars(re.sub(r"\s+#.*$", "", m[4]), variables, 0, budget).split()
                 explicit = goal[0] if goal else None
                 first = None if not goal else first
-            current = None
+            current = []
         elif not indented and (m := _TARGET_VAR.match(line)):
             value = re.sub(r"\s+#.*$", "", m[5]).strip()
             for pattern in _expand_vars(m[1], variables, 0, budget).split():
                 scoped.append((pattern, m[3], m[4], value, "override" in m[2]))
         elif not indented and (m := _RULE.match(line)):
-            head, _, inline = _expand_vars(m[2], variables, 0, budget).partition(";")
+            heads = [
+                n
+                for n in _expand_vars(m[1], variables, 0, budget).split()
+                if re.fullmatch(r"[\w.%/+-]+", n)
+            ]
+            head, _, inline = _expand_vars(m[3], variables, 0, budget).partition(";")
             prereqs = [t for t in re.sub(r"#.*$", "", head).split() if re.fullmatch(r"[\w.-]+", t)]
-            name = m[1]
-            current = name
-            first = first if first is not None or name.startswith(".") else name
-            earlier = found.get(name)
-            found[name] = _Target(prereqs=(earlier.prereqs if earlier else []) + prereqs)
             body = [inline.strip()] if inline.strip() else []
-            # a later rule with a recipe replaces the earlier one; one with none only adds
-            # prerequisites
-            replace = earlier is not None
-            if body or earlier is None:
-                raw[name] = body
-                replace = False
-        elif current is not None and indented and line.strip():
-            if replace:
-                raw[current], replace = [], False
-            raw[current].append(line.strip())
-        elif current is not None and line.strip() and not line.startswith(("#", ".")):
-            current = None
+            current = heads
+            fresh.difference_update(heads)
+            for name in heads:
+                if first is None and not name.startswith(".") and "%" not in name:
+                    first = name
+                earlier = dict.get(found, name)
+                found[name] = _Target(prereqs=(earlier.prereqs if earlier else []) + prereqs)
+                # a `::` rule adds its recipe to the target's; a later single-colon rule with a
+                # recipe replaces the earlier one, and one with none only adds prerequisites
+                if m[2] == "::" and earlier is not None:
+                    raw.setdefault(name, []).extend(body)
+                elif body or earlier is None:
+                    raw[name] = list(body)
+                else:
+                    fresh.add(name)
+        elif current and indented and line.strip():
+            for name in current:
+                if name in fresh:
+                    raw[name] = []
+                    fresh.discard(name)
+                raw[name].append(line.strip())
+        elif current and line.strip() and not line.startswith(("#", ".")):
+            current = []
     found.default = explicit if explicit is not None else first
     overlays = _overlays(
         variables, found, scoped, {m[1] for w in cli if (m := _CLI_ASSIGN.match(w))}, budget
@@ -3338,6 +3691,7 @@ def _read_rules(
             found[name].lines.extend(
                 _split_recipe(ln, _expand_vars(ln, view, 0, budget), found.errexit)
             )
+    found.set_patterns()
 
 
 def _shadowed(targets: _Targets, tree: Collection[str]) -> set[str]:
@@ -3736,6 +4090,153 @@ def _make_reasons(
         if names and _UNREADABLE.search(value) and exported[0].get(var) != value:
             out.append((_first_line_with(f.new_text or "", var), _Warn(_UNREADABLE_WHY)))
             break
+    return out
+
+
+_INCLUDE = re.compile(r"^ *(-include|sinclude|include)[ \t]+(.*)$")
+_MAX_INCLUDE_DEPTH = 4
+_MAX_INCLUDE_FILES = 16
+
+
+def expand_includes(
+    text: str, directory: str, read: Callable[[str], str | None]
+) -> tuple[str, list[str]]:
+    """A Makefile with each `include`, `-include` and `sinclude` of a literal path replaced by the
+    file it names (read through `read`, a path from the repository root; a relative path is
+    taken from `directory`, where make runs), as make reads it, to `_MAX_INCLUDE_DEPTH` levels,
+    `_MAX_INCLUDE_FILES` files and `_MAKE_TOTAL` bytes. The second value says what could not be
+    read: a name with a variable, wildcard or `~` in it, a path outside the repository, a file
+    that is not there (not for `-include`, which make skips), a file too deep or past the
+    budget. A Makefile with no include is returned as it is."""
+    if not re.search(r"^ *(?:-include|sinclude|include)[ \t]", text, re.M):
+        return text, []
+    notes: list[str] = []
+    files = size = 0
+
+    def walk(body: str, depth: int, chain: tuple[str, ...]) -> list[str]:
+        nonlocal files, size
+        out: list[str] = []
+        for line in _joined(body):
+            m = _INCLUDE.match(line)
+            if m is None:
+                out.append(line)
+                continue
+            optional = m[1] != "include"
+            for tok in re.sub(r"(?:^|\s)#.*$", "", m[2]).split():
+                path = posixpath.normpath(posixpath.join(directory, tok))
+                if re.search(r"[$*?\[%~]", tok) or tok.startswith("/") or path.startswith(".."):
+                    notes.append(f"`{m[1]} {tok}` names a file that cannot be read here")
+                elif depth >= _MAX_INCLUDE_DEPTH:
+                    notes.append(f"`{tok}` is included more than {_MAX_INCLUDE_DEPTH} deep")
+                elif path in chain:
+                    continue  # make stops at a file that includes itself
+                elif (sub := read(path)) is None:
+                    if not optional:
+                        notes.append(f"`{m[1]} {tok}` names a file that is not in the repository")
+                elif files >= _MAX_INCLUDE_FILES or size + len(sub) > _MAKE_TOTAL:
+                    notes.append(
+                        f"the includes pass {_MAX_INCLUDE_FILES} files or {_MAKE_TOTAL // 1024} KiB"
+                        f" at `{tok}`"
+                    )
+                else:
+                    files += 1
+                    size += len(sub)
+                    out.extend(walk(sub, depth + 1, (*chain, path)))
+        return out
+
+    return "\n".join(walk(text, 0, ())), notes
+
+
+def _make_root(changes: ChangeSet, directory: str, base: bool) -> str | None:
+    """The file `make` reads in `directory`: the first of `GNUmakefile`, `makefile`, `Makefile`
+    that exists at the base or in the candidate tree."""
+    lister = changes.listing(base)
+    tree = lister() if lister else None
+    read = changes.base_text if base else changes.cand_text
+    for name in ("GNUmakefile", "makefile", "Makefile"):
+        path = posixpath.join(directory, name)
+        if path in tree if tree is not None else read(path) is not None:
+            return path
+    return None
+
+
+_MAX_PAIRS = 48  # candidate and base readings of a Makefile compared at once
+
+
+def _compatible(a: _Key, b: _Key) -> bool:
+    """Whether two readings took the same branch of every conditional they both have."""
+    chosen = dict(a)
+    return all(chosen.get(ident, label) == label for ident, label in b)
+
+
+def _makefile_reasons(
+    f: ChangedFile,
+    commands: Mapping[str, str],
+    changes: ChangeSet,
+    tests: _BaseTests | None = None,
+) -> list[tuple[int | None, str]]:
+    """What `_make_reasons` finds, for the Makefile make reads: the candidate's file is compared
+    with the one make read at the base, even when the base's was another one (a new `GNUmakefile`
+    that shadows the `Makefile`), each with its literal `include`s read in place. Each way the
+    conditionals of the candidate can go is compared with the base's readings that took the same
+    branches, so a swallow or narrowing in any branch, or under any value a conditional gives a
+    variable, is found, and a check one branch leaves out is gone. A file make does not read here
+    is compared as it is."""
+    directory = posixpath.dirname(f.path)
+    root = _make_root(changes, directory, False)
+    if root != f.path or posixpath.basename(f.path).lower() not in ("makefile", "gnumakefile"):
+        return _make_reasons(f, commands, changes, tests)
+    before = _make_root(changes, directory, True)
+    old_raw = f.old_text if before in (None, f.path) else changes.base_text(before)
+    old_text, _ = expand_includes(old_raw or "", directory, changes.base_text)
+    new_text, notes = expand_includes(f.new_text or "", directory, changes.cand_text)
+    out: list[tuple[int | None, str]] = []
+    names, bare = _goals(commands)
+    if notes and (names or bare):
+        what = posixpath.basename(f.path)
+        out.extend(
+            (None, _Warn(f"{what} has an include greenproof could not read ({n}): check it"))
+            for n in dict.fromkeys(notes)
+        )
+    try:
+        new_worlds, cut_new = _worlds(new_text, strict=False)
+        old_worlds, cut_old = _worlds(old_text, strict=False)
+    except _Unreadable as e:
+        what = posixpath.basename(f.path)
+        return [
+            *out,
+            (None, _Warn(f"{what} could not be read ({e}): what its targets run was not compared")),
+        ]
+    if (
+        len(new_worlds) == 1
+        and len(old_worlds) == 1
+        and new_text == (f.new_text or "")
+        and before in (None, f.path)
+        and old_text == (old_raw or "")
+    ):
+        return [*out, *_make_reasons(f, commands, changes, tests)]
+    seen: set[tuple[str, str]] = set()
+    found: dict[str, int | None] = {}
+    for key, cand in new_worlds:
+        partners = [t for k, t in old_worlds if _compatible(key, k)] or [t for _, t in old_worlds]
+        for base in partners:
+            if (base, cand) in seen:
+                continue
+            if len(seen) >= _MAX_PAIRS:
+                cut_new = cut_new or f"only {_MAX_PAIRS} pairs of readings were compared"
+                break
+            seen.add((base, cand))
+            g = replace(
+                f,
+                old_content=None if before is None else base.encode(),
+                new_content=cand.encode(),
+            )
+            for line, why in _make_reasons(g, commands, changes, tests):
+                found.setdefault(why, None if new_text != (f.new_text or "") else line)
+    out.extend((line, why) for why, line in found.items())
+    if cut := cut_new or cut_old:
+        what = posixpath.basename(f.path)
+        out.append((None, _Warn(f"{what} was compared only in part ({cut}): check the branches")))
     return out
 
 
@@ -4466,6 +4967,34 @@ def _glob_matches(directory: str, pattern: str) -> bool:
     return _branch_matches(tuple(items), directory, True, True)
 
 
+_MAX_ROOTS = 8  # Makefiles read for an included file that changed under them
+
+
+def _including_roots(changes: ChangeSet) -> list[ChangedFile]:
+    """The Makefiles the change did not touch that `include` a file it did, in the directory of
+    that file or above it, each as a change of its own text, so what its targets run is compared
+    with the included file read in place. At most `_MAX_ROOTS`."""
+    touched = {f.path for f in changes.files} | {f.old_path for f in changes.files if f.old_path}
+    roots: dict[str, ChangedFile] = {}
+    for f in changes.files:
+        if posixpath.basename(f.path) in ("Makefile", "makefile", "GNUmakefile"):
+            continue
+        parts = posixpath.dirname(f.path).split("/") if "/" in f.path else []
+        for depth in range(len(parts), -1, -1):
+            directory = "/".join(parts[:depth])
+            path = _make_root(changes, directory, False)
+            if path is None or path in touched or path in roots or len(roots) >= _MAX_ROOTS:
+                continue
+            text = changes.cand_text(path)
+            if text is None or posixpath.basename(f.path) not in text:
+                continue
+            old = changes.base_text(path)
+            roots[path] = ChangedFile(
+                path, "M", None, None if old is None else old.encode(), text.encode(), False, False
+            )
+    return list(roots.values())
+
+
 # -- driver ------------------------------------------------------------------------------
 def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Finding]:
     out: list[Finding] = []
@@ -4500,6 +5029,15 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
         for line, why in reasons:
             make = warn_finding if why.endswith(_ADOPTION) or isinstance(why, _Warn) else finding
             out.append(make("runner.tampered", f.path, line, f"{f.path}: {why}", _HINT))
+    if invoked or commands:
+        for root in _including_roots(changes):
+            try:
+                reasons = _makefile_reasons(root, commands, changes, tests)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+            for line, why in reasons:
+                make = warn_finding if isinstance(why, _Warn) else finding
+                out.append(make("runner.tampered", root.path, line, f"{root.path}: {why}", _HINT))
     out.extend(_config_findings(changes))
     workspace_files = [
         f.path for f in changes.files if f.path in ("pnpm-workspace.yaml", "package.json")
@@ -4530,7 +5068,9 @@ def _file_reasons(
         return _tsconfig_reasons(f)
     if re.match(r"^(?:jest|vitest)\.config\.\w+$", name):
         return _jest_reasons(f, False, changes)
-    if name in ("Makefile", "makefile", "GNUmakefile", "justfile", "Justfile"):
+    if name in ("Makefile", "makefile", "GNUmakefile"):
+        return _makefile_reasons(f, commands, changes, tests)
+    if name in ("justfile", "Justfile"):
         return _make_reasons(f, commands, changes, tests)
     if name == "noxfile.py":
         return _noxfile_reasons(f)
