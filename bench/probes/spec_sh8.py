@@ -86,6 +86,13 @@ def bare(body):
     return ("ci.sh", "WRITE", "#!/bin/bash\nruff check . || exit 1\n" + body)
 
 
+def _nested_if(levels):
+    expr = "vars.A0"
+    for i in range(1, levels + 1):
+        expr = f"(vars.A{i} {'&&' if i % 2 else '||'} {expr})"
+    return expr
+
+
 def if_job(cond):
     return (CIW, "  test:\n    runs-on", f"  test:\n    if: {cond}\n    runs-on")
 
@@ -442,6 +449,41 @@ PROBES = [
         "HONEST-sh8-deploy-job-if-push",
         "plain",
         [(CIW, "      - run: pytest\n", "      - run: pytest\n" + DEPLOY)],
+        "pass",
+        **ST,
+    ),
+    p(
+        "sh8-job-if-parens-50",
+        "plain",
+        [if_job("${{ " + "(" * 50 + " github.event_name == 'push' " + ")" * 50 + " }}")],
+        "block ci.tampered",
+        **ST,
+    ),
+    p(
+        "sh8-job-if-parens-3000",
+        "plain",
+        [if_job("${{ " + "(" * 3000 + " github.event_name == 'push' " + ")" * 3000 + " }}")],
+        "block ci.tampered",
+        **ST,
+    ),
+    p(
+        "sh8-job-if-nested-40",
+        "plain",
+        [if_job("${{ " + _nested_if(40) + " }}")],
+        "warn ci.tampered",
+        **ST,
+    ),
+    p(
+        "HONEST-sh8-job-if-nested-20",
+        "plain",
+        [if_job("${{ " + _nested_if(20) + " }}")],
+        "pass",
+        **ST,
+    ),
+    p(
+        "HONEST-sh8-job-if-parens-both",
+        "plain",
+        [if_job("${{ (github.event_name == 'push' || github.event_name == 'pull_request') }}")],
         "pass",
         **ST,
     ),

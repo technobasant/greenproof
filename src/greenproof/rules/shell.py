@@ -164,6 +164,16 @@ _HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?([A-Za-z_][
 
 
 def _split(script: str) -> list[Seg]:
+    """`_split_raw` of `script`, read once however many times a rule asks for the same text."""
+    return list(_split_memo(script))
+
+
+@lru_cache(maxsize=32)
+def _split_memo(script: str) -> tuple[Seg, ...]:
+    return tuple(_split_raw(script))
+
+
+def _split_raw(script: str) -> list[Seg]:
     """The raw statements of a script: `split_segments` before functions and `case` are read.
 
     A `;;` (or `;&`, `;;&`) is not a separator but the end of a `case` arm: the next segment's
@@ -1849,6 +1859,9 @@ def _flat_swallows(
         chain_members[-1].append(i)
         if seg.sep == "||" and _is_failing_exit(seg.text):
             chain_guard[-1] = True
+    # per chain, its last member that does not follow an `&&`: a `||` or `;` after a statement
+    last_non_and = [max((j for j in m if segs[j].sep != "&&"), default=-1) for m in chain_members]
+    last_check_in_chain = [-1] * len(chain_members)  # the last check seen so far in each chain
     reads = [bool(_STATUS_READ.search(s.text)) for s in segs]
     seg_index = _SegIndex(segs)
     # `rc=$?` on a line of its own saves the status of the statement before it: it reads that
@@ -1863,6 +1876,18 @@ def _flat_swallows(
             saves[i] = m["v"]
             if check(i - 1):  # the status of anything else is not the one that matters
                 reads[i] = _rc_kept(segs, i, m["v"], seg_index)
+    unread_checks: list[int] | None = None
+    minus_e: list[int] = []
+    # the last statement that reads PIPESTATUS, and the last `wait $job`: what follows a statement
+    last_pipestatus = max((k for k, sg in enumerate(segs) if "PIPESTATUS" in sg.text), default=-1)
+    last_wait = max((k for k, sg in enumerate(segs) if _WAIT.match(sg.text)), default=-1)
+    some_check: list[bool] = []
+
+    def any_check() -> bool:
+        if not some_check:
+            some_check.append(any(check(j) for j in range(len(segs))))
+        return some_check[0]
+
     next_read = [-1] * (len(segs) + 1)  # the first statement at or after each one that reads
     for i in range(len(segs) - 1, -1, -1):
         next_read[i] = i if reads[i] else next_read[i + 1]
@@ -1895,7 +1920,9 @@ def _flat_swallows(
                 if segs[k].sep != "&&":
                     break
                 rhs.append(segs[k].text)
-            before = [j for j in chain_members[chain_of[i]] if j < i and check(j)]
+            before = (
+                [last_check_in_chain[chain_of[i]]] if last_check_in_chain[chain_of[i]] >= 0 else []
+            )
             keeper = next((m for r in rhs if (m := _RC_SET.match(r))), None)
             if before and keeper and not any(_is_failing_exit(r) for r in rhs):
                 if not _rc_kept(segs, i, keeper["v"], seg_index):
@@ -1922,8 +1949,10 @@ def _flat_swallows(
             before = chain_members[chain_of[i] - 1]
             if nxt_sep in ("\n", "") and not state_errexit and any(check(j) for j in before):
                 add(seg, "true", f"`; {text}` after a check discards its status")
-        elif (rc_then := _RC_SET.match(text) or _RC_NONZERO.match(text)) and _in_check_if(
-            segs, i, check
+        elif (
+            (rc_then := _RC_SET.match(text) or _RC_NONZERO.match(text))
+            and seg_index.enclosing_if[i] >= 0
+            and check(seg_index.enclosing_if[i])
         ):
             if not _rc_kept(segs, i, rc_then["v"], seg_index):
                 add(
@@ -1941,16 +1970,24 @@ def _flat_swallows(
             )
         elif _SET_PLUS_E.match(text):
             state_errexit = False
-            end = next(
-                (k for k in range(i + 1, len(segs)) if _SET_MINUS_E.match(segs[k].text)), len(segs)
+            if unread_checks is None:  # read once, so many `set +e` cost no more than one
+                unread_checks = [
+                    c
+                    for c in range(len(segs))
+                    if check(c)
+                    and not _is_zero_exit(segs[c].text)
+                    and next_read[c] < 0
+                    and not (c + 1 < len(segs) and segs[c + 1].sep in ("||", "&&"))
+                ]
+                minus_e = [k for k in range(len(segs)) if _SET_MINUS_E.match(segs[k].text)]
+            end = (
+                minus_e[bisect_right(minus_e, i)]
+                if bisect_right(minus_e, i) < len(minus_e)
+                else len(segs)
             )
-            for c in range(i + 1, end):
-                if not check(c) or _is_zero_exit(segs[c].text):
-                    continue
-                joined = c + 1 < len(segs) and segs[c + 1].sep in ("||", "&&")
-                if next_read[c] < 0 and not joined:
-                    add(seg, "set+e", "`set +e` and the exit status is never read afterwards")
-                    break
+            first = bisect_right(unread_checks, i)
+            if first < len(unread_checks) and unread_checks[first] < end:
+                add(seg, "set+e", "`set +e` and the exit status is never read afterwards")
         elif _SET_MINUS_E.match(text):
             state_errexit = True
         if (flip := _pipefail_set(text)) is not None:
@@ -1964,7 +2001,7 @@ def _flat_swallows(
                     stages[0], literals=literals, scripts=scripts, make_check=make_check, defs=defs
                 )
             )
-            and not any("PIPESTATUS" in segs[k].text for k in range(i + 1, len(segs)))
+            and last_pipestatus <= i
         ):
             add(
                 seg,
@@ -1972,11 +2009,11 @@ def _flat_swallows(
                 f"`{_short(text)}` pipes the check into another command and its"
                 " status is the last stage's: use `set -o pipefail` or `${PIPESTATUS[0]}`",
             )
-        if seg.bg and check(i) and not _waited(segs, i):
+        if seg.bg and check(i) and last_wait <= i:
             add(seg, "bg", f"`{_short(seg.text)}` runs in the background and its status is lost")
         if check(i) and status_dropped(seg.text):
             add(seg, "dropped", "`pytest.main(...)` returns the status, it does not exit with it")
-        if _trap_exit0(text) and any(check(j) for j in range(len(segs))):
+        if _trap_exit0(text) and any_check():
             add(seg, "trap", f"`{_short(text)}` makes the shell exit 0 whatever a check did")
         if early and top[i] and _is_zero_exit(text):
             if first_exit is None:
@@ -1990,12 +2027,16 @@ def _flat_swallows(
             unguarded[i] = True
         if reads[i]:
             last_read = i
+        if check(i):
+            last_check_in_chain[chain_of[i]] = i
     depth = seg_index.depth
     for i, seg in enumerate(segs):
         if (
             check(i)
             and under_e[i]
-            and _and_list_swallowed(segs, i, depth, chain_members[chain_of[i]])
+            and _and_list_swallowed(
+                segs, i, depth, chain_members[chain_of[i]], last_non_and[chain_of[i]]
+            )
             and not chain_guard[chain_of[i]]
         ):
             label = kinds[i] or "check"
@@ -2015,7 +2056,7 @@ def _flat_swallows(
             if i + 1 < len(segs) and saves[i + 1]:
                 continue  # judged above, where the status is saved
             members = chain_members[chain_of[i]]
-            if any(segs[j].sep != "&&" for j in members if j > i):
+            if last_non_and[chain_of[i]] > i:
                 continue  # a `||` after it: judged above
             after = range(members[-1] + 1, len(segs))
             if not after or next_read[i + 1] >= 0:
@@ -2042,14 +2083,16 @@ _LIST_HEAD = re.compile(r"^(?:if|elif|while|until)\b")
 _LAST_STATUS = re.compile(r"\$\?|\$\{\?|PIPESTATUS")
 
 
-def _and_list_swallowed(segs: Sequence[Seg], i: int, depth: list[int], members: list[int]) -> bool:
+def _and_list_swallowed(
+    segs: Sequence[Seg], i: int, depth: list[int], members: list[int], last_non_and: int
+) -> bool:
     """Whether `segs[i]`, a check under `set -e`, is in an `&&` list but not its last command
     (errexit does not stop on a failure there) and a statement of the same block follows the list
     whose status read is not `$?`: the failure is then dropped. The condition of an `if` or
     `while` is read by it, and a list that ends `|| exit 1` is judged by the `||` rule."""
     if i == members[-1] or _LIST_HEAD.match(segs[members[0]].text):
         return False
-    if any(segs[j].sep != "&&" for j in members if j > i):
+    if last_non_and > i:
         return False
     level = depth[i]  # the block the walk is in; its `else` and `elif` branches are not reached
     skipping = False
@@ -2146,6 +2189,26 @@ def _rc_final_test(text: str, var: str, last: bool) -> bool:
 _IDENT = re.compile(r"[A-Za-z_]\w*")
 
 
+def _enclosing_ifs(segs: Sequence[Seg]) -> list[int]:
+    """For each statement, the index of the `if` or `elif` it sits inside (the nearest one not yet
+    closed by a `fi`), or -1: one forward pass with a stack."""
+    open_ifs: list[int] = []
+    out: list[int] = []
+    for k, seg in enumerate(segs):
+        out.append(open_ifs[-1] if open_ifs else -1)
+        word = _first_word(_KEYWORD.sub(r"\g<rest>", seg.text))
+        if word == "if":
+            open_ifs.append(k)
+        elif word == "elif":
+            if open_ifs:
+                open_ifs[-1] = k
+            else:
+                open_ifs.append(k)
+        elif word == "fi" and open_ifs:
+            open_ifs.pop()
+    return out
+
+
 class _SegIndex:
     """What `_rc_kept` needs from a whole script, read once: which statements are top level, how
     deep each block is, and for each name the statements that mention it."""
@@ -2153,10 +2216,51 @@ class _SegIndex:
     def __init__(self, segs: Sequence[Seg]) -> None:
         self.top = _top_level(segs)
         self.depth = _block_depth(segs)
+        self.enclosing_if = _enclosing_ifs(segs)
+        self.kept: dict[str, dict[int, bool]] = {}  # per name: mention position -> `_rc_kept`
         self.mentions: dict[str, list[int]] = {}
         for k, seg in enumerate(segs):
             for word in set(_IDENT.findall(seg.text)):
                 self.mentions.setdefault(word, []).append(k)
+
+
+def _rc_step(segs: Sequence[Seg], j: int, var: str, idx: _SegIndex) -> bool | None:
+    """What the statement `segs[j]`, which mentions `$var`, does to a saved status: True when it
+    keeps it to the script's exit, False when it assigns `var` afresh, None when it does neither."""
+    top, depth = idx.top, idx.depth
+    reset = re.compile(rf"^{_DECL}{re.escape(var)}=")
+    text = segs[j].text.strip()
+    if top[j]:
+        if re.fullmatch(rf"exit\s+{_rc_operand(var)}", text):
+            return True
+        if j + 1 == len(segs) and re.fullmatch(rf"return\s+{_rc_operand(var)}", text):
+            return True  # a function's value is the script's only when nothing follows it
+        inner = group_inner(text) if text.startswith("{") else None
+        tail = split_segments(inner.strip(" ;")) if inner else []
+        if tail and re.fullmatch(rf"exit\s+{_rc_operand(var)}", tail[-1].text.strip()):
+            return True
+        joined = j + 1 < len(segs) and segs[j + 1].sep in ("&&", "||")
+        if segs[j].sep in ("", ";", "\n") and _rc_final_test(text, var, j + 1 == len(segs)):
+            return True
+        if joined and (pol := _rc_test(text, var)):
+            if pol == "zero" and segs[j + 1].sep == "&&" and j + 2 == len(segs):
+                return True  # `[ "$rc" -eq 0 ] && echo ok` last: the list's status is the test's
+            want = "nonzero" if segs[j + 1].sep == "&&" else "zero"
+            if pol == want and _rc_exits(segs[j + 1].text, var, j + 2 == len(segs)):
+                return True
+        elif _first_word(text) == "if" and not joined and (pol := _rc_test(text[2:], var)):
+            if (branches := _rc_branches(segs, j, depth)) is not None:
+                fi = next(
+                    k
+                    for k in range(j + 1, len(segs))
+                    if segs[k].text == "fi" and depth[k] == depth[j]
+                )
+                for stmt in branches[0 if pol == "nonzero" else 1]:
+                    if _rc_exits(stmt, var, fi == len(segs) - 1):
+                        return True
+    if segs[j].sep in ("", ";", "\n") and reset.match(_KEYWORD.sub(r"\g<rest>", segs[j].text)):
+        return False
+    return None
 
 
 def _rc_kept(segs: Sequence[Seg], i: int, var: str, idx: _SegIndex) -> bool:
@@ -2165,60 +2269,23 @@ def _rc_kept(segs: Sequence[Seg], i: int, var: str, idx: _SegIndex) -> bool:
     top-level `{ ...; }` group, a top-level `if [ "$var" -ne 0 ]; then exit "$var"; fi` (or `exit
     1`), or `[ "$var" -eq 0 ] || exit "$var"`, with no later statement assigning `var` in
     between. A test that cannot be read does not count."""
-    top, depth = idx.top, idx.depth
-    reset = re.compile(rf"^{_DECL}{re.escape(var)}=")
     at = idx.mentions.get(var, [])
-    # every form that keeps the status, and the assignment that loses it, names the variable
+    memo = idx.kept.setdefault(var, {})
+    # every form that keeps the status, and the assignment that loses it, names the variable; what
+    # one mention decides does not depend on where the scan started, so each is read once
+    seen: list[int] = []
+    result = False
     for pos in range(bisect_right(at, i), len(at)):
-        j = at[pos]
-        text = segs[j].text.strip()
-        if top[j]:
-            if re.fullmatch(rf"exit\s+{_rc_operand(var)}", text):
-                return True
-            if j + 1 == len(segs) and re.fullmatch(rf"return\s+{_rc_operand(var)}", text):
-                return True  # a function's value is the script's only when nothing follows it
-            inner = group_inner(text) if text.startswith("{") else None
-            tail = split_segments(inner.strip(" ;")) if inner else []
-            if tail and re.fullmatch(rf"exit\s+{_rc_operand(var)}", tail[-1].text.strip()):
-                return True
-            joined = j + 1 < len(segs) and segs[j + 1].sep in ("&&", "||")
-            if segs[j].sep in ("", ";", "\n") and _rc_final_test(text, var, j + 1 == len(segs)):
-                return True
-            if joined and (pol := _rc_test(text, var)):
-                if pol == "zero" and segs[j + 1].sep == "&&" and j + 2 == len(segs):
-                    return (
-                        True  # `[ "$rc" -eq 0 ] && echo ok` last: the list's status is the test's
-                    )
-                want = "nonzero" if segs[j + 1].sep == "&&" else "zero"
-                if pol == want and _rc_exits(segs[j + 1].text, var, j + 2 == len(segs)):
-                    return True
-            elif _first_word(text) == "if" and not joined and (pol := _rc_test(text[2:], var)):
-                if (branches := _rc_branches(segs, j, depth)) is not None:
-                    fi = next(
-                        k
-                        for k in range(j + 1, len(segs))
-                        if segs[k].text == "fi" and depth[k] == depth[j]
-                    )
-                    for stmt in branches[0 if pol == "nonzero" else 1]:
-                        if _rc_exits(stmt, var, fi == len(segs) - 1):
-                            return True
-        if segs[j].sep in ("", ";", "\n") and reset.match(_KEYWORD.sub(r"\g<rest>", segs[j].text)):
-            return False
-    return False
-
-
-def _in_check_if(segs: Sequence[Seg], i: int, check: Callable[[int], bool]) -> bool:
-    """Whether `segs[i]` sits inside an `if` or `elif` whose condition runs a check."""
-    depth = 0
-    for k in range(i - 1, -1, -1):
-        word = _first_word(_KEYWORD.sub(r"\g<rest>", segs[k].text))
-        if word == "fi":
-            depth += 1
-        elif word in ("if", "elif") and depth == 0:
-            return check(k)
-        elif word == "if":
-            depth -= 1
-    return False
+        if pos in memo:
+            result = memo[pos]
+            break
+        seen.append(pos)
+        if (got := _rc_step(segs, at[pos], var, idx)) is not None:
+            result = got
+            break
+    for pos in seen:
+        memo[pos] = result
+    return result
 
 
 def _stages(text: str) -> list[str]:
@@ -2260,9 +2327,7 @@ def _pipefail_set(text: str) -> bool | None:
     return None
 
 
-def _waited(segs: Sequence[Seg], i: int) -> bool:
-    """Whether a later statement waits on a named job (`wait $pid`) and so reads its status."""
-    return any(re.match(r"^wait\s+\S", segs[k].text) for k in range(i + 1, len(segs)))
+_WAIT = re.compile(r"^wait\s+\S")  # a statement that waits on a named job and so reads its status
 
 
 def _trap_exit0(text: str) -> bool:
