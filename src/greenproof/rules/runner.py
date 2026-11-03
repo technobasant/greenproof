@@ -112,6 +112,11 @@ class _Settings:
     ruff_table: bool = False
     mypy_table: bool = False
     collection: dict[str, list[str]] = field(default_factory=dict)  # python_files etc.
+    norecursedirs: list[str] | None = None  # None: pytest's own list
+    doctest_modules: bool = False  # `--doctest-modules` in addopts
+    doctest_globs: list[str] = field(default_factory=list)  # `--doctest-glob`, in order
+    overrides: dict[str, str] = field(default_factory=dict)  # `-o key=value` in addopts
+    unread: dict[str, str] = field(default_factory=dict)  # collection options set to a variable
 
 
 # -- settings extraction ----------------------------------------------------------------
@@ -162,6 +167,18 @@ def _addopts(settings: _Settings, value: Any) -> None:
             settings.plugins_off[tok[5:]] += 1
         elif tok == "--disable-plugin-autoload":
             settings.autoload_off = True
+        elif tok == "--doctest-modules":
+            settings.doctest_modules = True
+        elif flag == "--doctest-glob" and (eq or i + 1 < len(tokens)):
+            settings.doctest_globs.append(rest if eq else tokens[i + 1])
+            i += 0 if eq else 1
+        elif (flag in ("-o", "--override-ini") and not eq and i + 1 < len(tokens)) or (
+            flag == "--override-ini" and eq
+        ):
+            _override(settings, rest if eq else tokens[i + 1])
+            i += 0 if eq else 1
+        elif re.match(r"^-o[^=]+=", tok):
+            _override(settings, tok[2:])
         elif tok == "-W" and i + 1 < len(tokens) and tokens[i + 1].startswith("error"):
             settings.error_filter = True
             i += 1
@@ -181,12 +198,40 @@ def _filters(settings: _Settings, value: Any) -> None:
 
 
 _COLLECTION_KEYS = ("python_files", "python_classes", "python_functions")
+# The ini options that decide which files and tests pytest collects, read from a config file, from
+# `-o key=value` / `--override-ini` (on a command line, in addopts or in PYTEST_ADDOPTS), alike.
+_SCOPE_KEYS = (*_COLLECTION_KEYS, "testpaths", "norecursedirs")
+
+
+def _override(settings: _Settings, text: str) -> None:
+    """A `-o key=value` inside addopts: it beats the config file for that key."""
+    key, _, value = text.partition("=")
+    if key in (*_SCOPE_KEYS, "addopts"):
+        settings.overrides[key] = value
 
 
 def _collection(settings: _Settings, options: Mapping[str, Any]) -> None:
     for key in _COLLECTION_KEYS:
-        if (words := _as_list(options.get(key))) and key not in settings.collection:
+        if key in settings.collection or key not in options:
+            continue
+        words = _as_list(options.get(key))
+        if words or key in settings.overrides:  # `-o python_files=` collects nothing
             settings.collection[key] = [w for w in re.split(r"\s+", " ".join(words)) if w]
+
+
+def _apply_pytest(s: _Settings, options: Mapping[str, Any], forced: Collection[str] = ()) -> None:
+    """The pytest options of one configuration into `s`: addopts first, whose `-o` options (and
+    `forced`, the keys a command line overrides) beat the file's values."""
+    _addopts(s, options.get("addopts"))
+    options = {**options, **s.overrides}
+    for key in (*s.overrides, *forced):
+        if key in _SCOPE_KEYS and re.search(r"[$`]", str(options.get(key))):
+            s.unread[key] = str(options[key])
+    _filters(s, options.get("filterwarnings"))
+    s.testpaths.update(_as_list(options.get("testpaths")))
+    if "norecursedirs" in options:
+        s.norecursedirs = _as_list(options.get("norecursedirs"))
+    _collection(s, options)
 
 
 def _per_file(value: Any) -> set[str]:
@@ -222,10 +267,7 @@ def _pick(top: Mapping[str, Any], lint: Mapping[str, Any], key: str) -> Any:
 
 def _into_pytest(tree: rc.Tree, s: _Settings) -> str | None:
     name, options = rc.pytest_options(tree)
-    _addopts(s, options.get("addopts"))
-    _filters(s, options.get("filterwarnings"))
-    s.testpaths.update(_as_list(options.get("testpaths")))
-    _collection(s, options)
+    _apply_pytest(s, options)
     return name
 
 
@@ -308,7 +350,9 @@ def _build(tree: rc.Tree) -> tuple[_Settings, dict[str, str | None], dict[str, s
     return settings, where, broken
 
 
-def _collection_reasons(base: _Settings, cand: _Settings) -> list[str]:
+def _collection_reasons(
+    base: _Settings, cand: _Settings, keys: Collection[str] = _COLLECTION_KEYS
+) -> list[str]:
     defaults = {
         "python_files": DEFAULT_FILES,
         "python_classes": DEFAULT_CLASSES,
@@ -316,7 +360,7 @@ def _collection_reasons(base: _Settings, cand: _Settings) -> list[str]:
     }
     out: list[str] = []
     for key, default in defaults.items():
-        if key not in base.collection and key not in cand.collection:
+        if key not in keys or (key not in base.collection and key not in cand.collection):
             continue
         before = base.collection.get(key, list(default))
         after = cand.collection.get(key, list(default))
@@ -364,6 +408,9 @@ def _plugin_reasons(base: _Settings | None, cand: _Settings) -> list[str]:
     return out
 
 
+_DOCTEST_HITS = 25
+
+
 class _Judge:
     """The base tree's files under one directory, for judging an exclusion against them."""
 
@@ -371,7 +418,9 @@ class _Judge:
         self.changes = changes
         self.root = root
         self.truncated = False
+        self.known = changes.list_base is not None  # the base tree is listed, not just the diff
         self._paths: list[str] | None = None
+        self._reads = 0
 
     def base(self) -> list[str]:
         if self._paths is None:
@@ -385,6 +434,23 @@ class _Judge:
             self._paths = under[: rc.MAX_FILES]
         return self._paths
 
+    def doctests(self, paths: Sequence[str]) -> tuple[list[str], int]:
+        """Of the files, those holding a `>>>` example at the base, and how many were left unread
+        (a budget on reads: `rc.MAX_READS` per check, and the search stops at 25 hits)."""
+        hits: list[str] = []
+        unread = 0
+        for path in sorted(paths):
+            if len(hits) >= _DOCTEST_HITS:
+                break
+            if self._reads >= rc.MAX_READS:
+                unread += 1
+                continue
+            self._reads += 1
+            text = self.changes.base_text(posixpath.join(self.root, path))
+            if text is not None and ">>>" in text:
+                hits.append(path)
+        return hits, unread
+
     def source(self) -> list[str]:
         """Python files that are not tests: what a coverage gate measures."""
         return [
@@ -397,7 +463,116 @@ def _gate(s: _Settings) -> float | None:
     return max(found) if found else None
 
 
-def _pytest_reasons(base: _Settings, cand: _Settings) -> list[str]:
+def _capped(patterns: Sequence[str], option: str, notes: list[str]) -> list[str]:
+    if len(patterns) > rc.MAX_PATTERNS:
+        notes.append(option)
+    return list(patterns[: rc.MAX_PATTERNS])
+
+
+def _scope(s: _Settings, notes: list[str]) -> tuple[list[str], ...]:
+    """What decides the files pytest collects, as lists: python_files, testpaths, norecursedirs,
+    `--doctest-modules` (a one-item list), `--doctest-glob`."""
+    files = s.collection.get("python_files", list(DEFAULT_FILES))
+    nr = list(rc.DEFAULT_NORECURSEDIRS) if s.norecursedirs is None else s.norecursedirs
+    return (
+        _capped(files, "python_files", notes),
+        _capped(sorted(s.testpaths), "testpaths", notes),
+        _capped(nr, "norecursedirs", notes),
+        ["--doctest-modules"] if s.doctest_modules else [],
+        _capped(s.doctest_globs or list(rc.DEFAULT_DOCTEST_GLOBS), "--doctest-glob", notes),
+    )
+
+
+def _collected(files: Sequence[str], view: Sequence[Sequence[str]]) -> set[str]:
+    python_files, testpaths, norecursedirs, modules, globs = view
+    found = rc.pytest_collected(files, python_files, testpaths, norecursedirs)
+    docs = rc.doctest_candidates(files, bool(modules), globs, norecursedirs)
+    return found | {f"doctest:{p}" for p in docs}
+
+
+_SCOPE_NAMES = ("python_files", "testpaths", "norecursedirs", "--doctest-modules", "--doctest-glob")
+
+
+def _scope_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str]:
+    """What the pytest options that choose the files to collect stop collecting, judged against
+    the base tree's files: one option at a time (so the reason names it), then all together. An
+    option that leaves out no file the base collected is housekeeping; a doctest source counts
+    only when it holds a `>>>` example."""
+    out: list[str] = []
+    for key, why in cand.unread.items():
+        if base.unread.get(key) != why:
+            out.append(
+                _Warn(
+                    f"pytest `{key}` is set to `{why}`, a value greenproof cannot read: "
+                    "which files it collects was not checked"
+                )
+            )
+    files = judge.base()
+    cut: list[str] = []
+    before, after = _scope(base, cut), _scope(cand, cut)
+    was = _collected(files, before)
+    tests_ran = any(not p.startswith("doctest:") for p in was)
+    if cut:
+        out.append(
+            _Warn(
+                f"pytest {', '.join(f'`{k}`' for k in dict.fromkeys(cut))} lists more than "
+                f"{rc.MAX_PATTERNS} patterns: only the first were read"
+            )
+        )
+    if not (judge.known and tests_ran):  # nothing to judge against: the patterns decide
+        if base.testpaths and cand.testpaths and (gone := base.testpaths - cand.testpaths):
+            out.append(f"testpaths narrowed: {', '.join(sorted(gone))} removed")
+        out.extend(_collection_reasons(base, cand))
+    else:
+        out.extend(_collection_reasons(base, cand, ("python_classes", "python_functions")))
+    explained: set[str] = set()
+    unread = 0
+    for i, name in enumerate(_SCOPE_NAMES):
+        if before[i] == after[i] or (i < 2 and not (judge.known and tests_ran)):
+            continue
+        swapped = list(before)
+        swapped[i] = after[i]
+        lost = was - _collected(files, swapped)
+        gone_files, read = _doctest_loss(judge, lost - explained)
+        explained |= lost
+        unread += read
+        if gone_files and i < 3:
+            out.append(
+                f"pytest `{name}` now leaves out {rc.hit_text(gone_files, 'files that ran')}"
+            )
+        elif gone_files:
+            verb = "dropped" if i == 3 else "narrowed"
+            out.append(
+                f"pytest `{name}` {verb}: {rc.hit_text(gone_files, 'files with doctests')} "
+                "no longer collected"
+            )
+    if judge.known and tests_ran:
+        lost = was - _collected(files, after) - explained
+        if gone_files := _doctest_loss(judge, lost)[0]:
+            out.append(
+                "pytest collection options together stop collecting "
+                f"{rc.hit_text(gone_files, 'files that ran')}"
+            )
+    if unread:
+        out.append(
+            _Warn(
+                f"pytest collection options now leave out {unread} files that were not read for "
+                "doctests (past the budget): check them"
+            )
+        )
+    return out
+
+
+def _doctest_loss(judge: _Judge, lost: Collection[str]) -> tuple[list[str], int]:
+    """The files among what stopped being collected that count: test files, and the doctest
+    sources that hold an example. Also how many sources were left unread."""
+    tests = sorted(p for p in lost if not p.startswith("doctest:"))
+    docs = [p.removeprefix("doctest:") for p in lost if p.startswith("doctest:")]
+    hits, unread = judge.doctests([d for d in docs if d not in tests]) if docs else ([], 0)
+    return sorted({*tests, *hits}), unread
+
+
+def _pytest_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str]:
     reasons: list[str] = []
     for item, count in (cand.select - base.select).items():
         reasons.append(f"pytest option `{item}` added" + (f" (x{count})" if count > 1 else ""))
@@ -407,14 +582,7 @@ def _pytest_reasons(base: _Settings, cand: _Settings) -> list[str]:
             + (f" (x{count})" if count > 1 else "")
         )
     reasons.extend(_plugin_reasons(base, cand))
-    if (
-        base.testpaths
-        and (gone := base.testpaths - cand.testpaths)
-        and cand.testpaths
-        and cand.testpaths != base.testpaths
-    ):
-        reasons.append(f"testpaths narrowed: {', '.join(sorted(gone))} removed")
-    reasons.extend(_collection_reasons(base, cand))
+    reasons.extend(_scope_reasons(base, cand, judge))
     return reasons
 
 
@@ -525,7 +693,7 @@ _TOOL_GROUPS = ("pytest", "coverage", "mypy", "lint")
 
 def _setting_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[tuple[str, str]]:
     """`(tool, reason)` for what the candidate's effective configuration loosened."""
-    out = [("pytest", r) for r in _pytest_reasons(base, cand)]
+    out = [("pytest", r) for r in _pytest_reasons(base, cand, judge)]
     out += [("coverage", r) for r in _coverage_reasons(base, cand, judge)]
     out += [("mypy", r) for r in _mypy_reasons(base, cand, judge)]
     out += [("lint", r) for r in _lint_reasons(base, cand, judge)]
@@ -970,6 +1138,10 @@ class _BaseTests:
         self._by_name: dict[str, list[str]] = {}
         self._budget = _MATCH_BUDGET
         self._selectable: TestFiles | None = None
+
+    @property
+    def changes(self) -> ChangeSet:
+        return self._changes
 
     def selectable(self) -> TestFiles:
         """The test files of the base tree, for judging what a runner's arguments still select."""
@@ -1796,6 +1968,8 @@ def neutering_reason(
         return f"it now passes {added[0]}"
     if flag := _new_selection_flag(base_e, cand_e):
         return f"it now passes {flag}"
+    if tests is not None and (over := _override_reason(narrow_base, narrow_cand, tests, cwds)):
+        return over
     if narrowed := narrowed_selection(
         narrow_base,
         narrow_cand,
@@ -2011,6 +2185,53 @@ def _new_selection_flag(base: list[str], cand: list[str]) -> str | None:
             if family_flag not in before and not (nextest and family_flag[1] == "--doc"):
                 return family_flag[1]
     return None
+
+
+_OVERRIDE_SCOPE = frozenset({*_SCOPE_KEYS, "addopts"})
+
+
+def _overrides_of(statements: Sequence[str]) -> dict[str, str]:
+    """The `-o key=value` options (`--override-ini`) the pytest runs among the statements pass, on
+    the command line and in PYTEST_ADDOPTS, for the keys that decide what is collected."""
+    found: dict[str, str] = {}
+    for st in statements:
+        words = _split_words(st)
+        env = dict(command_env(st).vars).get("PYTEST_ADDOPTS", "")
+        for args in _after_pytest(words):
+            tmp = _Settings()
+            _addopts(tmp, [*_split_words(env), *args])
+            found.update({k: v for k, v in tmp.overrides.items() if k in _OVERRIDE_SCOPE})
+    return found
+
+
+def _override_reason(
+    base: Sequence[str], cand: Sequence[str], tests: _BaseTests, cwds: Sequence[str]
+) -> str | None:
+    """A pytest run that now passes `-o key=value` for an option that decides what is collected,
+    judged like the same key in the config file: what the repository's configuration collected
+    with the base's overrides against what it collects with the candidate's."""
+    over, was = _overrides_of(cand), _overrides_of(base)
+    if not over or all(was.get(k) == v for k, v in over.items()):
+        return None
+    changes = tests.changes
+    warned: str | None = None
+    for root in dict.fromkeys((*cwds, "")):
+        try:
+            _, options = rc.pytest_options(rc.Tree(changes.base_text, root))
+            settings = []
+            for given in (was, over):
+                s = _Settings()
+                _apply_pytest(s, {**options, **given}, tuple(given))
+                settings.append(s)
+        except (rc.Broken, ValueError, TypeError, AttributeError):
+            continue
+        shown = " ".join(f"-o {k}={shlex.quote(v)}" for k, v in over.items() if was.get(k) != v)
+        for why in _pytest_reasons(settings[0], settings[1], _Judge(changes, root)):
+            text = f"it now passes `{shown}`, and {why}"
+            if not isinstance(why, _Warn):
+                return text
+            warned = warned or _Warn(text)
+    return warned
 
 
 def _plain_check(statement: str) -> tuple[str, ...]:
@@ -2820,11 +3041,14 @@ def _jest_reasons(
     """Loosenings of a jest or vitest configuration, judged against the test files of the base
     tree: an exclusion that matches no test the base ran is housekeeping."""
     old, new = f.old_text or "", f.new_text or ""
+    whole = new  # lines are looked up in the whole file
+    if posixpath.basename(f.path).startswith("vite.config"):  # only its `test` block is vitest's
+        old, new = (_bracket_block(text, "test") or "" for text in (old, new))
     out: list[tuple[int | None, str]] = []
     judge = _Judge(changes, posixpath.dirname(f.path))
     base_known = changes.list_base is not None
     tests = [p for p in rc.js_files(judge.base()) if changes.is_test(posixpath.join(judge.root, p))]
-    keys = ["testPathIgnorePatterns", "exclude"]
+    keys = ["testPathIgnorePatterns", "modulePathIgnorePatterns", "exclude"]
     for key in keys:
         text_old, text_new = (
             (_without_block(old, "coverage"), _without_block(new, "coverage"))
@@ -2837,11 +3061,11 @@ def _jest_reasons(
         added = _strings(_bracket_block(text_new, key)) - before_p
         if not added:
             continue
-        line = _first_line_with(new, key)
+        line = _first_line_with(whole, key)
         if not base_known:
             out.append((line, f"`{key}` now excludes {', '.join(sorted(added))}"))
             continue
-        if key == "testPathIgnorePatterns":
+        if key != "exclude":
             hit, bad = rc.regex_paths(sorted(added), tests)
             was, _ = rc.regex_paths(sorted(before_p), tests)
         else:
@@ -2858,22 +3082,114 @@ def _jest_reasons(
         if key == "include" and is_package:
             continue
         reasons, unread = _jest_selection(old, new, key, tests, base_known)
-        line = _first_line_with(new, key)
+        line = _first_line_with(whole, key)
         out.extend((line, r) for r in reasons)
         out.extend((line, _Warn(r)) for r in unread)
+    out.extend(_scope_reasons_js(f, is_package, tests, base_known))
     flag = re.compile(r"passWithNoTests[\"']?\s*:\s*true")
     if flag.search(new) and not flag.search(old):
-        out.append((_first_line_with(new, "passWithNoTests"), "`passWithNoTests` enabled"))
+        out.append((_first_line_with(whole, "passWithNoTests"), "`passWithNoTests` enabled"))
     before, after = _thresholds(old), _thresholds(new)
     for key, value in after.items():
         if key in before and value < before[key]:
             out.append(
                 (
-                    _first_line_with(new, key.split(".")[1]),
+                    _first_line_with(whole, key.split(".")[1]),
                     f"coverage threshold {key.split('.')[1]} lowered "
                     f"from {before[key]:g} to {value:g}",
                 )
             )
+    return out
+
+
+_JEST_SCOPE = ("rootDir", "roots", "testRegex")
+
+
+def _unread_why(key: str, raw: str) -> str:
+    return _Warn(
+        f"`{key}` is `{raw}`, a value greenproof cannot read: which tests it leaves out was not "
+        "checked"
+    )
+
+
+def _js_dirs(values: Mapping[str, rc.Value], vitest: bool) -> list[str] | None:
+    """The directories (relative to the configuration's) a jest `roots` or a vitest `dir` reaches,
+    None when that cannot be told: a computed value, or a path outside the tree."""
+    if vitest:
+        raw = values.get("dir")
+        entries = raw if isinstance(raw, list) else ["."]
+        base = "."
+    else:
+        root, roots = values.get("rootDir"), values.get("roots")
+        rooted = root[0] if isinstance(root, list) and root else "."
+        base = posixpath.normpath(rooted.removeprefix("<rootDir>").removeprefix("./") or ".")
+        entries = roots if isinstance(roots, list) else ["<rootDir>"]
+    out: list[str] = []
+    for entry in entries:
+        if entry.startswith("<rootDir>"):
+            entry = entry.removeprefix("<rootDir>").lstrip("/") or "."
+        elif entry.startswith("/"):
+            return None
+        out.append(posixpath.normpath(posixpath.join(base, entry.removeprefix("./"))))
+    return out
+
+
+def _scope_reasons_js(
+    f: ChangedFile, is_package: bool, tests: Sequence[str], base_known: bool
+) -> list[tuple[int | None, str]]:
+    """jest's `rootDir`, `roots` and `testRegex` and vitest's `dir`: what they stop running among
+    the base tests. A value that cannot be read warns."""
+    name = posixpath.basename(f.path)
+    vitest = name.startswith(("vitest.", "vite."))
+    keys = ("dir",) if vitest else _JEST_SCOPE
+    fmt = "json" if is_package else rc.format_of(name)
+
+    def read(text: str | None) -> dict[str, rc.Value] | None:
+        if text is None:
+            return {}
+        if vitest and fmt == "js":
+            text = _bracket_block(_without_block(text, "coverage"), "test") or ""
+        block = "jest" if is_package else None
+        return rc.read_options(text, fmt, keys, block)
+
+    old, new = read(f.old_text), read(f.new_text)
+    if old is None or new is None:  # a file that does not parse is static.parse_error's
+        return []
+    whole = f.new_text or ""
+    out: list[tuple[int | None, str]] = []
+    for key in keys:
+        value = new.get(key)
+        if isinstance(value, rc.Unread) and old.get(key) != value:
+            out.append((_first_line_with(whole, key), _unread_why(key, value.raw)))
+    if not base_known:
+        return out
+    before, after = _js_dirs(old, vitest), _js_dirs(new, vitest)
+    if before is not None and after is not None and before != after:
+        lost = sorted(t for t in tests if rc.under_dirs(t, before) and not rc.under_dirs(t, after))
+        if lost:
+            key = (
+                "dir" if vitest else "roots" if old.get("roots") != new.get("roots") else "rootDir"
+            )
+            out.append(
+                (
+                    _first_line_with(whole, key),
+                    f"`{key}` no longer reaches {rc.hit_text(lost, 'tests')}",
+                )
+            )
+    if isinstance(now := new.get("testRegex"), list) and old.get("testRegex") != now:
+        was = old.get("testRegex")
+        ran = rc.regex_paths(was, tests)[0] if isinstance(was, list) else set(tests)
+        hit, bad = rc.regex_paths(now, tests)
+        line = _first_line_with(whole, "testRegex")
+        if lost := sorted(ran - hit):
+            out.append((line, f"`testRegex` no longer runs {rc.hit_text(lost, 'tests')}"))
+        out.extend(
+            (
+                line,
+                _Warn(f"`testRegex` pattern `{p}` could not be read: its effect was not checked"),
+            )
+            for p in bad
+        )
     return out
 
 
@@ -2933,6 +3249,130 @@ def _nyc_reasons(old: str, new: str) -> list[tuple[int | None, str]]:
                     _first_line_with(new, key),
                     f"nyc `{key}` threshold lowered from {was:g} to {now:g}",
                 )
+            )
+    return out
+
+
+_MOCHA_RC = (
+    ".mocharc.cjs",
+    ".mocharc.js",
+    ".mocharc.yaml",
+    ".mocharc.yml",
+    ".mocharc.jsonc",
+    ".mocharc.json",
+)
+_MOCHA_KEYS = ("spec", "ignore", "exclude", "extension", "recursive")
+_MOCHA_FILES = frozenset({*_MOCHA_RC, "package.json"})
+
+
+def _mocha_source(
+    read: Callable[[str], str | None], root: str
+) -> tuple[str | None, str, dict[str, rc.Value] | None]:
+    """The file mocha takes its configuration from (the first of its names that exists, then
+    package.json's `mocha` key), its text and the options read from it. None for the options when
+    the file does not parse."""
+    for name in _MOCHA_RC:
+        text = read(posixpath.join(root, name))
+        if text is not None:
+            return name, text, rc.read_options(text, rc.format_of(name), _MOCHA_KEYS)
+    text = read(posixpath.join(root, "package.json")) or ""
+    values = rc.read_options(text, "json", _MOCHA_KEYS, "mocha") if text else {}
+    return ("package.json" if values else None), text, values
+
+
+def _mocha_list(values: Mapping[str, rc.Value], *keys: str) -> list[str] | None:
+    """The strings set under `keys` (None when one of them cannot be read)."""
+    out: list[str] = []
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, rc.Unread):
+            return None
+        if isinstance(value, list):
+            out.extend(value)
+    return out
+
+
+def _mocha_settings(values: Mapping[str, rc.Value]) -> dict[str, Any] | None:
+    """spec, ignore, extension and recursive as mocha applies them, defaults filled in."""
+    spec = _mocha_list(values, "spec")
+    ignore = _mocha_list(values, "ignore", "exclude")
+    ext = _mocha_list(values, "extension")
+    recursive = values.get("recursive")
+    if spec is None or ignore is None or ext is None or isinstance(recursive, rc.Unread):
+        return None
+    return {
+        "spec": spec if "spec" in values else ["./test"],
+        "ignore": ignore,
+        "extension": ext if "extension" in values else list(rc.MOCHA_EXTENSIONS),
+        "recursive": recursive is True,
+    }
+
+
+def _mocha_findings(changes: ChangeSet) -> list[Finding]:
+    """What mocha loads, by its configuration file, before and after: a `spec` narrowed, an
+    `ignore` added, an `extension` list cut or `recursive` taken off stop tests that ran."""
+    out: list[Finding] = []
+    roots = {
+        posixpath.dirname(path)
+        for f in changes.files
+        for path in (f.path, f.old_path)
+        if path and posixpath.basename(path) in _MOCHA_FILES
+    }
+    for root in sorted(roots):
+        base_name, base_text, base = _mocha_source(changes.base_text, root)
+        cand_name, cand_text, cand = _mocha_source(changes.cand_text, root)
+        if base is None or cand is None:  # a file that does not parse is static.parse_error's
+            continue
+        package = changes.base_text(posixpath.join(root, "package.json")) or ""
+        if base_name is None and "mocha" not in package:
+            continue
+        where = posixpath.join(root, cand_name or base_name or "package.json")
+        text = cand_text if cand_name else base_text
+
+        def add(why: str, key: str, where: str = where, text: str = text) -> None:
+            make = warn_finding if isinstance(why, _Warn) else finding
+            line = _first_line_with(text, key)
+            out.append(make("runner.tampered", where, line, f"{where}: {why}", _HINT))
+
+        if cand_name is not None and cand_name != "package.json":
+            read = rc.format_of(cand_name) == "js" and (
+                "..." in cand_text or "require(" in cand_text
+            )
+            if read and cand_text != base_text:
+                add(_Warn("mocha configuration takes values from elsewhere: not checked"), "spec")
+        for key in _MOCHA_KEYS:
+            value = cand.get(key)
+            if isinstance(value, rc.Unread) and base.get(key) != value:
+                add(_unread_why(key, value.raw), key)
+        was, now = _mocha_settings(base), _mocha_settings(cand)
+        if was is None or now is None:
+            continue
+        judge = _Judge(changes, root)
+        tests = [p for p in rc.js_files(judge.base()) if changes.is_test(posixpath.join(root, p))]
+        ran, ok = rc.mocha_collected(tests, **was)
+        if not ok:
+            continue
+        found = False
+        for key in ("spec", "ignore", "extension", "recursive"):
+            if was[key] == now[key]:
+                continue
+            kept, ok = rc.mocha_collected(tests, **{**was, key: now[key]})
+            if not ok:
+                add(_Warn(f"mocha `{key}` could not be read: its effect was not checked"), key)
+            elif lost := sorted(ran - kept):
+                found = True
+                add(f"mocha `{key}` now leaves out {rc.hit_text(lost, 'tests that ran')}", key)
+        if not found:
+            kept, ok = rc.mocha_collected(tests, **now)
+            if ok and (lost := sorted(ran - kept)):
+                add(
+                    f"mocha configuration now leaves out {rc.hit_text(lost, 'tests that ran')}",
+                    "spec",
+                )
+        if judge.truncated:
+            add(
+                _Warn(f"more than {rc.MAX_FILES} files at the base; judged against the first only"),
+                "spec",
             )
     return out
 
@@ -4501,6 +4941,7 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
             make = warn_finding if why.endswith(_ADOPTION) or isinstance(why, _Warn) else finding
             out.append(make("runner.tampered", f.path, line, f"{f.path}: {why}", _HINT))
     out.extend(_config_findings(changes))
+    out.extend(_mocha_findings(changes))
     workspace_files = [
         f.path for f in changes.files if f.path in ("pnpm-workspace.yaml", "package.json")
     ]
@@ -4528,7 +4969,7 @@ def _file_reasons(
         return found
     if re.match(r"^tsconfig.*\.json$", name):
         return _tsconfig_reasons(f)
-    if re.match(r"^(?:jest|vitest)\.config\.\w+$", name):
+    if re.match(r"^(?:jest|vitest|vite)\.config\.\w+$", name):
         return _jest_reasons(f, False, changes)
     if name in ("Makefile", "makefile", "GNUmakefile", "justfile", "Justfile"):
         return _make_reasons(f, commands, changes, tests)

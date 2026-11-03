@@ -9,10 +9,12 @@ a loosening. The helpers here are pure; `runner.py` wires them to the changed fi
 from __future__ import annotations
 
 import configparser
+import json
 import posixpath
 import re
 import tomllib
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any
 
@@ -230,6 +232,422 @@ def regex_paths(patterns: Iterable[str], paths: Iterable[str]) -> tuple[set[str]
         except re.error:
             bad.append(pattern)
     return {p for p in paths if any(rx.search(f"/{p}") for rx in rxs)}, bad
+
+
+# -- pytest: which files a run collects -------------------------------------------------------
+MAX_PATTERNS = 256  # patterns of one option read per check; the rest are named in a warning
+MAX_READS = 2000  # files read for a `>>>` example per check; the rest are named in a warning
+# What pytest does not descend into when `norecursedirs` is not set (a set one replaces them).
+DEFAULT_NORECURSEDIRS = ("*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv")
+DEFAULT_DOCTEST_GLOBS = ("test*.txt",)
+_DOCTEST_SKIP = frozenset({"conftest.py", "setup.py"})  # modules `--doctest-modules` leaves out
+
+
+def pytest_match(pattern: str, path: str) -> bool:
+    """pytest's `fnmatch_ex`: a pattern without a `/` is a file or directory name, any other is
+    read against the path (`*` crosses `/`, as there)."""
+    pattern = pattern.strip().removeprefix("./")
+    if not pattern:
+        return False
+    if "/" not in pattern:
+        return fnmatchcase(posixpath.basename(path), pattern)
+    return fnmatchcase(path, pattern) or fnmatchcase(f"/{path}", f"*/{pattern.lstrip('/')}")
+
+
+def _under_testpath(path: str, testpath: str) -> bool:
+    testpath = testpath.strip().removeprefix("./").rstrip("/")
+    if testpath in ("", "."):
+        return True
+    parts = path.split("/")
+    return any(fnmatchcase("/".join(parts[:n]), testpath) for n in range(1, len(parts) + 1))
+
+
+class _Skipped:
+    """Whether a file is under a directory `norecursedirs` skips; one answer per directory."""
+
+    def __init__(self, patterns: Sequence[str]) -> None:
+        self._patterns = patterns
+        self._memo: dict[str, bool] = {"": False}
+
+    def __call__(self, path: str) -> bool:
+        return self._dir(posixpath.dirname(path))
+
+    def _dir(self, directory: str) -> bool:
+        if directory not in self._memo:
+            self._memo[directory] = any(
+                pytest_match(p, directory) for p in self._patterns
+            ) or self._dir(posixpath.dirname(directory))
+        return self._memo[directory]
+
+
+def pytest_collected(
+    paths: Iterable[str],
+    python_files: Sequence[str],
+    testpaths: Sequence[str],
+    norecursedirs: Sequence[str],
+) -> set[str]:
+    """The Python files a bare `pytest` collects tests from: `.py` files named by `python_files`,
+    under `testpaths` (all of them when there are none), in a directory `norecursedirs` allows."""
+    skipped = _Skipped(norecursedirs)
+    found: set[str] = set()
+    for path in paths:
+        if not path.endswith(".py") or skipped(path):
+            continue
+        if not any(pytest_match(p, path) for p in python_files):
+            continue
+        if testpaths and not any(_under_testpath(path, t) for t in testpaths):
+            continue
+        found.add(path)
+    return found
+
+
+def doctest_candidates(
+    paths: Iterable[str], modules: bool, globs: Sequence[str], norecursedirs: Sequence[str]
+) -> set[str]:
+    """The files pytest may take doctests from: every module with `--doctest-modules`, and the
+    text files named by `--doctest-glob` (`test*.txt` when none is given)."""
+    skipped = _Skipped(norecursedirs)
+    found: set[str] = set()
+    for path in paths:
+        if skipped(path):
+            continue
+        if path.endswith(".py"):
+            if modules and posixpath.basename(path) not in _DOCTEST_SKIP:
+                found.add(path)
+        elif any(pytest_match(g, path) for g in globs):
+            found.add(path)
+    return found
+
+
+# -- jest, vitest and mocha: option values read from the text of a configuration ----------------
+@dataclass(frozen=True)
+class Unread:
+    """A value greenproof cannot read (a variable, a call, a template); `raw` is how it is
+    written, so an unchanged one is told from an edited one."""
+
+    raw: str
+
+
+Value = list[str] | bool | None | Unread
+_CLOSERS = {"[": "]", "{": "}"}
+
+
+def _string_end(text: str, i: int) -> int | None:
+    """The index after the string literal that starts at `i`, None when it never ends on its line
+    (a template literal may span lines)."""
+    quote = text[i]
+    j = i + 1
+    while j < len(text):
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == quote:
+            return j + 1
+        if text[j] == "\n" and quote != "`":
+            return None
+        j += 1
+    return None
+
+
+def _skip_blanks(text: str, i: int) -> int:
+    """`i` moved past whitespace and `//` and `/* */` comments."""
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = len(text) if end < 0 else end + 2
+        else:
+            break
+    return i
+
+
+def _bracket_end(text: str, i: int) -> int | None:
+    """The index of the bracket that closes the one at `i`, strings and comments skipped."""
+    depth = 0
+    while i < len(text):
+        i = _skip_blanks(text, i)
+        if i >= len(text):
+            break
+        char = text[i]
+        if char in "'\"`":
+            end = _string_end(text, i)
+            if end is None:
+                return None
+            i = end
+            continue
+        if char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r"}
+
+
+def _literal(text: str, i: int) -> tuple[str, int] | None:
+    """The string literal at `i` and the index after it; None for one that is not a plain
+    string (a template with `${`)."""
+    end = _string_end(text, i)
+    if end is None:
+        return None
+    body = text[i + 1 : end - 1]
+    if text[i] == "`" and "${" in body:
+        return None
+    if "\\" in body:
+        if re.search(r"\\(?:[ux]|\n)", body):
+            return None
+        body = re.sub(r"\\(.)", lambda m: _ESCAPES.get(m[1], m[1]), body, flags=re.DOTALL)
+    return body, end
+
+
+def _regex_literal(text: str, i: int) -> tuple[str, int] | None:
+    """The source of the regular expression literal at `i` and the index after its flags."""
+    j, in_class = i + 1, False
+    while j < len(text) and text[j] != "\n":
+        char = text[j]
+        if char == "\\":
+            j += 2
+            continue
+        if char == "[":
+            in_class = True
+        elif char == "]":
+            in_class = False
+        elif char == "/" and not in_class:
+            end = j + 1
+            while end < len(text) and text[end].isalpha():
+                end += 1
+            return text[i + 1 : j], end
+        j += 1
+    return None
+
+
+def _literals(block: str) -> list[str] | None:
+    """The strings of a list body, None when it holds anything else (a name, a call, a spread)."""
+    out: list[str] = []
+    i = 0
+    while True:
+        i = _skip_blanks(block, i)
+        while i < len(block) and block[i] == ",":
+            i = _skip_blanks(block, i + 1)
+        if i >= len(block):
+            return out
+        if block[i] not in "'\"`" or (got := _literal(block, i)) is None:
+            return None
+        out.append(got[0])
+        i = got[1]
+
+
+def _raw_at(text: str, i: int) -> str:
+    end = i
+    while end < len(text) and text[end] not in ",\n}" and end - i < 200:
+        end += 1
+    return text[i:end].strip()
+
+
+def _js_value(text: str, i: int) -> Value:
+    """The value that starts at `i` in a JavaScript or JSON object: a string, a list of strings,
+    a boolean or null; anything else is unread."""
+    i = _skip_blanks(text, i)
+    if i >= len(text):
+        return Unread("")
+    char = text[i]
+    if char == "[":
+        end = _bracket_end(text, i)
+        items = None if end is None else _literals(text[i + 1 : end])
+        return Unread(_raw_at(text, i)) if items is None else items
+    if char in "'\"`":
+        got = _literal(text, i)
+        if got is not None:
+            after = _skip_blanks(text, got[1])
+            if after >= len(text) or text[after] in ",}":
+                return [got[0]]
+        return Unread(_raw_at(text, i))
+    if char == "/" and (rx := _regex_literal(text, i)) is not None:
+        after = _skip_blanks(text, rx[1])
+        if after >= len(text) or text[after] in ",}":
+            return [rx[0]]
+        return Unread(_raw_at(text, i))
+    word = re.match(r"(true|false|null)(?![\w$])", text[i : i + 6])
+    if word:
+        after = _skip_blanks(text, i + len(word[1]))
+        if after >= len(text) or text[after] in ",}":
+            return None if word[1] == "null" else word[1] == "true"
+    return Unread(_raw_at(text, i))
+
+
+def _js_option(text: str, key: str) -> tuple[bool, Value]:
+    found = re.search(rf"(?<![\w$.])[\"']?{re.escape(key)}[\"']?\s*:", text)
+    if found:
+        return True, _js_value(text, found.end())
+    if re.search(rf"[{{,]\s*{re.escape(key)}\s*[,}}]", text):  # `{ spec }`: a variable's value
+        return True, Unread(key)
+    return False, None
+
+
+def _yaml_option(text: str, key: str) -> tuple[bool, Value]:
+    found = re.search(rf"^[\"']?{re.escape(key)}[\"']?[ \t]*:[ \t]*(.*)$", text, re.M)
+    if not found:
+        return False, None
+    rest = found[1].strip()
+    if rest[:1] in ("'", '"'):
+        got = _literal(rest, 0)
+        tail = rest[got[1] :].strip() if got else "x"
+        return True, ([got[0]] if got and tail[:1] in ("", "#") else Unread(rest))
+    rest = re.split(r"\s+#", rest, maxsplit=1)[0].strip()
+    if rest.startswith("["):
+        end = rest.find("]")
+        if end < 0:  # a flow list over several lines
+            tail = text[found.start(1) : found.start(1) + 4000]
+            end = tail.find("]")
+            rest = tail[: end + 1].replace("\n", " ") if end >= 0 else rest
+            end = rest.find("]")
+        body = rest[1:end] if end >= 0 else ""
+        if end < 0 or any(c in body for c in "[{&*!|>"):
+            return True, Unread(rest)
+        return True, [i.strip().strip("'\"") for i in body.split(",") if i.strip()]
+    if rest == "":
+        items: list[str] = []
+        for line in text[found.end() :].splitlines()[1:]:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if not stripped.startswith("-"):
+                nested = not items and line[:1].isspace()  # a mapping under the key: not a list
+                return True, Unread("") if nested else (items or None)
+            body = re.split(r"\s+#", stripped[1:].strip(), maxsplit=1)[0].strip().strip("'\"")
+            if body:
+                items.append(body)
+        return True, items or None
+    if rest[0] in "&*!|>{%@":
+        return True, Unread(rest)
+    if rest in ("true", "false"):
+        return True, rest == "true"
+    return True, (None if rest in ("~", "null") else [rest])
+
+
+def _json_value(value: Any) -> Value:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return list(value)
+    return Unread(json.dumps(value)[:200])
+
+
+def _json_text(text: str) -> Any:
+    """JSON or JSONC (comments and trailing commas), None when it does not parse."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == '"':
+            end = _string_end(text, i)
+            if end is None:
+                return None
+            out.append(text[i:end])
+            i = end
+        elif text.startswith(("//", "/*"), i):
+            i = _skip_blanks(text, i)
+        else:
+            out.append(text[i])
+            i += 1
+    try:
+        return json.loads(re.sub(r",(\s*[\]}])", r"\1", "".join(out)))
+    except ValueError:
+        return None
+
+
+def read_options(
+    text: str, fmt: str, keys: Sequence[str], block: str | None = None
+) -> dict[str, Value] | None:
+    """The values of `keys` in a configuration's text (`fmt` is `js`, `yaml` or `json`), those it
+    does not set left out. `block` names the key of a JSON file the options live under
+    (package.json's `jest`, `mocha`). None when a JSON file does not parse."""
+    out: dict[str, Value] = {}
+    if fmt == "json":
+        data = _json_text(text)
+        if block is not None and isinstance(data, dict):
+            data = data.get(block)
+        if data is None and block is not None:
+            return out
+        if not isinstance(data, dict):
+            return None
+        for key in keys:
+            if key in data:
+                out[key] = _json_value(data[key])
+        return out
+    reader = _yaml_option if fmt == "yaml" else _js_option
+    for key in keys:
+        found, value = reader(text, key)
+        if found:
+            out[key] = value
+    return out
+
+
+def format_of(name: str) -> str:
+    """How a configuration file is written, by its extension."""
+    ext = posixpath.splitext(name)[1].lower()
+    return "yaml" if ext in (".yml", ".yaml") else "json" if ext in (".json", ".jsonc") else "js"
+
+
+def under_dirs(path: str, directories: Iterable[str]) -> bool:
+    """Whether `path` sits under one of the directories (`.` is all of them)."""
+    for d in directories:
+        d = posixpath.normpath(d.removeprefix("<rootDir>").lstrip("/") or ".")
+        if d == "." or path == d or path.startswith(d + "/"):
+            return True
+    return False
+
+
+MOCHA_EXTENSIONS = ("js", "cjs", "mjs")
+_GLOB_MAGIC = re.compile(r"[*?\[\]{}()!]")
+
+
+def mocha_collected(
+    tests: Sequence[str],
+    spec: Sequence[str],
+    ignore: Sequence[str],
+    extension: Sequence[str],
+    recursive: bool,
+) -> tuple[set[str], bool]:
+    """The test files among `tests` that mocha loads, and whether every pattern could be read.
+    A spec that is a glob names its files; a spec that is a directory loads the files in it with
+    one of the extensions (the ones below it only with `recursive`); a spec that is a file is
+    that file. `ignore` globs then take files out."""
+    exts = tuple(f".{e.lstrip('.')}" for e in extension)
+    complete = True
+    loaded: set[str] = set()
+    globs = [s for s in spec if _GLOB_MAGIC.search(s)]
+    plain = [
+        posixpath.normpath(s.removeprefix("./").rstrip("/") or ".") for s in spec if s not in globs
+    ]
+    hit, ok = glob_paths(globs, tests)
+    complete = complete and ok
+    loaded |= hit
+    for path in tests:
+        for p in plain:
+            inside = p == "." or path.startswith(p + "/")
+            if path == p or (
+                inside
+                and path.endswith(exts)
+                and (recursive or "/" not in path[len(p) + 1 if p != "." else 0 :])
+            ):
+                loaded.add(path)
+                break
+    dropped, ok = glob_paths(ignore, tests)
+    return loaded - dropped, complete and ok
 
 
 # -- which file a tool reads -------------------------------------------------------------------
