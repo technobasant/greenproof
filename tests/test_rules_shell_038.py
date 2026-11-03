@@ -359,6 +359,67 @@ def test_branches_ignore_on_push_without_pull_request_blocks(tmp_path: Path) -> 
     assert verdict(with_if(tmp_path, on)) == "block"
 
 
+@pytest.mark.parametrize(
+    "pattern", ["'**'", "'*'", "main", "master", "'ma*'", "'m*r'", "[dev, main]"]
+)
+def test_branches_ignore_that_takes_the_default_branch_off_push_warns(
+    tmp_path: Path, pattern: str
+) -> None:
+    pattern = pattern if pattern.startswith("[") else f"[{pattern}]"
+    on = f"on:\n  push:\n    branches-ignore: {pattern}\n  pull_request:\n"
+    found = with_if(tmp_path, on)
+    assert verdict(found) == "warn", pattern
+    assert any("branches-ignore" in m for m in messages(found, "warn"))
+
+
+@pytest.mark.parametrize("pattern", ["gh-pages", "'dependabot/**'", "'release-*'", "'*/main'"])
+def test_branches_ignore_that_leaves_the_default_branch_alone_is_honest(
+    tmp_path: Path, pattern: str
+) -> None:
+    on = f"on:\n  push:\n    branches-ignore: [{pattern}]\n  pull_request:\n"
+    assert verdict(with_if(tmp_path, on)) == "pass", pattern
+
+
+@pytest.mark.parametrize("pattern", ["'release/**'", "nope", "'v*'", "[a, b]"])
+def test_a_push_branches_filter_that_selects_neither_main_nor_master_warns(
+    tmp_path: Path, pattern: str
+) -> None:
+    pattern = pattern if pattern.startswith("[") else f"[{pattern}]"
+    on = f"on:\n  push:\n    branches: {pattern}\n  pull_request:\n"
+    found = with_if(tmp_path, on)
+    assert verdict(found) == "warn", pattern
+    assert any("default branch" in m for m in messages(found, "warn")), pattern
+
+
+@pytest.mark.parametrize("pattern", ["[main]", "[master]", "['**']", "['ma*']", "[dev, main]"])
+def test_a_push_branches_filter_that_keeps_main_or_master_is_honest(
+    tmp_path: Path, pattern: str
+) -> None:
+    on = f"on:\n  push:\n    branches: {pattern}\n  pull_request:\n"
+    assert verdict(with_if(tmp_path, on)) == "pass", pattern
+
+
+@pytest.mark.parametrize("pattern", ["'release/**'", "main"])
+def test_a_push_branches_filter_without_an_open_pull_request_is_judged_as_before(
+    tmp_path: Path, pattern: str
+) -> None:
+    on = f"on:\n  push:\n    branches: [{pattern}]\n"
+    found = with_if(tmp_path, on, base_on="on:\n  push:\n")
+    assert verdict(found) == "warn", pattern
+    assert any("fewer runs may test it" in m for m in messages(found, "warn")), pattern
+
+
+def test_branch_globs_follow_github_semantics_and_stay_linear() -> None:
+    from greenproof.rules.ci import _branch_matches as matches
+
+    assert matches("**", "main") and matches("*", "main") and matches("ma*", "master")
+    assert matches("**", "a/b") and not matches("*", "a/b") and not matches("a/*", "a/b/c")
+    assert matches("m[a-b]in", "main") and not matches("m[!a]in", "main")
+    assert matches("mai?n", "man") and matches("ma+in", "maaain")
+    assert not matches("release/**", "main") and not matches("dependabot/**", "main")
+    assert not matches("*" * 60 + "x", "m" * 5000)
+
+
 # ---- 9. a status saved on its own line must reach the exit -------------------------------------
 
 BARE = "#!/bin/bash\n"
@@ -476,3 +537,22 @@ def test_a_check_inside_thousands_of_nested_groups_is_still_a_check(
 def test_a_swallow_at_the_top_of_a_script_with_a_deep_nest_is_still_found() -> None:
     script = "pytest || true\n" + nest("{ cd . && ", "; }", "echo x") + "\n"
     assert "or" in kinds(script)
+
+
+def test_a_few_hundred_nested_groups_are_read_through(tmp_path: Path) -> None:
+    body = SET_E + nest("{ cd . && ", "; }", "echo x", 400) + "\npytest\n"
+    found = scene(fresh(tmp_path), {**PYTEST_CI, CI: SET_E + "pytest\n"}, {CI: body})
+    assert verdict(found) == "pass", messages(found)
+
+
+def test_nested_groups_past_what_can_be_read_block_instead_of_crashing(tmp_path: Path) -> None:
+    body = SET_E + nest("{ cd . && ", "; }", "echo x", 700) + "\npytest\n"
+    found = scene(fresh(tmp_path), {**PYTEST_CI, CI: SET_E + "pytest\n"}, {CI: body})
+    assert verdict(found) == "block"
+    assert "nested more than" in " ".join(messages(found))
+
+
+def test_thousands_of_saved_statuses_are_read_in_one_pass() -> None:
+    saves = "".join(f"echo {n}; rc{n}=$?\n" for n in range(3000))
+    assert kinds("pytest; rc=$?\n" + saves + "exit $rc\n", strict_status=True) == []
+    assert "or" in kinds("pytest; rc=$?\n" + saves + "exit 0\n", strict_status=True)

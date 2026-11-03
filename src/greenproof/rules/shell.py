@@ -28,6 +28,7 @@ from __future__ import annotations
 import posixpath
 import re
 import shlex
+from bisect import bisect_right
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -1817,6 +1818,7 @@ def _flat_swallows(
         if seg.sep == "||" and _is_failing_exit(seg.text):
             chain_guard[-1] = True
     reads = [bool(_STATUS_READ.search(s.text)) for s in segs]
+    seg_index = _SegIndex(segs)
     # `rc=$?` on a line of its own saves the status of the statement before it: it reads that
     # status only if the script then ends with `$rc` (see `_rc_kept`)
     saves = [""] * len(segs)
@@ -1827,7 +1829,8 @@ def _flat_swallows(
             and (m := _RC_SET.match(_KEYWORD.sub(r"\g<rest>", seg.text)))
         ):
             saves[i] = m["v"]
-            reads[i] = _rc_kept(segs, i, m["v"])
+            if check(i - 1):  # the status of anything else is not the one that matters
+                reads[i] = _rc_kept(segs, i, m["v"], seg_index)
     next_read = [-1] * (len(segs) + 1)  # the first statement at or after each one that reads
     for i in range(len(segs) - 1, -1, -1):
         next_read[i] = i if reads[i] else next_read[i + 1]
@@ -1863,7 +1866,7 @@ def _flat_swallows(
             before = [j for j in chain_members[chain_of[i]] if j < i and check(j)]
             keeper = next((m for r in rhs if (m := _RC_SET.match(r))), None)
             if before and keeper and not any(_is_failing_exit(r) for r in rhs):
-                if not _rc_kept(segs, i, keeper["v"]):
+                if not _rc_kept(segs, i, keeper["v"], seg_index):
                     add(
                         seg,
                         "or",
@@ -1890,7 +1893,7 @@ def _flat_swallows(
         elif (rc_then := _RC_SET.match(text) or _RC_NONZERO.match(text)) and _in_check_if(
             segs, i, check
         ):
-            if not _rc_kept(segs, i, rc_then["v"]):
+            if not _rc_kept(segs, i, rc_then["v"], seg_index):
                 add(
                     seg,
                     "or",
@@ -1955,7 +1958,7 @@ def _flat_swallows(
             unguarded[i] = True
         if reads[i]:
             last_read = i
-    depth = _block_depth(segs)
+    depth = seg_index.depth
     for i, seg in enumerate(segs):
         if (
             check(i)
@@ -2108,16 +2111,34 @@ def _rc_final_test(text: str, var: str, last: bool) -> bool:
     return re.fullmatch(rf"\(\(\s*(?:{v}\s*==\s*0|!\s*{v})\s*\)\)", text.strip()) is not None
 
 
-def _rc_kept(segs: Sequence[Seg], i: int, var: str) -> bool:
+_IDENT = re.compile(r"[A-Za-z_]\w*")
+
+
+class _SegIndex:
+    """What `_rc_kept` needs from a whole script, read once: which statements are top level, how
+    deep each block is, and for each name the statements that mention it."""
+
+    def __init__(self, segs: Sequence[Seg]) -> None:
+        self.top = _top_level(segs)
+        self.depth = _block_depth(segs)
+        self.mentions: dict[str, list[int]] = {}
+        for k, seg in enumerate(segs):
+            for word in set(_IDENT.findall(seg.text)):
+                self.mentions.setdefault(word, []).append(k)
+
+
+def _rc_kept(segs: Sequence[Seg], i: int, var: str, idx: _SegIndex) -> bool:
     """Whether the script, after `segs[i]` saved a status in `$var`, ends non-zero when `$var`
     is: `exit $var` (also `exit ${var:-0}`, `exit $((var))`) at its top level or last in a
     top-level `{ ...; }` group, a top-level `if [ "$var" -ne 0 ]; then exit "$var"; fi` (or `exit
     1`), or `[ "$var" -eq 0 ] || exit "$var"`, with no later statement assigning `var` in
     between. A test that cannot be read does not count."""
-    top = _top_level(segs)
-    depth = _block_depth(segs)
+    top, depth = idx.top, idx.depth
     reset = re.compile(rf"^{_DECL}{re.escape(var)}=")
-    for j in range(i + 1, len(segs)):
+    at = idx.mentions.get(var, [])
+    # every form that keeps the status, and the assignment that loses it, names the variable
+    for pos in range(bisect_right(at, i), len(at)):
+        j = at[pos]
         text = segs[j].text.strip()
         if top[j]:
             if re.fullmatch(rf"exit\s+{_rc_operand(var)}", text):

@@ -14,7 +14,7 @@ from collections import Counter
 from collections.abc import Callable, Collection, Generator, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import WARN, Finding
@@ -324,7 +324,11 @@ class _Expansion(NamedTuple):
 _CD = frozenset({"cd", "chdir", "pushd", "popd"})
 
 
-_GROUP_DEPTH = 32  # levels of `( ... )`, `{ ...; }` and `sh -c` a script is walked through
+_GROUP_DEPTH = 128  # levels of `( ... )`, `{ ...; }` and `sh -c` a script is walked through
+_TOO_DEEP = (
+    f"a statement is nested more than {_GROUP_DEPTH} levels deep in `( ... )`, `{{ ...; }}` or "
+    "`sh -c`: it cannot be read to see whether it removes a test"
+)
 
 
 def _walk_leaves(
@@ -1451,18 +1455,117 @@ _POSITIVE_FILTERS = ("branches", "tags", "types")
 _IGNORE_FILTERS = ("branches-ignore", "tags-ignore")
 
 
+_DEFAULT_BRANCHES = ("main", "master")
+_QUANT = ("?", "+")
+
+
+def _branch_tokens(pattern: str) -> list[tuple[str, Any, str]]:
+    """A GitHub branch glob as (kind, value, quantifier) tokens: `**` crosses `/`, `*` does not,
+    `[...]` is a class, `?` is zero or one of the preceding token and `+` one or more."""
+    tokens: list[tuple[str, Any, str]] = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            j = i + 1
+            while j < len(pattern) and pattern[j] == "*":
+                j += 1
+            tokens.append(("**" if j - i > 1 else "*", None, ""))
+            i = j
+            continue
+        if c in _QUANT and tokens and not tokens[-1][2] and tokens[-1][0] in ("lit", "cls"):
+            tokens[-1] = (tokens[-1][0], tokens[-1][1], c)
+        elif c == "[" and (close := pattern.find("]", i + 2)) > 0:
+            body = pattern[i + 1 : close]
+            neg = body[:1] in ("!", "^")
+            tokens.append(("cls", (neg, body[1:] if neg else body), ""))
+            i = close + 1
+            continue
+        else:
+            tokens.append(("lit", c, ""))
+        i += 1
+    return tokens
+
+
+def _token_takes(token: tuple[str, Any, str], ch: str) -> bool:
+    kind, value, _ = token
+    if kind == "**":
+        return True
+    if kind == "*":
+        return ch != "/"
+    if kind == "lit":
+        return bool(ch == value)
+    neg, body = value
+    hit, k = False, 0
+    while k < len(body):
+        if k + 2 < len(body) and body[k + 1] == "-":
+            hit = hit or body[k] <= ch <= body[k + 2]
+            k += 3
+        else:
+            hit = hit or body[k] == ch
+            k += 1
+    return bool(hit != neg)
+
+
+def _branch_matches(pattern: str, name: str) -> bool:
+    """Whether the branch glob `pattern` matches `name` (a simulation over the tokens, so the work
+    is bounded by their number times the name's length and no regex is built from the pattern)."""
+    tokens = _branch_tokens(pattern)
+
+    def close(states: set[int]) -> set[int]:
+        todo = list(states)
+        while todo:
+            i = todo.pop()
+            optional = i < len(tokens) and (tokens[i][0] in ("*", "**") or tokens[i][2] == "?")
+            if optional and i + 1 not in states:
+                states.add(i + 1)
+                todo.append(i + 1)
+        return states
+
+    states = close({0})
+    for ch in name:
+        nxt: set[int] = set()
+        for i in states:
+            if i < len(tokens) and _token_takes(tokens[i], ch):
+                nxt.add(i + 1)
+                if tokens[i][0] in ("*", "**") or tokens[i][2] == "+":
+                    nxt.add(i)
+        states = close(nxt)
+        if not states:
+            return False
+    return len(tokens) in states
+
+
+def _branch_selected(patterns: list[str], name: str) -> bool:
+    """Whether a `branches` list selects `name`: a `!` pattern removes what came before it."""
+    chosen = False
+    for p in patterns:
+        if p.startswith("!"):
+            if _branch_matches(p[1:], name):
+                chosen = False
+        elif _branch_matches(p, name):
+            chosen = True
+    return chosen
+
+
 def _filter_warnings(
     event: str, was: dict[str, list[str]], now: dict[str, list[str]], pr_open: bool = False
 ) -> list[str]:
     """What a filter that is new or wider than at the base takes away from `event`. `pr_open`: a
-    `branches` or `branches-ignore` filter newly under `push` costs nothing the tests ran on,
-    since `pull_request` still runs them on every branch."""
+    `branches` or `branches-ignore` filter newly under `push` costs nothing the tests ran on while
+    `pull_request` still runs them on every branch, unless it takes the default branch off push
+    (`branches-ignore` matching main or master, `branches` selecting neither)."""
     out: list[str] = []
     for key in _POSITIVE_FILTERS:
         if key not in now:
             continue
         if key not in was:
             if pr_open and event == "push" and key == "branches":
+                if not any(_branch_selected(now[key], b) for b in _DEFAULT_BRANCHES):
+                    out.append(
+                        "a `branches` filter under `push` selects neither `main` nor `master`:"
+                        " the default branch no longer runs the tests on push"
+                    )
                 continue
             out.append(f"a `{key}` filter was added under `{event}`: fewer runs may test it")
         elif gone := [p for p in was[key] if p not in now[key]]:
@@ -1471,7 +1574,9 @@ def _filter_warnings(
         if key not in now:
             continue
         added = [p for p in now[key] if p not in was.get(key, [])]
-        if added and not (pr_open and event == "push" and key == "branches-ignore" not in was):
+        if added and pr_open and event == "push" and key == "branches-ignore" and key not in was:
+            added = [p for p in added if any(_branch_matches(p, b) for b in _DEFAULT_BRANCHES)]
+        if added:
             out.append(f"`{key}` under `{event}` now also excludes {', '.join(added)}")
     return out
 
@@ -1845,7 +1950,13 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                     continue
                 if tests is None:
                     continue
-                gone, _ = tests.scan(path_stmt, where)
+                try:
+                    gone, _ = tests.scan(path_stmt, where)
+                except RecursionError:  # a nest `_walk_leaves` left whole is too deep to read
+                    if (at, _TOO_DEEP) not in reported:
+                        reported.add((at, _TOO_DEEP))
+                        out.append(_block(at, _TOO_DEEP))
+                    continue
                 if gone is not None:
                     why = removal_reason(stmt[:80], gone)
                     if (at, why) not in reported:
