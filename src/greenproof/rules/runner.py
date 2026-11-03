@@ -219,10 +219,20 @@ def _collection(settings: _Settings, options: Mapping[str, Any]) -> None:
             settings.collection[key] = [w for w in re.split(r"\s+", " ".join(words)) if w]
 
 
-def _apply_pytest(s: _Settings, options: Mapping[str, Any], forced: Collection[str] = ()) -> None:
+def _apply_pytest(
+    s: _Settings,
+    options: Mapping[str, Any],
+    forced: Collection[str] = (),
+    late: Mapping[str, str] | None = None,
+) -> None:
     """The pytest options of one configuration into `s`: addopts first, whose `-o` options (and
-    `forced`, the keys a command line overrides) beat the file's values."""
+    `forced`, the keys a command line overrides) beat the file's values. `late` are the `-o`
+    options of the command line itself: they come after addopts and beat its `-o` options."""
+    if late and "addopts" in late:  # `-o addopts=...` replaces the file's addopts
+        options = {**options, "addopts": late["addopts"]}
     _addopts(s, options.get("addopts"))
+    s.overrides.update(late or {})
+    forced = (*forced, *(late or ()))
     options = {**options, **s.overrides}
     for key in (*s.overrides, *forced):
         if key in _SCOPE_KEYS and re.search(r"[$`]", str(options.get(key))):
@@ -572,7 +582,9 @@ def _doctest_loss(judge: _Judge, lost: Collection[str]) -> tuple[list[str], int]
     return sorted({*tests, *hits}), unread
 
 
-def _pytest_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str]:
+def _pytest_reasons(
+    base: _Settings, cand: _Settings, judge: _Judge, scope: bool = True
+) -> list[str]:
     reasons: list[str] = []
     for item, count in (cand.select - base.select).items():
         reasons.append(f"pytest option `{item}` added" + (f" (x{count})" if count > 1 else ""))
@@ -582,7 +594,8 @@ def _pytest_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str
             + (f" (x{count})" if count > 1 else "")
         )
     reasons.extend(_plugin_reasons(base, cand))
-    reasons.extend(_scope_reasons(base, cand, judge))
+    if scope:
+        reasons.extend(_scope_reasons(base, cand, judge))
     return reasons
 
 
@@ -691,9 +704,13 @@ def _lint_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str]:
 _TOOL_GROUPS = ("pytest", "coverage", "mypy", "lint")
 
 
-def _setting_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[tuple[str, str]]:
-    """`(tool, reason)` for what the candidate's effective configuration loosened."""
-    out = [("pytest", r) for r in _pytest_reasons(base, cand, judge)]
+def _setting_reasons(
+    base: _Settings, cand: _Settings, judge: _Judge, scope: bool = True
+) -> list[tuple[str, str]]:
+    """`(tool, reason)` for what the candidate's effective configuration loosened. `scope` is
+    False when the pytest runs are known: which files they collect is judged per run, from the
+    configuration and the run's own flags together (`_run_reasons`)."""
+    out = [("pytest", r) for r in _pytest_reasons(base, cand, judge, scope)]
     out += [("coverage", r) for r in _coverage_reasons(base, cand, judge)]
     out += [("mypy", r) for r in _mypy_reasons(base, cand, judge)]
     out += [("lint", r) for r in _lint_reasons(base, cand, judge)]
@@ -709,12 +726,17 @@ def _config_dirs(changes: ChangeSet) -> list[str]:
     return sorted(roots)
 
 
-def _config_findings(changes: ChangeSet) -> list[Finding]:
+def _config_findings(changes: ChangeSet, runs: _PolicyRuns | None = None) -> list[Finding]:
     """The tool configuration of each directory with a changed config file, compared as the
-    tools read it (one source each, by precedence) before and after the change."""
+    tools read it (one source each, by precedence) before and after the change. With the pytest
+    runs of the policy path known, which files pytest collects is judged per run instead, from
+    the configuration and the run's own flags together (see `_run_reasons`), so an option that
+    moved between the two is not a loss."""
     out: list[Finding] = []
     changed = {f.path for f in changes.files} | {f.old_path for f in changes.files if f.old_path}
-    for root in _config_dirs(changes):
+    per_run = runs is not None and runs.known()
+    roots = _config_dirs(changes)
+    for root in roots:
 
         def join(name: str, root: str = root) -> str:
             return posixpath.join(root, name)
@@ -728,7 +750,10 @@ def _config_findings(changes: ChangeSet) -> list[Finding]:
         if {"ruff", "flake8"} & skip:
             skip.add("lint")
         judge = _Judge(changes, root)
-        for tool, why in _setting_reasons(base, cand, judge):
+        found = _setting_reasons(base, cand, judge, scope=not per_run)
+        if per_run and runs is not None and "pytest" not in skip:
+            found.extend(("pytest", why) for why, _ in _run_reasons(changes, runs, root, judge))
+        for tool, why in found:
             if tool in skip:
                 continue
             winners = {"lint": cand_where["ruff"] or cand_where["flake8"]}
@@ -757,6 +782,8 @@ def _config_findings(changes: ChangeSet) -> list[Finding]:
                     _HINT,
                 )
             )
+    if per_run and runs is not None:
+        out.extend(_run_findings(changes, runs, roots))
     return out
 
 
@@ -1968,8 +1995,6 @@ def neutering_reason(
         return f"it now passes {added[0]}"
     if flag := _new_selection_flag(base_e, cand_e):
         return f"it now passes {flag}"
-    if tests is not None and (over := _override_reason(narrow_base, narrow_cand, tests, cwds)):
-        return over
     if narrowed := narrowed_selection(
         narrow_base,
         narrow_cand,
@@ -2188,50 +2213,270 @@ def _new_selection_flag(base: list[str], cand: list[str]) -> str | None:
 
 
 _OVERRIDE_SCOPE = frozenset({*_SCOPE_KEYS, "addopts"})
+_MAX_RUN_STATEMENTS = 400  # statements read on the policy path, per tree
+_MAX_RUN_DEPTH = 4  # `make x` in a script in a recipe...
+_MAX_MAKEFILES = 8
+_RUN_FILES = frozenset(
+    {*rc.CONFIG_NAMES, "package.json", ".greenproof.toml", "GNUmakefile", "makefile", "Makefile"}
+    | {"justfile", "Justfile"}
+)
+_MAX_RUNS = 8  # distinct pytest runs compared per tree (each base run against each candidate run)
 
 
-def _overrides_of(statements: Sequence[str]) -> dict[str, str]:
-    """The `-o key=value` options (`--override-ini`) the pytest runs among the statements pass, on
-    the command line and in PYTEST_ADDOPTS, for the keys that decide what is collected."""
-    found: dict[str, str] = {}
-    for st in statements:
-        words = _split_words(st)
-        env = dict(command_env(st).vars).get("PYTEST_ADDOPTS", "")
-        for args in _after_pytest(words):
-            tmp = _Settings()
-            _addopts(tmp, [*_split_words(env), *args])
-            found.update({k: v for k, v in tmp.overrides.items() if k in _OVERRIDE_SCOPE})
-    return found
+@dataclass
+class _Run:
+    """One pytest invocation on the policy path: its arguments (with the words of an
+    PYTEST_ADDOPTS that reaches it in front), the file its statement is in ("" for a policy
+    command) and the directory it runs from."""
+
+    args: list[str]
+    path: str
+    cwd: str
 
 
-def _override_reason(
-    base: Sequence[str], cand: Sequence[str], tests: _BaseTests, cwds: Sequence[str]
-) -> str | None:
-    """A pytest run that now passes `-o key=value` for an option that decides what is collected,
-    judged like the same key in the config file: what the repository's configuration collected
-    with the base's overrides against what it collects with the candidate's."""
-    over, was = _overrides_of(cand), _overrides_of(base)
-    if not over or all(was.get(k) == v for k, v in over.items()):
-        return None
-    changes = tests.changes
-    warned: str | None = None
-    for root in dict.fromkeys((*cwds, "")):
-        try:
-            _, options = rc.pytest_options(rc.Tree(changes.base_text, root))
-            settings = []
-            for given in (was, over):
-                s = _Settings()
-                _apply_pytest(s, {**options, **given}, tuple(given))
-                settings.append(s)
-        except (rc.Broken, ValueError, TypeError, AttributeError):
+def _run_key(args: Sequence[str]) -> tuple[Any, ...]:
+    """What of a run's own arguments decides which files it collects."""
+    tmp = _Settings()
+    _addopts(tmp, args)
+    scope = sorted((k, v) for k, v in tmp.overrides.items() if k in _OVERRIDE_SCOPE)
+    return (tmp.doctest_modules, tuple(tmp.doctest_globs), tuple(scope))
+
+
+def _make_runs(
+    changes: ChangeSet, commands: Mapping[str, str], base: bool
+) -> tuple[list[_Run], bool]:
+    """The pytest runs the policy commands reach in one tree: a command that runs pytest, one that
+    runs `make x` or `npm run x` (read into the recipe or script body), one that runs a script of
+    the repository (read through its own calls), with the flags `PYTEST_ADDOPTS` hands each (set
+    in front of it, exported by the script or the Makefile, or loaded from an env file). Runs that
+    differ only in what is not an option that picks files are one. Also whether more than
+    `_MAX_RUNS` were found (the rest were left out)."""
+    read = changes.base_text if base else changes.cand_text
+    makefiles: dict[str, tuple[_Targets, dict[str, str], str] | None] = {}
+    packages: dict[str, dict[str, Any]] = {}
+
+    def makefile(directory: str) -> tuple[_Targets, dict[str, str], str] | None:
+        if directory not in makefiles and len(makefiles) < _MAX_MAKEFILES:
+            makefiles[directory] = None
+            for name in ("GNUmakefile", "makefile", "Makefile"):
+                path = posixpath.join(directory, name)
+                if (text := read(path)) is not None:
+                    makefiles[directory] = (_targets(text), _make_exports(text), path)
+                    break
+        return makefiles.get(directory)
+
+    def scripts(directory: str) -> dict[str, Any]:
+        if directory not in packages:
+            try:
+                data = json.loads(read(posixpath.join(directory, "package.json")) or "{}")
+            except ValueError:
+                data = {}
+            found = data.get("scripts") if isinstance(data, dict) else None
+            packages[directory] = found if isinstance(found, dict) else {}
+        return packages[directory]
+
+    def make_lines(toks: list[str], cwd: str) -> tuple[list[str], str, str] | None:
+        if not toks or posixpath.basename(toks[0]) not in _MAKE_HEADS:
+            return None
+        directory, names, i = cwd, [], 1
+        while i < len(toks):
+            tok = toks[i]
+            if tok in ("-C", "--directory") and i + 1 < len(toks):
+                directory = posixpath.normpath(posixpath.join(cwd, toks[i + 1]))
+                i += 1
+            elif tok.startswith("--directory="):
+                directory = posixpath.normpath(posixpath.join(cwd, tok.partition("=")[2]))
+            elif tok.startswith(_MAKE_FILE_OPTS):
+                return None
+            elif not tok.startswith("-") and "=" not in tok:
+                names.append(tok)
+            i += 1
+        if (found := makefile(directory)) is None:
+            return None
+        targets, exports, path = found
+        default = targets.default
+        names = [n for n in names if n in targets] or (
+            [default] if not names and default is not None and default in targets else []
+        )
+        lines = [ln for n in names for ln in _effective(targets, n)]
+        return _with_exports(lines, False, exports), path, directory
+
+    runs: list[_Run] = []
+    cut = False
+    seen: set[tuple[Any, ...]] = set()
+    files: set[str] = set()
+    queue = [(cmd, "", "", 0) for cmd in commands.values()]
+    budget = _MAX_RUN_STATEMENTS
+    while queue and budget > 0:
+        statement, path, cwd, depth = queue.pop(0)
+        budget -= 1
+        for seg in split_segments(_RECIPE_PREFIX.sub("", statement.strip(), count=1)):
+            toks = command_tokens(seg.text)
+            for args in _after_pytest(toks):
+                env = command_env(seg.text)
+                if "PYTEST_ADDOPTS" not in env.vars:
+                    for name in env.files or ([".env"] if env.default else []):
+                        loaded = _dotenv_values(read(posixpath.join(cwd, name)))
+                        if value := loaded.get("PYTEST_ADDOPTS"):
+                            args = [*_split_words(value), *args]
+                key = (cwd, *_run_key(args))
+                if key in seen:
+                    continue
+                seen.add(key)
+                if len(runs) < _MAX_RUNS:
+                    runs.append(_Run(args, path, cwd))
+                else:
+                    cut = True
+            if depth >= _MAX_RUN_DEPTH:
+                continue
+            if (made := make_lines(toks, cwd)) is not None:
+                queue.extend((ln, made[1], made[2], depth + 1) for ln in made[0])
+            elif body := _script_expander(scripts(cwd))(seg.text):
+                queue.extend(
+                    (ln, posixpath.join(cwd, "package.json"), cwd, depth + 1) for ln in body
+                )
+            for script in scripts_in(seg.text, cwd):
+                text = read(script)
+                if text is not None and script not in files and len(text) < 200_000:
+                    files.add(script)
+                    lines = _with_exports(split_lines(text), True)
+                    queue.extend((ln, script, posixpath.dirname(script), depth + 1) for ln in lines)
+    return runs, cut
+
+
+class _PolicyRuns:
+    """The pytest runs of the policy path at the base and in the candidate, read once."""
+
+    def __init__(
+        self, changes: ChangeSet, commands: Mapping[str, str], invoked: Collection[str] = ()
+    ) -> None:
+        self._changes = changes
+        self._commands = commands
+        self._memo: dict[bool, tuple[list[_Run], bool]] = {}
+        # The runs are read only when a file that can change them changed: a configuration
+        # file, a Makefile, a package.json, an env file, a script a policy command runs.
+        self._live = any(
+            posixpath.basename(path) in _RUN_FILES
+            or _ENV_FILE.match(posixpath.basename(path))
+            or path in invoked
+            for f in changes.files
+            for path in (f.path, f.old_path or f.path)
+        )
+
+    def _read(self, base: bool) -> tuple[list[_Run], bool]:
+        if not self._live:
+            return [], False
+        if base not in self._memo:
+            self._memo[base] = _make_runs(self._changes, self._commands, base)
+        return self._memo[base]
+
+    def of(self, base: bool) -> list[_Run]:
+        return self._read(base)[0]
+
+    def cut(self) -> bool:
+        return self._read(True)[1] or self._read(False)[1]
+
+    def known(self) -> bool:
+        """Whether both trees have runs to compare, all of them read: with none on either side,
+        or with more than `_MAX_RUNS`, the configuration alone is judged."""
+        return bool(self.of(True) and self.of(False)) and not self.cut()
+
+    def warning(self) -> Finding | None:
+        """The warning for a change to a policy path that runs more pytest runs than were read."""
+        if not self.cut():
+            return None
+        keys = [{(r.cwd, *_run_key(r.args)) for r in self.of(b)} for b in (True, False)]
+        if keys[0] == keys[1]:
+            return None
+        where = self._changes.files[0].path if self._changes.files else "."
+        return warn_finding(
+            "runner.tampered",
+            where,
+            None,
+            f"{where}: the policy path runs more than {_MAX_RUNS} different pytest commands: "
+            "which files each collects was not compared per command",
+            _HINT,
+        )
+
+    def roots(self) -> list[str]:
+        return list(dict.fromkeys(("", *(r.cwd for r in (*self.of(True), *self.of(False))))))
+
+
+def _effective_run(options: Mapping[str, Any], args: Sequence[str]) -> _Settings:
+    """What pytest collects from a configuration's `options` run with `args`: the flags and `-o`
+    options of the command line come after the file's addopts and win."""
+    tmp = _Settings()
+    _addopts(tmp, args)
+    late = {k: v for k, v in tmp.overrides.items() if k in _OVERRIDE_SCOPE}
+    s = _Settings()
+    _apply_pytest(s, options, (), late)
+    s.doctest_modules = s.doctest_modules or tmp.doctest_modules
+    s.doctest_globs = [*s.doctest_globs, *tmp.doctest_globs]
+    return s
+
+
+def _scope_key(s: _Settings) -> str:
+    return repr((_scope(s, []), sorted(s.collection.items()), sorted(s.unread.items())))
+
+
+def _run_reasons(
+    changes: ChangeSet, runs: _PolicyRuns, root: str, judge: _Judge
+) -> list[tuple[str, str]]:
+    """`(reason, file)` for each pytest run of the base that no run of the candidate still
+    matches: judged with the configuration of `root` and the run's own flags, so a flag that
+    moved from addopts to the command line (or back) leaves the run collecting what it did, and
+    one that was dropped from the command line is the loss it is. Each run of the base is
+    compared with the candidate's runs, and covered by the first that loses nothing."""
+    try:
+        _, before = rc.pytest_options(rc.Tree(changes.base_text, root))
+        _, after = rc.pytest_options(rc.Tree(changes.cand_text, root))
+    except (rc.Broken, ValueError, TypeError, AttributeError):
+        return []
+    base = {_scope_key(s): s for s in (_effective_run(before, r.args) for r in runs.of(True))}
+    cand = [(_effective_run(after, r.args), r.path) for r in runs.of(False)]
+    have = {_scope_key(s) for s, _ in cand}
+    out: list[tuple[str, str]] = []
+    for key, was in base.items():
+        if key in have:
             continue
-        shown = " ".join(f"-o {k}={shlex.quote(v)}" for k, v in over.items() if was.get(k) != v)
-        for why in _pytest_reasons(settings[0], settings[1], _Judge(changes, root)):
-            text = f"it now passes `{shown}`, and {why}"
-            if not isinstance(why, _Warn):
-                return text
-            warned = warned or _Warn(text)
-    return warned
+        best: tuple[list[str], str] | None = None
+        for now, path in cand:
+            why = _scope_reasons(was, now, judge)
+            if all(isinstance(w, _Warn) for w in why):
+                best = (why, path)
+                break
+            if best is None or len(why) < len(best[0]):
+                best = (why, path)
+        if best is not None:
+            out.extend((w, best[1]) for w in best[0] if (w, best[1]) not in out)
+    return out
+
+
+def _run_findings(changes: ChangeSet, runs: _PolicyRuns, done: Collection[str]) -> list[Finding]:
+    """The `_run_reasons` of the directories whose configuration did not change (those that did
+    are judged with their configuration in `_config_findings`): a command line that lost a flag."""
+    out: list[Finding] = []
+    fallback = changes.files[0].path if changes.files else "."
+    seen: set[tuple[str, str]] = set()
+    for root in runs.roots():
+        if root in done:
+            continue
+        if root:  # a directory of its own counts when it holds a pytest configuration
+            try:
+                names = [rc.pytest_options(rc.Tree(t, root))[0] for t in (changes.base_text,)]
+            except (rc.Broken, ValueError, TypeError, AttributeError):
+                continue
+            if names[0] is None:
+                continue
+        for why, path in _run_reasons(changes, runs, root, _Judge(changes, root)):
+            where = path or fallback
+            if (where, why) in seen:
+                continue
+            seen.add((where, why))
+            line = _first_line_with(changes.cand_text(where) or "", _anchor(why))
+            make = warn_finding if isinstance(why, _Warn) else finding
+            out.append(make("runner.tampered", where, line, f"{where}: {why}", _HINT))
+    return out
 
 
 def _plain_check(statement: str) -> tuple[str, ...]:
@@ -4940,7 +5185,10 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
         for line, why in reasons:
             make = warn_finding if why.endswith(_ADOPTION) or isinstance(why, _Warn) else finding
             out.append(make("runner.tampered", f.path, line, f"{f.path}: {why}", _HINT))
-    out.extend(_config_findings(changes))
+    runs = _PolicyRuns(changes, commands, invoked)
+    out.extend(_config_findings(changes, runs))
+    if (note := runs.warning()) is not None:
+        out.append(note)
     out.extend(_mocha_findings(changes))
     workspace_files = [
         f.path for f in changes.files if f.path in ("pnpm-workspace.yaml", "package.json")

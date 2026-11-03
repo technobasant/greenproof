@@ -47,8 +47,13 @@ MOCHA9 = {
     "package.json": js_pkg({"test": "mocha"}),
     ".mocharc.yml": RC,
 }
+TWO = "test: unit docs\nunit:\n\tpytest tests\ndocs:\n\tpytest --doctest-modules\n"
+PF = "'python_files=test_*.py *_test.py'"
 BASES = {
     "py9": PY9,
+    "py9cmd": {**PY9, "Makefile": "test:\n\tpytest --doctest-modules\n"},
+    "py9two": {**PY9, "Makefile": TWO},
+    "py9pf": {**PY9, "Makefile": f"test:\n\tpytest -o {PF}\n"},
     "py9txt": {**PY9, **TXT, PP: INI + 'addopts = "--doctest-glob=*.txt"\n'},
     "py9doc": {**PY9, PP: INI + 'addopts = "-ra --doctest-modules"\n'},
     "jest9": JS9,
@@ -70,6 +75,55 @@ def jp(name, base, edits, expect):
 
 
 PROBES = [
+    # -- pytest: an option that moves between the configuration and a command line
+    p(
+        "HONEST-cfg9-pytest-doctest-moved-to-cmd",
+        "py9doc",
+        [(PP, " --doctest-modules", ""), ("Makefile", "pytest", "pytest --doctest-modules")],
+        "pass",
+        **ST,
+    ),
+    p(
+        "HONEST-cfg9-pytest-doctest-moved-to-addopts",
+        "py9cmd",
+        [
+            (PP, '["tests"]\n', '["tests"]\naddopts = "--doctest-modules"\n'),
+            ("Makefile", " --doctest-modules", ""),
+        ],
+        "pass",
+        **ST,
+    ),
+    p(
+        "cfg9-pytest-doctest-moved-dropped-cmd",
+        "py9cmd",
+        [("Makefile", " --doctest-modules", "")],
+        "block runner.tampered",
+        **ST,
+    ),
+    p(
+        "HONEST-cfg9-pytest-two-runs-flag-kept",
+        "py9two",
+        [("Makefile", "pytest tests", "pytest -q tests")],
+        "pass",
+        **ST,
+    ),
+    p(
+        "cfg9-pytest-two-runs-flag-lost",
+        "py9two",
+        [("Makefile", "pytest --doctest-modules", "pytest")],
+        "block runner.tampered",
+        **ST,
+    ),
+    p(
+        "HONEST-cfg9-pytest-python-files-moved-to-ini",
+        "py9pf",
+        [
+            ("Makefile", f" -o {PF}", ""),
+            (PP, '["tests"]\n', '["tests"]\npython_files = ["test_*.py", "*_test.py"]\n'),
+        ],
+        "pass",
+        **ST,
+    ),
     # -- pytest
     p(
         "cfg9-pytest-norecursedirs-integration",
