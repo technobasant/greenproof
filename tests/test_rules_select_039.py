@@ -2,7 +2,8 @@
 
 S1 go `-tags`, S2 cargo targets, packages and features, S3 jest and vitest flags, S4 monorepo
 changed-only runs, S5 tox and nox defaults (runner side), S6 the same for a workflow step,
-S7 each reader costs time linear in its input.
+S7 each reader costs time linear in its input, S8 package-name filters of a task runner and the
+`commands` of each tox environment and nox session.
 """
 
 from __future__ import annotations
@@ -204,7 +205,6 @@ def test_dash_t_is_a_name_filter_for_jest_and_a_timeout_for_mocha() -> None:
 @pytest.mark.parametrize(
     ("base", "cand"),
     [
-        ("nx run-many -t test", "nx affected -t test"),
         ("turbo run test", "turbo run test --affected"),
         ("turbo run test", "turbo run test --filter=...[origin/main]"),
         ("lerna run test", "lerna run test --since origin/main"),
@@ -466,6 +466,317 @@ def test_a_scope_that_is_lost_is_named() -> None:
     assert scope is not None and "b" in scope
 
 
+# ---- S8: package-name filters, and the commands of each tox environment or nox session ----
+
+
+@pytest.mark.parametrize(
+    ("base", "cand"),
+    [
+        ("turbo run test", "turbo run test --filter=web"),
+        ("turbo run test", "turbo run test -F web"),
+        ("turbo run test", "turbo run test --filter='!docs'"),
+        ("turbo run test --filter=web --filter=api", "turbo run test --filter=web"),
+        ("turbo run test --filter=web*", "turbo run test --filter=web-app"),
+        ("pnpm -r test", "pnpm -r --filter web test"),
+        ("pnpm -r run test", "pnpm -r -F web run test"),
+        ("pnpm --filter 'web...' test", "pnpm --filter web test"),
+        ("pnpm -r test", "pnpm -r --filter '!docs' test"),
+        ("nx run-many -t test", "nx run-many -t test --projects=web"),
+        ("nx run-many -t test", "nx run-many -t test -p web api"),
+        ("nx run-many -t test -p web api docs", "nx run-many -t test -p web api"),
+        ("nx run-many -t test", "nx run-many -t test --exclude=docs"),
+        ("nx run-many -t test --exclude=docs", "nx run-many -t test --exclude=docs,api"),
+        ("lerna run test", "lerna run test --scope web"),
+        ("lerna run test", "lerna run test --ignore docs"),
+        (
+            "yarn workspaces foreach -A run test",
+            "yarn workspaces foreach -A --include web run test",
+        ),
+        (
+            "yarn workspaces foreach -A run test",
+            "yarn workspaces foreach -A --exclude docs run test",
+        ),
+    ],
+)
+def test_a_name_filter_that_leaves_packages_out_blocks(
+    tmp_path: Path, base: str, cand: str
+) -> None:
+    assert script(tmp_path, base, cand) == "block"
+
+
+@pytest.mark.parametrize(
+    ("base", "cand"),
+    [
+        ("turbo run test --filter=web", "turbo run test --filter=app"),
+        ("turbo run test --filter=web", "turbo run test --filter='app-*'"),
+        ("nx run-many -t test", "nx affected -t test"),
+    ],
+)
+def test_a_name_filter_that_changes_to_something_else_warns(
+    tmp_path: Path, base: str, cand: str
+) -> None:
+    assert script(tmp_path, base, cand) == "warn"
+
+
+@pytest.mark.parametrize(
+    ("base", "cand"),
+    [
+        ("turbo run test --filter=web", "turbo run test"),
+        ("turbo run test --filter=web", "turbo run test --filter=web --filter=api"),
+        ("turbo run test", "turbo run test lint"),
+        ("turbo run test --filter=web-app", "turbo run test --filter='web*'"),
+        ("turbo run build", "turbo run build --filter=web"),
+        ("turbo run test --filter=web", "turbo run test --filter=web --concurrency=2"),
+        ("turbo run test --filter='!docs'", "turbo run test"),
+        ("pnpm -r --filter web test", "pnpm -r test"),
+        ("pnpm --filter web test", "pnpm --filter 'web...' test"),
+        ("pnpm install", "pnpm install --filter web"),
+        ("nx run-many -t test -p web", "nx run-many -t test -p web api"),
+        ("nx run-many -t test -p web", "nx run-many -t test"),
+        ("nx run-many -t test --exclude=docs", "nx run-many -t test"),
+        ("nx run-many -t build", "nx run-many -t build --projects=web"),
+        ("lerna run test --scope web", "lerna run test"),
+        ("lerna run test --scope web", "lerna run test --scope web --scope api"),
+        (
+            "yarn workspaces foreach -A --include web run test",
+            "yarn workspaces foreach -A run test",
+        ),
+        (
+            "yarn workspaces foreach -A --exclude docs run test",
+            "yarn workspaces foreach -A run test",
+        ),
+    ],
+)
+def test_a_name_filter_that_keeps_or_widens_the_packages_is_honest(
+    tmp_path: Path, base: str, cand: str
+) -> None:
+    assert script(tmp_path, base, cand) == "pass"
+
+
+def test_a_filter_added_in_a_recipe_blocks_too(tmp_path: Path) -> None:
+    files = {"src/cart.js": "x\n", "tests/cart.test.js": "test('a', () => {})\n"}
+    assert recipe(tmp_path, "turbo run test", "turbo run test --filter=web", files) == "block"
+    assert recipe(tmp_path / "b", "turbo run test --filter=web", "turbo run test", files) == "pass"
+
+
+def test_the_package_filter_is_named_in_the_finding() -> None:
+    scope, _ = narrowed_scope(["turbo run test"], ["turbo run test --filter=web"])
+    assert scope is not None and "web" in scope
+    scope, _ = narrowed_scope(["nx run-many -t test"], ["nx run-many -t test --exclude=docs"])
+    assert scope is not None and "docs" in scope
+
+
+P = "commands = pytest {posargs:tests}"
+DASH = TOX.replace(P, "commands = - pytest {posargs:tests}")
+IGNORE = TOX.replace("deps = pytest\n", "deps = pytest\nignore_errors = true\n")
+REF = TOX.replace(P, "commands = {[base]run}") + "\n[base]\nrun = pytest {posargs:tests}\n"
+FACTOR = TOX.replace(P, "commands =\n    py312: pytest {posargs:tests}")
+ENVPY = TOX.replace(P, "commands = {envpython} -m pytest {posargs:tests}")
+TWO = TOX.replace(P, "commands =\n    pytest {posargs:tests}\n    ruff check .")
+RUN = '    session.run("pytest", "tests")\n'
+CODES = NOX.replace(RUN, '    session.run("pytest", "tests", success_codes=[0, 1, 5])\n')
+
+TOX_COMMAND_TAMPERS = [
+    ("tox.ini", TOX, DASH),
+    ("tox.ini", TOX, TOX.replace(P, "commands = -pytest {posargs:tests}")),
+    ("tox.ini", TOX, TOX.replace("ruff check .", "- ruff check .")),
+    ("tox.ini", FACTOR, FACTOR.replace("py312: pytest", "py312: - pytest")),
+    ("tox.ini", REF, REF.replace("run = pytest", "run = - pytest")),
+    ("tox.ini", TOX, TOX.replace(P, 'commands = python -c "print(1)"')),
+    ("tox.ini", TOX, TOX.replace(P, "commands =")),
+    ("tox.ini", TOX, TOX.replace("ruff check .", "echo skipped")),
+    ("tox.ini", TOX, IGNORE),
+    ("tox.ini", TOX, TOX.replace("deps = ruff\n", "deps = ruff\nignore_outcome = True\n")),
+    ("setup.cfg", SETUP, SETUP.replace("commands = pytest", "commands = - pytest")),
+    ("pyproject.toml", PYP, PYP.replace('[["pytest"', '[["-pytest"')),
+    (
+        "pyproject.toml",
+        PYP,
+        PYP.replace("[tool.tox.env_run_base]\n", "[tool.tox.env_run_base]\nignore_errors = true\n"),
+    ),
+    (
+        "tox.toml",
+        TOXTOML,
+        TOXTOML.replace('[["pytest", "{posargs:tests}"]]', '[["python", "-c", "x"]]'),
+    ),
+]
+TOX_COMMAND_HONEST = [
+    ("tox.ini", TOX, TOX.replace(P, "commands = python -m pytest {posargs:tests}")),
+    ("tox.ini", TOX, ENVPY),
+    ("tox.ini", ENVPY, ENVPY.replace("pytest {posargs", "pytest -q {posargs")),
+    ("tox.ini", TOX, TOX.replace(P, "commands = pytest -v {posargs:tests}")),
+    ("tox.ini", TOX, TOX.replace(P, "commands =\n    pytest {posargs:tests}\n    coverage report")),
+    ("tox.ini", DASH, DASH.replace("- pytest", "- pytest -v")),
+    ("tox.ini", DASH, TOX),
+    ("tox.ini", TOX, TOX.replace(P, 'commands =\n    pytest {posargs:tests}\n    - python -c "x"')),
+    ("tox.ini", IGNORE, TOX),
+    (
+        "tox.ini",
+        IGNORE,
+        IGNORE.replace("ignore_errors = true\n", "ignore_errors = true\nsetenv = A=1\n"),
+    ),
+    ("tox.ini", TOX, TOX.replace("deps = pytest\n", "deps = pytest\nignore_errors = false\n")),
+    (
+        "tox.ini",
+        TWO,
+        TWO.replace(
+            "    pytest {posargs:tests}\n    ruff check .",
+            "    ruff check .\n    pytest {posargs:tests}",
+        ),
+    ),
+    (
+        "tox.ini",
+        TOX,
+        TOX.replace("[testenv:lint]", "[flake8]\nmax-line-length = 100\n\n[testenv:lint]"),
+    ),
+]
+
+
+@pytest.mark.parametrize(("name", "base", "cand"), TOX_COMMAND_TAMPERS)
+def test_a_tox_command_that_no_longer_fails_the_run_or_no_longer_checks_blocks(
+    tmp_path: Path, name: str, base: str, cand: str
+) -> None:
+    assert config(tmp_path, name, base, cand) == "block"
+
+
+@pytest.mark.parametrize(("name", "base", "cand"), TOX_COMMAND_HONEST)
+def test_a_tox_command_edit_that_keeps_every_check_is_honest(
+    tmp_path: Path, name: str, base: str, cand: str
+) -> None:
+    assert config(tmp_path, name, base, cand) == "pass"
+
+
+def test_the_environment_the_run_names_is_the_one_whose_commands_are_read(tmp_path: Path) -> None:
+    assert config(tmp_path, "tox.ini", TOX, DASH, "tox -e py312") == "block"
+    dash_lint = TOX.replace("ruff check .", "- ruff check .")
+    assert config(tmp_path / "b", "tox.ini", TOX, dash_lint, "tox -e py312") == "pass"
+
+
+def test_a_cleanup_or_docs_command_may_go_on_whatever_it_exits_with(tmp_path: Path) -> None:
+    docs = (
+        TOX.replace("py312, lint", "py312, lint, docs")
+        + "\n[testenv:docs]\ncommands = sphinx-build\n"
+    )
+    assert (
+        config(tmp_path, "tox.ini", docs, docs.replace("= sphinx-build", "= - sphinx-build"))
+        == "pass"
+    )
+
+
+def test_the_tox_commands_are_read_for_tox_through_make(tmp_path: Path) -> None:
+    got = verdict_of(
+        tmp_path,
+        {**PYTESTS, "tox.ini": TOX, "Makefile": "test:\n\ttox\n"},
+        {"tox.ini": DASH},
+        {"test": "make test"},
+    )
+    assert got == "block"
+
+
+def test_a_test_moved_to_another_environment_is_honest(tmp_path: Path) -> None:
+    moved = (
+        "[tox]\nenvlist = unit, lint\n\n[testenv]\ndeps = pytest\n\n[testenv:unit]\n"
+        "commands = pytest {posargs:tests}\n\n[testenv:lint]\ndeps = ruff\n"
+        "commands = ruff check .\n"
+    )
+    assert config(tmp_path, "tox.ini", TOX, moved) == "pass"
+
+
+NOX_COMMAND_TAMPERS = [
+    NOX.replace(RUN, "    pass\n"),
+    NOX.replace(RUN, '    session.run("python", "-c", "pass")\n'),
+    CODES,
+    NOX.replace(RUN, '    session.run("pytest", "tests", success_codes=range(10))\n'),
+    NOX.replace(
+        RUN,
+        '    try:\n        session.run("pytest", "tests")\n    except Exception:\n        pass\n',
+    ),
+    NOX.replace('    session.run("ruff", "check", ".")\n', "    session.log('later')\n"),
+]
+NOX_COMMAND_HONEST = [
+    (NOX, NOX.replace(RUN, '    session.run("pytest", "tests", env={"A": "1"})\n')),
+    (NOX, NOX.replace(RUN, '    session.run("python", "-m", "pytest", "tests")\n')),
+    (NOX, NOX.replace(RUN, '    session.run("pytest", "tests", success_codes=[0])\n')),
+    (CODES, CODES.replace("success_codes=[0, 1, 5])", "success_codes=[0, 1, 5], silent=True)")),
+    (CODES, NOX),
+    (
+        NOX,
+        NOX.replace(
+            RUN,
+            '    try:\n        session.run("pytest", "tests")\n'
+            "    except Exception:\n        raise\n",
+        ),
+    ),
+    (
+        NOX,
+        NOX.replace(
+            RUN,
+            '    try:\n        session.run("pytest", "tests")\n    finally:\n'
+            '        session.run("coverage", "report", success_codes=[0, 2])\n',
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize("cand", NOX_COMMAND_TAMPERS)
+def test_a_nox_run_that_is_gone_or_accepts_more_exit_codes_blocks(
+    tmp_path: Path, cand: str
+) -> None:
+    assert config(tmp_path, "noxfile.py", NOX, cand, "nox") == "block"
+
+
+@pytest.mark.parametrize(("base", "cand"), NOX_COMMAND_HONEST)
+def test_a_nox_edit_that_keeps_every_run_and_exit_code_is_honest(
+    tmp_path: Path, base: str, cand: str
+) -> None:
+    assert config(tmp_path, "noxfile.py", base, cand, "nox") == "pass"
+
+
+def test_a_workflow_step_that_runs_tox_or_nox_has_its_commands_judged(tmp_path: Path) -> None:
+    assert ci(tmp_path, "tox.ini", TOX, DASH, "tox") == "block"
+    assert ci(tmp_path / "a", "tox.ini", TOX, IGNORE, "tox") == "block"
+    assert ci(tmp_path / "b", "noxfile.py", NOX, CODES, "nox") == "block"
+    assert (
+        ci(tmp_path / "c", "noxfile.py", NOX, NOX.replace(RUN, "    pass\n"), "nox -s tests")
+        == "block"
+    )
+    assert (
+        ci(
+            tmp_path / "d",
+            "tox.ini",
+            TOX,
+            TOX.replace(P, "commands = python -m pytest {posargs:tests}"),
+            "tox",
+        )
+        == "pass"
+    )
+    assert ci(tmp_path / "e", "tox.ini", TOX, DASH, "pytest") == "pass"
+
+
+def test_commands_too_many_to_read_warn_instead_of_passing(tmp_path: Path) -> None:
+    def many(first: str) -> str:
+        envs = "\n".join(
+            f"[testenv:e{i}]\ncommands =\n" + "".join(f"    echo {k}\n" for k in range(150))
+            for i in range(200)
+        )
+        names = ", ".join(f"e{i}" for i in range(200))
+        return f"[tox]\nenvlist = {names}\n\n[testenv:e0]\ncommands = {first}\n\n{envs}"
+
+    assert config(tmp_path, "tox.ini", many("pytest"), many("- pytest")) == "warn"
+    sessions = "".join(f"    session.run('x', '{k}')\n" for k in range(60_000))
+    big = f"import nox\n\n@nox.session\ndef tests(session):\n    session.run('pytest')\n{sessions}"
+    assert (
+        config(
+            tmp_path / "n",
+            "noxfile.py",
+            big,
+            big.replace("run('pytest')", "run('pytest', success_codes=[0, 1])"),
+            "nox",
+        )
+        == "warn"
+    )
+
+
 # ---- S7: every reader is linear in its input -----------------------------------------------
 
 
@@ -540,3 +851,45 @@ def test_the_nox_reader_is_linear() -> None:
         toxnox.judge(old, new, ["nox"])
 
     assert_linear(make, run)
+
+
+def test_the_name_filter_reader_is_linear() -> None:
+    assert_linear(
+        lambda n: [f"turbo run test --filter=pkg{i} --filter='!x{i}'" for i in range(n)],
+        lambda cmds: narrowed_scope(cmds, cmds[::-1]),
+    )
+    assert_linear(
+        lambda n: [
+            f"nx run-many -t test -p {' '.join(f'a{i}_{k}' for k in range(8))}" for i in range(n)
+        ],
+        lambda cmds: narrowed_scope(cmds, [c + " --exclude=z" for c in cmds]),
+    )
+
+
+def test_the_tox_commands_reader_is_linear() -> None:
+    def make(n: int) -> str:
+        lines = "".join(f"    {'- ' if i % 7 == 0 else ''}pytest t{i}\n" for i in range(n))
+        return f"[tox]\nenvlist = a, b\n\n[testenv]\ncommands =\n{lines}"
+
+    def run(text: str) -> None:
+        old = toxnox.read_defaults("tox.ini", text)
+        new = toxnox.read_defaults("tox.ini", text.replace("t1\n", "t1 -q\n"))
+        toxnox.judge(old, new, ["tox"])
+
+    assert_linear(make, run, sizes=(1000, 4000))
+
+
+def test_the_nox_commands_reader_is_linear() -> None:
+    def make(n: int) -> str:
+        runs = "".join(
+            f"    try:\n        session.run('pytest', 't{i}')\n    except OSError:\n        pass\n"
+            for i in range(n)
+        )
+        return f"import nox\n\n@nox.session\ndef tests(session):\n{runs}"
+
+    def run(text: str) -> None:
+        old = toxnox.read_defaults("noxfile.py", text)
+        new = toxnox.read_defaults("noxfile.py", text.replace("t1'", "u1'"))
+        toxnox.judge(old, new, ["nox"])
+
+    assert_linear(make, run, sizes=(500, 2000))

@@ -22,7 +22,11 @@ def case(name, base, cand, delete=()):
             "lang": kind,
             "base": name,
             "edits": [(path, "WRITE", text) for path, text in cand.items()],
-            "expect": "pass" if name.startswith("HONEST-") else f"block {where}",
+            "expect": "pass"
+            if name.startswith("HONEST-")
+            else "warn"
+            if name.startswith("WARN-")
+            else f"block {where}",
             **ST,
         }
     )
@@ -178,7 +182,6 @@ pkg_case("TAMPER-sel-vitest-related-sub", "vitest run", "vitest related src/cart
 pkg_case("TAMPER-sel-vitest-project", "vitest run", "vitest run --project unit")
 pkg_case("HONEST-sel-vitest-coverage", "vitest", "vitest run --coverage --reporter=verbose")
 # ---- monorepo changed-only
-pkg_case("TAMPER-sel-nx-affected", "nx run-many -t test", "nx affected -t test")
 pkg_case("TAMPER-sel-turbo-affected", "turbo run test", "turbo run test --affected")
 pkg_case(
     "TAMPER-sel-turbo-filter-ref", "turbo run test", "turbo run test --filter=...[origin/main]"
@@ -488,4 +491,350 @@ ci_case(
         + '\n\n@nox.session\ndef docs(session):\n    session.run("sphinx-build", "docs", "out")\n'
     },
     "nox",
+)
+# ---- S1 follow-up: tox/nox commands, monorepo name filters
+P = "commands = pytest {posargs:tests}"
+
+
+def R(base, old, new):
+    assert old in base, old
+    return base.replace(old, new)
+
+
+def TX(new, base=TOX):
+    return R(base, P, new)
+
+
+DASH = TX("commands = - pytest {posargs:tests}")
+tox_case("TAMPER-sel-tox-commands-dash", DASH)
+tox_case("TAMPER-sel-tox-commands-dash-nospace", TX("commands = -pytest {posargs:tests}"))
+tox_case(
+    "TAMPER-sel-tox-commands-dash-lint",
+    R(TOX, "commands = ruff check .", "commands = - ruff check ."),
+)
+FAC = TX("commands =\n    py312: pytest {posargs:tests}")
+tox_case(
+    "TAMPER-sel-tox-commands-dash-factor", R(FAC, "py312: pytest", "py312: - pytest"), base=FAC
+)
+tox_case("TAMPER-sel-tox-commands-dash-explicit-env", DASH, policy="tox -e py312")
+REF = TX("commands = {[base]run}") + "\n[base]\nrun = pytest {posargs:tests}\n"
+tox_case("TAMPER-sel-tox-commands-dash-via-ref", R(REF, "run = pytest", "run = - pytest"), base=REF)
+tox_case("TAMPER-sel-tox-commands-replaced", TX('commands = python -c "print(1)"'))
+tox_case("TAMPER-sel-tox-commands-emptied", TX("commands ="))
+tox_case(
+    "TAMPER-sel-tox-commands-echo", R(TOX, "commands = ruff check .", "commands = echo skipped")
+)
+tox_case(
+    "TAMPER-sel-tox-ignore-errors",
+    R(TOX, "deps = pytest\n", "deps = pytest\nignore_errors = true\n"),
+)
+tox_case(
+    "TAMPER-sel-tox-ignore-outcome-env",
+    R(TOX, "deps = ruff\n", "deps = ruff\nignore_outcome = True\n"),
+)
+tox_case(
+    "TAMPER-sel-tox-commands-dash-setupcfg",
+    {"setup.cfg": R(SETUP, "commands = pytest", "commands = - pytest")},
+    base={"setup.cfg": SETUP},
+)
+tox_case(
+    "TAMPER-sel-tox-commands-dash-pyproject",
+    {"pyproject.toml": R(PYP, '[["pytest"', '[["-pytest"')},
+    base={"pyproject.toml": PYP},
+)
+tox_case(
+    "TAMPER-sel-tox-ignore-errors-pyproject",
+    {
+        "pyproject.toml": R(
+            PYP, "[tool.tox.env_run_base]\n", "[tool.tox.env_run_base]\nignore_errors = true\n"
+        )
+    },
+    base={"pyproject.toml": PYP},
+)
+tox_case(
+    "TAMPER-sel-tox-commands-replaced-toxtoml",
+    {"tox.toml": R(TOXTOML, '[["pytest", "{posargs:tests}"]]', '[["python", "-c", "pass"]]')},
+    base={"tox.toml": TOXTOML},
+)
+tox_case(
+    "TAMPER-sel-tox-commands-dash-via-make",
+    DASH,
+    policy="make test",
+    extra={"Makefile": "test:\n\ttox\n"},
+)
+tox_case("HONEST-sel-tox-commands-python-m", TX("commands = python -m pytest {posargs:tests}"))
+ENVPY = TX("commands = {envpython} -m pytest {posargs:tests}")
+tox_case("HONEST-sel-tox-commands-envpython", ENVPY)
+tox_case(
+    "HONEST-sel-tox-commands-envpython-both",
+    R(ENVPY, "pytest {posargs:tests}", "pytest -q {posargs:tests}"),
+    base=ENVPY,
+)
+tox_case("HONEST-sel-tox-commands-flag-added", TX("commands = pytest -v {posargs:tests}"))
+tox_case(
+    "HONEST-sel-tox-commands-line-added",
+    TX("commands =\n    pytest {posargs:tests}\n    coverage report"),
+)
+tox_case("HONEST-sel-tox-commands-dash-kept", R(DASH, "- pytest", "- pytest -v"), base=DASH)
+tox_case("HONEST-sel-tox-commands-dash-removed", TOX, base=DASH)
+tox_case(
+    "HONEST-sel-tox-commands-dash-on-cleanup",
+    TX('commands =\n    pytest {posargs:tests}\n    - python -c "print(1)"'),
+)
+IGN = R(TOX, "deps = pytest\n", "deps = pytest\nignore_errors = true\n")
+tox_case("HONEST-sel-tox-ignore-errors-removed", TOX, base=IGN)
+tox_case(
+    "HONEST-sel-tox-ignore-errors-kept",
+    R(IGN, "ignore_errors = true\n", "ignore_errors = true\nsetenv = A=1\n"),
+    base=IGN,
+)
+tox_case(
+    "HONEST-sel-tox-ignore-errors-false",
+    R(TOX, "deps = pytest\n", "deps = pytest\nignore_errors = false\n"),
+)
+TWO = TX("commands =\n    pytest {posargs:tests}\n    ruff check .")
+tox_case(
+    "HONEST-sel-tox-commands-reordered",
+    TX("commands =\n    ruff check .\n    pytest {posargs:tests}"),
+    base=TWO,
+)
+MOVED = "[tox]\nenvlist = unit, lint\n\n[testenv]\ndeps = pytest\n\n[testenv:unit]\ncommands = pytest {posargs:tests}\n\n[testenv:lint]\ndeps = ruff\ncommands = ruff check .\n"
+tox_case("HONEST-sel-tox-commands-test-moved", MOVED)
+DOCS0 = (
+    R(TOX, "py312, lint", "py312, lint, docs")
+    + "\n[testenv:docs]\ncommands = sphinx-build docs out\n"
+)
+tox_case(
+    "HONEST-sel-tox-commands-docs-env-dash",
+    R(DOCS0, "commands = sphinx-build", "commands = - sphinx-build"),
+    base=DOCS0,
+)
+tox_case(
+    "HONEST-sel-tox-commands-dash-in-other-env",
+    R(TOX, "commands = ruff check .", "commands = - ruff check ."),
+    policy="tox -e py312",
+)
+tox_case(
+    "HONEST-sel-tox-commands-explicit-env-reworded",
+    TX("commands = pytest -ra {posargs:tests}"),
+    policy="tox -e py312",
+)
+tox_case(
+    "HONEST-sel-tox-commands-unrelated-section",
+    R(TOX, "[testenv:lint]", "[flake8]\nmax-line-length = 100\n\n[testenv:lint]"),
+)
+ci_case("TAMPER-ci-sel-tox-commands-dash", {"tox.ini": TOX}, {"tox.ini": DASH}, "tox")
+ci_case(
+    "TAMPER-ci-sel-tox-commands-replaced",
+    {"tox.ini": TOX},
+    {"tox.ini": TX('commands = python -c "print(1)"')},
+    "tox -e py312",
+)
+ci_case("TAMPER-ci-sel-tox-ignore-errors", {"tox.ini": TOX}, {"tox.ini": IGN}, "tox")
+ci_case(
+    "HONEST-ci-sel-tox-commands-python-m",
+    {"tox.ini": TOX},
+    {"tox.ini": TX("commands = python -m pytest {posargs:tests}")},
+    "tox",
+)
+# nox
+RUN = '    session.run("pytest", "tests")\n'
+
+
+def NX(new, base=NOX):
+    return R(base, RUN, new)
+
+
+nox_case("TAMPER-sel-nox-run-dropped", NX("    pass\n"))
+nox_case("TAMPER-sel-nox-run-replaced", NX('    session.run("python", "-c", "pass")\n'))
+nox_case(
+    "TAMPER-sel-nox-success-codes",
+    NX('    session.run("pytest", "tests", success_codes=[0, 1, 5])\n'),
+)
+nox_case(
+    "TAMPER-sel-nox-success-codes-range",
+    NX('    session.run("pytest", "tests", success_codes=range(10))\n'),
+)
+nox_case(
+    "TAMPER-sel-nox-try-except-pass",
+    NX('    try:\n        session.run("pytest", "tests")\n    except Exception:\n        pass\n'),
+)
+nox_case(
+    "TAMPER-sel-nox-lint-run-dropped",
+    R(NOX, '    session.run("ruff", "check", ".")\n', "    session.log('later')\n"),
+)
+nox_case("TAMPER-sel-nox-explicit-session-run-dropped", NX("    pass\n"), policy="nox -s tests")
+nox_case("HONEST-sel-nox-run-env-kw", NX('    session.run("pytest", "tests", env={"A": "1"})\n'))
+nox_case("HONEST-sel-nox-run-python-m", NX('    session.run("python", "-m", "pytest", "tests")\n'))
+nox_case(
+    "HONEST-sel-nox-success-codes-default",
+    NX('    session.run("pytest", "tests", success_codes=[0])\n'),
+)
+SC = NX('    session.run("pytest", "tests", success_codes=[0, 1, 5])\n')
+nox_case(
+    "HONEST-sel-nox-success-codes-kept",
+    R(SC, "success_codes=[0, 1, 5])", "success_codes=[0, 1, 5], silent=True)"),
+    base=SC,
+)
+nox_case("HONEST-sel-nox-success-codes-removed", NOX, base=SC)
+nox_case(
+    "HONEST-sel-nox-try-reraise",
+    NX(
+        '    try:\n        session.run("pytest", "tests")\n    except Exception:\n        session.log("failed")\n        raise\n'
+    ),
+)
+nox_case(
+    "HONEST-sel-nox-try-finally",
+    NX(
+        '    try:\n        session.run("pytest", "tests")\n    finally:\n        session.run("coverage", "report", success_codes=[0, 2])\n'
+    ),
+)
+DOCSN0 = (
+    R(NOX, '["tests", "lint"]', '["tests", "lint", "docs"]')
+    + '\n\n@nox.session\ndef docs(session):\n    session.run("sphinx-build", "docs", "out")\n'
+)
+nox_case(
+    "HONEST-sel-nox-docs-session-success-codes",
+    R(DOCSN0, '"docs", "out")', '"docs", "out", success_codes=[0, 1])'),
+    base=DOCSN0,
+)
+ci_case(
+    "TAMPER-ci-sel-nox-success-codes",
+    {"noxfile.py": NOX},
+    {"noxfile.py": NX('    session.run("pytest", "tests", success_codes=[0, 1])\n')},
+    "nox",
+)
+ci_case(
+    "TAMPER-ci-sel-nox-run-dropped",
+    {"noxfile.py": NOX},
+    {"noxfile.py": NX("    pass\n")},
+    "nox -s tests",
+)
+ci_case(
+    "HONEST-ci-sel-nox-run-env-kw",
+    {"noxfile.py": NOX},
+    {"noxfile.py": NX('    session.run("pytest", "tests", env={"A": "1"})\n')},
+    "nox",
+)
+# monorepo name filters
+for name, b, c in [
+    ("TAMPER-sel-turbo-filter-added", "turbo run test", "turbo run test --filter=web"),
+    ("TAMPER-sel-turbo-filter-short", "turbo run test", "turbo run test -F web"),
+    ("TAMPER-sel-turbo-filter-excluded", "turbo run test", "turbo run test --filter='!docs'"),
+    (
+        "TAMPER-sel-turbo-filter-list-narrowed",
+        "turbo run test --filter=web --filter=api",
+        "turbo run test --filter=web",
+    ),
+    (
+        "TAMPER-sel-turbo-filter-glob-to-name",
+        "turbo run test --filter=web*",
+        "turbo run test --filter=web-app",
+    ),
+    ("TAMPER-sel-pnpm-filter-added", "pnpm -r test", "pnpm -r --filter web test"),
+    ("TAMPER-sel-pnpm-filter-F-added", "pnpm -r run test", "pnpm -r -F web run test"),
+    (
+        "TAMPER-sel-pnpm-filter-dependents-dropped",
+        "pnpm --filter 'web...' test",
+        "pnpm --filter web test",
+    ),
+    ("TAMPER-sel-pnpm-filter-negated", "pnpm -r test", "pnpm -r --filter '!docs' test"),
+    ("TAMPER-sel-nx-projects-added", "nx run-many -t test", "nx run-many -t test --projects=web"),
+    ("TAMPER-sel-nx-projects-short", "nx run-many -t test", "nx run-many -t test -p web api"),
+    (
+        "TAMPER-sel-nx-projects-name-removed",
+        "nx run-many -t test -p web api docs",
+        "nx run-many -t test -p web api",
+    ),
+    ("TAMPER-sel-nx-exclude-added", "nx run-many -t test", "nx run-many -t test --exclude=docs"),
+    (
+        "TAMPER-sel-nx-exclude-grown",
+        "nx run-many -t test --exclude=docs",
+        "nx run-many -t test --exclude=docs,api",
+    ),
+    ("TAMPER-sel-lerna-scope-added", "lerna run test", "lerna run test --scope web"),
+    ("TAMPER-sel-lerna-ignore-added", "lerna run test", "lerna run test --ignore docs"),
+    (
+        "TAMPER-sel-yarn-include-added",
+        "yarn workspaces foreach -A run test",
+        "yarn workspaces foreach -A --include web run test",
+    ),
+    (
+        "TAMPER-sel-yarn-exclude-added",
+        "yarn workspaces foreach -A run test",
+        "yarn workspaces foreach -A --exclude docs run test",
+    ),
+    ("WARN-sel-turbo-filter-renamed", "turbo run test --filter=web", "turbo run test --filter=app"),
+    (
+        "WARN-sel-turbo-filter-to-glob",
+        "turbo run test --filter=web",
+        "turbo run test --filter='app-*'",
+    ),
+    ("WARN-sel-nx-run-many-to-affected", "nx run-many -t test", "nx affected -t test"),
+    ("HONEST-sel-turbo-filter-removed", "turbo run test --filter=web", "turbo run test"),
+    (
+        "HONEST-sel-turbo-filter-name-added",
+        "turbo run test --filter=web",
+        "turbo run test --filter=web --filter=api",
+    ),
+    ("HONEST-sel-turbo-test-and-lint", "turbo run test", "turbo run test lint"),
+    (
+        "HONEST-sel-turbo-filter-glob-wider",
+        "turbo run test --filter=web-app",
+        "turbo run test --filter='web*'",
+    ),
+    ("HONEST-sel-turbo-filter-build-only", "turbo run build", "turbo run build --filter=web"),
+    (
+        "HONEST-sel-turbo-filter-kept",
+        "turbo run test --filter=web",
+        "turbo run test --filter=web --concurrency=2",
+    ),
+    (
+        "HONEST-sel-turbo-filter-exclusion-removed",
+        "turbo run test --filter='!docs'",
+        "turbo run test",
+    ),
+    ("HONEST-sel-pnpm-filter-removed", "pnpm -r --filter web test", "pnpm -r test"),
+    (
+        "HONEST-sel-pnpm-filter-dependents-added",
+        "pnpm --filter web test",
+        "pnpm --filter 'web...' test",
+    ),
+    ("HONEST-sel-pnpm-install-filter", "pnpm install", "pnpm install --filter web"),
+    (
+        "HONEST-sel-nx-projects-name-added",
+        "nx run-many -t test -p web",
+        "nx run-many -t test -p web api",
+    ),
+    ("HONEST-sel-nx-projects-removed", "nx run-many -t test -p web", "nx run-many -t test"),
+    ("HONEST-sel-nx-exclude-removed", "nx run-many -t test --exclude=docs", "nx run-many -t test"),
+    ("HONEST-sel-nx-run-many-build", "nx run-many -t build", "nx run-many -t build --projects=web"),
+    ("HONEST-sel-lerna-scope-removed", "lerna run test --scope web", "lerna run test"),
+    (
+        "HONEST-sel-lerna-scope-name-added",
+        "lerna run test --scope web",
+        "lerna run test --scope web --scope api",
+    ),
+    (
+        "HONEST-sel-yarn-include-removed",
+        "yarn workspaces foreach -A --include web run test",
+        "yarn workspaces foreach -A run test",
+    ),
+    (
+        "HONEST-sel-yarn-exclude-removed",
+        "yarn workspaces foreach -A --exclude docs run test",
+        "yarn workspaces foreach -A run test",
+    ),
+]:
+    pkg_case(name, b, c)
+make_case("TAMPER-sel-turbo-filter-added-make", JS, "turbo run test", "turbo run test --filter=web")
+make_case("TAMPER-sel-pnpm-filter-added-make", JS, "pnpm -r test", "pnpm -r --filter web test")
+make_case(
+    "TAMPER-sel-nx-projects-added-make",
+    JS,
+    "nx run-many -t test",
+    "nx run-many -t test --projects=web",
+)
+make_case(
+    "HONEST-sel-turbo-filter-removed-make", JS, "turbo run test --filter=web", "turbo run test"
 )
