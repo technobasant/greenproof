@@ -357,3 +357,202 @@ def test_branches_ignore_on_push_with_an_open_pull_request_is_honest(tmp_path: P
 def test_branches_ignore_on_push_without_pull_request_blocks(tmp_path: Path) -> None:
     on = "on:\n  push:\n    branches-ignore: [gh-pages]\n"
     assert verdict(with_if(tmp_path, on)) == "block"
+
+
+@pytest.mark.parametrize(
+    "pattern", ["'**'", "'*'", "main", "master", "'ma*'", "'m*r'", "[dev, main]"]
+)
+def test_branches_ignore_that_takes_the_default_branch_off_push_warns(
+    tmp_path: Path, pattern: str
+) -> None:
+    pattern = pattern if pattern.startswith("[") else f"[{pattern}]"
+    on = f"on:\n  push:\n    branches-ignore: {pattern}\n  pull_request:\n"
+    found = with_if(tmp_path, on)
+    assert verdict(found) == "warn", pattern
+    assert any("branches-ignore" in m for m in messages(found, "warn"))
+
+
+@pytest.mark.parametrize("pattern", ["gh-pages", "'dependabot/**'", "'release-*'", "'*/main'"])
+def test_branches_ignore_that_leaves_the_default_branch_alone_is_honest(
+    tmp_path: Path, pattern: str
+) -> None:
+    on = f"on:\n  push:\n    branches-ignore: [{pattern}]\n  pull_request:\n"
+    assert verdict(with_if(tmp_path, on)) == "pass", pattern
+
+
+@pytest.mark.parametrize("pattern", ["'release/**'", "nope", "'v*'", "[a, b]"])
+def test_a_push_branches_filter_that_selects_neither_main_nor_master_warns(
+    tmp_path: Path, pattern: str
+) -> None:
+    pattern = pattern if pattern.startswith("[") else f"[{pattern}]"
+    on = f"on:\n  push:\n    branches: {pattern}\n  pull_request:\n"
+    found = with_if(tmp_path, on)
+    assert verdict(found) == "warn", pattern
+    assert any("default branch" in m for m in messages(found, "warn")), pattern
+
+
+@pytest.mark.parametrize("pattern", ["[main]", "[master]", "['**']", "['ma*']", "[dev, main]"])
+def test_a_push_branches_filter_that_keeps_main_or_master_is_honest(
+    tmp_path: Path, pattern: str
+) -> None:
+    on = f"on:\n  push:\n    branches: {pattern}\n  pull_request:\n"
+    assert verdict(with_if(tmp_path, on)) == "pass", pattern
+
+
+@pytest.mark.parametrize("pattern", ["'release/**'", "main"])
+def test_a_push_branches_filter_without_an_open_pull_request_is_judged_as_before(
+    tmp_path: Path, pattern: str
+) -> None:
+    on = f"on:\n  push:\n    branches: [{pattern}]\n"
+    found = with_if(tmp_path, on, base_on="on:\n  push:\n")
+    assert verdict(found) == "warn", pattern
+    assert any("fewer runs may test it" in m for m in messages(found, "warn")), pattern
+
+
+def test_branch_globs_follow_github_semantics_and_stay_linear() -> None:
+    from greenproof.rules.ci import _branch_matches as matches
+
+    assert matches("**", "main") and matches("*", "main") and matches("ma*", "master")
+    assert matches("**", "a/b") and not matches("*", "a/b") and not matches("a/*", "a/b/c")
+    assert matches("m[a-b]in", "main") and not matches("m[!a]in", "main")
+    assert matches("mai?n", "man") and matches("ma+in", "maaain")
+    assert not matches("release/**", "main") and not matches("dependabot/**", "main")
+    assert not matches("*" * 60 + "x", "m" * 5000)
+
+
+# ---- 9. a status saved on its own line must reach the exit -------------------------------------
+
+BARE = "#!/bin/bash\n"
+
+
+def judge_bare(tmp_path: Path, body: str) -> str:
+    """The verdict on `ci.sh` going from a plain `pytest` (no `set -e`) to `body`."""
+    base = {**PYTEST_CI, CI: BARE + "pytest\n"}
+    return verdict(scene(fresh(tmp_path), base, {CI: BARE + body}))
+
+
+SAVED_AND_LOST = {
+    "exit0": "pytest\nrc=$?\nexit 0\n",
+    "semi": "pytest; rc=$?\nexit 0\n",
+    "or-save": "pytest || rc=$?\nexit 0\n",
+    "echo-exit0": 'pytest\nrc=$?\necho "tests: $rc"\nexit 0\n',
+    "or-echo-exit0": 'pytest\nrc=$?\n[ "$rc" -eq 0 ] || echo failed\nexit 0\n',
+    "bare-exit": "pytest\nrc=$?\nexit\n",
+    "true-last": "pytest\nrc=$?\ntrue\n",
+    "echo-last": "pytest\nrc=$?\necho done\n",
+    "status": "pytest\nstatus=$?\necho done\n",
+    "ret": "pytest\nret=$?\nexit 0\n",
+    "code": "pytest\ncode=$?\necho done\n",
+    "local": "run() {\n  pytest\n  local rc=$?\n  echo done\n}\nrun\n",
+    "reassigned": 'pytest\nrc=$?\nrc=0\nexit "$rc"\n',
+    "other": "pytest\nrc=$?\nother=1\nexit $other\n",
+    "trap": "trap 'exit 0' EXIT\npytest\nrc=$?\nexit $rc\n",
+    "if-echo": 'pytest\nrc=$?\nif [ "$rc" -ne 0 ]; then\n  echo failed\nfi\n',
+    "if-exit0": 'pytest\nrc=$?\nif [ "$rc" -ne 0 ]; then\n  exit 0\nfi\n',
+    "test-inverted-last": "pytest\nrc=$?\n[ $rc -ne 0 ]\n",
+    "test-then-echo": "pytest\nrc=$?\ntest $rc -eq 0\necho done\n",
+    "return-then-echo": "run() {\n  pytest\n  rc=$?\n  return $rc\n}\nrun\necho done\n",
+    "and-echo-then": 'pytest\nrc=$?\n[ "$rc" -eq 0 ] && echo ok\necho done\n',
+}
+SAVED_AND_KEPT = {
+    "exit-rc": "pytest\nrc=$?\nexit $rc\n",
+    "exit-quoted": 'pytest\nrc=$?\nexit "$rc"\n',
+    "semi-exit": "pytest; rc=$?\nexit $rc\n",
+    "or-exit": "pytest\nrc=$?\n[ $rc -eq 0 ] || exit $rc\n",
+    "if-exit1": "pytest\nrc=$?\nif [ $rc -ne 0 ]; then exit 1; fi\n",
+    "and-exit": "pytest\nrc=$?\n[ $rc -ne 0 ] && exit 1\necho ok\n",
+    "cleanup": 'pytest\nstatus=$?\necho cleaning\nexit "$status"\n',
+    "or-save-exit": "pytest || rc=$?\nexit ${rc:-0}\n",
+    "plain": "set -e\npytest\n",
+    "test-last": "pytest -q\nrc=$?\ntest $rc -eq 0\n",
+    "bracket-last": 'pytest\nrc=$?\n[ "$rc" = 0 ]\n',
+    "dparen-last": "pytest\nrc=$?\n(( rc == 0 ))\n",
+    "and-echo-last": 'pytest\nrc=$?\n[ "$rc" -eq 0 ] && echo ok\n',
+    "return-last": "run() {\n  pytest\n  rc=$?\n  return $rc\n}\nrun\n",
+}
+
+
+@pytest.mark.parametrize("body", SAVED_AND_LOST.values(), ids=SAVED_AND_LOST)
+def test_a_status_saved_on_its_own_line_and_never_exited_with_blocks(
+    tmp_path: Path, body: str
+) -> None:
+    assert judge_bare(tmp_path, body) == "block"
+
+
+@pytest.mark.parametrize("body", SAVED_AND_KEPT.values(), ids=SAVED_AND_KEPT)
+def test_a_status_saved_on_its_own_line_and_exited_with_is_honest(
+    tmp_path: Path, body: str
+) -> None:
+    assert judge_bare(tmp_path, body) == "pass"
+
+
+def test_a_saved_status_is_a_swallow_in_the_reader() -> None:
+    assert "or" in kinds("pytest\nrc=$?\nexit 0\n", strict_status=True)
+    assert kinds("pytest\nrc=$?\nexit $rc\n", strict_status=True) == []
+
+
+# ---- 10. nesting is read to a bound ------------------------------------------------------------
+
+DEEP = 3000
+
+
+def test_an_if_wrapped_in_thousands_of_parentheses_is_unknown_not_a_crash() -> None:
+    from greenproof.rules.ci import _if_on
+
+    assert _if_on("(" * DEEP + "github.event_name == 'push'" + ")" * DEEP, "pull_request") is None
+    assert _if_on("(" * 20 + "github.event_name == 'push'" + ")" * 20, "pull_request") is False
+    assert _if_on("(" * 20 + "github.event_name == 'push'" + ")" * 20, "push") is True
+
+
+OPENERS = [("{ cd . && ", "; }"), ("( cd . && ", " )")]
+
+
+def nest(opener: str, closer: str, inner: str, depth: int = DEEP) -> str:
+    return opener * depth + inner + closer * depth
+
+
+@pytest.mark.parametrize(("opener", "closer"), OPENERS, ids=["braces", "subshell"])
+def test_thousands_of_nested_groups_are_walked_to_a_bound(opener: str, closer: str) -> None:
+    from greenproof.rules.ci import _leaves
+
+    leaves = list(_leaves(nest(opener, closer, "pytest"), {}))
+    assert leaves
+    assert leaves[0][0].count("pytest") == 1  # the nest past the bound is one leaf, kept whole
+
+
+@pytest.mark.parametrize(("opener", "closer"), OPENERS, ids=["braces", "subshell"])
+def test_a_check_inside_thousands_of_nested_groups_is_still_a_check(
+    opener: str, closer: str
+) -> None:
+    from greenproof.rules.shell import check_kind, is_non_check
+
+    deep = nest(opener, closer, "pytest")
+    assert check_kind(deep) is not None
+    assert not is_non_check(deep)
+    assert check_kind(nest(opener, closer, "echo x")) is None
+    assert check_kind(nest(opener, closer, "pytest", 8)) is not None  # within the bound: read
+    assert is_non_check(nest(opener, closer, "echo x", 8))
+
+
+def test_a_swallow_at_the_top_of_a_script_with_a_deep_nest_is_still_found() -> None:
+    script = "pytest || true\n" + nest("{ cd . && ", "; }", "echo x") + "\n"
+    assert "or" in kinds(script)
+
+
+def test_a_few_hundred_nested_groups_are_read_through(tmp_path: Path) -> None:
+    body = SET_E + nest("{ cd . && ", "; }", "echo x", 400) + "\npytest\n"
+    found = scene(fresh(tmp_path), {**PYTEST_CI, CI: SET_E + "pytest\n"}, {CI: body})
+    assert verdict(found) == "pass", messages(found)
+
+
+def test_nested_groups_past_what_can_be_read_block_instead_of_crashing(tmp_path: Path) -> None:
+    body = SET_E + nest("{ cd . && ", "; }", "echo x", 700) + "\npytest\n"
+    found = scene(fresh(tmp_path), {**PYTEST_CI, CI: SET_E + "pytest\n"}, {CI: body})
+    assert verdict(found) == "block"
+    assert "nested more than" in " ".join(messages(found))
+
+
+def test_thousands_of_saved_statuses_are_read_in_one_pass() -> None:
+    saves = "".join(f"echo {n}; rc{n}=$?\n" for n in range(3000))
+    assert kinds("pytest; rc=$?\n" + saves + "exit $rc\n", strict_status=True) == []
+    assert "or" in kinds("pytest; rc=$?\n" + saves + "exit 0\n", strict_status=True)

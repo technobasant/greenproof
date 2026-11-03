@@ -13,8 +13,8 @@ import posixpath
 import re
 import shlex
 from bisect import bisect_left
-from collections import ChainMap, Counter
-from collections.abc import Callable, Collection, Iterator, Mapping, MutableMapping, Sequence
+from collections import ChainMap, Counter, deque
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from typing import Any, NamedTuple
@@ -22,22 +22,27 @@ from typing import Any, NamedTuple
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import Finding
 from greenproof.rules import runner_config as rc
+from greenproof.rules import toxnox
 from greenproof.rules._common import finding, split_lines, warn_finding
 from greenproof.rules.collect import DEFAULT_CLASSES, DEFAULT_FILES, DEFAULT_FUNCTIONS
 from greenproof.rules.shell import (
+    FLAG_ALIASES,
     NEXTEST,
     NOOP_FLAGS,
     SELECT_FLAGS,
     Swallow,
     TestFiles,
     _group_inner,
+    _invocations,
     _top_level,
     check_kind,
     command_env,
     command_tokens,
+    covered_test_files,
     early_exit,
     find_swallows,
     is_non_check,
+    narrowed_scope,
     narrowed_selection,
     scripts_in,
     selection_flags,
@@ -70,6 +75,7 @@ _TOOL_NARROW: dict[str, frozenset[str]] = {
     "mocha": _LONG_NARROW | SELECT_FLAGS["mocha"] | {"-f", "--fgrep", "--only"},
     "none": frozenset(),
 }
+_UNION_FLAGS = ("--testPathPattern",)  # repeated, they run what any one of them matches
 _NARROW_RUNNERS = {
     "pytest": "pytest",
     "py.test": "pytest",
@@ -112,6 +118,11 @@ class _Settings:
     ruff_table: bool = False
     mypy_table: bool = False
     collection: dict[str, list[str]] = field(default_factory=dict)  # python_files etc.
+    norecursedirs: list[str] | None = None  # None: pytest's own list
+    doctest_modules: bool = False  # `--doctest-modules` in addopts
+    doctest_globs: list[str] = field(default_factory=list)  # `--doctest-glob`, in order
+    overrides: dict[str, str] = field(default_factory=dict)  # `-o key=value` in addopts
+    unread: dict[str, str] = field(default_factory=dict)  # collection options set to a variable
 
 
 # -- settings extraction ----------------------------------------------------------------
@@ -162,6 +173,18 @@ def _addopts(settings: _Settings, value: Any) -> None:
             settings.plugins_off[tok[5:]] += 1
         elif tok == "--disable-plugin-autoload":
             settings.autoload_off = True
+        elif tok == "--doctest-modules":
+            settings.doctest_modules = True
+        elif flag == "--doctest-glob" and (eq or i + 1 < len(tokens)):
+            settings.doctest_globs.append(rest if eq else tokens[i + 1])
+            i += 0 if eq else 1
+        elif (flag in ("-o", "--override-ini") and not eq and i + 1 < len(tokens)) or (
+            flag == "--override-ini" and eq
+        ):
+            _override(settings, rest if eq else tokens[i + 1])
+            i += 0 if eq else 1
+        elif re.match(r"^-o[^=]+=", tok):
+            _override(settings, tok[2:])
         elif tok == "-W" and i + 1 < len(tokens) and tokens[i + 1].startswith("error"):
             settings.error_filter = True
             i += 1
@@ -181,12 +204,40 @@ def _filters(settings: _Settings, value: Any) -> None:
 
 
 _COLLECTION_KEYS = ("python_files", "python_classes", "python_functions")
+# The ini options that decide which files and tests pytest collects, read from a config file, from
+# `-o key=value` / `--override-ini` (on a command line, in addopts or in PYTEST_ADDOPTS), alike.
+_SCOPE_KEYS = (*_COLLECTION_KEYS, "testpaths", "norecursedirs")
+
+
+def _override(settings: _Settings, text: str) -> None:
+    """A `-o key=value` inside addopts: it beats the config file for that key."""
+    key, _, value = text.partition("=")
+    if key in (*_SCOPE_KEYS, "addopts"):
+        settings.overrides[key] = value
 
 
 def _collection(settings: _Settings, options: Mapping[str, Any]) -> None:
     for key in _COLLECTION_KEYS:
-        if (words := _as_list(options.get(key))) and key not in settings.collection:
+        if key in settings.collection or key not in options:
+            continue
+        words = _as_list(options.get(key))
+        if words or key in settings.overrides:  # `-o python_files=` collects nothing
             settings.collection[key] = [w for w in re.split(r"\s+", " ".join(words)) if w]
+
+
+def _apply_pytest(s: _Settings, options: Mapping[str, Any], forced: Collection[str] = ()) -> None:
+    """The pytest options of one configuration into `s`: addopts first, whose `-o` options (and
+    `forced`, the keys a command line overrides) beat the file's values."""
+    _addopts(s, options.get("addopts"))
+    options = {**options, **s.overrides}
+    for key in (*s.overrides, *forced):
+        if key in _SCOPE_KEYS and re.search(r"[$`]", str(options.get(key))):
+            s.unread[key] = str(options[key])
+    _filters(s, options.get("filterwarnings"))
+    s.testpaths.update(_as_list(options.get("testpaths")))
+    if "norecursedirs" in options:
+        s.norecursedirs = _as_list(options.get("norecursedirs"))
+    _collection(s, options)
 
 
 def _per_file(value: Any) -> set[str]:
@@ -222,10 +273,7 @@ def _pick(top: Mapping[str, Any], lint: Mapping[str, Any], key: str) -> Any:
 
 def _into_pytest(tree: rc.Tree, s: _Settings) -> str | None:
     name, options = rc.pytest_options(tree)
-    _addopts(s, options.get("addopts"))
-    _filters(s, options.get("filterwarnings"))
-    s.testpaths.update(_as_list(options.get("testpaths")))
-    _collection(s, options)
+    _apply_pytest(s, options)
     return name
 
 
@@ -308,7 +356,9 @@ def _build(tree: rc.Tree) -> tuple[_Settings, dict[str, str | None], dict[str, s
     return settings, where, broken
 
 
-def _collection_reasons(base: _Settings, cand: _Settings) -> list[str]:
+def _collection_reasons(
+    base: _Settings, cand: _Settings, keys: Collection[str] = _COLLECTION_KEYS
+) -> list[str]:
     defaults = {
         "python_files": DEFAULT_FILES,
         "python_classes": DEFAULT_CLASSES,
@@ -316,7 +366,7 @@ def _collection_reasons(base: _Settings, cand: _Settings) -> list[str]:
     }
     out: list[str] = []
     for key, default in defaults.items():
-        if key not in base.collection and key not in cand.collection:
+        if key not in keys or (key not in base.collection and key not in cand.collection):
             continue
         before = base.collection.get(key, list(default))
         after = cand.collection.get(key, list(default))
@@ -364,6 +414,9 @@ def _plugin_reasons(base: _Settings | None, cand: _Settings) -> list[str]:
     return out
 
 
+_DOCTEST_HITS = 25
+
+
 class _Judge:
     """The base tree's files under one directory, for judging an exclusion against them."""
 
@@ -371,7 +424,9 @@ class _Judge:
         self.changes = changes
         self.root = root
         self.truncated = False
+        self.known = changes.list_base is not None  # the base tree is listed, not just the diff
         self._paths: list[str] | None = None
+        self._reads = 0
 
     def base(self) -> list[str]:
         if self._paths is None:
@@ -385,6 +440,23 @@ class _Judge:
             self._paths = under[: rc.MAX_FILES]
         return self._paths
 
+    def doctests(self, paths: Sequence[str]) -> tuple[list[str], int]:
+        """Of the files, those holding a `>>>` example at the base, and how many were left unread
+        (a budget on reads: `rc.MAX_READS` per check, and the search stops at 25 hits)."""
+        hits: list[str] = []
+        unread = 0
+        for path in sorted(paths):
+            if len(hits) >= _DOCTEST_HITS:
+                break
+            if self._reads >= rc.MAX_READS:
+                unread += 1
+                continue
+            self._reads += 1
+            text = self.changes.base_text(posixpath.join(self.root, path))
+            if text is not None and ">>>" in text:
+                hits.append(path)
+        return hits, unread
+
     def source(self) -> list[str]:
         """Python files that are not tests: what a coverage gate measures."""
         return [
@@ -397,7 +469,116 @@ def _gate(s: _Settings) -> float | None:
     return max(found) if found else None
 
 
-def _pytest_reasons(base: _Settings, cand: _Settings) -> list[str]:
+def _capped(patterns: Sequence[str], option: str, notes: list[str]) -> list[str]:
+    if len(patterns) > rc.MAX_PATTERNS:
+        notes.append(option)
+    return list(patterns[: rc.MAX_PATTERNS])
+
+
+def _scope(s: _Settings, notes: list[str]) -> tuple[list[str], ...]:
+    """What decides the files pytest collects, as lists: python_files, testpaths, norecursedirs,
+    `--doctest-modules` (a one-item list), `--doctest-glob`."""
+    files = s.collection.get("python_files", list(DEFAULT_FILES))
+    nr = list(rc.DEFAULT_NORECURSEDIRS) if s.norecursedirs is None else s.norecursedirs
+    return (
+        _capped(files, "python_files", notes),
+        _capped(sorted(s.testpaths), "testpaths", notes),
+        _capped(nr, "norecursedirs", notes),
+        ["--doctest-modules"] if s.doctest_modules else [],
+        _capped(s.doctest_globs or list(rc.DEFAULT_DOCTEST_GLOBS), "--doctest-glob", notes),
+    )
+
+
+def _collected(files: Sequence[str], view: Sequence[Sequence[str]]) -> set[str]:
+    python_files, testpaths, norecursedirs, modules, globs = view
+    found = rc.pytest_collected(files, python_files, testpaths, norecursedirs)
+    docs = rc.doctest_candidates(files, bool(modules), globs, norecursedirs)
+    return found | {f"doctest:{p}" for p in docs}
+
+
+_SCOPE_NAMES = ("python_files", "testpaths", "norecursedirs", "--doctest-modules", "--doctest-glob")
+
+
+def _scope_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str]:
+    """What the pytest options that choose the files to collect stop collecting, judged against
+    the base tree's files: one option at a time (so the reason names it), then all together. An
+    option that leaves out no file the base collected is housekeeping; a doctest source counts
+    only when it holds a `>>>` example."""
+    out: list[str] = []
+    for key, why in cand.unread.items():
+        if base.unread.get(key) != why:
+            out.append(
+                _Warn(
+                    f"pytest `{key}` is set to `{why}`, a value greenproof cannot read: "
+                    "which files it collects was not checked"
+                )
+            )
+    files = judge.base()
+    cut: list[str] = []
+    before, after = _scope(base, cut), _scope(cand, cut)
+    was = _collected(files, before)
+    tests_ran = any(not p.startswith("doctest:") for p in was)
+    if cut:
+        out.append(
+            _Warn(
+                f"pytest {', '.join(f'`{k}`' for k in dict.fromkeys(cut))} lists more than "
+                f"{rc.MAX_PATTERNS} patterns: only the first were read"
+            )
+        )
+    if not (judge.known and tests_ran):  # nothing to judge against: the patterns decide
+        if base.testpaths and cand.testpaths and (gone := base.testpaths - cand.testpaths):
+            out.append(f"testpaths narrowed: {', '.join(sorted(gone))} removed")
+        out.extend(_collection_reasons(base, cand))
+    else:
+        out.extend(_collection_reasons(base, cand, ("python_classes", "python_functions")))
+    explained: set[str] = set()
+    unread = 0
+    for i, name in enumerate(_SCOPE_NAMES):
+        if before[i] == after[i] or (i < 2 and not (judge.known and tests_ran)):
+            continue
+        swapped = list(before)
+        swapped[i] = after[i]
+        lost = was - _collected(files, swapped)
+        gone_files, read = _doctest_loss(judge, lost - explained)
+        explained |= lost
+        unread += read
+        if gone_files and i < 3:
+            out.append(
+                f"pytest `{name}` now leaves out {rc.hit_text(gone_files, 'files that ran')}"
+            )
+        elif gone_files:
+            verb = "dropped" if i == 3 else "narrowed"
+            out.append(
+                f"pytest `{name}` {verb}: {rc.hit_text(gone_files, 'files with doctests')} "
+                "no longer collected"
+            )
+    if judge.known and tests_ran:
+        lost = was - _collected(files, after) - explained
+        if gone_files := _doctest_loss(judge, lost)[0]:
+            out.append(
+                "pytest collection options together stop collecting "
+                f"{rc.hit_text(gone_files, 'files that ran')}"
+            )
+    if unread:
+        out.append(
+            _Warn(
+                f"pytest collection options now leave out {unread} files that were not read for "
+                "doctests (past the budget): check them"
+            )
+        )
+    return out
+
+
+def _doctest_loss(judge: _Judge, lost: Collection[str]) -> tuple[list[str], int]:
+    """The files among what stopped being collected that count: test files, and the doctest
+    sources that hold an example. Also how many sources were left unread."""
+    tests = sorted(p for p in lost if not p.startswith("doctest:"))
+    docs = [p.removeprefix("doctest:") for p in lost if p.startswith("doctest:")]
+    hits, unread = judge.doctests([d for d in docs if d not in tests]) if docs else ([], 0)
+    return sorted({*tests, *hits}), unread
+
+
+def _pytest_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[str]:
     reasons: list[str] = []
     for item, count in (cand.select - base.select).items():
         reasons.append(f"pytest option `{item}` added" + (f" (x{count})" if count > 1 else ""))
@@ -407,14 +588,7 @@ def _pytest_reasons(base: _Settings, cand: _Settings) -> list[str]:
             + (f" (x{count})" if count > 1 else "")
         )
     reasons.extend(_plugin_reasons(base, cand))
-    if (
-        base.testpaths
-        and (gone := base.testpaths - cand.testpaths)
-        and cand.testpaths
-        and cand.testpaths != base.testpaths
-    ):
-        reasons.append(f"testpaths narrowed: {', '.join(sorted(gone))} removed")
-    reasons.extend(_collection_reasons(base, cand))
+    reasons.extend(_scope_reasons(base, cand, judge))
     return reasons
 
 
@@ -525,7 +699,7 @@ _TOOL_GROUPS = ("pytest", "coverage", "mypy", "lint")
 
 def _setting_reasons(base: _Settings, cand: _Settings, judge: _Judge) -> list[tuple[str, str]]:
     """`(tool, reason)` for what the candidate's effective configuration loosened."""
-    out = [("pytest", r) for r in _pytest_reasons(base, cand)]
+    out = [("pytest", r) for r in _pytest_reasons(base, cand, judge)]
     out += [("coverage", r) for r in _coverage_reasons(base, cand, judge)]
     out += [("mypy", r) for r in _mypy_reasons(base, cand, judge)]
     out += [("lint", r) for r in _lint_reasons(base, cand, judge)]
@@ -970,6 +1144,10 @@ class _BaseTests:
         self._by_name: dict[str, list[str]] = {}
         self._budget = _MATCH_BUDGET
         self._selectable: TestFiles | None = None
+
+    @property
+    def changes(self) -> ChangeSet:
+        return self._changes
 
     def selectable(self) -> TestFiles:
         """The test files of the base tree, for judging what a runner's arguments still select."""
@@ -1732,6 +1910,168 @@ def _removed_tests(
     return warned
 
 
+_CD_HEADS = ("cd", "chdir", "pushd", "popd")
+_Place = tuple[
+    str, str | tuple[str, ...]
+]  # ("d", directory) or ("?", the `cd`s that cannot be read)
+
+
+def _place_steps(
+    script: str,
+    where: _Dir,
+    history: list[str],
+    tests: _BaseTests,
+    groups: dict[_Place, list[str]],
+) -> None:
+    """The statements of a script, each put under the directory its shell stands in (a `cd` or
+    `pushd` moves it, a `( ... )` group or `sh -c` body keeps its own). A statement in a directory
+    the reading cannot tell is put under the `cd`s that led there, `history`."""
+    for text, before in tests.steps(script, where):
+        inner = shell_c_body(text)
+        braces = False
+        if inner is None and (inner := _group_inner(text)) is not None:
+            braces = text.lstrip().startswith("{")
+        if inner is not None:
+            _place_steps(inner, before, history if braces else list(history), tests, groups)
+            continue
+        if posixpath.basename((command_tokens(text) or [""])[0]) in _CD_HEADS:
+            history.append(text)
+            continue
+        key: _Place = ("?", tuple(history)) if before.path is None else ("d", before.path)
+        groups.setdefault(key, []).append(text)
+
+
+def _placed(
+    lines: Sequence[str], tests: _BaseTests, start: str, oneshell: bool
+) -> dict[_Place, list[str]]:
+    """The statements of a recipe by the directory they run in. Each line is a shell of its own,
+    started in `start` (the Makefile's directory), unless `.ONESHELL` puts them in one."""
+    bare = [_RECIPE_PREFIX.sub("", ln, count=1) for ln in lines]
+    scripts = ["\n".join(bare)] if oneshell else bare
+    groups: dict[_Place, list[str]] = {}
+    for script in scripts:
+        _place_steps(script, _Dir(start), [], tests, groups)
+    return groups
+
+
+def _rebased(files: TestFiles, directory: str) -> TestFiles:
+    """The test files under `directory`, named from it: what a runner started there sees."""
+    if not directory:
+        return files
+    prefix = directory + "/"
+    return TestFiles(
+        [p[len(prefix) :] for p in files.paths if p.startswith(prefix)],
+        files.go_module,
+        files.mocharc,
+    )
+
+
+def _same_files(base: Sequence[str], cand: Sequence[str], files: TestFiles) -> bool:
+    """Whether, for every runner family both run, the candidate selects each test file the base
+    did (and the base selected some), when the base named no path but the directory itself: a
+    hand-picked file that is all of what `.` was is the same run, but `tests` becoming one file
+    of `tests` is still a hand-picked list."""
+    if any(
+        w not in (".", "./")
+        for runs in _invocations(base, None).values()
+        for r in runs
+        for w in r.words
+    ):
+        return False
+    before, after = covered_test_files(base, files), covered_test_files(cand, files)
+    common = [family for family in before if family in after]
+    return bool(common) and all(
+        before[family] and after[family] is not None and before[family] <= after[family]  # type: ignore[operator]
+        for family in common
+    )
+
+
+def _recipe_narrowing(
+    base: Sequence[str],
+    cand: Sequence[str],
+    tests: _BaseTests,
+    start: str,
+    modes: tuple[_Mode, _Mode],
+) -> str | None:
+    """`narrowed_selection` for a make recipe, each statement read from the directory it runs in:
+    paths are the Makefile's directory's, and a `cd` moves them. The statements of one directory
+    are compared with the same directory's at the other side; the ones that have no counterpart
+    (a runner that moved to another directory) are compared together, from the root. Statements
+    after a `cd` that cannot be read are compared as text, when the `cd` is the same on both
+    sides; a candidate runner under one the base did not have is a warning.
+
+    In a directory other than the root, a hand-picked file (`pytest test_example.py`) that
+    selects every test file `pytest .` did is not a narrowing."""
+    files = tests.selectable()
+    before = _placed(base, tests, start, modes[0].oneshell)
+    after = _placed(cand, tests, start, modes[1].oneshell)
+    everything = [st for group in after.values() for st in group]
+    warn: str | None = None
+    for key in dict.fromkeys([*before, *after]):
+        mine, theirs = before.get(key), after.get(key)
+        if theirs is None and mine is not None:  # a runner of the base that moved
+            moved = (
+                _moved(mine, str(key[1]), after, files)
+                if key[0] == "d"
+                else narrowed_selection(mine, everything, files=files)
+            )
+            if moved:
+                return moved
+            continue
+        if mine is None and theirs is not None:
+            if key[0] == "?" and covered_test_files(theirs, None):
+                warn = warn or _Warn(
+                    f"it runs tests after `{key[1][-1] if key[1] else 'a cd'}`, a directory "
+                    "that cannot be read here, which the base did not: check what they select"
+                )
+            continue
+        if mine is None or theirs is None:
+            continue
+        if key[0] == "?":
+            if narrowed := narrowed_selection(mine, theirs):
+                return narrowed
+            continue
+        path = str(key[1])
+        rebased = _rebased(files, path)
+        narrowed = narrowed_selection(mine, theirs, files=rebased)
+        if narrowed and path and _same_files(mine, theirs, rebased):
+            narrowed = None
+        if narrowed:
+            return narrowed
+    return warn
+
+
+def _moved(
+    statements: Sequence[str],
+    path: str,
+    after: Mapping[_Place, Sequence[str]],
+    files: TestFiles,
+) -> str | None:
+    """A reason when statements run in `path` at the base, and the candidate has no statement there:
+    a test file they ran that no statement of the candidate runs, from wherever it does. A directory
+    the candidate's statements run in that cannot be read leaves the words to be compared."""
+
+    def named(directory: str, found: set[str]) -> set[str]:
+        return {f"{directory}/{x}" if directory else x for x in found}
+
+    selected: dict[str, set[str]] = {}
+    for key, group in after.items():
+        if key[0] != "d":
+            return narrowed_selection(
+                statements, [st for g in after.values() for st in g], files=files
+            )
+        for family, found in covered_test_files(group, _rebased(files, str(key[1]))).items():
+            if found is None:
+                return narrowed_selection(
+                    statements, [st for g in after.values() for st in g], files=files
+                )
+            selected.setdefault(family, set()).update(named(str(key[1]), found))
+    for family, found in covered_test_files(statements, _rebased(files, path)).items():
+        if found and family in selected and (lost := sorted(named(path, found) - selected[family])):
+            return f"{family} ran `{lost[0]}` before and the candidate no longer runs it"
+    return None
+
+
 def neutering_reason(
     base_lines: list[str],
     cand_lines: list[str],
@@ -1780,6 +2120,7 @@ def neutering_reason(
         return None
     unread = False
     narrow_base, narrow_cand = _statements(base_e, script), _statements(cand_e, script)
+    unexpanded = base_e, cand_e  # a task runner read into its commands loses `nx affected`
     if tasks is not None:
         base_c, _ = _read_tasks(base_c, tasks[0])
         cand_c, unread = _read_tasks(cand_c, tasks[1])
@@ -1794,13 +2135,23 @@ def neutering_reason(
     after = _check_tokens(cand_e, script, ctx, known[1], base_texts)
     if added := sorted(after - before):
         return f"it now passes {added[0]}"
-    if flag := _new_selection_flag(base_e, cand_e):
+    if flag := _new_selection_flag(base_e, cand_e) or _new_selection_flag(*unexpanded):
         return f"it now passes {flag}"
-    if narrowed := narrowed_selection(
-        narrow_base,
-        narrow_cand,
-        files=tests.selectable() if tests is not None else None,
-    ):
+    scope, scope_unread = narrowed_scope(narrow_base, narrow_cand)
+    if scope:
+        return f"it now runs less ({scope})"
+    if tests is not None and (over := _override_reason(narrow_base, narrow_cand, tests, cwds)):
+        return over
+    pending: str | None = None
+    if recipe and not script and tests is not None and modes is not None:
+        narrowed = _recipe_narrowing(base_e, cand_e, tests, cwds[0], modes)
+    else:
+        narrowed = narrowed_selection(
+            narrow_base, narrow_cand, files=tests.selectable() if tests is not None else None
+        )
+    if narrowed and isinstance(narrowed, _Warn):
+        pending = narrowed
+    elif narrowed:
         return f"it now selects fewer paths ({narrowed})"
     gone = None
     if tests is not None:
@@ -1830,7 +2181,9 @@ def neutering_reason(
         _statements(base_c, script)
     ):
         return _Warn(_UNREADABLE_WHY)
-    return None
+    if scope_unread:
+        return _Warn(scope_unread)
+    return pending
 
 
 _UNREAD_TASKS_WHY = (
@@ -1953,12 +2306,15 @@ def _check_tokens(
 ) -> Counter[str]:
     """The narrowing flags of the check statements: `ls -t` or `tar --exclude` are not narrowing
     a run, and each flag counts for the tool it is given to (see `_TOOL_NARROW`)."""
-    return Counter(
+    found = Counter(
         flag
         for st in _statements(lines, script)
         if _counts(st, ctx, known, base_texts)
         for flag in _narrow_flags(st)
     )
+    for union in _UNION_FLAGS:  # a second `--testPathPatterns` adds a pattern: that widens
+        found[union] = min(found[union], 1)
+    return +found
 
 
 def _narrow_flags(statement: str) -> list[str]:
@@ -1981,7 +2337,11 @@ def _narrow_flags(statement: str) -> list[str]:
             "jest",
         )
     flags = _TOOL_NARROW.get(family or "", _LONG_NARROW)
-    found = [t.partition("=")[0] for t in toks[1:] if t.partition("=")[0] in flags]
+    found = [
+        FLAG_ALIASES.get(name, name)
+        for t in toks[1:]
+        if (name := t.partition("=")[0]) in flags and not (name == "-o" and head == "vitest")
+    ]
     if family == "pytest":
         found.extend("-k" for t in toks[1:] if re.match(r"^-k.+", t))
     return found
@@ -2011,6 +2371,53 @@ def _new_selection_flag(base: list[str], cand: list[str]) -> str | None:
             if family_flag not in before and not (nextest and family_flag[1] == "--doc"):
                 return family_flag[1]
     return None
+
+
+_OVERRIDE_SCOPE = frozenset({*_SCOPE_KEYS, "addopts"})
+
+
+def _overrides_of(statements: Sequence[str]) -> dict[str, str]:
+    """The `-o key=value` options (`--override-ini`) the pytest runs among the statements pass, on
+    the command line and in PYTEST_ADDOPTS, for the keys that decide what is collected."""
+    found: dict[str, str] = {}
+    for st in statements:
+        words = _split_words(st)
+        env = dict(command_env(st).vars).get("PYTEST_ADDOPTS", "")
+        for args in _after_pytest(words):
+            tmp = _Settings()
+            _addopts(tmp, [*_split_words(env), *args])
+            found.update({k: v for k, v in tmp.overrides.items() if k in _OVERRIDE_SCOPE})
+    return found
+
+
+def _override_reason(
+    base: Sequence[str], cand: Sequence[str], tests: _BaseTests, cwds: Sequence[str]
+) -> str | None:
+    """A pytest run that now passes `-o key=value` for an option that decides what is collected,
+    judged like the same key in the config file: what the repository's configuration collected
+    with the base's overrides against what it collects with the candidate's."""
+    over, was = _overrides_of(cand), _overrides_of(base)
+    if not over or all(was.get(k) == v for k, v in over.items()):
+        return None
+    changes = tests.changes
+    warned: str | None = None
+    for root in dict.fromkeys((*cwds, "")):
+        try:
+            _, options = rc.pytest_options(rc.Tree(changes.base_text, root))
+            settings = []
+            for given in (was, over):
+                s = _Settings()
+                _apply_pytest(s, {**options, **given}, tuple(given))
+                settings.append(s)
+        except (rc.Broken, ValueError, TypeError, AttributeError):
+            continue
+        shown = " ".join(f"-o {k}={shlex.quote(v)}" for k, v in over.items() if was.get(k) != v)
+        for why in _pytest_reasons(settings[0], settings[1], _Judge(changes, root)):
+            text = f"it now passes `{shown}`, and {why}"
+            if not isinstance(why, _Warn):
+                return text
+            warned = warned or _Warn(text)
+    return warned
 
 
 def _plain_check(statement: str) -> tuple[str, ...]:
@@ -2820,11 +3227,14 @@ def _jest_reasons(
     """Loosenings of a jest or vitest configuration, judged against the test files of the base
     tree: an exclusion that matches no test the base ran is housekeeping."""
     old, new = f.old_text or "", f.new_text or ""
+    whole = new  # lines are looked up in the whole file
+    if posixpath.basename(f.path).startswith("vite.config"):  # only its `test` block is vitest's
+        old, new = (_bracket_block(text, "test") or "" for text in (old, new))
     out: list[tuple[int | None, str]] = []
     judge = _Judge(changes, posixpath.dirname(f.path))
     base_known = changes.list_base is not None
     tests = [p for p in rc.js_files(judge.base()) if changes.is_test(posixpath.join(judge.root, p))]
-    keys = ["testPathIgnorePatterns", "exclude"]
+    keys = ["testPathIgnorePatterns", "modulePathIgnorePatterns", "exclude"]
     for key in keys:
         text_old, text_new = (
             (_without_block(old, "coverage"), _without_block(new, "coverage"))
@@ -2837,11 +3247,11 @@ def _jest_reasons(
         added = _strings(_bracket_block(text_new, key)) - before_p
         if not added:
             continue
-        line = _first_line_with(new, key)
+        line = _first_line_with(whole, key)
         if not base_known:
             out.append((line, f"`{key}` now excludes {', '.join(sorted(added))}"))
             continue
-        if key == "testPathIgnorePatterns":
+        if key != "exclude":
             hit, bad = rc.regex_paths(sorted(added), tests)
             was, _ = rc.regex_paths(sorted(before_p), tests)
         else:
@@ -2858,22 +3268,114 @@ def _jest_reasons(
         if key == "include" and is_package:
             continue
         reasons, unread = _jest_selection(old, new, key, tests, base_known)
-        line = _first_line_with(new, key)
+        line = _first_line_with(whole, key)
         out.extend((line, r) for r in reasons)
         out.extend((line, _Warn(r)) for r in unread)
+    out.extend(_scope_reasons_js(f, is_package, tests, base_known))
     flag = re.compile(r"passWithNoTests[\"']?\s*:\s*true")
     if flag.search(new) and not flag.search(old):
-        out.append((_first_line_with(new, "passWithNoTests"), "`passWithNoTests` enabled"))
+        out.append((_first_line_with(whole, "passWithNoTests"), "`passWithNoTests` enabled"))
     before, after = _thresholds(old), _thresholds(new)
     for key, value in after.items():
         if key in before and value < before[key]:
             out.append(
                 (
-                    _first_line_with(new, key.split(".")[1]),
+                    _first_line_with(whole, key.split(".")[1]),
                     f"coverage threshold {key.split('.')[1]} lowered "
                     f"from {before[key]:g} to {value:g}",
                 )
             )
+    return out
+
+
+_JEST_SCOPE = ("rootDir", "roots", "testRegex")
+
+
+def _unread_why(key: str, raw: str) -> str:
+    return _Warn(
+        f"`{key}` is `{raw}`, a value greenproof cannot read: which tests it leaves out was not "
+        "checked"
+    )
+
+
+def _js_dirs(values: Mapping[str, rc.Value], vitest: bool) -> list[str] | None:
+    """The directories (relative to the configuration's) a jest `roots` or a vitest `dir` reaches,
+    None when that cannot be told: a computed value, or a path outside the tree."""
+    if vitest:
+        raw = values.get("dir")
+        entries = raw if isinstance(raw, list) else ["."]
+        base = "."
+    else:
+        root, roots = values.get("rootDir"), values.get("roots")
+        rooted = root[0] if isinstance(root, list) and root else "."
+        base = posixpath.normpath(rooted.removeprefix("<rootDir>").removeprefix("./") or ".")
+        entries = roots if isinstance(roots, list) else ["<rootDir>"]
+    out: list[str] = []
+    for entry in entries:
+        if entry.startswith("<rootDir>"):
+            entry = entry.removeprefix("<rootDir>").lstrip("/") or "."
+        elif entry.startswith("/"):
+            return None
+        out.append(posixpath.normpath(posixpath.join(base, entry.removeprefix("./"))))
+    return out
+
+
+def _scope_reasons_js(
+    f: ChangedFile, is_package: bool, tests: Sequence[str], base_known: bool
+) -> list[tuple[int | None, str]]:
+    """jest's `rootDir`, `roots` and `testRegex` and vitest's `dir`: what they stop running among
+    the base tests. A value that cannot be read warns."""
+    name = posixpath.basename(f.path)
+    vitest = name.startswith(("vitest.", "vite."))
+    keys = ("dir",) if vitest else _JEST_SCOPE
+    fmt = "json" if is_package else rc.format_of(name)
+
+    def read(text: str | None) -> dict[str, rc.Value] | None:
+        if text is None:
+            return {}
+        if vitest and fmt == "js":
+            text = _bracket_block(_without_block(text, "coverage"), "test") or ""
+        block = "jest" if is_package else None
+        return rc.read_options(text, fmt, keys, block)
+
+    old, new = read(f.old_text), read(f.new_text)
+    if old is None or new is None:  # a file that does not parse is static.parse_error's
+        return []
+    whole = f.new_text or ""
+    out: list[tuple[int | None, str]] = []
+    for key in keys:
+        value = new.get(key)
+        if isinstance(value, rc.Unread) and old.get(key) != value:
+            out.append((_first_line_with(whole, key), _unread_why(key, value.raw)))
+    if not base_known:
+        return out
+    before, after = _js_dirs(old, vitest), _js_dirs(new, vitest)
+    if before is not None and after is not None and before != after:
+        lost = sorted(t for t in tests if rc.under_dirs(t, before) and not rc.under_dirs(t, after))
+        if lost:
+            key = (
+                "dir" if vitest else "roots" if old.get("roots") != new.get("roots") else "rootDir"
+            )
+            out.append(
+                (
+                    _first_line_with(whole, key),
+                    f"`{key}` no longer reaches {rc.hit_text(lost, 'tests')}",
+                )
+            )
+    if isinstance(now := new.get("testRegex"), list) and old.get("testRegex") != now:
+        was = old.get("testRegex")
+        ran = rc.regex_paths(was, tests)[0] if isinstance(was, list) else set(tests)
+        hit, bad = rc.regex_paths(now, tests)
+        line = _first_line_with(whole, "testRegex")
+        if lost := sorted(ran - hit):
+            out.append((line, f"`testRegex` no longer runs {rc.hit_text(lost, 'tests')}"))
+        out.extend(
+            (
+                line,
+                _Warn(f"`testRegex` pattern `{p}` could not be read: its effect was not checked"),
+            )
+            for p in bad
+        )
     return out
 
 
@@ -2933,6 +3435,130 @@ def _nyc_reasons(old: str, new: str) -> list[tuple[int | None, str]]:
                     _first_line_with(new, key),
                     f"nyc `{key}` threshold lowered from {was:g} to {now:g}",
                 )
+            )
+    return out
+
+
+_MOCHA_RC = (
+    ".mocharc.cjs",
+    ".mocharc.js",
+    ".mocharc.yaml",
+    ".mocharc.yml",
+    ".mocharc.jsonc",
+    ".mocharc.json",
+)
+_MOCHA_KEYS = ("spec", "ignore", "exclude", "extension", "recursive")
+_MOCHA_FILES = frozenset({*_MOCHA_RC, "package.json"})
+
+
+def _mocha_source(
+    read: Callable[[str], str | None], root: str
+) -> tuple[str | None, str, dict[str, rc.Value] | None]:
+    """The file mocha takes its configuration from (the first of its names that exists, then
+    package.json's `mocha` key), its text and the options read from it. None for the options when
+    the file does not parse."""
+    for name in _MOCHA_RC:
+        text = read(posixpath.join(root, name))
+        if text is not None:
+            return name, text, rc.read_options(text, rc.format_of(name), _MOCHA_KEYS)
+    text = read(posixpath.join(root, "package.json")) or ""
+    values = rc.read_options(text, "json", _MOCHA_KEYS, "mocha") if text else {}
+    return ("package.json" if values else None), text, values
+
+
+def _mocha_list(values: Mapping[str, rc.Value], *keys: str) -> list[str] | None:
+    """The strings set under `keys` (None when one of them cannot be read)."""
+    out: list[str] = []
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, rc.Unread):
+            return None
+        if isinstance(value, list):
+            out.extend(value)
+    return out
+
+
+def _mocha_settings(values: Mapping[str, rc.Value]) -> dict[str, Any] | None:
+    """spec, ignore, extension and recursive as mocha applies them, defaults filled in."""
+    spec = _mocha_list(values, "spec")
+    ignore = _mocha_list(values, "ignore", "exclude")
+    ext = _mocha_list(values, "extension")
+    recursive = values.get("recursive")
+    if spec is None or ignore is None or ext is None or isinstance(recursive, rc.Unread):
+        return None
+    return {
+        "spec": spec if "spec" in values else ["./test"],
+        "ignore": ignore,
+        "extension": ext if "extension" in values else list(rc.MOCHA_EXTENSIONS),
+        "recursive": recursive is True,
+    }
+
+
+def _mocha_findings(changes: ChangeSet) -> list[Finding]:
+    """What mocha loads, by its configuration file, before and after: a `spec` narrowed, an
+    `ignore` added, an `extension` list cut or `recursive` taken off stop tests that ran."""
+    out: list[Finding] = []
+    roots = {
+        posixpath.dirname(path)
+        for f in changes.files
+        for path in (f.path, f.old_path)
+        if path and posixpath.basename(path) in _MOCHA_FILES
+    }
+    for root in sorted(roots):
+        base_name, base_text, base = _mocha_source(changes.base_text, root)
+        cand_name, cand_text, cand = _mocha_source(changes.cand_text, root)
+        if base is None or cand is None:  # a file that does not parse is static.parse_error's
+            continue
+        package = changes.base_text(posixpath.join(root, "package.json")) or ""
+        if base_name is None and "mocha" not in package:
+            continue
+        where = posixpath.join(root, cand_name or base_name or "package.json")
+        text = cand_text if cand_name else base_text
+
+        def add(why: str, key: str, where: str = where, text: str = text) -> None:
+            make = warn_finding if isinstance(why, _Warn) else finding
+            line = _first_line_with(text, key)
+            out.append(make("runner.tampered", where, line, f"{where}: {why}", _HINT))
+
+        if cand_name is not None and cand_name != "package.json":
+            read = rc.format_of(cand_name) == "js" and (
+                "..." in cand_text or "require(" in cand_text
+            )
+            if read and cand_text != base_text:
+                add(_Warn("mocha configuration takes values from elsewhere: not checked"), "spec")
+        for key in _MOCHA_KEYS:
+            value = cand.get(key)
+            if isinstance(value, rc.Unread) and base.get(key) != value:
+                add(_unread_why(key, value.raw), key)
+        was, now = _mocha_settings(base), _mocha_settings(cand)
+        if was is None or now is None:
+            continue
+        judge = _Judge(changes, root)
+        tests = [p for p in rc.js_files(judge.base()) if changes.is_test(posixpath.join(root, p))]
+        ran, ok = rc.mocha_collected(tests, **was)
+        if not ok:
+            continue
+        found = False
+        for key in ("spec", "ignore", "extension", "recursive"):
+            if was[key] == now[key]:
+                continue
+            kept, ok = rc.mocha_collected(tests, **{**was, key: now[key]})
+            if not ok:
+                add(_Warn(f"mocha `{key}` could not be read: its effect was not checked"), key)
+            elif lost := sorted(ran - kept):
+                found = True
+                add(f"mocha `{key}` now leaves out {rc.hit_text(lost, 'tests that ran')}", key)
+        if not found:
+            kept, ok = rc.mocha_collected(tests, **now)
+            if ok and (lost := sorted(ran - kept)):
+                add(
+                    f"mocha configuration now leaves out {rc.hit_text(lost, 'tests that ran')}",
+                    "spec",
+                )
+        if judge.truncated:
+            add(
+                _Warn(f"more than {rc.MAX_FILES} files at the base; judged against the first only"),
+                "spec",
             )
     return out
 
@@ -3053,6 +3679,7 @@ _MAX_PREREQS = 16  # how deep a target's prerequisites are followed
 _MAKE_VALUE = 64 * 1024  # bytes of one expanded value or recipe line (ci.py reads no more per file)
 _MAKE_TOTAL = 1024 * 1024  # bytes of expanded values and recipe lines in one Makefile
 _MAKE_STEPS = 50_000  # variable references expanded in one Makefile
+_MAKE_SCOPE = 500_000  # target and prerequisite visits spent on target-specific variables
 _MAKE_RECIPE = 256 * 1024  # bytes of recipe one target and its prerequisites run
 _SHELLS = frozenset(
     {"sh", "bash", "dash", "zsh", "ksh", "ksh93", "mksh", "pdksh", "ash", "busybox", "rbash"}
@@ -3063,21 +3690,42 @@ _SHELLS = frozenset(
 class _Budget:
     """What reading one Makefile may spend on expanding variables; spending past a limit raises
     `_Unreadable`, so a Makefile whose variables double (`V2 = $(V1)$(V1)`) cannot make the
-    reader's work or memory grow with anything but the file's size."""
+    reader's work or memory grow with anything but the file's size. Once a limit is spent the
+    budget is `dead`: text with nothing to expand is still read, text that needs it is not (see
+    `_read_rules`), so a Makefile past a budget keeps what was read before it."""
 
     def __init__(self) -> None:
         self.steps = 0
         self.total = 0
+        self.scope = 0
+        self.dead = False
+        self.why = ""
+
+    def _stop(self, why: str) -> _Unreadable:
+        self.dead = True
+        self.why = self.why or why
+        return _Unreadable(why)
+
+    def cap(self, text: str) -> None:
+        if len(text) > _MAKE_VALUE:
+            raise _Unreadable(f"a value or recipe line is over {_MAKE_VALUE // 1024} KiB")
 
     def spend(self, text: str) -> None:
         self.steps += 1
         self.total += len(text)
-        if len(text) > _MAKE_VALUE:
-            raise _Unreadable(f"a value or recipe line is over {_MAKE_VALUE // 1024} KiB")
+        self.cap(text)
         if self.steps > _MAKE_STEPS:
-            raise _Unreadable(f"it expands more than {_MAKE_STEPS} variable references")
+            raise self._stop(f"it expands more than {_MAKE_STEPS} variable references")
         if self.total > _MAKE_TOTAL:
-            raise _Unreadable(f"its expanded text is over {_MAKE_TOTAL // 1024} KiB")
+            raise self._stop(f"its expanded text is over {_MAKE_TOTAL // 1024} KiB")
+
+    def visit(self, count: int = 1) -> None:
+        """Count `count` visits to targets or prerequisites for target-specific variables."""
+        self.scope += count
+        if self.scope > _MAKE_SCOPE:
+            raise self._stop(
+                f"its target-specific variables took more than {_MAKE_SCOPE} lookups to resolve"
+            )
 
 
 _REF = re.compile(r"(?<!\$)\$([({])(?:call[ \t]+([A-Za-z_.][\w.-]*)|([A-Za-z_][\w.]*)[)}])")
@@ -3121,10 +3769,12 @@ def _expand_vars(
     name) put in. A name the Makefile does not define, a call of anything but a macro, and any
     other function call are left as they are. Raises `_Unreadable` when variables or calls nest
     deeper than `_MAX_VAR_DEPTH` or the expansion outgrows `budget`."""
+    if "$" not in text:
+        if budget is not None:
+            budget.cap(text)
+        return text
     if budget is not None:
         budget.spend(text)
-    if "$" not in text:
-        return text
     if depth >= _MAX_VAR_DEPTH:
         raise _Unreadable(f"its variables nest more than {_MAX_VAR_DEPTH} levels deep")
     out: list[str] = []
@@ -3139,7 +3789,11 @@ def _expand_vars(
                 continue
             if len(found) > _MAKE_VALUE:
                 raise _Unreadable(f"the value of `{m[3]}` is over {_MAKE_VALUE // 1024} KiB")
-            out.append(_expand_vars(found, variables, depth + 1, budget))
+            if budget is not None and "$" not in found:
+                budget.spend(found)  # a reference is a step, whatever it stands for
+                out.append(found)
+            else:
+                out.append(_expand_vars(found, variables, depth + 1, budget))
             continue
         name = m[2] or ""
         macro = variables.get(name)
@@ -3476,8 +4130,8 @@ def _variables(
     return out
 
 
-def _phony_names(rest: str, variables: Mapping[str, str], budget: _Budget) -> set[str]:
-    return set(_expand_vars(re.sub(r"#.*$", "", rest), variables, 0, budget).split())
+def _phony_names(rest: str, expand: Callable[[str], str]) -> set[str]:
+    return set(expand(re.sub(r"#.*$", "", rest)).split())
 
 
 _FOR_LOOP = re.compile(r"\bfor\s+(\w+)\s+in\s+([^;]*?)\s*;\s*do\b\s*(.*?)\s*;?\s*\bdone\b")
@@ -3539,51 +4193,181 @@ def _split_recipe(raw: str, expanded: str, errexit: bool) -> list[str]:
     return out
 
 
-def _overlays(
-    variables: MutableMapping[str, str],
-    rules: Mapping[str, _Target],
-    scoped: Sequence[tuple[str, str, str, str, bool]],
-    cli: Collection[str],
-    budget: _Budget,
-) -> dict[str, dict[str, str]]:
+def _glob_match(parts: Sequence[str], target: str) -> bool:
+    """Whether a make pattern (`%` any string; `parts` is the pattern split at the `%`s) matches
+    `target`, without a regular expression: the first part is the start, the last the end, and the
+    ones between are found in order."""
+    head, tail = parts[0], parts[-1]
+    if len(target) < len(head) + len(tail) or not target.startswith(head):
+        return False
+    if not target.endswith(tail):
+        return False
+    middle = target[len(head) : len(target) - len(tail)]
+    at = 0
+    for part in parts[1:-1]:
+        found = middle.find(part, at)
+        if found < 0:
+            return False
+        at = found + len(part)
+    return True
+
+
+class _PatternIndex:
+    """The targets of a Makefile by their first and last letters, to find the ones a pattern
+    (`t10%`, `%.o`) matches without trying it on every target: the ones that start (or, with no
+    start, end) as it does are found by bisection, and only they are tried."""
+
+    def __init__(self, rules: Mapping[str, _Target]) -> None:
+        self.order = {t: i for i, t in enumerate(rules)}
+        self.names = sorted(rules)
+        self.reversed = sorted(t[::-1] for t in rules)
+
+    def matching(self, pattern: str, budget: _Budget) -> list[str]:
+        """The targets the pattern matches, in the order of the file."""
+        parts = pattern.split("%")
+        head, tail = parts[0], parts[-1]
+        if head:
+            lo = bisect_left(self.names, head)
+            hi = bisect_left(self.names, head + "\U0010ffff")
+            pool = self.names[lo:hi]
+        elif tail:
+            key = tail[::-1]
+            lo = bisect_left(self.reversed, key)
+            hi = bisect_left(self.reversed, key + "\U0010ffff")
+            pool = [t[::-1] for t in self.reversed[lo:hi]]
+        else:
+            pool = self.names
+        budget.visit(len(pool) + 1)
+        found = [t for t in pool if _glob_match(parts, t)]
+        found.sort(key=self.order.__getitem__)
+        return found
+
+
+class _Overlays:
     """The target-specific variable values (`test: ARGS := -k add`, `%.o: CFLAGS = -g`) each target
     runs with: its own, then those of the targets it is a prerequisite of. A command-line
-    assignment beats them unless they are `override`."""
-    own: dict[str, list[tuple[str, str, str, bool]]] = {}
-    for pattern, name, op, value, override in scoped:
-        regex = re.escape(pattern).replace("%", ".*")
-        for target in rules:
-            if re.fullmatch(regex, target):
-                own.setdefault(target, []).append((name, op, value, override))
-    scopes: dict[str, list[tuple[str, str, str, bool]]] = {t: list(a) for t, a in own.items()}
-    for root, assignments in own.items():
-        queue, seen = list(rules[root].prereqs), {root}
-        while queue:
-            node = queue.pop(0)
-            if node in seen or node not in rules:
+    assignment beats them unless they are `override`.
+
+    A value is worked out when a recipe line asks for it, once per target and name: a target's own
+    assignments of the name, or the first target in file order that has one and reaches it through
+    prerequisites (found by one walk per name, not per target). What the reader spends is counted
+    (`_Budget.visit`), so a Makefile of many targets and variables cannot make it quadratic."""
+
+    def __init__(
+        self,
+        variables: Mapping[str, str],
+        rules: Mapping[str, _Target],
+        scoped: Sequence[tuple[str, str, str, str, bool]],
+        cli: Collection[str],
+        budget: _Budget,
+    ) -> None:
+        self.variables = variables
+        self.rules = rules
+        self.cli = cli
+        self.budget = budget
+        self.own: dict[str, dict[str, list[tuple[str, str, bool]]]] = {}
+        matched: dict[str, list[str]] = {}
+        index: _PatternIndex | None = None
+        for pattern, name, op, value, override in scoped:
+            if pattern not in matched:
+                if "%" in pattern:
+                    index = index or _PatternIndex(rules)
+                    matched[pattern] = index.matching(pattern, budget)
+                else:
+                    budget.visit()
+                    matched[pattern] = [pattern] if pattern in rules else []
+            budget.visit(len(matched[pattern]))
+            for target in matched[pattern]:
+                self.own.setdefault(target, {}).setdefault(name, []).append((op, value, override))
+        self.names = {name for per in self.own.values() for name in per}
+        self._roots: dict[str, list[str]] = {}
+        for root, per in self.own.items():
+            for name in per:
+                self._roots.setdefault(name, []).append(root)
+        self._owners: dict[str, dict[str, str]] = {}
+        self._memo: dict[tuple[str, str], str | None] = {}
+        self._busy: set[tuple[str, str]] = set()
+
+    def _owner(self, name: str) -> dict[str, str]:
+        """For each target without an assignment of `name` of its own that one reaches, the first
+        target (in file order) whose assignment it inherits."""
+        if name in self._owners:
+            return self._owners[name]
+        owner: dict[str, str] = {}
+        seen: set[str] = set()
+        for root in self._roots.get(name, ()):
+            if root in seen:  # an earlier root reaches it, and so everything it does
                 continue
-            seen.add(node)
-            defined = {a[0] for a in scopes.get(node, ())}
-            scopes.setdefault(node, []).extend(a for a in assignments if a[0] not in defined)
-            queue.extend(rules[node].prereqs)
-    out: dict[str, dict[str, str]] = {}
-    for target, assignments in scopes.items():
-        view: dict[str, str] = {}
-        merged = ChainMap(view, variables)
-        for name, op, value, override in assignments:
-            if name in cli and not override:
-                continue
-            if op in (":=", "::="):
-                view[name] = _expand_vars(value, merged, 0, budget)
-            elif op == "?=":
-                if name not in merged:
-                    view[name] = value
-            elif op == "+=" and name in merged:
-                view[name] = f"{merged[name]} {value}".strip()
-            else:
-                view[name] = value
-        out[target] = view
-    return out
+            seen.add(root)
+            queue = deque(self.rules[root].prereqs)
+            while queue:
+                node = queue.popleft()
+                self.budget.visit()
+                if node in seen or node not in self.rules:
+                    continue
+                seen.add(node)
+                if name not in self.own.get(node, ()):
+                    owner[node] = root
+                queue.extend(self.rules[node].prereqs)
+        self._owners[name] = owner
+        return owner
+
+    def value(self, node: str, name: str) -> str | None:
+        """What the target-specific assignments say `name` is for `node`; None when none applies."""
+        if name not in self.names:
+            return None
+        key = (node, name)
+        if key in self._memo:
+            return self._memo[key]
+        if key in self._busy:  # a value defined through itself: the base value stands
+            return None
+        per = self.own.get(node)
+        if per is not None and name in per:
+            entries = per[name]
+        elif (root := self._owner(name).get(node)) is not None:
+            entries = self.own[root][name]
+        else:
+            entries = []
+        self._busy.add(key)
+        try:
+            current: str | None = None
+            base = self.variables
+            scope = _Scope(self, node)
+            for op, text, override in entries:
+                if name in self.cli and not override:
+                    continue
+                if op in (":=", "::="):
+                    current = _expand_vars(text, scope, 0, self.budget)
+                elif op == "?=":
+                    if current is None and name not in base:
+                        current = text
+                elif op == "+=" and (current is not None or name in base):
+                    previous = current if current is not None else base[name]
+                    current = f"{previous} {text}".strip()
+                else:
+                    current = text
+        finally:
+            self._busy.discard(key)
+        self._memo[key] = current
+        return current
+
+
+class _Scope(Mapping[str, str]):
+    """The variables one target runs with: its target-specific values over the Makefile's."""
+
+    def __init__(self, overlays: _Overlays, node: str) -> None:
+        self._overlays = overlays
+        self._node = node
+
+    def __getitem__(self, name: str) -> str:
+        found = self._overlays.value(self._node, name)
+        return found if found is not None else self._overlays.variables[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._overlays.variables)
+
+    def __len__(self) -> int:
+        return len(self._overlays.variables)
 
 
 def _targets(
@@ -3610,13 +4394,12 @@ def _merge_targets(parts: Sequence[_Targets]) -> _Targets:
     """The rules of several readings of one Makefile as one: a target's recipe lines are those of
     each reading, each line once; `.ONESHELL` and `-i` hold when any reading has them, `-e` and
     `pipefail` only when every reading has them, and `SHELL` is the first one that is not a
-    shell, else the first."""
+    shell, else the first. A reading that stopped short keeps the rules it had read, and the
+    result's `stopped` says so."""
     out = _Targets()
     for part in parts:
         out.stopped = out.stopped or part.stopped
         out.cut = out.cut or part.cut
-    if out.stopped:
-        return out
     first = parts[0]
     out.variables, out.default = first.variables, first.default
     out.phony = set().union(*(p.phony for p in parts))
@@ -3654,14 +4437,15 @@ def _targets_flat(
     target-specific variables apply to a target's recipe and its prerequisites'. A rule with
     several targets (`ci test: lint`) is each of them, `name::` rules all run (their recipes are
     the target's, in order), and a name with no rule of its own takes a matching pattern rule
-    (`test-%:`, with `$*` the stem). The result's `stopped` is set, and it has no rules, when the
-    Makefile outgrows the reader's limits."""
+    (`test-%:`, with `$*` the stem). The result's `stopped` is set when the Makefile outgrows the
+    reader's limits: the rules and recipe lines read before that stay, and a line that needs a
+    variable expanded past the limit is left out."""
     found = _Targets()
     variables = _variables_flat(text, env, cli)
-    if variables.stopped:
-        found.stopped = variables.stopped
-        return found
     budget = _Budget()
+    if variables.stopped:  # what needs no expansion is still read (see `_read_rules`)
+        found.stopped = variables.stopped
+        budget.dead, budget.why = True, variables.stopped
     try:
         _read_rules(text or "", variables, cli, budget, found)
     except _Unreadable as e:
@@ -3673,12 +4457,31 @@ def _targets_flat(
 def _read_rules(
     text: str, variables: _Vars, cli: Sequence[str], budget: _Budget, found: _Targets
 ) -> None:
+
+    def expand(text: str, scope: Mapping[str, str] = variables) -> str | None:
+        """`text` with its variables expanded; None when the budget is spent or it is over a
+        limit (`found.stopped` says so). Text with nothing to expand is always read."""
+        if budget.dead and "$" in text:
+            found.stopped = found.stopped or budget.why
+            return None
+        try:
+            return _expand_vars(text, scope, 0, budget)
+        except _Unreadable as e:
+            found.stopped = found.stopped or str(e)
+            return None
+
+    def head_text(text: str) -> str:
+        """What a rule head, `.PHONY` list or target-specific pattern expands to; the text as it
+        is (its `$(...)` stays) when that cannot be told."""
+        out = expand(text)
+        return text if out is None else out
+
     flags = variables.get(".SHELLFLAGS", "")
     found.errexit = bool(re.search(r"(?:^|\s)-[A-Za-z]*e|errexit", flags))
     found.variables = variables
     found.flags_ignore = make_ignores(variables.get("MAKEFLAGS", ""))
     shell = variables.get("SHELL")
-    found.shell = None if shell is None else _expand_vars(shell, variables, 0, budget).strip()
+    found.shell = None if shell is None else head_text(shell).strip()
     # a recipe runs under `/bin/sh -c`: its pipelines keep the last stage's status unless SHELL
     # is bash and `.SHELLFLAGS` adds `-o pipefail`
     found.pipefail = "bash" in (found.shell or "") and bool(
@@ -3700,30 +4503,26 @@ def _read_rules(
             continue
         indented = line.startswith((" ", "\t"))
         if not indented and (m := re.match(r"^\.PHONY\s*:(.*)$", line)):
-            found.phony |= _phony_names(m[1], variables, budget)
+            found.phony |= _phony_names(m[1], head_text)
         elif not indented and re.match(r"^\.ONESHELL\s*:", line):
             found.oneshell = True
         elif not indented and (m := re.match(r"^\.IGNORE\s*:(.*)$", line)):
-            names = _phony_names(m[1], variables, budget)
+            names = _phony_names(m[1], head_text)
             found.ignore |= names
             found.ignore_all = found.ignore_all or not names
         elif not indented and (m := _ASSIGN.match(line)):
             if m[2] == ".DEFAULT_GOAL":
-                goal = _expand_vars(re.sub(r"\s+#.*$", "", m[4]), variables, 0, budget).split()
+                goal = head_text(re.sub(r"\s+#.*$", "", m[4])).split()
                 explicit = goal[0] if goal else None
                 first = None if not goal else first
             current = []
         elif not indented and (m := _TARGET_VAR.match(line)):
             value = re.sub(r"\s+#.*$", "", m[5]).strip()
-            for pattern in _expand_vars(m[1], variables, 0, budget).split():
+            for pattern in head_text(m[1]).split():
                 scoped.append((pattern, m[3], m[4], value, "override" in m[2]))
         elif not indented and (m := _RULE.match(line)):
-            heads = [
-                n
-                for n in _expand_vars(m[1], variables, 0, budget).split()
-                if re.fullmatch(r"[\w.%/+-]+", n)
-            ]
-            head, _, inline = _expand_vars(m[3], variables, 0, budget).partition(";")
+            heads = [n for n in head_text(m[1]).split() if re.fullmatch(r"[\w.%/+-]+", n)]
+            head, _, inline = head_text(m[3]).partition(";")
             prereqs = [t for t in re.sub(r"#.*$", "", head).split() if re.fullmatch(r"[\w.-]+", t)]
             body = [inline.strip()] if inline.strip() else []
             current = heads
@@ -3750,17 +4549,22 @@ def _read_rules(
         elif current and line.strip() and not line.startswith(("#", ".")):
             current = []
     found.default = explicit if explicit is not None else first
-    overlays = _overlays(
-        variables, found, scoped, {m[1] for w in cli if (m := _CLI_ASSIGN.match(w))}, budget
-    )
-    for name, lines in raw.items():
-        view: Mapping[str, str] = (
-            ChainMap(overlays[name], variables) if name in overlays else variables
-        )
-        for ln in lines:
-            found[name].lines.extend(
-                _split_recipe(ln, _expand_vars(ln, view, 0, budget), found.errexit)
+    overlays: _Overlays | None = None
+    if scoped:
+        try:
+            overlays = _Overlays(
+                variables, found, scoped, {m[1] for w in cli if (m := _CLI_ASSIGN.match(w))}, budget
             )
+        except _Unreadable as e:
+            found.stopped = found.stopped or str(e)
+    for name, lines in raw.items():
+        for ln in lines:
+            if "$" in ln and overlays is not None:
+                expanded = expand(ln, _Scope(overlays, name))
+            else:
+                expanded = expand(ln)
+            if expanded is not None:
+                found[name].lines.extend(_split_recipe(ln, expanded, found.errexit))
     found.set_patterns()
 
 
@@ -4049,16 +4853,6 @@ def _make_reasons(
 ) -> list[tuple[int | None, str]]:
     names, bare = _goals(commands)
     old, new = _targets(f.old_text), _targets(f.new_text)
-    if new.stopped and (names or bare):
-        return [
-            (
-                None,
-                _Warn(
-                    f"{posixpath.basename(f.path)} could not be read ({new.stopped}): the reader "
-                    "stopped, so what its targets run was not compared"
-                ),
-            )
-        ]
     extra = list(commands.values())
     old_shadow: set[str] = set()
     new_shadow: set[str] = set()
@@ -4076,11 +4870,18 @@ def _make_reasons(
     ctx = _Ctx(extra, resolve)
     ignoring = new.ignore_all or new.flags_ignore or _policy_ignores(extra)
     unread: set[str] = set()
+
+    # past a limit of the reader (`stopped`, `cut`) a line that is missing may only be unread: what
+    # a change took away is then a warning, and what it added or narrowed is still a block
+    def partial() -> bool:  # `cut` is set as the chains are followed, so it is asked late
+        return bool(old.stopped or new.stopped or old.cut or new.cut)
+
     for name, old_name, new_name in goals:
         if old_name not in old:
             continue
         if new_name not in new:
-            out.append((None, f"target `{name}` was removed from {posixpath.basename(f.path)}"))
+            gone = f"target `{name}` was removed from {posixpath.basename(f.path)}"
+            out.append((None, _Warn(gone) if partial() else gone))
             continue
         base_lines = _effective(old, old_name, old_shadow)
         cand_lines = _effective(new, new_name, new_shadow)
@@ -4115,6 +4916,8 @@ def _make_reasons(
         if why and not cand_lines and _effective(new, new_name):
             why = _SHADOW_WHY
         why = why or _oneshell_reason(old, new, new_name, ctx)
+        if why and partial() and not isinstance(why, _Warn) and _absence(why):
+            why = _Warn(why)
         if why:
             out.append(
                 (
@@ -4139,16 +4942,28 @@ def _make_reasons(
         if why := _shell_reason(old, new):
             at = _first_line_with(f.new_text or "", "SHELL")
             out.append((at, _carry(why, f"{why}")))
-        if new.cut:
-            out = [
+        base_name = posixpath.basename(f.path)
+        if old.stopped or new.stopped:
+            why_stopped = new.stopped or old.stopped
+            out.append(
                 (
                     None,
                     _Warn(
-                        f"{posixpath.basename(f.path)} was read only up to a point ({new.cut}): "
+                        f"{base_name} could not be read in full ({why_stopped}): the lines the "
+                        "reader kept were compared, the rest was not"
+                    ),
+                )
+            )
+        if old.cut or new.cut:
+            out.append(
+                (
+                    None,
+                    _Warn(
+                        f"{base_name} was read only up to a point ({new.cut or old.cut}): "
                         "what its targets run was not fully compared"
                     ),
                 )
-            ]
+            )
     if (
         names
         and _makefile_sets_autoload_off(f.new_text)
@@ -4352,6 +5167,16 @@ def _makefile_reasons(
     return out
 
 
+def _absence(why: str) -> bool:
+    """Whether a reason says something is missing from what was read (a recipe emptied, a step or
+    a kind of check gone): when the reader stopped short, it may only be unread."""
+    return why in (
+        "it was emptied",
+        "it was replaced by a no-op",
+        "it runs fewer steps than before",
+    ) or why.startswith("it no longer runs")
+
+
 _PYTEST_WORDS = frozenset({"pytest", "py.test"})
 _NO_VALUE = frozenset({"--lf", "--last-failed"})
 _COMMAND_END = frozenset({"&&", "||", ";", "|"})
@@ -4399,6 +5224,10 @@ _MAX_RESOLVE_DEPTH = 8
 _Env = dict[str, list[str] | None]
 
 
+def _is_posargs(node: ast.expr) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "posargs"
+
+
 def _resolve_words(node: ast.expr, env: _Env, depth: int = 0) -> list[str] | None:
     """The strings an expression stands for, when that can be told from the file: string and
     list or tuple literals (starred parts included), names bound once to one of those, `a + b`
@@ -4411,6 +5240,15 @@ def _resolve_words(node: ast.expr, env: _Env, depth: int = 0) -> list[str] | Non
         return _split_words(node.value) if " " in node.value else [node.value]
     if isinstance(node, ast.Attribute) and node.attr == "posargs":
         return []
+    if (  # `session.posargs or [D]`: D, the words when the caller passes none
+        isinstance(node, ast.BoolOp)
+        and isinstance(node.op, ast.Or)
+        and len(node.values) == 2
+        and _is_posargs(node.values[0])
+    ):
+        return _resolve_words(node.values[1], env, nxt)
+    if isinstance(node, ast.IfExp) and _is_posargs(node.test):
+        return _resolve_words(node.orelse, env, nxt)
     if isinstance(node, ast.Name):
         return env.get(node.id)
     if isinstance(node, (ast.List, ast.Tuple)):
@@ -5171,6 +6009,7 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
                 make = warn_finding if isinstance(why, _Warn) else finding
                 out.append(make("runner.tampered", root.path, line, f"{root.path}: {why}", _HINT))
     out.extend(_config_findings(changes))
+    out.extend(_mocha_findings(changes))
     workspace_files = [
         f.path for f in changes.files if f.path in ("pnpm-workspace.yaml", "package.json")
     ]
@@ -5198,14 +6037,14 @@ def _file_reasons(
         return found
     if re.match(r"^tsconfig.*\.json$", name):
         return _tsconfig_reasons(f)
-    if re.match(r"^(?:jest|vitest)\.config\.\w+$", name):
+    if re.match(r"^(?:jest|vitest|vite)\.config\.\w+$", name):
         return _jest_reasons(f, False, changes)
     if name in ("Makefile", "makefile", "GNUmakefile"):
         return _makefile_reasons(f, commands, changes, tests)
     if name in ("justfile", "Justfile"):
         return _make_reasons(f, commands, changes, tests)
     if name == "noxfile.py":
-        return _noxfile_reasons(f)
+        return [*_noxfile_reasons(f), *_toxnox_reasons(f, name, commands, changes)]
     if re.match(r"^\.mocharc(\.\w+)?$", name):
         return _mocha_reasons(f.old_text or "", f.new_text or "")
     if re.match(r"^(\.nycrc(\.\w+)?|nyc\.config\.\w+)$", name):
@@ -5215,8 +6054,47 @@ def _file_reasons(
     if _ENV_FILE.match(name):
         return _envfile_reasons(f, name, commands, changes)
     if name == "tox.ini":
-        return _noxfile_reasons(f)
+        return [*_noxfile_reasons(f), *_toxnox_reasons(f, name, commands, changes)]
+    if name in toxnox.CONFIG_NAMES:
+        return _toxnox_reasons(f, name, commands, changes)
     return []
+
+
+def _toxnox_reasons(
+    f: ChangedFile, name: str, commands: Mapping[str, str], changes: ChangeSet
+) -> list[tuple[int | None, str]]:
+    """A tox or nox configuration that now runs less by default (see `toxnox`), judged for the
+    policy commands, and the recipes and scripts beside the file, that run `tox` or `nox`."""
+    old, new = toxnox.read_defaults(name, f.old_text), toxnox.read_defaults(name, f.new_text)
+    if old is None or new is None or f.old_text == f.new_text:
+        return []
+    where = posixpath.dirname(f.path)
+    statements = [*commands.values(), *_recipe_statements(changes, where)]
+    text = f.new_text or ""
+    anchor = "sessions" if new.tool == "nox" else ("env_list" if "env_list" in text else "envlist")
+    line = _first_line_with(text, anchor)
+    return [(line, _Warn(why) if warn else why) for why, warn in toxnox.judge(old, new, statements)]
+
+
+def _recipe_statements(changes: ChangeSet, directory: str) -> list[str]:
+    """The recipe lines of a Makefile or justfile and the scripts of a package.json in the
+    directory (candidate tree): what a policy command such as `make test` may run."""
+    lines: list[str] = []
+    for name in ("Makefile", "GNUmakefile", "makefile", "justfile", "Justfile"):
+        text = changes.cand_text(posixpath.join(directory, name))
+        lines.extend(
+            _RECIPE_PREFIX.sub("", ln.strip(), count=1)
+            for ln in (text or "").splitlines()
+            if ln[:1] in (" ", "\t")
+        )
+    try:
+        data = json.loads(changes.cand_text(posixpath.join(directory, "package.json")) or "{}")
+    except ValueError:
+        data = {}
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if isinstance(scripts, dict):
+        lines.extend(v for v in scripts.values() if isinstance(v, str))
+    return lines[:2000]
 
 
 _ENV_FILE = re.compile(r"^(?:\.env(?:\..+)?|.+\.env)$")

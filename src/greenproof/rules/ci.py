@@ -14,11 +14,11 @@ from collections import Counter
 from collections.abc import Callable, Collection, Generator, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import WARN, Finding
-from greenproof.rules import workflow
+from greenproof.rules import toxnox, workflow
 from greenproof.rules._common import CODE_SUFFIXES, finding, sev_finding, split_lines
 from greenproof.rules.ci_expand import (
     Child,
@@ -49,6 +49,7 @@ from greenproof.rules.shell import (
     functions_in,
     group_inner,
     is_non_check,
+    narrowed_scope,
     narrowed_selection,
     script_token,
     scripts_in,
@@ -325,21 +326,32 @@ class _Expansion(NamedTuple):
 _CD = frozenset({"cd", "chdir", "pushd", "popd"})
 
 
+_GROUP_DEPTH = 128  # levels of `( ... )`, `{ ...; }` and `sh -c` a script is walked through
+_TOO_DEEP = (
+    f"a statement is nested more than {_GROUP_DEPTH} levels deep in `( ... )`, `{{ ...; }}` or "
+    "`sh -c`: it cannot be read to see whether it removes a test"
+)
+
+
 def _walk_leaves(
-    text: str, defs: Defs, at: tuple[str, _Dir]
+    text: str, defs: Defs, at: tuple[str, _Dir], depth: int = 0
 ) -> Generator[tuple[str, str, _Dir], None, tuple[str, _Dir]]:
     """`_leaf_dirs` with the directory as `_leaves` tells it too, returning where the script
-    ends."""
+    ends. Past `_GROUP_DEPTH` levels a nested statement is one leaf, not walked into (the readers
+    of a statement bound their own nesting the same way)."""
     cwd, where = at
     for seg in split_segments(text):
         before = where
         inner = shell_c_body(seg.text, defs)
-        if inner is not None:  # a shell of its own: its `cd` stays in it
-            yield from _walk_leaves(inner, defs, (cwd, where))
+        group = None if inner is not None else group_inner(seg.text)
+        if depth >= _GROUP_DEPTH and (inner is not None or group is not None):
+            yield seg.text, cwd, where
             continue
-        group = group_inner(seg.text)
+        if inner is not None:  # a shell of its own: its `cd` stays in it
+            yield from _walk_leaves(inner, defs, (cwd, where), depth + 1)
+            continue
         if group is not None:
-            moved = yield from _walk_leaves(group, defs, (cwd, where))
+            moved = yield from _walk_leaves(group, defs, (cwd, where), depth + 1)
             if not seg.text.lstrip().startswith("("):
                 cwd, where = moved
         else:
@@ -544,6 +556,10 @@ class _Walk:
                 children = tox_children(toks, cwd, self.read)
             if children is None:
                 children = nox_children(toks, cwd, self.read)
+            if tool := next((t for t in map(posixpath.basename, toks[:5]) if t in _TOX_NOX), None):
+                for name in _TOX_NOX[tool]:  # a step that runs them reads their configuration
+                    if (path := _join(cwd, name)) is not None:
+                        self.read(path)
             if children is None:
                 self.script(body, stmt, toks, cwd, depth)
             else:
@@ -1465,18 +1481,117 @@ _POSITIVE_FILTERS = ("branches", "tags", "types")
 _IGNORE_FILTERS = ("branches-ignore", "tags-ignore")
 
 
+_DEFAULT_BRANCHES = ("main", "master")
+_QUANT = ("?", "+")
+
+
+def _branch_tokens(pattern: str) -> list[tuple[str, Any, str]]:
+    """A GitHub branch glob as (kind, value, quantifier) tokens: `**` crosses `/`, `*` does not,
+    `[...]` is a class, `?` is zero or one of the preceding token and `+` one or more."""
+    tokens: list[tuple[str, Any, str]] = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            j = i + 1
+            while j < len(pattern) and pattern[j] == "*":
+                j += 1
+            tokens.append(("**" if j - i > 1 else "*", None, ""))
+            i = j
+            continue
+        if c in _QUANT and tokens and not tokens[-1][2] and tokens[-1][0] in ("lit", "cls"):
+            tokens[-1] = (tokens[-1][0], tokens[-1][1], c)
+        elif c == "[" and (close := pattern.find("]", i + 2)) > 0:
+            body = pattern[i + 1 : close]
+            neg = body[:1] in ("!", "^")
+            tokens.append(("cls", (neg, body[1:] if neg else body), ""))
+            i = close + 1
+            continue
+        else:
+            tokens.append(("lit", c, ""))
+        i += 1
+    return tokens
+
+
+def _token_takes(token: tuple[str, Any, str], ch: str) -> bool:
+    kind, value, _ = token
+    if kind == "**":
+        return True
+    if kind == "*":
+        return ch != "/"
+    if kind == "lit":
+        return bool(ch == value)
+    neg, body = value
+    hit, k = False, 0
+    while k < len(body):
+        if k + 2 < len(body) and body[k + 1] == "-":
+            hit = hit or body[k] <= ch <= body[k + 2]
+            k += 3
+        else:
+            hit = hit or body[k] == ch
+            k += 1
+    return bool(hit != neg)
+
+
+def _branch_matches(pattern: str, name: str) -> bool:
+    """Whether the branch glob `pattern` matches `name` (a simulation over the tokens, so the work
+    is bounded by their number times the name's length and no regex is built from the pattern)."""
+    tokens = _branch_tokens(pattern)
+
+    def close(states: set[int]) -> set[int]:
+        todo = list(states)
+        while todo:
+            i = todo.pop()
+            optional = i < len(tokens) and (tokens[i][0] in ("*", "**") or tokens[i][2] == "?")
+            if optional and i + 1 not in states:
+                states.add(i + 1)
+                todo.append(i + 1)
+        return states
+
+    states = close({0})
+    for ch in name:
+        nxt: set[int] = set()
+        for i in states:
+            if i < len(tokens) and _token_takes(tokens[i], ch):
+                nxt.add(i + 1)
+                if tokens[i][0] in ("*", "**") or tokens[i][2] == "+":
+                    nxt.add(i)
+        states = close(nxt)
+        if not states:
+            return False
+    return len(tokens) in states
+
+
+def _branch_selected(patterns: list[str], name: str) -> bool:
+    """Whether a `branches` list selects `name`: a `!` pattern removes what came before it."""
+    chosen = False
+    for p in patterns:
+        if p.startswith("!"):
+            if _branch_matches(p[1:], name):
+                chosen = False
+        elif _branch_matches(p, name):
+            chosen = True
+    return chosen
+
+
 def _filter_warnings(
     event: str, was: dict[str, list[str]], now: dict[str, list[str]], pr_open: bool = False
 ) -> list[str]:
     """What a filter that is new or wider than at the base takes away from `event`. `pr_open`: a
-    `branches` or `branches-ignore` filter newly under `push` costs nothing the tests ran on,
-    since `pull_request` still runs them on every branch."""
+    `branches` or `branches-ignore` filter newly under `push` costs nothing the tests ran on while
+    `pull_request` still runs them on every branch, unless it takes the default branch off push
+    (`branches-ignore` matching main or master, `branches` selecting neither)."""
     out: list[str] = []
     for key in _POSITIVE_FILTERS:
         if key not in now:
             continue
         if key not in was:
             if pr_open and event == "push" and key == "branches":
+                if not any(_branch_selected(now[key], b) for b in _DEFAULT_BRANCHES):
+                    out.append(
+                        "a `branches` filter under `push` selects neither `main` nor `master`:"
+                        " the default branch no longer runs the tests on push"
+                    )
                 continue
             out.append(f"a `{key}` filter was added under `{event}`: fewer runs may test it")
         elif gone := [p for p in was[key] if p not in now[key]]:
@@ -1485,7 +1600,9 @@ def _filter_warnings(
         if key not in now:
             continue
         added = [p for p in now[key] if p not in was.get(key, [])]
-        if added and not (pr_open and event == "push" and key == "branches-ignore" not in was):
+        if added and pr_open and event == "push" and key == "branches-ignore" and key not in was:
+            added = [p for p in added if any(_branch_matches(p, b) for b in _DEFAULT_BRANCHES)]
+        if added:
             out.append(f"`{key}` under `{event}` now also excludes {', '.join(added)}")
     return out
 
@@ -1572,25 +1689,31 @@ def _balanced(text: str) -> bool:
     return depth == 0
 
 
-def _if_on(value: str, event: str) -> bool | None:
+_IF_DEPTH = 32  # nested parentheses and `&&`/`||` levels read before the reading gives up
+
+
+def _if_on(value: str, event: str, depth: int = 0) -> bool | None:
     """Whether an `if:` holds on an `event` run: False for `github.event_name == 'push'` on a
     pull request, True for `!= 'pull_request'` on one; `github.ref` and `github.ref_name`
     conditions are False on `pull_request` (a pull request's ref is `refs/pull/N/merge`) and
-    unknown on any other event. None for anything the reading cannot tell."""
+    unknown on any other event. None for anything the reading cannot tell, and for an expression
+    nested more than `_IF_DEPTH` levels deep."""
+    if depth > _IF_DEPTH:
+        return None
     text = " ".join(value.split())
     if len(text) > 1 and text[0] == text[-1] and text[0] in "'\"" and text[0] not in text[1:-1]:
         text = text[1:-1].strip()
     if m := _EXPR.match(text):
         text = m[1].strip()
     if _wrapped(text):
-        return _if_on(text[1:-1], event)
+        return _if_on(text[1:-1], event, depth + 1)
     ors = _split_top(text, "||")
     if len(ors) > 1:
-        got = [_if_on(p, event) for p in ors]
+        got = [_if_on(p, event, depth + 1) for p in ors]
         return True if True in got else False if all(g is False for g in got) else None
     ands = _split_top(text, "&&")
     if len(ands) > 1:
-        got = [_if_on(p, event) for p in ands]
+        got = [_if_on(p, event, depth + 1) for p in ands]
         return False if False in got else True if all(g is True for g in got) else None
     text = text.strip()
     if text in ("true", "'true'"):
@@ -1853,7 +1976,13 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                     continue
                 if tests is None:
                     continue
-                gone, _ = tests.scan(path_stmt, where)
+                try:
+                    gone, _ = tests.scan(path_stmt, where)
+                except RecursionError:  # a nest `_walk_leaves` left whole is too deep to read
+                    if (at, _TOO_DEEP) not in reported:
+                        reported.add((at, _TOO_DEEP))
+                        out.append(_block(at, _TOO_DEEP))
+                    continue
                 if gone is not None:
                     why = removal_reason(stmt[:80], gone)
                     if (at, why) not in reported:
@@ -2212,8 +2341,38 @@ def _selection_reasons(world: _World, path: str) -> list[tuple[str, int | None, 
     files = world.tests.selectable() if world.tests is not None else None
     if why := narrowed_selection(base_cmds, cand_cmds, defs, files):
         out.append((path, None, f"the tests run on a narrower selection: {why}", False))
+    scope, unread = narrowed_scope(base_cmds, cand_cmds, defs)
+    if scope:
+        out.append((path, None, f"the tests run on a narrower scope: {scope}", False))
+    elif unread:
+        out.append((path, None, unread, True))
     if why := selection_changed_warning(base_cmds, cand_cmds, defs, files):
         out.append((path, None, why, True))
+    return out
+
+
+_TOX_NOX = {
+    "tox": ("tox.ini", "setup.cfg", "pyproject.toml", "tox.toml"),
+    "nox": ("noxfile.py",),
+}
+
+
+def _toxnox_reasons(world: _World) -> list[tuple[str, int | None, str, bool]]:
+    """A tox or nox configuration the change edited that now runs less by default, for the
+    `tox` and `nox` steps of the candidate's workflows (see `toxnox`)."""
+    out: list[tuple[str, int | None, str, bool]] = []
+    cmds: list[str] | None = None
+    defs: dict[str, str] = {}
+    for f in world.changes.files:
+        name = posixpath.basename(f.path)
+        if name not in toxnox.CONFIG_NAMES or f.old_text == f.new_text:
+            continue
+        old, new = toxnox.read_defaults(name, f.old_text), toxnox.read_defaults(name, f.new_text)
+        if old is None or new is None:
+            continue
+        if cmds is None:
+            cmds, defs = _commands(world, False)
+        out.extend((f.path, None, why, warn) for why, warn in toxnox.judge(old, new, cmds, defs))
     return out
 
 
@@ -2224,6 +2383,7 @@ def _candidate(path: str) -> bool:
     return (
         name in _ACTION_NAMES
         or name == "package.json"
+        or name in toxnox.CONFIG_NAMES
         or name.startswith(("Makefile", "makefile", "GNUmakefile"))
         or posixpath.splitext(name)[1].lower() in _SCRIPT_EXTS | {".mk"}
     )
@@ -2302,6 +2462,7 @@ def check_ci(changes: ChangeSet, commands: Mapping[str, str] | None = None) -> l
     reasons.extend(_greenproof_reasons(world))
     here = next((f.path for f in touched if f.new_text is not None), touched[0].path)
     reasons.extend(_selection_reasons(world, here))
+    reasons.extend(_toxnox_reasons(world))
     for path, line, why, warn in reasons:
         message = f"{path}: {why}"
         if names := via.get(path):

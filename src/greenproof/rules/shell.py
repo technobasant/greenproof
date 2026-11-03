@@ -28,6 +28,7 @@ from __future__ import annotations
 import posixpath
 import re
 import shlex
+from bisect import bisect_right
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -82,7 +83,9 @@ SELECT_FLAGS: dict[str, frozenset[str]] = {
     "js": frozenset(
         {"-t", "--testNamePattern", "--testPathIgnorePatterns", "--onlyChanged", "-o"}
         | {"--findRelatedTests", "--shard", "--testPathPattern", "--selectProjects"}
-        | {"--project", "--changed", "--related"}
+        | {"--project", "--changed", "--related", "--dir", "--exclude", "--ignoreProjects"}
+        | {"--testPathPatterns", "--changedSince", "--lastCommit", "--changedFilesWithAncestor"}
+        | {"--onlyFailures", "-f"}
     ),
     # `--doc` runs the doctests only and `-- --ignored` the ignored tests only; `--include-ignored`
     # runs more than the default, so it is not here.
@@ -1405,6 +1408,11 @@ def _make_kind(rest: list[str], make_check: Callable[[str], bool | None] | None)
 
 _KIND_MEMO: dict[tuple[object, ...], str | None] = {}
 _KIND_MEMO_MAX = 20000
+# How many `( ... )`, `{ ...; }` and `sh -c` levels a statement is read through. Past it the
+# statement is read flat (see `check_kind`): a script is not nested this deep by hand, and each
+# level costs a pass over the text and a stack frame.
+_NEST_BUDGET = 32
+_FLAT_SPLIT = re.compile(r"[;&|(){}\n]+")
 
 
 def check_kind(
@@ -1414,20 +1422,22 @@ def check_kind(
     scripts: Collection[str] = (),
     make_check: Callable[[str], bool | None] | None = None,
     defs: Mapping[str, str] | None = None,
+    _depth: int = 0,
 ) -> str | None:
     """`_check_kind`, remembered for a statement read again under the same policy and variables
     (a Makefile's recipe lines and a step's body are asked about once per walk of them)."""
     if make_check is not None or len(text) > 4096:
-        return _check_kind(text, literals, scripts, make_check, defs)
+        return _check_kind(text, literals, scripts, make_check, defs, _depth)
     key = (
         text,
         tuple(literals),
         frozenset(scripts),
         tuple(sorted(defs.items())) if defs else (),
+        _depth,
     )
     if key in _KIND_MEMO:
         return _KIND_MEMO[key]
-    kind = _check_kind(text, literals, scripts, make_check, defs)
+    kind = _check_kind(text, literals, scripts, make_check, defs, _depth)
     if len(_KIND_MEMO) >= _KIND_MEMO_MAX:
         _KIND_MEMO.clear()
     _KIND_MEMO[key] = kind
@@ -1440,18 +1450,30 @@ def _check_kind(
     scripts: Collection[str],
     make_check: Callable[[str], bool | None] | None,
     defs: Mapping[str, str] | None,
+    _depth: int = 0,
 ) -> str | None:
     """The kind of check a statement runs in command position, None when it is not a check.
 
     `literals` are policy commands (a statement containing one is a check), `scripts` the
     repo-relative paths of scripts a policy command runs, `defs` the variables (`env:`, Makefile
-    assignments) a `$VAR` command word may be defined by.
+    assignments) a `$VAR` command word may be defined by. Past `_NEST_BUDGET` levels of groups the
+    statement is read flat: its first piece that is a check, without descending into any `sh -c`.
     """
+    if _depth > _NEST_BUDGET:
+        for piece in _FLAT_SPLIT.split(text):
+            if kind := classify(command_tokens(piece, defs), make_check):
+                return kind
+        return None
     inner = _group_inner(text)
     if inner is not None:
         for seg in split_segments(inner):
             kind = check_kind(
-                seg.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs
+                seg.text,
+                literals=literals,
+                scripts=scripts,
+                make_check=make_check,
+                defs=defs,
+                _depth=_depth + 1,
             )
             if kind:
                 return kind
@@ -1459,7 +1481,12 @@ def _check_kind(
     if (body := shell_c_body(text, defs)) is not None:  # sh -c "..."
         for seg in split_segments(body):
             kind = check_kind(
-                seg.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs
+                seg.text,
+                literals=literals,
+                scripts=scripts,
+                make_check=make_check,
+                defs=defs,
+                _depth=_depth + 1,
             )
             if kind:
                 return kind
@@ -1540,15 +1567,17 @@ def _inline_eval(toks: list[str]) -> bool:
     return cmd in _INLINE_EVAL and any(_EVAL_FLAG.match(t) for t in toks[1:3])
 
 
-def is_non_check(text: str, defs: Mapping[str, str] | None = None) -> bool:
+def is_non_check(text: str, defs: Mapping[str, str] | None = None, _depth: int = 0) -> bool:
     """Whether a statement is recognisably not a check: a command from the list of ones that run
     no tests (`echo`, `exit 0`, `pip install`, `git`, `docker push`, a `deploy.sh`, `bash -n`,
     inline code that is not a recognised check)."""
+    if _depth > _NEST_BUDGET:
+        return False  # nested past the budget: not read, so not known to be free of a check
     inner = _group_inner(text)
     if inner is not None:
-        return all(is_non_check(seg.text, defs) for seg in split_segments(inner))
+        return all(is_non_check(seg.text, defs, _depth + 1) for seg in split_segments(inner))
     if (body := shell_c_body(text, defs)) is not None:
-        return all(is_non_check(seg.text, defs) for seg in split_segments(body))
+        return all(is_non_check(seg.text, defs, _depth + 1) for seg in split_segments(body))
     toks = command_tokens(text, defs)
     if not toks:
         return True  # nothing but assignments
@@ -1821,6 +1850,19 @@ def _flat_swallows(
         if seg.sep == "||" and _is_failing_exit(seg.text):
             chain_guard[-1] = True
     reads = [bool(_STATUS_READ.search(s.text)) for s in segs]
+    seg_index = _SegIndex(segs)
+    # `rc=$?` on a line of its own saves the status of the statement before it: it reads that
+    # status only if the script then ends with `$rc` (see `_rc_kept`)
+    saves = [""] * len(segs)
+    for i, seg in enumerate(segs):
+        if (
+            i
+            and seg.sep in ("", ";", "\n")
+            and (m := _RC_SET.match(_KEYWORD.sub(r"\g<rest>", seg.text)))
+        ):
+            saves[i] = m["v"]
+            if check(i - 1):  # the status of anything else is not the one that matters
+                reads[i] = _rc_kept(segs, i, m["v"], seg_index)
     next_read = [-1] * (len(segs) + 1)  # the first statement at or after each one that reads
     for i in range(len(segs) - 1, -1, -1):
         next_read[i] = i if reads[i] else next_read[i + 1]
@@ -1856,7 +1898,7 @@ def _flat_swallows(
             before = [j for j in chain_members[chain_of[i]] if j < i and check(j)]
             keeper = next((m for r in rhs if (m := _RC_SET.match(r))), None)
             if before and keeper and not any(_is_failing_exit(r) for r in rhs):
-                if not _rc_kept(segs, i, keeper["v"]):
+                if not _rc_kept(segs, i, keeper["v"], seg_index):
                     add(
                         seg,
                         "or",
@@ -1883,13 +1925,20 @@ def _flat_swallows(
         elif (rc_then := _RC_SET.match(text) or _RC_NONZERO.match(text)) and _in_check_if(
             segs, i, check
         ):
-            if not _rc_kept(segs, i, rc_then["v"]):
+            if not _rc_kept(segs, i, rc_then["v"], seg_index):
                 add(
                     seg,
                     "or",
                     f"the failure sets `${rc_then['v']}` but the script never ends with"
                     f" `exit ${rc_then['v']}`",
                 )
+        elif saves[i] and unguarded[i - 1] and not reads[i]:
+            add(
+                seg,
+                "or",
+                f"the status is saved in `${saves[i]}` but the script never ends with"
+                f" `exit ${saves[i]}`",
+            )
         elif _SET_PLUS_E.match(text):
             state_errexit = False
             end = next(
@@ -1941,7 +1990,7 @@ def _flat_swallows(
             unguarded[i] = True
         if reads[i]:
             last_read = i
-    depth = _block_depth(segs)
+    depth = seg_index.depth
     for i, seg in enumerate(segs):
         if (
             check(i)
@@ -1963,6 +2012,8 @@ def _flat_swallows(
         for i, seg in enumerate(segs):
             if not (check(i) and unguarded[i]) or depth[i] or reads[i]:
                 continue
+            if i + 1 < len(segs) and saves[i + 1]:
+                continue  # judged above, where the status is saved
             members = chain_members[chain_of[i]]
             if any(segs[j].sep != "&&" for j in members if j > i):
                 continue  # a `||` after it: judged above
@@ -2016,7 +2067,8 @@ def _and_list_swallowed(segs: Sequence[Seg], i: int, depth: list[int], members: 
     return False
 
 
-_RC_SET = re.compile(r"^(?P<v>[A-Za-z_]\w*)=(?:\$\?|\"\$\?\"|\$\{\?\})$")
+_DECL = r"(?:(?:local|declare|typeset|readonly|export)\s+(?:-\w+\s+)*)?"
+_RC_SET = re.compile(rf"^{_DECL}(?P<v>[A-Za-z_]\w*)=(?:\$\?|\"\$\?\"|\$\{{\?\}})$")
 _RC_NONZERO = re.compile(r"^(?P<v>[A-Za-z_]\w*)=\"?[1-9]\d*\"?$")
 
 
@@ -2080,26 +2132,63 @@ def _rc_branches(
     return None
 
 
-def _rc_kept(segs: Sequence[Seg], i: int, var: str) -> bool:
+def _rc_final_test(text: str, var: str, last: bool) -> bool:
+    """Whether `text`, the last statement of the script, is a test that fails when `$var` is not
+    0 (`test $rc -eq 0`, `[ "$rc" = 0 ]`, `(( rc == 0 ))`), its status being the script's."""
+    if not last:
+        return False
+    if _rc_test(text, var) == "zero":
+        return True
+    v = re.escape(var)
+    return re.fullmatch(rf"\(\(\s*(?:{v}\s*==\s*0|!\s*{v})\s*\)\)", text.strip()) is not None
+
+
+_IDENT = re.compile(r"[A-Za-z_]\w*")
+
+
+class _SegIndex:
+    """What `_rc_kept` needs from a whole script, read once: which statements are top level, how
+    deep each block is, and for each name the statements that mention it."""
+
+    def __init__(self, segs: Sequence[Seg]) -> None:
+        self.top = _top_level(segs)
+        self.depth = _block_depth(segs)
+        self.mentions: dict[str, list[int]] = {}
+        for k, seg in enumerate(segs):
+            for word in set(_IDENT.findall(seg.text)):
+                self.mentions.setdefault(word, []).append(k)
+
+
+def _rc_kept(segs: Sequence[Seg], i: int, var: str, idx: _SegIndex) -> bool:
     """Whether the script, after `segs[i]` saved a status in `$var`, ends non-zero when `$var`
     is: `exit $var` (also `exit ${var:-0}`, `exit $((var))`) at its top level or last in a
     top-level `{ ...; }` group, a top-level `if [ "$var" -ne 0 ]; then exit "$var"; fi` (or `exit
     1`), or `[ "$var" -eq 0 ] || exit "$var"`, with no later statement assigning `var` in
     between. A test that cannot be read does not count."""
-    top = _top_level(segs)
-    depth = _block_depth(segs)
-    reset = re.compile(rf"^{re.escape(var)}=")
-    for j in range(i + 1, len(segs)):
+    top, depth = idx.top, idx.depth
+    reset = re.compile(rf"^{_DECL}{re.escape(var)}=")
+    at = idx.mentions.get(var, [])
+    # every form that keeps the status, and the assignment that loses it, names the variable
+    for pos in range(bisect_right(at, i), len(at)):
+        j = at[pos]
         text = segs[j].text.strip()
         if top[j]:
             if re.fullmatch(rf"exit\s+{_rc_operand(var)}", text):
                 return True
+            if j + 1 == len(segs) and re.fullmatch(rf"return\s+{_rc_operand(var)}", text):
+                return True  # a function's value is the script's only when nothing follows it
             inner = group_inner(text) if text.startswith("{") else None
             tail = split_segments(inner.strip(" ;")) if inner else []
             if tail and re.fullmatch(rf"exit\s+{_rc_operand(var)}", tail[-1].text.strip()):
                 return True
             joined = j + 1 < len(segs) and segs[j + 1].sep in ("&&", "||")
+            if segs[j].sep in ("", ";", "\n") and _rc_final_test(text, var, j + 1 == len(segs)):
+                return True
             if joined and (pol := _rc_test(text, var)):
+                if pol == "zero" and segs[j + 1].sep == "&&" and j + 2 == len(segs):
+                    return (
+                        True  # `[ "$rc" -eq 0 ] && echo ok` last: the list's status is the test's
+                    )
                 want = "nonzero" if segs[j + 1].sep == "&&" else "zero"
                 if pol == want and _rc_exits(segs[j + 1].text, var, j + 2 == len(segs)):
                     return True
@@ -2304,13 +2393,18 @@ def _block_depth(segs: Sequence[Seg]) -> list[int]:
 _ATTACHED = "kmtgesRELIf"  # short flags whose value may follow them directly: `-kfoo`, `-Rfoo`
 
 
+# One flag under two names: jest 30 renamed `--testPathPattern` to `--testPathPatterns`, so the
+# rename is not a new selection flag.
+FLAG_ALIASES = {"--testPathPatterns": "--testPathPattern"}
+
+
 def _flag_name(token: str, flags: frozenset[str]) -> str | None:
     """The selection flag `token` is (`-k`, `-k=x`, `-kx`, `--grep=x`), else None."""
     if token in flags:
-        return token
+        return FLAG_ALIASES.get(token, token)
     head = token.partition("=")[0]
     if head in flags:
-        return head
+        return FLAG_ALIASES.get(head, head)
     if re.match(r"^-[A-Za-z].+", token) and token[1] in _ATTACHED and token[:2] in flags:
         return token[:2]
     return None
@@ -2396,13 +2490,66 @@ def _calls(command: str, defs: Mapping[str, str] | None = None) -> list[tuple[Se
     return out
 
 
+# Task runners and package managers that run only what changed since a git ref: the base run
+# `nx run-many -t test` becomes `nx affected -t test` and the tests of an untouched package stop.
+# `[ref]` in a pnpm or turbo `--filter` is that selection (`...[origin/main]`, `{dir}[HEAD^1]`).
+_GIT_FILTER = re.compile(r"(?:^|\.\.\.|\}|\^)\[[^\[\]]+\](?:\.\.\.)?$")
+_FILTER_FLAGS = frozenset({"--filter", "-F", "--filter-prod"})
+
+
+def _filter_values(args: Sequence[str]) -> list[str]:
+    """The values of the `--filter` flags among `args` (`--filter x`, `--filter=x`, `-Fx`)."""
+    out: list[str] = []
+    for i, tok in enumerate(args):
+        name, eq, value = tok.partition("=")
+        if name in _FILTER_FLAGS:
+            out.append(value if eq else "".join(args[i + 1 : i + 2]))
+        elif re.match(r"^-F.", tok):
+            out.append(tok[2:])
+    return out
+
+
+def _changed_only(tokens: list[str]) -> list[str]:
+    """The ways a monorepo statement runs only the packages that changed since a git ref:
+    `nx affected`, turbo `--affected` and `--filter=...[ref]`, lerna `--since`, pnpm
+    `--filter "...[ref]"`, `yarn workspaces foreach --since`. What it runs by name (`--filter
+    web`) is not listed: it is the same set of packages whatever changed."""
+    if "--" in tokens:
+        tokens = tokens[: tokens.index("--")]
+    found: list[str] = []
+    for i, tok in enumerate(tokens[:4]):
+        tool, rest = _cmd_name(tok), tokens[i + 1 :]
+        if tool == "nx":
+            word = next((t for t in rest if not t.startswith("-")), "")
+            if word == "affected" or word.startswith("affected:"):
+                found.append("nx affected")
+        elif tool == "turbo":
+            if any(t == "--affected" or t.startswith("--affected=") for t in rest):
+                found.append("--affected")
+            if any(_GIT_FILTER.search(v) for v in _filter_values(rest)):
+                found.append("--filter [ref]")
+        elif tool == "lerna" and any(t in ("run", "exec") for t in rest):
+            if any(t == "--since" or t.startswith("--since=") for t in rest):
+                found.append("--since")
+        elif tool == "pnpm" and any(_GIT_FILTER.search(v) for v in _filter_values(rest)):
+            found.append("--filter [ref]")
+        elif tool == "yarn" and "foreach" in rest:
+            if any(t == "--since" or t.startswith("--since=") for t in rest):
+                found.append("--since")
+        else:
+            continue
+        break
+    return found
+
+
 def selection_uses(
     command: str, *, retries_ok: bool = False, defs: Mapping[str, str] | None = None
 ) -> list[tuple[str, str, str]]:
     """`(runner family, flag, the statement)` for each narrowing flag a runner is run with.
 
     With `retries_ok`, the rerun-the-failures flags (`--lf`) do not count on the right side of
-    `check || check --lf`: that reruns what the first run failed.
+    `check || check --lf`: that reruns what the first run failed. A monorepo task runner that
+    runs only what changed is the family `monorepo` (see `_changed_only`).
     """
     found: list[tuple[str, str, str]] = []
     chain: list[str] = []  # the kinds of check on the current `&&` / `||` chain
@@ -2430,6 +2577,7 @@ def selection_uses(
                     and not (retry and n in RERUN_FLAGS)
                     and not (n in _VALUED_NOOP and re.search(r"=(?:false|0|no)$", t, re.IGNORECASE))
                     and not (n in _ZERO_VALUED and not _is_zero(t, args[k + 1 : k + 2]))
+                    and not (n == "-o" and _cmd_name(tokens[0]) == "vitest")  # vitest's `--open`
                 )
                 if "-x test" in flags:
                     found.extend(
@@ -2437,6 +2585,9 @@ def selection_uses(
                         for k, t in enumerate(args[:-1])
                         if t in ("-x", "--exclude-task") and args[k + 1] in ("test", "check")
                     )
+        found.extend(("monorepo", mode, seg.text) for mode in _changed_only(tokens))
+        if tokens and _cmd_name(tokens[0]) == "vitest" and tokens[1:2] == ["related"]:
+            found.append(("js", "related", seg.text))
         if "--" in tokens and tokens and _is_tox(tokens[0]):
             pytest_flags = _ALL_FLAGS["pytest"]
             found.extend(
@@ -2981,6 +3132,174 @@ def narrowed_selection(
         elif all(_restricts(family, words) for words in cand_runs):
             return f"{family} ran everything before and now runs only {_listing(cand_words)}"
     return None
+
+
+# -- scope flags: the packages, targets, features and build tags a run covers -------------------
+# `cargo test --lib`, `-p a`, `--features x` and `go test -tags integration` pick what is built and
+# run without naming a test. Each is a set the run covers: a candidate that covers less than the
+# base did narrowed the run, and one that covers more (`--all-targets`, `--workspace`, a tag
+# added) did not.
+@dataclass(frozen=True)
+class _Dim:
+    """What one kind of flag lets through: everything (`top`), or only the named items."""
+
+    top: bool
+    items: frozenset[str] = frozenset()
+
+
+_TARGET_GROUPS = {"bins": "bin:", "tests": "test:", "examples": "example:", "benches": "bench:"}
+_TARGET_FLAGS = {"--bin": "bin:", "--test": "test:", "--example": "example:", "--bench": "bench:"}
+_TARGET_ALL = {"--lib": "lib", **{f"--{k}": k for k in _TARGET_GROUPS}}
+_SCOPE_LABELS = {
+    "packages": "package",
+    "targets": "target",
+    "features": "feature",
+    "tags": "build tag",
+}
+_UNREAD = re.compile(r"[$`]")
+
+
+def _flag_pairs(
+    args: Sequence[str], values: frozenset[str], attached: bool
+) -> list[tuple[str, str]]:
+    """`(flag, value)` of each flag among `args` up to `--`: the value of `--flag=v`, `--flag v`
+    and, with `attached`, `-pv`; "" for a flag that takes none (or whose next word is a flag)."""
+    out: list[tuple[str, str]] = []
+    i = 0
+    while i < len(args) and args[i] not in ("--", "-args"):
+        tok = args[i]
+        i += 1
+        if not (tok.startswith("-") and len(tok) > 1):
+            continue
+        name, eq, value = tok.partition("=")
+        if attached and not eq and not tok.startswith("--") and len(tok) > 2 and tok[:2] in values:
+            name, value = tok[:2], tok[2:]
+        elif not eq and name in values and i < len(args) and not args[i].startswith("-"):
+            value = args[i]
+            i += 1
+        out.append((name, value))
+    return out
+
+
+def _cargo_scope(args: Sequence[str]) -> dict[str, _Dim]:
+    """The packages, targets and features of one `cargo test` or `cargo nextest` run."""
+    packages: set[str] = set()
+    targets: set[str] = set()
+    features: set[str] = set()
+    everything = {"workspace": False, "targets": False, "features": False, "defaults": True}
+    for name, value in _flag_pairs(args, _VALUE_FLAGS["cargo"], True):
+        if name in ("-p", "--package"):
+            packages.add(value or "?")
+        elif name in ("--workspace", "--all"):
+            everything["workspace"] = True
+        elif name == "--all-targets":
+            everything["targets"] = True
+        elif name in _TARGET_ALL:
+            targets.add(_TARGET_ALL[name])
+        elif name in _TARGET_FLAGS:  # a bare `--bin` is every binary
+            targets.add(_TARGET_FLAGS[name] + value if value else _TARGET_FLAGS[name][:-1] + "s")
+        elif name in ("--features", "-F"):
+            features.update(f for f in re.split(r"[,\s]+", value) if f)
+        elif name == "--all-features":
+            everything["features"] = True
+        elif name == "--no-default-features":
+            everything["defaults"] = False
+    return {
+        "packages": _Dim(everything["workspace"] or not packages, frozenset(packages)),
+        "targets": _Dim(everything["targets"] or not targets, frozenset(targets)),
+        "features": _Dim(everything["features"], frozenset(features)),
+        "defaults": _Dim(False, frozenset({"default"}) if everything["defaults"] else frozenset()),
+    }
+
+
+def _go_scope(args: Sequence[str]) -> dict[str, _Dim]:
+    """The build tags of one `go test` run (`-tags a,b`, `-tags=a`, `-tags "a b"`)."""
+    tags: set[str] = set()
+    for name, value in _flag_pairs(args, _VALUE_FLAGS["go"], False):
+        if name in ("-tags", "--tags"):
+            tags.update(t for t in re.split(r"[,\s]+", value.strip("'\"")) if t)
+    return {"tags": _Dim(False, frozenset(tags))}
+
+
+def _scopes(commands: Sequence[str], defs: Mapping[str, str] | None) -> dict[str, dict[str, _Dim]]:
+    """Per runner (`cargo`, `go`) the dimensions its runs together cover: a dimension is
+    unrestricted when any run leaves it so, else it is the union of the runs' items."""
+    runs: dict[str, list[dict[str, _Dim]]] = {}
+    for command in commands:
+        command = _EXPRESSION.sub(lambda m: re.sub(r"\s+", "", m[0]), command)
+        for _, tokens, _sep in _calls(command, defs):
+            if not tokens:
+                continue
+            if (start := _runner_end("cargo", tokens)) is None:
+                start = _runner_end("nextest", tokens)
+            if start is not None:
+                runs.setdefault("cargo", []).append(
+                    _cargo_scope(_without_redirects(tokens[start:]))
+                )
+            elif (start := _runner_end("go", tokens)) is not None:
+                args = _without_redirects(tokens[start:])
+                if _cmd_name(tokens[0]) == "gotestsum":  # its own flags end at `--`
+                    args = args[args.index("--") + 1 :] if "--" in args else []
+                runs.setdefault("go", []).append(_go_scope(args))
+    return {
+        family: {
+            dim: _Dim(any(r[dim].top for r in rs), frozenset().union(*(r[dim].items for r in rs)))
+            for dim in rs[0]
+        }
+        for family, rs in runs.items()
+    }
+
+
+def _item_covers(cand: str, base: str) -> bool:
+    """Whether the candidate's item `cand` covers the base's `base`: the same, `--bins` for
+    `--bin x` (and `--tests`, `--examples`, `--benches`), or a package glob."""
+    if cand == base or ((prefix := _TARGET_GROUPS.get(cand)) and base.startswith(prefix)):
+        return True
+    return "*" in cand and len(cand) < 200 and fnmatchcase(base, cand)
+
+
+def narrowed_scope(
+    base_cmds: Sequence[str], cand_cmds: Sequence[str], defs: Mapping[str, str] | None = None
+) -> tuple[str | None, str | None]:
+    """`(block, warning)`: a description when the candidate runs `cargo test` or `go test` over
+    less than the base did, and a warning when it cannot be told.
+
+    cargo: packages (`-p`, against `--workspace` or none), targets (`--lib`, `--bins`, `--bin X`,
+    `--test X`, `--example X`, `--benches`; none and `--all-targets` are everything), features
+    (`--features`, `--all-features`) and `--no-default-features`. go: `-tags`, whose files stop
+    being built when a tag goes. A run covers a dimension when it covers every item the base
+    did; more items, or an unrestricted dimension, is not a narrowing. A value that is a
+    variable cannot be read: the warning, when it differs from the base's.
+    """
+    base = _scopes(base_cmds, defs)
+    cand = _scopes(cand_cmds, defs)
+    warn: str | None = None
+    for family, dims in base.items():
+        if family not in cand:
+            continue
+        for dim, before in dims.items():
+            after = cand[family][dim]
+            if after.top or any(_UNREAD.search(i) for i in after.items):
+                if not after.top and after != before:
+                    warn = warn or (
+                        f"{family} is run with a {_SCOPE_LABELS.get(dim, dim)} that cannot be read"
+                        " here: check that it still covers what the base did"
+                    )
+                continue
+            lost = sorted(
+                b for b in before.items if not any(_item_covers(c, b) for c in after.items)
+            )
+            if dim == "defaults" and lost:
+                return f"{family} now runs with `--no-default-features`", warn
+            noun = _SCOPE_LABELS.get(dim, dim)
+            if before.top and dim == "features":
+                return f"{family} no longer runs with `--all-features`", warn
+            if before.top:
+                only = _listing(sorted(after.items))
+                return f"{family} ran every {noun} before and now only {only}", warn
+            if lost:
+                return f"{family} no longer runs with {noun} {_listing(lost)}", warn
+    return None, warn
 
 
 def selection_changed_warning(
