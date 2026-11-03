@@ -30,7 +30,7 @@ import re
 import shlex
 from bisect import bisect_right
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from functools import lru_cache
@@ -164,6 +164,16 @@ _HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?([A-Za-z_][
 
 
 def _split(script: str) -> list[Seg]:
+    """`_split_raw` of `script`, read once however many times a rule asks for the same text."""
+    return list(_split_memo(script))
+
+
+@lru_cache(maxsize=32)
+def _split_memo(script: str) -> tuple[Seg, ...]:
+    return tuple(_split_raw(script))
+
+
+def _split_raw(script: str) -> list[Seg]:
     """The raw statements of a script: `split_segments` before functions and `case` are read.
 
     A `;;` (or `;&`, `;;&`) is not a separator but the end of a `case` arm: the next segment's
@@ -1849,6 +1859,9 @@ def _flat_swallows(
         chain_members[-1].append(i)
         if seg.sep == "||" and _is_failing_exit(seg.text):
             chain_guard[-1] = True
+    # per chain, its last member that does not follow an `&&`: a `||` or `;` after a statement
+    last_non_and = [max((j for j in m if segs[j].sep != "&&"), default=-1) for m in chain_members]
+    last_check_in_chain = [-1] * len(chain_members)  # the last check seen so far in each chain
     reads = [bool(_STATUS_READ.search(s.text)) for s in segs]
     seg_index = _SegIndex(segs)
     # `rc=$?` on a line of its own saves the status of the statement before it: it reads that
@@ -1863,6 +1876,18 @@ def _flat_swallows(
             saves[i] = m["v"]
             if check(i - 1):  # the status of anything else is not the one that matters
                 reads[i] = _rc_kept(segs, i, m["v"], seg_index)
+    unread_checks: list[int] | None = None
+    minus_e: list[int] = []
+    # the last statement that reads PIPESTATUS, and the last `wait $job`: what follows a statement
+    last_pipestatus = max((k for k, sg in enumerate(segs) if "PIPESTATUS" in sg.text), default=-1)
+    last_wait = max((k for k, sg in enumerate(segs) if _WAIT.match(sg.text)), default=-1)
+    some_check: list[bool] = []
+
+    def any_check() -> bool:
+        if not some_check:
+            some_check.append(any(check(j) for j in range(len(segs))))
+        return some_check[0]
+
     next_read = [-1] * (len(segs) + 1)  # the first statement at or after each one that reads
     for i in range(len(segs) - 1, -1, -1):
         next_read[i] = i if reads[i] else next_read[i + 1]
@@ -1895,7 +1920,9 @@ def _flat_swallows(
                 if segs[k].sep != "&&":
                     break
                 rhs.append(segs[k].text)
-            before = [j for j in chain_members[chain_of[i]] if j < i and check(j)]
+            before = (
+                [last_check_in_chain[chain_of[i]]] if last_check_in_chain[chain_of[i]] >= 0 else []
+            )
             keeper = next((m for r in rhs if (m := _RC_SET.match(r))), None)
             if before and keeper and not any(_is_failing_exit(r) for r in rhs):
                 if not _rc_kept(segs, i, keeper["v"], seg_index):
@@ -1922,8 +1949,10 @@ def _flat_swallows(
             before = chain_members[chain_of[i] - 1]
             if nxt_sep in ("\n", "") and not state_errexit and any(check(j) for j in before):
                 add(seg, "true", f"`; {text}` after a check discards its status")
-        elif (rc_then := _RC_SET.match(text) or _RC_NONZERO.match(text)) and _in_check_if(
-            segs, i, check
+        elif (
+            (rc_then := _RC_SET.match(text) or _RC_NONZERO.match(text))
+            and seg_index.enclosing_if[i] >= 0
+            and check(seg_index.enclosing_if[i])
         ):
             if not _rc_kept(segs, i, rc_then["v"], seg_index):
                 add(
@@ -1941,16 +1970,24 @@ def _flat_swallows(
             )
         elif _SET_PLUS_E.match(text):
             state_errexit = False
-            end = next(
-                (k for k in range(i + 1, len(segs)) if _SET_MINUS_E.match(segs[k].text)), len(segs)
+            if unread_checks is None:  # read once, so many `set +e` cost no more than one
+                unread_checks = [
+                    c
+                    for c in range(len(segs))
+                    if check(c)
+                    and not _is_zero_exit(segs[c].text)
+                    and next_read[c] < 0
+                    and not (c + 1 < len(segs) and segs[c + 1].sep in ("||", "&&"))
+                ]
+                minus_e = [k for k in range(len(segs)) if _SET_MINUS_E.match(segs[k].text)]
+            end = (
+                minus_e[bisect_right(minus_e, i)]
+                if bisect_right(minus_e, i) < len(minus_e)
+                else len(segs)
             )
-            for c in range(i + 1, end):
-                if not check(c) or _is_zero_exit(segs[c].text):
-                    continue
-                joined = c + 1 < len(segs) and segs[c + 1].sep in ("||", "&&")
-                if next_read[c] < 0 and not joined:
-                    add(seg, "set+e", "`set +e` and the exit status is never read afterwards")
-                    break
+            first = bisect_right(unread_checks, i)
+            if first < len(unread_checks) and unread_checks[first] < end:
+                add(seg, "set+e", "`set +e` and the exit status is never read afterwards")
         elif _SET_MINUS_E.match(text):
             state_errexit = True
         if (flip := _pipefail_set(text)) is not None:
@@ -1964,7 +2001,7 @@ def _flat_swallows(
                     stages[0], literals=literals, scripts=scripts, make_check=make_check, defs=defs
                 )
             )
-            and not any("PIPESTATUS" in segs[k].text for k in range(i + 1, len(segs)))
+            and last_pipestatus <= i
         ):
             add(
                 seg,
@@ -1972,11 +2009,11 @@ def _flat_swallows(
                 f"`{_short(text)}` pipes the check into another command and its"
                 " status is the last stage's: use `set -o pipefail` or `${PIPESTATUS[0]}`",
             )
-        if seg.bg and check(i) and not _waited(segs, i):
+        if seg.bg and check(i) and last_wait <= i:
             add(seg, "bg", f"`{_short(seg.text)}` runs in the background and its status is lost")
         if check(i) and status_dropped(seg.text):
             add(seg, "dropped", "`pytest.main(...)` returns the status, it does not exit with it")
-        if _trap_exit0(text) and any(check(j) for j in range(len(segs))):
+        if _trap_exit0(text) and any_check():
             add(seg, "trap", f"`{_short(text)}` makes the shell exit 0 whatever a check did")
         if early and top[i] and _is_zero_exit(text):
             if first_exit is None:
@@ -1990,12 +2027,16 @@ def _flat_swallows(
             unguarded[i] = True
         if reads[i]:
             last_read = i
+        if check(i):
+            last_check_in_chain[chain_of[i]] = i
     depth = seg_index.depth
     for i, seg in enumerate(segs):
         if (
             check(i)
             and under_e[i]
-            and _and_list_swallowed(segs, i, depth, chain_members[chain_of[i]])
+            and _and_list_swallowed(
+                segs, i, depth, chain_members[chain_of[i]], last_non_and[chain_of[i]]
+            )
             and not chain_guard[chain_of[i]]
         ):
             label = kinds[i] or "check"
@@ -2015,7 +2056,7 @@ def _flat_swallows(
             if i + 1 < len(segs) and saves[i + 1]:
                 continue  # judged above, where the status is saved
             members = chain_members[chain_of[i]]
-            if any(segs[j].sep != "&&" for j in members if j > i):
+            if last_non_and[chain_of[i]] > i:
                 continue  # a `||` after it: judged above
             after = range(members[-1] + 1, len(segs))
             if not after or next_read[i + 1] >= 0:
@@ -2042,14 +2083,16 @@ _LIST_HEAD = re.compile(r"^(?:if|elif|while|until)\b")
 _LAST_STATUS = re.compile(r"\$\?|\$\{\?|PIPESTATUS")
 
 
-def _and_list_swallowed(segs: Sequence[Seg], i: int, depth: list[int], members: list[int]) -> bool:
+def _and_list_swallowed(
+    segs: Sequence[Seg], i: int, depth: list[int], members: list[int], last_non_and: int
+) -> bool:
     """Whether `segs[i]`, a check under `set -e`, is in an `&&` list but not its last command
     (errexit does not stop on a failure there) and a statement of the same block follows the list
     whose status read is not `$?`: the failure is then dropped. The condition of an `if` or
     `while` is read by it, and a list that ends `|| exit 1` is judged by the `||` rule."""
     if i == members[-1] or _LIST_HEAD.match(segs[members[0]].text):
         return False
-    if any(segs[j].sep != "&&" for j in members if j > i):
+    if last_non_and > i:
         return False
     level = depth[i]  # the block the walk is in; its `else` and `elif` branches are not reached
     skipping = False
@@ -2146,6 +2189,26 @@ def _rc_final_test(text: str, var: str, last: bool) -> bool:
 _IDENT = re.compile(r"[A-Za-z_]\w*")
 
 
+def _enclosing_ifs(segs: Sequence[Seg]) -> list[int]:
+    """For each statement, the index of the `if` or `elif` it sits inside (the nearest one not yet
+    closed by a `fi`), or -1: one forward pass with a stack."""
+    open_ifs: list[int] = []
+    out: list[int] = []
+    for k, seg in enumerate(segs):
+        out.append(open_ifs[-1] if open_ifs else -1)
+        word = _first_word(_KEYWORD.sub(r"\g<rest>", seg.text))
+        if word == "if":
+            open_ifs.append(k)
+        elif word == "elif":
+            if open_ifs:
+                open_ifs[-1] = k
+            else:
+                open_ifs.append(k)
+        elif word == "fi" and open_ifs:
+            open_ifs.pop()
+    return out
+
+
 class _SegIndex:
     """What `_rc_kept` needs from a whole script, read once: which statements are top level, how
     deep each block is, and for each name the statements that mention it."""
@@ -2153,10 +2216,51 @@ class _SegIndex:
     def __init__(self, segs: Sequence[Seg]) -> None:
         self.top = _top_level(segs)
         self.depth = _block_depth(segs)
+        self.enclosing_if = _enclosing_ifs(segs)
+        self.kept: dict[str, dict[int, bool]] = {}  # per name: mention position -> `_rc_kept`
         self.mentions: dict[str, list[int]] = {}
         for k, seg in enumerate(segs):
             for word in set(_IDENT.findall(seg.text)):
                 self.mentions.setdefault(word, []).append(k)
+
+
+def _rc_step(segs: Sequence[Seg], j: int, var: str, idx: _SegIndex) -> bool | None:
+    """What the statement `segs[j]`, which mentions `$var`, does to a saved status: True when it
+    keeps it to the script's exit, False when it assigns `var` afresh, None when it does neither."""
+    top, depth = idx.top, idx.depth
+    reset = re.compile(rf"^{_DECL}{re.escape(var)}=")
+    text = segs[j].text.strip()
+    if top[j]:
+        if re.fullmatch(rf"exit\s+{_rc_operand(var)}", text):
+            return True
+        if j + 1 == len(segs) and re.fullmatch(rf"return\s+{_rc_operand(var)}", text):
+            return True  # a function's value is the script's only when nothing follows it
+        inner = group_inner(text) if text.startswith("{") else None
+        tail = split_segments(inner.strip(" ;")) if inner else []
+        if tail and re.fullmatch(rf"exit\s+{_rc_operand(var)}", tail[-1].text.strip()):
+            return True
+        joined = j + 1 < len(segs) and segs[j + 1].sep in ("&&", "||")
+        if segs[j].sep in ("", ";", "\n") and _rc_final_test(text, var, j + 1 == len(segs)):
+            return True
+        if joined and (pol := _rc_test(text, var)):
+            if pol == "zero" and segs[j + 1].sep == "&&" and j + 2 == len(segs):
+                return True  # `[ "$rc" -eq 0 ] && echo ok` last: the list's status is the test's
+            want = "nonzero" if segs[j + 1].sep == "&&" else "zero"
+            if pol == want and _rc_exits(segs[j + 1].text, var, j + 2 == len(segs)):
+                return True
+        elif _first_word(text) == "if" and not joined and (pol := _rc_test(text[2:], var)):
+            if (branches := _rc_branches(segs, j, depth)) is not None:
+                fi = next(
+                    k
+                    for k in range(j + 1, len(segs))
+                    if segs[k].text == "fi" and depth[k] == depth[j]
+                )
+                for stmt in branches[0 if pol == "nonzero" else 1]:
+                    if _rc_exits(stmt, var, fi == len(segs) - 1):
+                        return True
+    if segs[j].sep in ("", ";", "\n") and reset.match(_KEYWORD.sub(r"\g<rest>", segs[j].text)):
+        return False
+    return None
 
 
 def _rc_kept(segs: Sequence[Seg], i: int, var: str, idx: _SegIndex) -> bool:
@@ -2165,60 +2269,23 @@ def _rc_kept(segs: Sequence[Seg], i: int, var: str, idx: _SegIndex) -> bool:
     top-level `{ ...; }` group, a top-level `if [ "$var" -ne 0 ]; then exit "$var"; fi` (or `exit
     1`), or `[ "$var" -eq 0 ] || exit "$var"`, with no later statement assigning `var` in
     between. A test that cannot be read does not count."""
-    top, depth = idx.top, idx.depth
-    reset = re.compile(rf"^{_DECL}{re.escape(var)}=")
     at = idx.mentions.get(var, [])
-    # every form that keeps the status, and the assignment that loses it, names the variable
+    memo = idx.kept.setdefault(var, {})
+    # every form that keeps the status, and the assignment that loses it, names the variable; what
+    # one mention decides does not depend on where the scan started, so each is read once
+    seen: list[int] = []
+    result = False
     for pos in range(bisect_right(at, i), len(at)):
-        j = at[pos]
-        text = segs[j].text.strip()
-        if top[j]:
-            if re.fullmatch(rf"exit\s+{_rc_operand(var)}", text):
-                return True
-            if j + 1 == len(segs) and re.fullmatch(rf"return\s+{_rc_operand(var)}", text):
-                return True  # a function's value is the script's only when nothing follows it
-            inner = group_inner(text) if text.startswith("{") else None
-            tail = split_segments(inner.strip(" ;")) if inner else []
-            if tail and re.fullmatch(rf"exit\s+{_rc_operand(var)}", tail[-1].text.strip()):
-                return True
-            joined = j + 1 < len(segs) and segs[j + 1].sep in ("&&", "||")
-            if segs[j].sep in ("", ";", "\n") and _rc_final_test(text, var, j + 1 == len(segs)):
-                return True
-            if joined and (pol := _rc_test(text, var)):
-                if pol == "zero" and segs[j + 1].sep == "&&" and j + 2 == len(segs):
-                    return (
-                        True  # `[ "$rc" -eq 0 ] && echo ok` last: the list's status is the test's
-                    )
-                want = "nonzero" if segs[j + 1].sep == "&&" else "zero"
-                if pol == want and _rc_exits(segs[j + 1].text, var, j + 2 == len(segs)):
-                    return True
-            elif _first_word(text) == "if" and not joined and (pol := _rc_test(text[2:], var)):
-                if (branches := _rc_branches(segs, j, depth)) is not None:
-                    fi = next(
-                        k
-                        for k in range(j + 1, len(segs))
-                        if segs[k].text == "fi" and depth[k] == depth[j]
-                    )
-                    for stmt in branches[0 if pol == "nonzero" else 1]:
-                        if _rc_exits(stmt, var, fi == len(segs) - 1):
-                            return True
-        if segs[j].sep in ("", ";", "\n") and reset.match(_KEYWORD.sub(r"\g<rest>", segs[j].text)):
-            return False
-    return False
-
-
-def _in_check_if(segs: Sequence[Seg], i: int, check: Callable[[int], bool]) -> bool:
-    """Whether `segs[i]` sits inside an `if` or `elif` whose condition runs a check."""
-    depth = 0
-    for k in range(i - 1, -1, -1):
-        word = _first_word(_KEYWORD.sub(r"\g<rest>", segs[k].text))
-        if word == "fi":
-            depth += 1
-        elif word in ("if", "elif") and depth == 0:
-            return check(k)
-        elif word == "if":
-            depth -= 1
-    return False
+        if pos in memo:
+            result = memo[pos]
+            break
+        seen.append(pos)
+        if (got := _rc_step(segs, at[pos], var, idx)) is not None:
+            result = got
+            break
+    for pos in seen:
+        memo[pos] = result
+    return result
 
 
 def _stages(text: str) -> list[str]:
@@ -2260,9 +2327,7 @@ def _pipefail_set(text: str) -> bool | None:
     return None
 
 
-def _waited(segs: Sequence[Seg], i: int) -> bool:
-    """Whether a later statement waits on a named job (`wait $pid`) and so reads its status."""
-    return any(re.match(r"^wait\s+\S", segs[k].text) for k in range(i + 1, len(segs)))
+_WAIT = re.compile(r"^wait\s+\S")  # a statement that waits on a named job and so reads its status
 
 
 def _trap_exit0(text: str) -> bool:
@@ -2877,6 +2942,23 @@ def _covers(family: str, c: str, b: str) -> bool:
     return c == "." or b.startswith((c + "/", c + "::"))
 
 
+def _covered(family: str, cands: set[str], b: str) -> bool:
+    """`any(_covers(family, c, b) for c in cands)` for normalised `cands`, in the time of one
+    word: it looks the word, each parent of it (and for go each `parent/...`) up in the set."""
+    b = _norm_path(family, b)
+    if b in cands or ("." in cands and family != "go"):
+        return True
+    if family == "go":
+        if "./..." in cands or "..." in cands or f"{b}/..." in cands:
+            return True
+        return any(b[: i + 1] + "..." in cands for i, ch in enumerate(b) if ch == "/")
+    return any(
+        b[:i] in cands
+        for i, ch in enumerate(b)
+        if i and (ch == "/" or (ch == ":" and b.startswith("::", i)))
+    )
+
+
 def _restricts(family: str, words: list[str]) -> bool:
     """Whether a run with these positional words runs less than everything."""
     if not words:
@@ -3121,9 +3203,8 @@ def narrowed_selection(
         if base_words:
             if family != "go" and any(not words for words in cand_runs):
                 continue  # a candidate run with no path runs everything
-            lost_words = [
-                b for b in base_words if not any(_covers(family, c, b) for c in cand_words)
-            ]
+            kept = {_norm_path(family, c) for c in cand_words}
+            lost_words = [b for b in base_words if not _covered(family, kept, b)]
             if lost_words:
                 return (
                     f"{family} ran `{lost_words[0]}` before and now runs only"
@@ -3155,6 +3236,7 @@ _SCOPE_LABELS = {
     "targets": "target",
     "features": "feature",
     "tags": "build tag",
+    "filter": "package",
 }
 _UNREAD = re.compile(r"[$`]")
 
@@ -3221,6 +3303,85 @@ def _go_scope(args: Sequence[str]) -> dict[str, _Dim]:
     return {"tags": _Dim(False, frozenset(tags))}
 
 
+# Task runners whose name filters pick the packages a test run covers: the flags that name
+# packages, the flags that leave some out, and the flags that take every following word.
+_MONOREPO_FLAGS: dict[str, tuple[tuple[str, ...], tuple[str, ...], bool]] = {
+    "turbo": (("--filter", "-F"), (), False),
+    "pnpm": (("--filter", "-F", "--filter-prod"), (), False),
+    "nx": (("--projects", "-p"), ("--exclude",), True),
+    "lerna": (("--scope",), ("--ignore",), False),
+    "yarn": (("--include",), ("--exclude",), False),
+}
+_TEST_TASK = re.compile(r"^(?:test|tests|check|lint|typecheck|verify|ci|e2e)(?:[:_-]\S*)?$")
+
+
+def _runs_tests(args: Sequence[str]) -> bool:
+    """Whether a task runner's words name a test-like task (`test`, `-t test`, `--target=check`)."""
+    return any(_TEST_TASK.match(t.rpartition("=")[2]) for t in args)
+
+
+def _flag_words(args: Sequence[str], names: Sequence[str], several: bool) -> list[str]:
+    """The values of the flags `names` among `args`: `--flag=a,b`, `--flag a`, `-Fa`, repeated;
+    with `several`, every word up to the next flag (`-p a b`). Split at commas."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        name, eq, value = args[i].partition("=")
+        i += 1
+        if name in names:
+            words = [value] if eq else []
+            while (
+                not eq and i < len(args) and not args[i].startswith("-") and (several or not words)
+            ):
+                words.append(args[i])
+                i += 1
+            out.extend(w for word in words for w in word.split(",") if w)
+        elif len(args[i - 1]) > 2 and args[i - 1][:2] in names and not args[i - 1].startswith("--"):
+            out.append(args[i - 1][2:])
+    return out
+
+
+def _monorepo_scope(tokens: Sequence[str]) -> tuple[str, dict[str, _Dim]] | None:
+    """The packages one `turbo`, `pnpm`, `nx run-many`, `lerna run` or `yarn workspaces foreach`
+    test run covers: its name filters (`!x` and the excluding flags leave packages out). A filter
+    by git ref is `_changed_only`'s."""
+    for i, tok in enumerate(tokens[:4]):
+        tool = _cmd_name(tok)
+        if tool not in _MONOREPO_FLAGS:
+            continue
+        args = list(tokens[i + 1 :])
+        if "--" in args:
+            args = args[: args.index("--")]
+        head = args[:3]
+        if (
+            (tool == "nx" and "run-many" not in head)
+            or (tool == "lerna" and not any(t in ("run", "exec") for t in head))
+            or (tool == "yarn" and "foreach" not in args)
+            or not _runs_tests(args)
+        ):
+            return None
+        flags, excluding, several = _MONOREPO_FLAGS[tool]
+        named: list[str] = []
+        left: list[str] = []
+        for value in _flag_words(args, flags, several):
+            if value.startswith("!"):
+                left.append(value[1:])
+            elif not _GIT_FILTER.search(value):
+                named.append(value)
+        left.extend(_flag_words(args, excluding, several))
+        return tool, {
+            "filter": _Dim(not named, frozenset(named)),
+            "excludes": _Dim(False, frozenset(left)),
+        }
+    return None
+
+
+def runs_monorepo_tests(text: str, defs: Mapping[str, str] | None = None) -> bool:
+    """Whether a statement is a `turbo`, `nx run-many`, `lerna run`, `pnpm` or `yarn workspaces
+    foreach` run of a test task: the step a name filter changes without it being another step."""
+    return _monorepo_scope(_without_redirects(command_tokens(text, defs))) is not None
+
+
 def _scopes(commands: Sequence[str], defs: Mapping[str, str] | None) -> dict[str, dict[str, _Dim]]:
     """Per runner (`cargo`, `go`) the dimensions its runs together cover: a dimension is
     unrestricted when any run leaves it so, else it is the union of the runs' items."""
@@ -3241,13 +3402,20 @@ def _scopes(commands: Sequence[str], defs: Mapping[str, str] | None) -> dict[str
                 if _cmd_name(tokens[0]) == "gotestsum":  # its own flags end at `--`
                     args = args[args.index("--") + 1 :] if "--" in args else []
                 runs.setdefault("go", []).append(_go_scope(args))
+            elif (found := _monorepo_scope(_without_redirects(tokens))) is not None:
+                runs.setdefault(found[0], []).append(found[1])
     return {
-        family: {
-            dim: _Dim(any(r[dim].top for r in rs), frozenset().union(*(r[dim].items for r in rs)))
-            for dim in rs[0]
-        }
+        family: {dim: _merge(dim, [r[dim] for r in rs]) for dim in rs[0]}
         for family, rs in runs.items()
     }
+
+
+def _merge(dim: str, parts: list[_Dim]) -> _Dim:
+    """One dimension over several runs: it is unrestricted when any run leaves it so, and covers
+    the items of every run; a package is left out (`excludes`) only when every run leaves it out."""
+    if dim == "excludes":
+        return _Dim(False, frozenset.intersection(*(p.items for p in parts)))
+    return _Dim(any(p.top for p in parts), frozenset().union(*(p.items for p in parts)))
 
 
 def _item_covers(cand: str, base: str) -> bool:
@@ -3256,6 +3424,68 @@ def _item_covers(cand: str, base: str) -> bool:
     if cand == base or ((prefix := _TARGET_GROUPS.get(cand)) and base.startswith(prefix)):
         return True
     return "*" in cand and len(cand) < 200 and fnmatchcase(base, cand)
+
+
+def _filter_parts(item: str) -> tuple[str, bool, bool, bool]:
+    """`web...` and `...web` also run what the package needs or what needs it, `^web` leaves the
+    package itself out: the name, and whether each of those is there."""
+    before, after = item.startswith("..."), item.endswith("...")
+    core = item[3 * before : len(item) - 3 * after]
+    caret = core.startswith("^") or core.endswith("^")
+    return core.strip("^"), before, after, caret
+
+
+def _filter_covers(cand: str, base: str) -> bool:
+    """Whether the candidate's package filter covers the base's: the same name or a glob over it,
+    reaching at least as far (`web...` and `...web` also run what the package needs or what
+    needs it) and leaving the package itself in when the base did."""
+    (c, c_before, c_after, c_caret), (b, b_before, b_after, b_caret) = (
+        _filter_parts(cand),
+        _filter_parts(base),
+    )
+    return (
+        _item_covers(c, b)
+        and (c_before or not b_before)
+        and (c_after or not b_after)
+        and (b_caret or not c_caret)
+    )
+
+
+_COVER_BUDGET = 200_000  # item-against-item comparisons of one dimension
+
+
+def _filter_name(item: str) -> str:
+    return _filter_parts(item)[0]
+
+
+def _uncovered(
+    items: Iterable[str],
+    by: frozenset[str],
+    covers: Callable[[str, str], bool],
+    name: Callable[[str], str] = str,
+) -> list[str] | None:
+    """The `items` that none of `by` covers (`covers(by_item, item)`); None when there are too
+    many to compare. An item is covered by itself, by a glob or a target group, or by one with
+    the same name (`name`): those are the only ones compared, so the cost follows the input."""
+    named: dict[str, list[str]] = {}
+    wild: list[str] = []
+    for c in by:
+        if "*" in name(c) or c in _TARGET_GROUPS:
+            wild.append(c)
+        else:
+            named.setdefault(name(c), []).append(c)
+    budget = _COVER_BUDGET
+    out: list[str] = []
+    for item in sorted(items):
+        if item in by:
+            continue
+        pool = [*named.get(name(item), ()), *wild]
+        budget -= len(pool) + 1
+        if budget < 0:
+            return None
+        if not any(covers(c, item) for c in pool):
+            out.append(item)
+    return out
 
 
 def narrowed_scope(
@@ -3267,9 +3497,13 @@ def narrowed_scope(
     cargo: packages (`-p`, against `--workspace` or none), targets (`--lib`, `--bins`, `--bin X`,
     `--test X`, `--example X`, `--benches`; none and `--all-targets` are everything), features
     (`--features`, `--all-features`) and `--no-default-features`. go: `-tags`, whose files stop
-    being built when a tag goes. A run covers a dimension when it covers every item the base
-    did; more items, or an unrestricted dimension, is not a narrowing. A value that is a
-    variable cannot be read: the warning, when it differs from the base's.
+    being built when a tag goes. turbo, pnpm, `nx run-many`, `lerna run` and `yarn workspaces
+    foreach`: the packages their name filters pick (none is every package) and the ones they
+    leave out (`!x`, `--exclude`, `--ignore`); a filter that names other packages than the base's
+    (a rename, a glob) is the warning, as it cannot be judged without the workspace. A run covers
+    a dimension when it covers every item the base did; more items, or an unrestricted dimension,
+    is not a narrowing. A value that is a variable cannot be read: the warning, when it differs
+    from the base's.
     """
     base = _scopes(base_cmds, defs)
     cand = _scopes(cand_cmds, defs)
@@ -3279,6 +3513,13 @@ def narrowed_scope(
             continue
         for dim, before in dims.items():
             after = cand[family][dim]
+            if dim == "excludes":  # packages left out: one more is a run that covers less
+                added = _uncovered(after.items, before.items, _filter_covers, _filter_name)
+                if added is None or any(_UNREAD.search(c) for c in added):
+                    warn = warn or f"{family} leaves out a package that cannot be read here"
+                elif added:
+                    return f"{family} now leaves out {_listing(added)}", warn
+                continue
             if after.top or any(_UNREAD.search(i) for i in after.items):
                 if not after.top and after != before:
                     warn = warn or (
@@ -3286,9 +3527,23 @@ def narrowed_scope(
                         " here: check that it still covers what the base did"
                     )
                 continue
-            lost = sorted(
-                b for b in before.items if not any(_item_covers(c, b) for c in after.items)
-            )
+            covers = _filter_covers if dim == "filter" else _item_covers
+            name = _filter_name if dim == "filter" else str
+            lost = _uncovered(before.items, after.items, covers, name)
+            if lost is None:
+                warn = warn or f"{family} has too many {_SCOPE_LABELS.get(dim, dim)}s to compare"
+                continue
+            if (
+                lost
+                and dim == "filter"
+                and not before.top
+                and _uncovered(after.items, before.items, covers, name)
+            ):
+                warn = warn or (  # renamed, or a glob: not a subset of what the base ran
+                    f"{family} package filter changed from {_listing(sorted(before.items))}"
+                    f" to {_listing(sorted(after.items))}: check that it still covers them"
+                )
+                continue
             if dim == "defaults" and lost:
                 return f"{family} now runs with `--no-default-features`", warn
             noun = _SCOPE_LABELS.get(dim, dim)
@@ -3333,4 +3588,6 @@ def selection_changed_warning(
 
 
 def _listing(words: Sequence[str]) -> str:
-    return ", ".join(f"`{w}`" for w in dict.fromkeys(words))
+    names = list(dict.fromkeys(words))
+    more = f" and {len(names) - 8} more" if len(names) > 8 else ""
+    return ", ".join(f"`{w}`" for w in names[:8]) + more

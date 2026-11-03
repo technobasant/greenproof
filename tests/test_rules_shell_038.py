@@ -6,6 +6,7 @@ Each item has a tamper that must block and an honest neighbour that must pass.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -420,6 +421,51 @@ def test_branch_globs_follow_github_semantics_and_stay_linear() -> None:
     assert not matches("*" * 60 + "x", "m" * 5000)
 
 
+def nested_if(levels: int) -> str:
+    """`(vars.A{n} && (vars.A{n-1} || (... vars.A0)))`: real `&&`/`||` nesting nobody can fold."""
+    expr = "vars.A0"
+    for i in range(1, levels + 1):
+        expr = f"(vars.A{i} {'&&' if i % 2 else '||'} {expr})"
+    return expr
+
+
+@pytest.mark.parametrize("wrap", [50, 3000])
+def test_a_job_if_wrapped_in_parentheses_that_keeps_pull_requests_out_blocks(
+    tmp_path: Path, wrap: int
+) -> None:
+    cond = "${{ " + "(" * wrap + " github.event_name == 'push' " + ")" * wrap + " }}"
+    found = with_if(tmp_path, BOTH, job=f"    if: {cond}\n")
+    assert verdict(found) == "block", messages(found)
+
+
+def test_an_if_nested_past_what_can_be_read_warns(tmp_path: Path) -> None:
+    for where, kw in (("job", "job"), ("step", "step")):
+        cond = "${{ " + nested_if(40) + " }}"
+        indent = "    " if kw == "job" else "        "
+        found = with_if(tmp_path, BOTH, **{kw: f"{indent}if: {cond}\n"})
+        assert verdict(found) == "warn", where
+        assert any("too deeply to read" in m for m in messages(found, "warn")), where
+
+
+def test_an_if_nested_within_what_can_be_read_is_honest(tmp_path: Path) -> None:
+    cond = "${{ " + nested_if(20) + " }}"
+    assert verdict(with_if(tmp_path, BOTH, job=f"    if: {cond}\n")) == "pass"
+
+
+def test_a_parenthesised_if_that_runs_on_both_events_is_honest(tmp_path: Path) -> None:
+    cond = "${{ (github.event_name == 'push' || github.event_name == 'pull_request') }}"
+    assert verdict(with_if(tmp_path, BOTH, job=f"    if: {cond}\n")) == "pass"
+
+
+def test_an_unchanged_deep_if_is_not_a_finding(tmp_path: Path) -> None:
+    cond = "${{ " + nested_if(40) + " }}"
+    job = f"    if: {cond}\n"
+    found = with_if(tmp_path, BOTH, job=job, base_on=BOTH)
+    assert any("too deeply" in m for m in messages(found, "warn"))
+    base = {WF: workflow(BOTH, job=job), "tests/test_a.py": TEST}
+    assert scene(fresh(tmp_path), base, {WF: workflow(BOTH, job=job)}) == []
+
+
 # ---- 9. a status saved on its own line must reach the exit -------------------------------------
 
 BARE = "#!/bin/bash\n"
@@ -499,7 +545,9 @@ DEEP = 3000
 def test_an_if_wrapped_in_thousands_of_parentheses_is_unknown_not_a_crash() -> None:
     from greenproof.rules.ci import _if_on
 
-    assert _if_on("(" * DEEP + "github.event_name == 'push'" + ")" * DEEP, "pull_request") is None
+    # peeling redundant parentheses spends no depth, so a wrapped condition is still read
+    assert _if_on("(" * DEEP + "github.event_name == 'push'" + ")" * DEEP, "pull_request") is False
+    assert _if_on("( " * DEEP + "github.event_name == 'push'" + " )" * DEEP, "push") is True
     assert _if_on("(" * 20 + "github.event_name == 'push'" + ")" * 20, "pull_request") is False
     assert _if_on("(" * 20 + "github.event_name == 'push'" + ")" * 20, "push") is True
 
@@ -556,3 +604,107 @@ def test_thousands_of_saved_statuses_are_read_in_one_pass() -> None:
     saves = "".join(f"echo {n}; rc{n}=$?\n" for n in range(3000))
     assert kinds("pytest; rc=$?\n" + saves + "exit $rc\n", strict_status=True) == []
     assert "or" in kinds("pytest; rc=$?\n" + saves + "exit 0\n", strict_status=True)
+
+
+# ---- 11. reading cost grows with the script, not with its square --------------------------------
+
+
+def cpu_of(script: str, **kw: object) -> float:
+    best = float("inf")
+    for _ in range(2):
+        start = time.process_time()
+        find_swallows(script, **kw)  # type: ignore[arg-type]
+        best = min(best, time.process_time() - start)
+    return best
+
+
+SCALING = {
+    "saved statuses": ("echo {n}; rc{n}=$?\n", "pytest\nrc=$?\nexit $rc\n", {}),
+    "statuses saved in an if": (
+        "if pytest; then echo a; else rc=$?; fi\n",
+        "exit $rc\n",
+        {"strict_status": True},
+    ),
+    "set +e": ("set +e\npytest\nrc=$?\n", "exit $rc\n", {}),
+    "or-saved": ("pytest || rc=$?\n", "[ $rc -eq 0 ] || exit $rc\n", {}),
+    "pipes": ("pytest | tee log\n", "echo ${{PIPESTATUS[0]}}\n", {"strict_status": True}),
+    "background checks": ("pytest &\n", "wait $!\n", {}),
+    "traps": ("trap 'exit 0' EXIT\n", "pytest\n", {}),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(SCALING))
+def test_reading_a_script_four_times_as_long_costs_well_under_sixteen_times(shape: str) -> None:
+    unit, tail, kw = SCALING[shape]
+
+    def script(n: int) -> str:
+        return "#!/bin/bash\n" + "".join(unit.format(n=k) for k in range(n)) + tail
+
+    small, large = cpu_of(script(500), **kw), cpu_of(script(2000), **kw)
+    assert large < 9 * max(small, 0.02), (shape, small, large)
+
+
+@pytest.mark.parametrize("joiner", [" && ", " || "])
+def test_a_list_of_thousands_of_commands_on_one_line_is_read_in_linear_time(joiner: str) -> None:
+    def script(n: int) -> str:
+        return "#!/bin/bash\nset -e\n" + joiner.join(["pytest"] * n) + "\n"
+
+    kw = {"strict_status": True, "errexit": True}
+    small, large = cpu_of(script(500), **kw), cpu_of(script(2000), **kw)
+    assert large < 9 * max(small, 0.02), (joiner, small, large)
+
+
+def test_a_status_saved_in_an_if_among_thousands_of_statements_is_judged_as_before() -> None:
+    filler = "echo x\n" * 2000
+    save = "if pytest; then echo a; else rc=$?; fi\n"
+    assert "or" in kinds(filler + save + filler + "exit 0\n", strict_status=True)
+    assert kinds(filler + save + filler + "exit $rc\n", strict_status=True) == []
+
+
+def test_enclosing_ifs_match_a_walk_back_over_the_statements() -> None:
+    from greenproof.rules.shell import _KEYWORD, _enclosing_ifs, _first_word, split_segments
+
+    def walked(segs: list, i: int) -> int:
+        depth = 0
+        for k in range(i - 1, -1, -1):
+            word = _first_word(_KEYWORD.sub(r"\g<rest>", segs[k].text))
+            if word == "fi":
+                depth += 1
+            elif word in ("if", "elif") and depth == 0:
+                return k
+            elif word == "if":
+                depth -= 1
+        return -1
+
+    for script in (
+        "a\nif x; then\nb\nif y; then\nc\nfi\nd\nelif z; then\ne\nfi\nf\n",
+        "if a; then if b; then c; elif d; then e; fi; elif f; then g; else h; fi; i\n",
+        "if a; then b; fi; if c; then d; fi; e\nelif q; then r; fi; s\n",
+    ):
+        segs = split_segments(script)
+        assert _enclosing_ifs(segs) == [walked(segs, i) for i in range(len(segs))], script
+
+
+def test_a_relative_path_is_found_without_asking_for_the_working_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import posixpath
+
+    from greenproof.rules.ci import _rel
+
+    pairs = [
+        ("scripts", "."),
+        ("scripts/lib", "scripts"),
+        ("scripts", "scripts/lib"),
+        (".", "a/b/c"),
+        ("a/b", "a/b"),
+        ("a/../b", "c/./d"),
+        ("x", "x/y/z"),
+    ]
+    want = [posixpath.relpath(path, start) for path, start in pairs]
+
+    def no_cwd() -> str:
+        raise AssertionError("getcwd called")
+
+    monkeypatch.setattr("os.getcwd", no_cwd)
+    assert [_rel(path, start) for path, start in pairs] == want
