@@ -799,22 +799,39 @@ def big_workflow(steps: int) -> str:
     )
 
 
-def test_parsing_a_4000_step_workflow_is_fast() -> None:
-    text = big_workflow(4000)
+def parsing_cpu(steps: int) -> float:
+    text = big_workflow(steps)
     started = time.process_time()
     found = workflow.parse(text)
-    assert len(found.steps) == 4001
-    assert time.process_time() - started < 2.0
+    spent = time.process_time() - started
+    assert len(found.steps) == steps + 1
     assert all(workflow.default_shell(text, s.line) == "bash {0}" for s in found.steps[:3])
+    return spent
 
 
-def test_judging_a_4000_step_workflow_takes_seconds(tmp_path: Path) -> None:
-    base = big_workflow(4000)
+def test_parsing_a_4000_step_workflow_grows_linearly() -> None:
+    small, big = parsing_cpu(1000), parsing_cpu(4000)
+    assert big < 8 * max(small, 0.02)
+    assert big < 10.0
+
+
+def judging_cpu(tmp_path: Path, steps: int) -> float:
+    base = big_workflow(steps)
     new = base + "      - run: echo one more\n"
-    # This process's CPU time: on a shared CI runner under coverage, wall time is not the rule's.
+    tmp_path.mkdir()
     started = time.process_time()
     assert verdict(ci(tmp_path, new, base=base)) == "pass"
-    assert time.process_time() - started < 15.0
+    return time.process_time() - started
+
+
+def test_judging_a_4000_step_workflow_grows_linearly(tmp_path: Path) -> None:
+    # CPU time, and four times the steps against one: a shared CI runner under coverage is
+    # several times slower than a laptop, so a fixed bound fails there, but a quadratic rule
+    # still fails the ratio. Linear is about 3 to 4, quadratic 16.
+    small = judging_cpu(tmp_path / "small", 1000)
+    big = judging_cpu(tmp_path / "big", 4000)
+    assert big < 8 * max(small, 0.05)
+    assert big < 60.0
 
 
 # ---- the reader ----------------------------------------------------------------------------
