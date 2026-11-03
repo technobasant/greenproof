@@ -18,7 +18,7 @@ from typing import Any, NamedTuple
 
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import WARN, Finding
-from greenproof.rules import workflow
+from greenproof.rules import toxnox, workflow
 from greenproof.rules._common import CODE_SUFFIXES, finding, sev_finding, split_lines
 from greenproof.rules.ci_expand import (
     Child,
@@ -49,6 +49,7 @@ from greenproof.rules.shell import (
     functions_in,
     group_inner,
     is_non_check,
+    narrowed_scope,
     narrowed_selection,
     script_token,
     scripts_in,
@@ -555,6 +556,10 @@ class _Walk:
                 children = tox_children(toks, cwd, self.read)
             if children is None:
                 children = nox_children(toks, cwd, self.read)
+            if tool := next((t for t in map(posixpath.basename, toks[:5]) if t in _TOX_NOX), None):
+                for name in _TOX_NOX[tool]:  # a step that runs them reads their configuration
+                    if (path := _join(cwd, name)) is not None:
+                        self.read(path)
             if children is None:
                 self.script(body, stmt, toks, cwd, depth)
             else:
@@ -2336,8 +2341,38 @@ def _selection_reasons(world: _World, path: str) -> list[tuple[str, int | None, 
     files = world.tests.selectable() if world.tests is not None else None
     if why := narrowed_selection(base_cmds, cand_cmds, defs, files):
         out.append((path, None, f"the tests run on a narrower selection: {why}", False))
+    scope, unread = narrowed_scope(base_cmds, cand_cmds, defs)
+    if scope:
+        out.append((path, None, f"the tests run on a narrower scope: {scope}", False))
+    elif unread:
+        out.append((path, None, unread, True))
     if why := selection_changed_warning(base_cmds, cand_cmds, defs, files):
         out.append((path, None, why, True))
+    return out
+
+
+_TOX_NOX = {
+    "tox": ("tox.ini", "setup.cfg", "pyproject.toml", "tox.toml"),
+    "nox": ("noxfile.py",),
+}
+
+
+def _toxnox_reasons(world: _World) -> list[tuple[str, int | None, str, bool]]:
+    """A tox or nox configuration the change edited that now runs less by default, for the
+    `tox` and `nox` steps of the candidate's workflows (see `toxnox`)."""
+    out: list[tuple[str, int | None, str, bool]] = []
+    cmds: list[str] | None = None
+    defs: dict[str, str] = {}
+    for f in world.changes.files:
+        name = posixpath.basename(f.path)
+        if name not in toxnox.CONFIG_NAMES or f.old_text == f.new_text:
+            continue
+        old, new = toxnox.read_defaults(name, f.old_text), toxnox.read_defaults(name, f.new_text)
+        if old is None or new is None:
+            continue
+        if cmds is None:
+            cmds, defs = _commands(world, False)
+        out.extend((f.path, None, why, warn) for why, warn in toxnox.judge(old, new, cmds, defs))
     return out
 
 
@@ -2348,6 +2383,7 @@ def _candidate(path: str) -> bool:
     return (
         name in _ACTION_NAMES
         or name == "package.json"
+        or name in toxnox.CONFIG_NAMES
         or name.startswith(("Makefile", "makefile", "GNUmakefile"))
         or posixpath.splitext(name)[1].lower() in _SCRIPT_EXTS | {".mk"}
     )
@@ -2426,6 +2462,7 @@ def check_ci(changes: ChangeSet, commands: Mapping[str, str] | None = None) -> l
     reasons.extend(_greenproof_reasons(world))
     here = next((f.path for f in touched if f.new_text is not None), touched[0].path)
     reasons.extend(_selection_reasons(world, here))
+    reasons.extend(_toxnox_reasons(world))
     for path, line, why, warn in reasons:
         message = f"{path}: {why}"
         if names := via.get(path):

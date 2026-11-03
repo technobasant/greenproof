@@ -83,7 +83,9 @@ SELECT_FLAGS: dict[str, frozenset[str]] = {
     "js": frozenset(
         {"-t", "--testNamePattern", "--testPathIgnorePatterns", "--onlyChanged", "-o"}
         | {"--findRelatedTests", "--shard", "--testPathPattern", "--selectProjects"}
-        | {"--project", "--changed", "--related"}
+        | {"--project", "--changed", "--related", "--dir", "--exclude", "--ignoreProjects"}
+        | {"--testPathPatterns", "--changedSince", "--lastCommit", "--changedFilesWithAncestor"}
+        | {"--onlyFailures", "-f"}
     ),
     # `--doc` runs the doctests only and `-- --ignored` the ignored tests only; `--include-ignored`
     # runs more than the default, so it is not here.
@@ -2391,13 +2393,18 @@ def _block_depth(segs: Sequence[Seg]) -> list[int]:
 _ATTACHED = "kmtgesRELIf"  # short flags whose value may follow them directly: `-kfoo`, `-Rfoo`
 
 
+# One flag under two names: jest 30 renamed `--testPathPattern` to `--testPathPatterns`, so the
+# rename is not a new selection flag.
+FLAG_ALIASES = {"--testPathPatterns": "--testPathPattern"}
+
+
 def _flag_name(token: str, flags: frozenset[str]) -> str | None:
     """The selection flag `token` is (`-k`, `-k=x`, `-kx`, `--grep=x`), else None."""
     if token in flags:
-        return token
+        return FLAG_ALIASES.get(token, token)
     head = token.partition("=")[0]
     if head in flags:
-        return head
+        return FLAG_ALIASES.get(head, head)
     if re.match(r"^-[A-Za-z].+", token) and token[1] in _ATTACHED and token[:2] in flags:
         return token[:2]
     return None
@@ -2483,13 +2490,66 @@ def _calls(command: str, defs: Mapping[str, str] | None = None) -> list[tuple[Se
     return out
 
 
+# Task runners and package managers that run only what changed since a git ref: the base run
+# `nx run-many -t test` becomes `nx affected -t test` and the tests of an untouched package stop.
+# `[ref]` in a pnpm or turbo `--filter` is that selection (`...[origin/main]`, `{dir}[HEAD^1]`).
+_GIT_FILTER = re.compile(r"(?:^|\.\.\.|\}|\^)\[[^\[\]]+\](?:\.\.\.)?$")
+_FILTER_FLAGS = frozenset({"--filter", "-F", "--filter-prod"})
+
+
+def _filter_values(args: Sequence[str]) -> list[str]:
+    """The values of the `--filter` flags among `args` (`--filter x`, `--filter=x`, `-Fx`)."""
+    out: list[str] = []
+    for i, tok in enumerate(args):
+        name, eq, value = tok.partition("=")
+        if name in _FILTER_FLAGS:
+            out.append(value if eq else "".join(args[i + 1 : i + 2]))
+        elif re.match(r"^-F.", tok):
+            out.append(tok[2:])
+    return out
+
+
+def _changed_only(tokens: list[str]) -> list[str]:
+    """The ways a monorepo statement runs only the packages that changed since a git ref:
+    `nx affected`, turbo `--affected` and `--filter=...[ref]`, lerna `--since`, pnpm
+    `--filter "...[ref]"`, `yarn workspaces foreach --since`. What it runs by name (`--filter
+    web`) is not listed: it is the same set of packages whatever changed."""
+    if "--" in tokens:
+        tokens = tokens[: tokens.index("--")]
+    found: list[str] = []
+    for i, tok in enumerate(tokens[:4]):
+        tool, rest = _cmd_name(tok), tokens[i + 1 :]
+        if tool == "nx":
+            word = next((t for t in rest if not t.startswith("-")), "")
+            if word == "affected" or word.startswith("affected:"):
+                found.append("nx affected")
+        elif tool == "turbo":
+            if any(t == "--affected" or t.startswith("--affected=") for t in rest):
+                found.append("--affected")
+            if any(_GIT_FILTER.search(v) for v in _filter_values(rest)):
+                found.append("--filter [ref]")
+        elif tool == "lerna" and any(t in ("run", "exec") for t in rest):
+            if any(t == "--since" or t.startswith("--since=") for t in rest):
+                found.append("--since")
+        elif tool == "pnpm" and any(_GIT_FILTER.search(v) for v in _filter_values(rest)):
+            found.append("--filter [ref]")
+        elif tool == "yarn" and "foreach" in rest:
+            if any(t == "--since" or t.startswith("--since=") for t in rest):
+                found.append("--since")
+        else:
+            continue
+        break
+    return found
+
+
 def selection_uses(
     command: str, *, retries_ok: bool = False, defs: Mapping[str, str] | None = None
 ) -> list[tuple[str, str, str]]:
     """`(runner family, flag, the statement)` for each narrowing flag a runner is run with.
 
     With `retries_ok`, the rerun-the-failures flags (`--lf`) do not count on the right side of
-    `check || check --lf`: that reruns what the first run failed.
+    `check || check --lf`: that reruns what the first run failed. A monorepo task runner that
+    runs only what changed is the family `monorepo` (see `_changed_only`).
     """
     found: list[tuple[str, str, str]] = []
     chain: list[str] = []  # the kinds of check on the current `&&` / `||` chain
@@ -2517,6 +2577,7 @@ def selection_uses(
                     and not (retry and n in RERUN_FLAGS)
                     and not (n in _VALUED_NOOP and re.search(r"=(?:false|0|no)$", t, re.IGNORECASE))
                     and not (n in _ZERO_VALUED and not _is_zero(t, args[k + 1 : k + 2]))
+                    and not (n == "-o" and _cmd_name(tokens[0]) == "vitest")  # vitest's `--open`
                 )
                 if "-x test" in flags:
                     found.extend(
@@ -2524,6 +2585,9 @@ def selection_uses(
                         for k, t in enumerate(args[:-1])
                         if t in ("-x", "--exclude-task") and args[k + 1] in ("test", "check")
                     )
+        found.extend(("monorepo", mode, seg.text) for mode in _changed_only(tokens))
+        if tokens and _cmd_name(tokens[0]) == "vitest" and tokens[1:2] == ["related"]:
+            found.append(("js", "related", seg.text))
         if "--" in tokens and tokens and _is_tox(tokens[0]):
             pytest_flags = _ALL_FLAGS["pytest"]
             found.extend(
@@ -3068,6 +3132,174 @@ def narrowed_selection(
         elif all(_restricts(family, words) for words in cand_runs):
             return f"{family} ran everything before and now runs only {_listing(cand_words)}"
     return None
+
+
+# -- scope flags: the packages, targets, features and build tags a run covers -------------------
+# `cargo test --lib`, `-p a`, `--features x` and `go test -tags integration` pick what is built and
+# run without naming a test. Each is a set the run covers: a candidate that covers less than the
+# base did narrowed the run, and one that covers more (`--all-targets`, `--workspace`, a tag
+# added) did not.
+@dataclass(frozen=True)
+class _Dim:
+    """What one kind of flag lets through: everything (`top`), or only the named items."""
+
+    top: bool
+    items: frozenset[str] = frozenset()
+
+
+_TARGET_GROUPS = {"bins": "bin:", "tests": "test:", "examples": "example:", "benches": "bench:"}
+_TARGET_FLAGS = {"--bin": "bin:", "--test": "test:", "--example": "example:", "--bench": "bench:"}
+_TARGET_ALL = {"--lib": "lib", **{f"--{k}": k for k in _TARGET_GROUPS}}
+_SCOPE_LABELS = {
+    "packages": "package",
+    "targets": "target",
+    "features": "feature",
+    "tags": "build tag",
+}
+_UNREAD = re.compile(r"[$`]")
+
+
+def _flag_pairs(
+    args: Sequence[str], values: frozenset[str], attached: bool
+) -> list[tuple[str, str]]:
+    """`(flag, value)` of each flag among `args` up to `--`: the value of `--flag=v`, `--flag v`
+    and, with `attached`, `-pv`; "" for a flag that takes none (or whose next word is a flag)."""
+    out: list[tuple[str, str]] = []
+    i = 0
+    while i < len(args) and args[i] not in ("--", "-args"):
+        tok = args[i]
+        i += 1
+        if not (tok.startswith("-") and len(tok) > 1):
+            continue
+        name, eq, value = tok.partition("=")
+        if attached and not eq and not tok.startswith("--") and len(tok) > 2 and tok[:2] in values:
+            name, value = tok[:2], tok[2:]
+        elif not eq and name in values and i < len(args) and not args[i].startswith("-"):
+            value = args[i]
+            i += 1
+        out.append((name, value))
+    return out
+
+
+def _cargo_scope(args: Sequence[str]) -> dict[str, _Dim]:
+    """The packages, targets and features of one `cargo test` or `cargo nextest` run."""
+    packages: set[str] = set()
+    targets: set[str] = set()
+    features: set[str] = set()
+    everything = {"workspace": False, "targets": False, "features": False, "defaults": True}
+    for name, value in _flag_pairs(args, _VALUE_FLAGS["cargo"], True):
+        if name in ("-p", "--package"):
+            packages.add(value or "?")
+        elif name in ("--workspace", "--all"):
+            everything["workspace"] = True
+        elif name == "--all-targets":
+            everything["targets"] = True
+        elif name in _TARGET_ALL:
+            targets.add(_TARGET_ALL[name])
+        elif name in _TARGET_FLAGS:  # a bare `--bin` is every binary
+            targets.add(_TARGET_FLAGS[name] + value if value else _TARGET_FLAGS[name][:-1] + "s")
+        elif name in ("--features", "-F"):
+            features.update(f for f in re.split(r"[,\s]+", value) if f)
+        elif name == "--all-features":
+            everything["features"] = True
+        elif name == "--no-default-features":
+            everything["defaults"] = False
+    return {
+        "packages": _Dim(everything["workspace"] or not packages, frozenset(packages)),
+        "targets": _Dim(everything["targets"] or not targets, frozenset(targets)),
+        "features": _Dim(everything["features"], frozenset(features)),
+        "defaults": _Dim(False, frozenset({"default"}) if everything["defaults"] else frozenset()),
+    }
+
+
+def _go_scope(args: Sequence[str]) -> dict[str, _Dim]:
+    """The build tags of one `go test` run (`-tags a,b`, `-tags=a`, `-tags "a b"`)."""
+    tags: set[str] = set()
+    for name, value in _flag_pairs(args, _VALUE_FLAGS["go"], False):
+        if name in ("-tags", "--tags"):
+            tags.update(t for t in re.split(r"[,\s]+", value.strip("'\"")) if t)
+    return {"tags": _Dim(False, frozenset(tags))}
+
+
+def _scopes(commands: Sequence[str], defs: Mapping[str, str] | None) -> dict[str, dict[str, _Dim]]:
+    """Per runner (`cargo`, `go`) the dimensions its runs together cover: a dimension is
+    unrestricted when any run leaves it so, else it is the union of the runs' items."""
+    runs: dict[str, list[dict[str, _Dim]]] = {}
+    for command in commands:
+        command = _EXPRESSION.sub(lambda m: re.sub(r"\s+", "", m[0]), command)
+        for _, tokens, _sep in _calls(command, defs):
+            if not tokens:
+                continue
+            if (start := _runner_end("cargo", tokens)) is None:
+                start = _runner_end("nextest", tokens)
+            if start is not None:
+                runs.setdefault("cargo", []).append(
+                    _cargo_scope(_without_redirects(tokens[start:]))
+                )
+            elif (start := _runner_end("go", tokens)) is not None:
+                args = _without_redirects(tokens[start:])
+                if _cmd_name(tokens[0]) == "gotestsum":  # its own flags end at `--`
+                    args = args[args.index("--") + 1 :] if "--" in args else []
+                runs.setdefault("go", []).append(_go_scope(args))
+    return {
+        family: {
+            dim: _Dim(any(r[dim].top for r in rs), frozenset().union(*(r[dim].items for r in rs)))
+            for dim in rs[0]
+        }
+        for family, rs in runs.items()
+    }
+
+
+def _item_covers(cand: str, base: str) -> bool:
+    """Whether the candidate's item `cand` covers the base's `base`: the same, `--bins` for
+    `--bin x` (and `--tests`, `--examples`, `--benches`), or a package glob."""
+    if cand == base or ((prefix := _TARGET_GROUPS.get(cand)) and base.startswith(prefix)):
+        return True
+    return "*" in cand and len(cand) < 200 and fnmatchcase(base, cand)
+
+
+def narrowed_scope(
+    base_cmds: Sequence[str], cand_cmds: Sequence[str], defs: Mapping[str, str] | None = None
+) -> tuple[str | None, str | None]:
+    """`(block, warning)`: a description when the candidate runs `cargo test` or `go test` over
+    less than the base did, and a warning when it cannot be told.
+
+    cargo: packages (`-p`, against `--workspace` or none), targets (`--lib`, `--bins`, `--bin X`,
+    `--test X`, `--example X`, `--benches`; none and `--all-targets` are everything), features
+    (`--features`, `--all-features`) and `--no-default-features`. go: `-tags`, whose files stop
+    being built when a tag goes. A run covers a dimension when it covers every item the base
+    did; more items, or an unrestricted dimension, is not a narrowing. A value that is a
+    variable cannot be read: the warning, when it differs from the base's.
+    """
+    base = _scopes(base_cmds, defs)
+    cand = _scopes(cand_cmds, defs)
+    warn: str | None = None
+    for family, dims in base.items():
+        if family not in cand:
+            continue
+        for dim, before in dims.items():
+            after = cand[family][dim]
+            if after.top or any(_UNREAD.search(i) for i in after.items):
+                if not after.top and after != before:
+                    warn = warn or (
+                        f"{family} is run with a {_SCOPE_LABELS.get(dim, dim)} that cannot be read"
+                        " here: check that it still covers what the base did"
+                    )
+                continue
+            lost = sorted(
+                b for b in before.items if not any(_item_covers(c, b) for c in after.items)
+            )
+            if dim == "defaults" and lost:
+                return f"{family} now runs with `--no-default-features`", warn
+            noun = _SCOPE_LABELS.get(dim, dim)
+            if before.top and dim == "features":
+                return f"{family} no longer runs with `--all-features`", warn
+            if before.top:
+                only = _listing(sorted(after.items))
+                return f"{family} ran every {noun} before and now only {only}", warn
+            if lost:
+                return f"{family} no longer runs with {noun} {_listing(lost)}", warn
+    return None, warn
 
 
 def selection_changed_warning(
