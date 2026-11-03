@@ -34,6 +34,7 @@ from greenproof.rules.runner import (
     _targets,
     _unread_reasons,
     _variables,
+    expand_includes,
     make_ignores,
 )
 
@@ -296,7 +297,9 @@ def make_children(
     if not texts:
         return None
     src = texts[0][0]
-    combined = "\n".join(t for _, t in texts)
+    combined, missing = expand_includes("\n".join(t for _, t in texts), directory, read)
+    if missing:
+        raise MakeUnreadable(f"the Makefile has an include that could not be read ({missing[0]})")
     make = _makefile(combined, tuple(overrides), _make_env(raw, defs))
     targets = make.targets
     if targets.shell is not None:
