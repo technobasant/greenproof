@@ -1199,10 +1199,11 @@ def _parametrize(fn: _FuncDef) -> tuple[int | None, bool, list[str]]:
     return (total if literal else None), literal, forms
 
 
-def _marked(fn: _FuncDef) -> list[str]:
+def _marked(fn: _FuncDef) -> list[tuple[str, tuple[str, ...]]]:
     """The exact form of each literal row of a parametrize decorator that carries a skip or xfail
-    mark (`pytest.param(..., marks=pytest.mark.skip)`): such a row never runs, or never counts."""
-    out: list[str] = []
+    mark (`pytest.param(..., marks=pytest.mark.skip)`), with the kinds of its marks: such a row
+    never runs, or never counts."""
+    out: list[tuple[str, tuple[str, ...]]] = []
     for dec in fn.decorator_list:
         if not (isinstance(dec, ast.Call) and dotted(dec.func).endswith("mark.parametrize")):
             continue
@@ -1215,11 +1216,21 @@ def _marked(fn: _FuncDef) -> list[str]:
         for e in values.elts:
             if isinstance(e, ast.Call) and dotted(e.func).rsplit(".", 1)[-1] == "param":
                 marks = next((k.value for k in e.keywords if k.arg == "marks"), None)
-                if marks is not None and re.search(
-                    r"\b(?:skip|skipif|xfail)\b", ast.unparse(marks)
-                ):
-                    out.append(digest(ast.dump(e)))
+                kinds = re.findall(r"\b(skipif|skip|xfail)\b", ast.unparse(marks)) if marks else []
+                if kinds:
+                    out.append((digest(ast.dump(e)), tuple(sorted(set(kinds)))))
     return out
+
+
+def _mark_kinds(fn: _FuncDef) -> set[str]:
+    """The skip, skipif and xfail marks a test carries as decorators."""
+    kinds = set()
+    for dec in fn.decorator_list:
+        name = dotted(dec.func if isinstance(dec, ast.Call) else dec)
+        for suffix in _MARK_SUFFIXES:
+            if name.endswith(suffix):
+                kinds.add(suffix.rsplit(".", 1)[-1])
+    return kinds
 
 
 _VOCAB_ROOTS = frozenset(
@@ -1339,6 +1350,7 @@ def _unit(
         row_gap=gap,
         row_big=big,
         param_marked=_marked(fn),
+        mark_kinds=_mark_kinds(fn),
         subjects=_subjects(live),
         swallowed=stats.swallowed,
         swallow_line=stats.swallow_line,

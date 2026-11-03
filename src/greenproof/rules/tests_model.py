@@ -75,10 +75,12 @@ class Unit:
     param_literal: bool = True  # False when some parametrize argvalues is not a literal list
     param_forms: list[str] = field(default_factory=list)  # exact form of each literal case
     # Python: why a parametrized row can finish without asserting a row value (tests_pyrows.py),
-    # whether that body was too large to read, and the forms of the rows marked skip or xfail
+    # whether that body was too large to read, the (form, mark kinds) of the rows marked skip or
+    # xfail, and the skip, skipif and xfail marks on the test itself
     row_gap: str = ""
     row_big: bool = False
-    param_marked: list[str] = field(default_factory=list)
+    param_marked: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
+    mark_kinds: set[str] = field(default_factory=set)  # skip, skipif, xfail marks on the test
     subjects: set[str] = field(default_factory=set)  # dotted names of the code under test called
     swallowed: int = 0
     swallow_line: int = 0
