@@ -53,6 +53,11 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   flag moved between `addopts` and the command line passes, and one dropped from a command line
   blocks. With more than 8 different pytest runs the runs are not compared one by one: the
   configuration alone is judged, and a change to the runs warns.
+- Makefile reading follows `include` files (literal paths, simple variables, `$(CURDIR)` and
+  `$(dir $(lastword $(MAKEFILE_LIST)))`), `define` macros used through `$(call ...)`,
+  conditionals (`ifeq`, `ifdef` and the like, read as alternative worlds, so an honest edit in
+  one branch passes and a swallow in any branch blocks), double-colon, pattern and
+  multi-target rules, and a `GNUmakefile` that make reads before `Makefile`.
 - Makefile recipes are judged in the directory they run in (`cd dir && ...`, `make -C dir`),
   target-specific variables are read in one pass, and a Makefile read only in part still judges
   the goal's recipe. `set -o pipefail` keeps a pipeline's status when `SHELL` is bash, a line
