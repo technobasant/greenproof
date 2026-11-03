@@ -17,6 +17,52 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A report note on the default branch with no upstream: only uncommitted changes are checked,
   and `--base REF` includes commits. `bench/replay.py` takes `--select runner` (commits that
   touch CI, runner configs, `package.json`, Makefiles or shell scripts) and `--command CMD`.
+- `runner.tampered` reads more of what chooses which tests run. tox and nox: the `commands` of
+  each tox environment and each nox session are read, and a `-` prefix on a check
+  (`commands = - pytest`), `ignore_errors` or `ignore_outcome` on an environment, a nox
+  `success_codes` widened (`[0, 1, 5]`, `range(10)`), a `session.run` inside a `try` whose
+  `except` swallows it, a check dropped (`ruff check .` became `echo skipped`) and a nox
+  `session.run` path narrowed (`tests` to `tests/test_shop.py`) block. `{envpython}`,
+  `{toxinidir}` and `{[section]key}` are normalised first, so `python -m pytest` for `pytest`
+  passes, and a workflow step that runs `tox` or `nox` is judged the same way. A bare `tox` or
+  `nox` is judged by what its default environments or sessions run, so a shorter `envlist` or a
+  narrower `{posargs:...}` default blocks. Also read as
+  selection: Go `-tags` dropped or narrowed; jest and vitest path flags (`--testPathPatterns`,
+  `--dir`) and changed-file flags (`--changedSince`, `--onlyChanged`, `--lastCommit`,
+  `--changed`, `--related`); cargo target kinds (`--lib`, `--bins`, `--bin`, `--test`, `--doc`,
+  `--example`), `--workspace` replaced by `-p`, and a dropped `--features` or `--all-features`.
+  Widening passes.
+- Monorepo package filters are selection, in `runner.tampered` and `ci.tampered`: turbo
+  `--filter`/`-F` (including `!docs`), pnpm `--filter`/`-F`, nx `run-many` `--projects`/`-p` and
+  `--exclude`, lerna `--scope`/`--ignore`, and yarn `workspaces foreach` `--include`/`--exclude`.
+  A filter added where the base had none, or one that leaves out a package the base ran, blocks
+  (`turbo run test` to `turbo run test --filter=web`); a dropped or widened filter passes, and a
+  rename or a glob (`web` to `app-*`) warns. In `runner.tampered`, `nx run-many` becoming
+  `nx affected` warns.
+- A test command that names exact test files covering every file the base path selected
+  (`pytest .` to `pytest test_shop.py` when that is the only test file) is a warn in
+  `runner.tampered`, in any directory, and says that test files added later will not run. Fewer
+  files, or a test file added in the same change, still blocks.
+- `runner.tampered` reads these as selection: pytest `python_files`, `python_classes`,
+  `python_functions`, `testpaths`, `norecursedirs`, `--doctest-modules` and `--doctest-glob`, `-o`
+  and `--override-ini` of any of them, and the keys of jest (`roots`, `rootDir`,
+  `modulePathIgnorePatterns`, `testRegex`), vitest (`dir`) and mocha (`spec`, `ignore`,
+  `recursive`) that choose or ignore test files. Each pytest run is judged from the config's
+  `addopts`, then `PYTEST_ADDOPTS`, then the run's own flags (a command-line `-o` beats
+  `addopts`), following the run through `make` (`-C` included), `npm run` and shell scripts. A
+  flag moved between `addopts` and the command line passes, and one dropped from a command line
+  blocks. With more than 8 different pytest runs the runs are not compared one by one: the
+  configuration alone is judged, and a change to the runs warns.
+- Makefile recipes are judged in the directory they run in (`cd dir && ...`, `make -C dir`),
+  target-specific variables are read in one pass, and a Makefile read only in part still judges
+  the goal's recipe. `set -o pipefail` keeps a pipeline's status when `SHELL` is bash, a line
+  that masks a check is credited when another line of the target runs the same check unmasked,
+  and a touched line with `$(call ...)` or `$(eval ...)` warns, once per target.
+- `ci.tampered` judges a `branches` or `branches-ignore` filter added under `push`: it passes
+  while `pull_request` still runs on every branch, and warns when it takes the default branch
+  (`main` or `master`) off `push`, or when `pull_request` is itself filtered or gone from the
+  workflow (a dropped `pull_request` also blocks, as before). It also reads kept exit statuses:
+  `rc=$?; ...; exit 0` swallows the check, `exit $rc` keeps it.
 
 ### Changed
 
@@ -39,6 +85,15 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `pytest_plugin`), up to 8 calls deep; application modules earn nothing. A helper or
   `conftest.py` that loses checks re-analyses the unchanged tests that use it (at most 300
   files read and 200 compared, with no note at the cap); one that loses none does not.
+- Table folds: folding several tests into one table-driven test (a parametrized Python test,
+  `it.each`, a Go table, Rust `#[case]`) keeps its `tests.replaced` warn, which 0.2.0 blocked,
+  only when the table runs, no row leaves early and the row values reach an assertion. It blocks
+  when an assertion sits inside a `try`/`except` or `try`/`catch` that swallows the failure, when
+  it is `assert a or b` with `a` depending on a row, or when a row carries a `skip`, `skipif` or
+  `xfail` mark of a kind the folded tests did not already carry. A Python `case _` or a Rust
+  catch-all arm that closes a `match`, `expect(() => f(row)).toThrow()` and `.rejects.*` count as
+  assertions, and a kept `xfail` row passes. A fold body past the reading budget keeps the warn
+  and says it is too large to check.
 - Python warnings: `tests.expected_changed` also fires when a `@pytest.fixture` returns a
   different literal, and `tests.self_mocked` when an added or changed autouse fixture patches
   a callable the tests in its scope assert on.
@@ -72,7 +127,8 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `ci.tampered` passes a split into a reusable workflow, a `paths` filter that only excludes docs
   or meta files, `rm -rf build || true`, `continue-on-error` on checkout, cache or upload steps,
   and `pytest || pytest`, `pytest || pytest --lf` (a retry, not a swallow). Narrowed
-  `branches`, `tags` or `types`, a matrix-chosen flag, `continue-on-error: ${{ ... }}`, a mocha
+  `branches`, `tags` or `types` filters (not a `push` `branches` or `branches-ignore` filter that
+  leaves the default branch alone while `pull_request` stays open), a matrix-chosen flag, `continue-on-error: ${{ ... }}`, a mocha
   selection change and a ref-only greenproof bump warn. An `if: ''` is read as false, and
   `if: "false"` blocks.
 - `runner.tampered` (block) reads swallows in Makefiles, `package.json` scripts and the files a
@@ -92,12 +148,18 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is not one. Heredocs are data, and only swallows the base lacked are reported.
 - Performance: git blobs are read through one `git cat-file --batch` process, workflows are
   parsed once, and swallow detection, `paths` globs and `pnpm run '/regex/'` run in linear time.
+  The shell reader, the tox and nox readers, the monorepo filter reader and the comparison of
+  selected paths also take time linear in their input.
 
 ### Fixed
 
 - A `pnpm run '/regex/'` pattern from the candidate could hang the gate (`/^(a+)+$/`); it is now
   matched by an automaton with a work budget. Names are no longer cut at 200 characters, which
   let `/^[a-z]*$/` match a long name ending in `!`.
+- An `if:` wrapped in redundant parentheses is read as the expression inside, however many
+  pairs wrap it, and the wrapping does not count toward depth. A new or changed `if:` with more
+  than 32 levels of real `&&`/`||` nesting on a job or step that runs a check is a warn, "has an
+  `if:` nested too deeply to read".
 - Dropping a workspace member from `pnpm-workspace.yaml` or `workspaces` made its neutered
   `package.json` a warn; it now blocks.
 - A huge numeric literal or a very deep expression in a test no longer crashes the check, and
