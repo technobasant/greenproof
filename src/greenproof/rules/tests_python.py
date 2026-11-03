@@ -15,6 +15,7 @@ from typing import Protocol
 
 from greenproof.rules._common import digest
 from greenproof.rules.tests_model import FileAnalysis, Fixture, Marker, Unit
+from greenproof.rules.tests_pyrows import row_gap
 
 _MARK_SUFFIXES = ("mark.skip", "mark.skipif", "mark.xfail")
 _FULL_KINDS = {
@@ -1198,6 +1199,29 @@ def _parametrize(fn: _FuncDef) -> tuple[int | None, bool, list[str]]:
     return (total if literal else None), literal, forms
 
 
+def _marked(fn: _FuncDef) -> list[str]:
+    """The exact form of each literal row of a parametrize decorator that carries a skip or xfail
+    mark (`pytest.param(..., marks=pytest.mark.skip)`): such a row never runs, or never counts."""
+    out: list[str] = []
+    for dec in fn.decorator_list:
+        if not (isinstance(dec, ast.Call) and dotted(dec.func).endswith("mark.parametrize")):
+            continue
+        values: ast.AST | None = dec.args[1] if len(dec.args) > 1 else None
+        for kw in dec.keywords:
+            if kw.arg == "argvalues":
+                values = kw.value
+        if not isinstance(values, (ast.List, ast.Tuple)):
+            continue
+        for e in values.elts:
+            if isinstance(e, ast.Call) and dotted(e.func).rsplit(".", 1)[-1] == "param":
+                marks = next((k.value for k in e.keywords if k.arg == "marks"), None)
+                if marks is not None and re.search(
+                    r"\b(?:skip|skipif|xfail)\b", ast.unparse(marks)
+                ):
+                    out.append(digest(ast.dump(e)))
+    return out
+
+
 _VOCAB_ROOTS = frozenset(
     {"pytest", "unittest", "mock", "mocker", "monkeypatch", "capsys", "capfd", "caplog", "request"}
 )
@@ -1293,6 +1317,7 @@ def _unit(
             stats.swallow_line = stats.swallow_line or dec.lineno
             break
     cases, literal, case_forms = _parametrize(fn)
+    gap, big = row_gap(fn)
     lost = _Stats(helpers)
     for stmt in dropped:
         lost.visit(stmt)
@@ -1311,6 +1336,9 @@ def _unit(
         param_cases=cases,
         param_literal=literal,
         param_forms=case_forms,
+        row_gap=gap,
+        row_big=big,
+        param_marked=_marked(fn),
         subjects=_subjects(live),
         swallowed=stats.swallowed,
         swallow_line=stats.swallow_line,

@@ -74,6 +74,11 @@ class Unit:
     param_cases: int | None = None  # product over literal parametrize decorators, else None
     param_literal: bool = True  # False when some parametrize argvalues is not a literal list
     param_forms: list[str] = field(default_factory=list)  # exact form of each literal case
+    # Python: why a parametrized row can finish without asserting a row value (tests_pyrows.py),
+    # whether that body was too large to read, and the forms of the rows marked skip or xfail
+    row_gap: str = ""
+    row_big: bool = False
+    param_marked: list[str] = field(default_factory=list)
     subjects: set[str] = field(default_factory=set)  # dotted names of the code under test called
     swallowed: int = 0
     swallow_line: int = 0
