@@ -409,6 +409,19 @@ _SELF_EXPR = re.compile(rf"{_SELF_PWD}|{_SELF}")
 _SELF_ASSIGN = re.compile(rf"^(?P<v>[A-Za-z_]\w*)=\"?(?:{_SELF_PWD}|{_SELF})\"?$")
 
 
+def _rel(path: str, start: str) -> str:
+    """`path` as seen from `start`, both repository-relative: `posixpath.relpath` without the
+    `getcwd` call each of its two `abspath` calls makes."""
+    if path.startswith("/") or start.startswith("/"):
+        return posixpath.relpath(path, start)
+    here = [p for p in posixpath.normpath(start).split("/") if p != "."]
+    there = [p for p in posixpath.normpath(path).split("/") if p != "."]
+    n = 0
+    while n < min(len(here), len(there)) and here[n] == there[n]:
+        n += 1
+    return "/".join([".."] * (len(here) - n) + there[n:]) or "."
+
+
 def _self_dir(stmt: str, src: str, cwd: str, here: set[str]) -> str:
     """`stmt` with the directory of the running script `src`, `$(dirname "$0")` or
     `${BASH_SOURCE%/*}` (or a variable `HERE="$(cd "$(dirname "$0")" && pwd)"` holds), written as
@@ -418,7 +431,7 @@ def _self_dir(stmt: str, src: str, cwd: str, here: set[str]) -> str:
     if m := _SELF_ASSIGN.match(stmt.strip()):
         here.add(m["v"])
         return stmt
-    where = posixpath.relpath(posixpath.dirname(src) or ".", cwd or ".")
+    where = _rel(posixpath.dirname(src) or ".", cwd or ".")
     stmt = _SELF_EXPR.sub(where, stmt)
     for var in here:
         stmt = re.sub(rf"\$(?:\{{{var}\}}|{var}\b)", where, stmt)
@@ -1668,47 +1681,77 @@ def _split_top(expr: str, op: str) -> list[str]:
     return parts
 
 
-def _wrapped(text: str) -> bool:
-    """Whether one pair of parentheses encloses all of `text`."""
+def _peel(text: str) -> str:
+    """`text` without the parentheses that enclose all of it, however many: the pairs are matched
+    once with a stack, so peeling is linear however deep the wrapping."""
     if not (text.startswith("(") and text.endswith(")")):
-        return False
-    return _balanced(text[1:-1])
-
-
-def _balanced(text: str) -> bool:
-    depth = 0
-    for c in text:
-        depth += (c == "(") - (c == ")")
-        if depth < 0:
-            return False
-    return depth == 0
+        return text
+    match: dict[int, int] = {}
+    stack: list[int] = []
+    quote = ""
+    for i, c in enumerate(text):
+        if quote:
+            quote = "" if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        elif c == "(":
+            stack.append(i)
+        elif c == ")" and stack:
+            match[stack.pop()] = i
+    lo, hi = 0, len(text) - 1
+    while lo < hi and match.get(lo) == hi:
+        lo, hi = lo + 1, hi - 1
+        while lo < hi and text[lo] == " ":
+            lo += 1
+        while lo < hi and text[hi] == " ":
+            hi -= 1
+    return text[lo : hi + 1]
 
 
 _IF_DEPTH = 32  # nested parentheses and `&&`/`||` levels read before the reading gives up
 
 
-def _if_on(value: str, event: str, depth: int = 0) -> bool | None:
+class _TooDeep(Exception):
+    """An `if:` nested past `_IF_DEPTH` levels of `&&`/`||` groups."""
+
+
+def _if_on(value: str, event: str) -> bool | None:
     """Whether an `if:` holds on an `event` run: False for `github.event_name == 'push'` on a
     pull request, True for `!= 'pull_request'` on one; `github.ref` and `github.ref_name`
     conditions are False on `pull_request` (a pull request's ref is `refs/pull/N/merge`) and
     unknown on any other event. None for anything the reading cannot tell, and for an expression
-    nested more than `_IF_DEPTH` levels deep."""
-    if depth > _IF_DEPTH:
+    nested more than `_IF_DEPTH` levels of `&&`/`||` groups deep (see `_if_unreadable`)."""
+    try:
+        return _if_eval(value, event, 0)
+    except _TooDeep:
         return None
+
+
+def _if_unreadable(value: str) -> bool:
+    """Whether `value` nests `&&`/`||` groups deeper than `_IF_DEPTH`, so `_if_on` cannot say."""
+    try:
+        _if_eval(value, "pull_request", 0)
+    except _TooDeep:
+        return True
+    return False
+
+
+def _if_eval(value: str, event: str, depth: int) -> bool | None:
+    if depth > _IF_DEPTH:
+        raise _TooDeep
     text = " ".join(value.split())
     if len(text) > 1 and text[0] == text[-1] and text[0] in "'\"" and text[0] not in text[1:-1]:
         text = text[1:-1].strip()
     if m := _EXPR.match(text):
         text = m[1].strip()
-    if _wrapped(text):
-        return _if_on(text[1:-1], event, depth + 1)
+    text = _peel(text).strip()
     ors = _split_top(text, "||")
     if len(ors) > 1:
-        got = [_if_on(p, event, depth + 1) for p in ors]
+        got = [_if_eval(p, event, depth + 1) for p in ors]
         return True if True in got else False if all(g is False for g in got) else None
     ands = _split_top(text, "&&")
     if len(ands) > 1:
-        got = [_if_on(p, event, depth + 1) for p in ands]
+        got = [_if_eval(p, event, depth + 1) for p in ands]
         return False if False in got else True if all(g is True for g in got) else None
     text = text.strip()
     if text in ("true", "'true'"):
@@ -1736,7 +1779,8 @@ def _pr_losses(
     world: _World, f: ChangedFile, base_path: str, events: Collection[str]
 ) -> list[Reason]:
     """Blocks for a job or step that runs a check and carries an `if:` new or changed since the
-    base that is false on `pull_request`: pull requests no longer run the check, whatever the
+    base that is false on `pull_request`, and a warn for one nested too deeply to read: pull
+    requests no longer run the check, whatever the
     `on:` section says. It is not a loss when another job of the workflow, or another workflow,
     still runs that kind of check on pull requests; when no event of the workflow satisfies the
     `if:`, the check never runs."""
@@ -1768,6 +1812,8 @@ def _pr_losses(
         }
     covered: set[str] = set()
     skipped: list[tuple[int, str, str, set[str]]] = []  # line, what, the `if:`, kinds
+    out: list[Reason] = []
+    unread: set[tuple[int, str]] = set()
     for step in wf.steps:
         job = wf.job_of(step)
         if job is None or not kinds[step.line] or _disabled(step):
@@ -1793,12 +1839,22 @@ def _pr_losses(
             for c, n, what, new in conds
             if c and new and _if_on(c, "pull_request") is False
         ]
+        for c, n, what, new in conds:
+            if c and new and (n or step.line, what) not in unread and _if_unreadable(c):
+                unread.add((n or step.line, what))
+                out.append(
+                    _warn(
+                        n or step.line,
+                        f"the {what} has an `if:` nested too deeply to read (more than"
+                        f" {_IF_DEPTH} levels): it may keep pull requests out of the"
+                        f" {', '.join(sorted(kinds[step.line]))} step",
+                    )
+                )
         if bad:
             c, n, what = bad[0]
             skipped.append((n or step.line, what, c, kinds[step.line]))
         elif not any(c and _if_on(c, "pull_request") is False for c, _, _, _ in conds):
             covered |= kinds[step.line]
-    out: list[Reason] = []
     for line, what, cond, got in skipped:
         lost = got - covered
         if not lost:
@@ -1834,7 +1890,8 @@ def _trigger_reasons(
     losses: list[Reason] = []
     if needed and "pull_request" in base_t and "pull_request" in cand_t:
         losses = _pr_losses(world, f, base_path, cand_t)
-        blocks.extend(losses)
+        blocks.extend(r for r in losses if not r[2])
+        warns.extend(r for r in losses if r[2])
     if needed:
         for event in _CORE_EVENTS:
             if event not in base_t or event in cand_t:
