@@ -13,8 +13,8 @@ import posixpath
 import re
 import shlex
 from bisect import bisect_left
-from collections import ChainMap, Counter
-from collections.abc import Callable, Collection, Iterator, Mapping, MutableMapping, Sequence
+from collections import Counter, deque
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from typing import Any, NamedTuple
@@ -31,10 +31,12 @@ from greenproof.rules.shell import (
     Swallow,
     TestFiles,
     _group_inner,
+    _invocations,
     _top_level,
     check_kind,
     command_env,
     command_tokens,
+    covered_test_files,
     early_exit,
     find_swallows,
     is_non_check,
@@ -1732,6 +1734,168 @@ def _removed_tests(
     return warned
 
 
+_CD_HEADS = ("cd", "chdir", "pushd", "popd")
+_Place = tuple[
+    str, str | tuple[str, ...]
+]  # ("d", directory) or ("?", the `cd`s that cannot be read)
+
+
+def _place_steps(
+    script: str,
+    where: _Dir,
+    history: list[str],
+    tests: _BaseTests,
+    groups: dict[_Place, list[str]],
+) -> None:
+    """The statements of a script, each put under the directory its shell stands in (a `cd` or
+    `pushd` moves it, a `( ... )` group or `sh -c` body keeps its own). A statement in a directory
+    the reading cannot tell is put under the `cd`s that led there, `history`."""
+    for text, before in tests.steps(script, where):
+        inner = shell_c_body(text)
+        braces = False
+        if inner is None and (inner := _group_inner(text)) is not None:
+            braces = text.lstrip().startswith("{")
+        if inner is not None:
+            _place_steps(inner, before, history if braces else list(history), tests, groups)
+            continue
+        if posixpath.basename((command_tokens(text) or [""])[0]) in _CD_HEADS:
+            history.append(text)
+            continue
+        key: _Place = ("?", tuple(history)) if before.path is None else ("d", before.path)
+        groups.setdefault(key, []).append(text)
+
+
+def _placed(
+    lines: Sequence[str], tests: _BaseTests, start: str, oneshell: bool
+) -> dict[_Place, list[str]]:
+    """The statements of a recipe by the directory they run in. Each line is a shell of its own,
+    started in `start` (the Makefile's directory), unless `.ONESHELL` puts them in one."""
+    bare = [_RECIPE_PREFIX.sub("", ln, count=1) for ln in lines]
+    scripts = ["\n".join(bare)] if oneshell else bare
+    groups: dict[_Place, list[str]] = {}
+    for script in scripts:
+        _place_steps(script, _Dir(start), [], tests, groups)
+    return groups
+
+
+def _rebased(files: TestFiles, directory: str) -> TestFiles:
+    """The test files under `directory`, named from it: what a runner started there sees."""
+    if not directory:
+        return files
+    prefix = directory + "/"
+    return TestFiles(
+        [p[len(prefix) :] for p in files.paths if p.startswith(prefix)],
+        files.go_module,
+        files.mocharc,
+    )
+
+
+def _same_files(base: Sequence[str], cand: Sequence[str], files: TestFiles) -> bool:
+    """Whether, for every runner family both run, the candidate selects each test file the base
+    did (and the base selected some), when the base named no path but the directory itself: a
+    hand-picked file that is all of what `.` was is the same run, but `tests` becoming one file
+    of `tests` is still a hand-picked list."""
+    if any(
+        w not in (".", "./")
+        for runs in _invocations(base, None).values()
+        for r in runs
+        for w in r.words
+    ):
+        return False
+    before, after = covered_test_files(base, files), covered_test_files(cand, files)
+    common = [family for family in before if family in after]
+    return bool(common) and all(
+        before[family] and after[family] is not None and before[family] <= after[family]  # type: ignore[operator]
+        for family in common
+    )
+
+
+def _recipe_narrowing(
+    base: Sequence[str],
+    cand: Sequence[str],
+    tests: _BaseTests,
+    start: str,
+    modes: tuple[_Mode, _Mode],
+) -> str | None:
+    """`narrowed_selection` for a make recipe, each statement read from the directory it runs in:
+    paths are the Makefile's directory's, and a `cd` moves them. The statements of one directory
+    are compared with the same directory's at the other side; the ones that have no counterpart
+    (a runner that moved to another directory) are compared together, from the root. Statements
+    after a `cd` that cannot be read are compared as text, when the `cd` is the same on both
+    sides; a candidate runner under one the base did not have is a warning.
+
+    In a directory other than the root, a hand-picked file (`pytest test_example.py`) that
+    selects every test file `pytest .` did is not a narrowing."""
+    files = tests.selectable()
+    before = _placed(base, tests, start, modes[0].oneshell)
+    after = _placed(cand, tests, start, modes[1].oneshell)
+    everything = [st for group in after.values() for st in group]
+    warn: str | None = None
+    for key in dict.fromkeys([*before, *after]):
+        mine, theirs = before.get(key), after.get(key)
+        if theirs is None and mine is not None:  # a runner of the base that moved
+            moved = (
+                _moved(mine, str(key[1]), after, files)
+                if key[0] == "d"
+                else narrowed_selection(mine, everything, files=files)
+            )
+            if moved:
+                return moved
+            continue
+        if mine is None and theirs is not None:
+            if key[0] == "?" and covered_test_files(theirs, None):
+                warn = warn or _Warn(
+                    f"it runs tests after `{key[1][-1] if key[1] else 'a cd'}`, a directory "
+                    "that cannot be read here, which the base did not: check what they select"
+                )
+            continue
+        if mine is None or theirs is None:
+            continue
+        if key[0] == "?":
+            if narrowed := narrowed_selection(mine, theirs):
+                return narrowed
+            continue
+        path = str(key[1])
+        rebased = _rebased(files, path)
+        narrowed = narrowed_selection(mine, theirs, files=rebased)
+        if narrowed and path and _same_files(mine, theirs, rebased):
+            narrowed = None
+        if narrowed:
+            return narrowed
+    return warn
+
+
+def _moved(
+    statements: Sequence[str],
+    path: str,
+    after: Mapping[_Place, Sequence[str]],
+    files: TestFiles,
+) -> str | None:
+    """A reason when statements run in `path` at the base, and the candidate has no statement there:
+    a test file they ran that no statement of the candidate runs, from wherever it does. A directory
+    the candidate's statements run in that cannot be read leaves the words to be compared."""
+
+    def named(directory: str, found: set[str]) -> set[str]:
+        return {f"{directory}/{x}" if directory else x for x in found}
+
+    selected: dict[str, set[str]] = {}
+    for key, group in after.items():
+        if key[0] != "d":
+            return narrowed_selection(
+                statements, [st for g in after.values() for st in g], files=files
+            )
+        for family, found in covered_test_files(group, _rebased(files, str(key[1]))).items():
+            if found is None:
+                return narrowed_selection(
+                    statements, [st for g in after.values() for st in g], files=files
+                )
+            selected.setdefault(family, set()).update(named(str(key[1]), found))
+    for family, found in covered_test_files(statements, _rebased(files, path)).items():
+        if found and family in selected and (lost := sorted(named(path, found) - selected[family])):
+            return f"{family} ran `{lost[0]}` before and the candidate no longer runs it"
+    return None
+
+
 def neutering_reason(
     base_lines: list[str],
     cand_lines: list[str],
@@ -1796,11 +1960,16 @@ def neutering_reason(
         return f"it now passes {added[0]}"
     if flag := _new_selection_flag(base_e, cand_e):
         return f"it now passes {flag}"
-    if narrowed := narrowed_selection(
-        narrow_base,
-        narrow_cand,
-        files=tests.selectable() if tests is not None else None,
-    ):
+    pending: str | None = None
+    if recipe and not script and tests is not None and modes is not None:
+        narrowed = _recipe_narrowing(base_e, cand_e, tests, cwds[0], modes)
+    else:
+        narrowed = narrowed_selection(
+            narrow_base, narrow_cand, files=tests.selectable() if tests is not None else None
+        )
+    if narrowed and isinstance(narrowed, _Warn):
+        pending = narrowed
+    elif narrowed:
         return f"it now selects fewer paths ({narrowed})"
     gone = None
     if tests is not None:
@@ -1830,7 +1999,7 @@ def neutering_reason(
         _statements(base_c, script)
     ):
         return _Warn(_UNREADABLE_WHY)
-    return None
+    return pending
 
 
 _UNREAD_TASKS_WHY = (
@@ -3001,6 +3170,7 @@ _MAX_PREREQS = 16  # how deep a target's prerequisites are followed
 _MAKE_VALUE = 64 * 1024  # bytes of one expanded value or recipe line (ci.py reads no more per file)
 _MAKE_TOTAL = 1024 * 1024  # bytes of expanded values and recipe lines in one Makefile
 _MAKE_STEPS = 50_000  # variable references expanded in one Makefile
+_MAKE_SCOPE = 500_000  # target and prerequisite visits spent on target-specific variables
 _MAKE_RECIPE = 256 * 1024  # bytes of recipe one target and its prerequisites run
 _SHELLS = frozenset(
     {"sh", "bash", "dash", "zsh", "ksh", "ksh93", "mksh", "pdksh", "ash", "busybox", "rbash"}
@@ -3011,21 +3181,42 @@ _SHELLS = frozenset(
 class _Budget:
     """What reading one Makefile may spend on expanding variables; spending past a limit raises
     `_Unreadable`, so a Makefile whose variables double (`V2 = $(V1)$(V1)`) cannot make the
-    reader's work or memory grow with anything but the file's size."""
+    reader's work or memory grow with anything but the file's size. Once a limit is spent the
+    budget is `dead`: text with nothing to expand is still read, text that needs it is not (see
+    `_read_rules`), so a Makefile past a budget keeps what was read before it."""
 
     def __init__(self) -> None:
         self.steps = 0
         self.total = 0
+        self.scope = 0
+        self.dead = False
+        self.why = ""
+
+    def _stop(self, why: str) -> _Unreadable:
+        self.dead = True
+        self.why = self.why or why
+        return _Unreadable(why)
+
+    def cap(self, text: str) -> None:
+        if len(text) > _MAKE_VALUE:
+            raise _Unreadable(f"a value or recipe line is over {_MAKE_VALUE // 1024} KiB")
 
     def spend(self, text: str) -> None:
         self.steps += 1
         self.total += len(text)
-        if len(text) > _MAKE_VALUE:
-            raise _Unreadable(f"a value or recipe line is over {_MAKE_VALUE // 1024} KiB")
+        self.cap(text)
         if self.steps > _MAKE_STEPS:
-            raise _Unreadable(f"it expands more than {_MAKE_STEPS} variable references")
+            raise self._stop(f"it expands more than {_MAKE_STEPS} variable references")
         if self.total > _MAKE_TOTAL:
-            raise _Unreadable(f"its expanded text is over {_MAKE_TOTAL // 1024} KiB")
+            raise self._stop(f"its expanded text is over {_MAKE_TOTAL // 1024} KiB")
+
+    def visit(self, count: int = 1) -> None:
+        """Count `count` visits to targets or prerequisites for target-specific variables."""
+        self.scope += count
+        if self.scope > _MAKE_SCOPE:
+            raise self._stop(
+                f"its target-specific variables took more than {_MAKE_SCOPE} lookups to resolve"
+            )
 
 
 def _expand_vars(
@@ -3034,10 +3225,12 @@ def _expand_vars(
     """`$(NAME)` and `${NAME}` replaced by what the Makefile assigns NAME, recursively. A name the
     Makefile does not define, or a function call, is left as it is. Raises `_Unreadable` when
     variables nest deeper than `_MAX_VAR_DEPTH` or the expansion outgrows `budget`."""
+    if "$" not in text:
+        if budget is not None:
+            budget.cap(text)
+        return text
     if budget is not None:
         budget.spend(text)
-    if "$" not in text:
-        return text
     if depth >= _MAX_VAR_DEPTH:
         raise _Unreadable(f"its variables nest more than {_MAX_VAR_DEPTH} levels deep")
 
@@ -3047,6 +3240,9 @@ def _expand_vars(
             return m[0]
         if len(found) > _MAKE_VALUE:
             raise _Unreadable(f"the value of `{m[1]}` is over {_MAKE_VALUE // 1024} KiB")
+        if budget is not None and "$" not in found:
+            budget.spend(found)  # a reference is a step, whatever it stands for
+            return found
         return _expand_vars(found, variables, depth + 1, budget)
 
     return _VAR_REF.sub(value, text)
@@ -3125,8 +3321,8 @@ def _variables(
     return out
 
 
-def _phony_names(rest: str, variables: Mapping[str, str], budget: _Budget) -> set[str]:
-    return set(_expand_vars(re.sub(r"#.*$", "", rest), variables, 0, budget).split())
+def _phony_names(rest: str, expand: Callable[[str], str]) -> set[str]:
+    return set(expand(re.sub(r"#.*$", "", rest)).split())
 
 
 _FOR_LOOP = re.compile(r"\bfor\s+(\w+)\s+in\s+([^;]*?)\s*;\s*do\b\s*(.*?)\s*;?\s*\bdone\b")
@@ -3188,51 +3384,181 @@ def _split_recipe(raw: str, expanded: str, errexit: bool) -> list[str]:
     return out
 
 
-def _overlays(
-    variables: MutableMapping[str, str],
-    rules: Mapping[str, _Target],
-    scoped: Sequence[tuple[str, str, str, str, bool]],
-    cli: Collection[str],
-    budget: _Budget,
-) -> dict[str, dict[str, str]]:
+def _glob_match(parts: Sequence[str], target: str) -> bool:
+    """Whether a make pattern (`%` any string; `parts` is the pattern split at the `%`s) matches
+    `target`, without a regular expression: the first part is the start, the last the end, and the
+    ones between are found in order."""
+    head, tail = parts[0], parts[-1]
+    if len(target) < len(head) + len(tail) or not target.startswith(head):
+        return False
+    if not target.endswith(tail):
+        return False
+    middle = target[len(head) : len(target) - len(tail)]
+    at = 0
+    for part in parts[1:-1]:
+        found = middle.find(part, at)
+        if found < 0:
+            return False
+        at = found + len(part)
+    return True
+
+
+class _PatternIndex:
+    """The targets of a Makefile by their first and last letters, to find the ones a pattern
+    (`t10%`, `%.o`) matches without trying it on every target: the ones that start (or, with no
+    start, end) as it does are found by bisection, and only they are tried."""
+
+    def __init__(self, rules: Mapping[str, _Target]) -> None:
+        self.order = {t: i for i, t in enumerate(rules)}
+        self.names = sorted(rules)
+        self.reversed = sorted(t[::-1] for t in rules)
+
+    def matching(self, pattern: str, budget: _Budget) -> list[str]:
+        """The targets the pattern matches, in the order of the file."""
+        parts = pattern.split("%")
+        head, tail = parts[0], parts[-1]
+        if head:
+            lo = bisect_left(self.names, head)
+            hi = bisect_left(self.names, head + "\U0010ffff")
+            pool = self.names[lo:hi]
+        elif tail:
+            key = tail[::-1]
+            lo = bisect_left(self.reversed, key)
+            hi = bisect_left(self.reversed, key + "\U0010ffff")
+            pool = [t[::-1] for t in self.reversed[lo:hi]]
+        else:
+            pool = self.names
+        budget.visit(len(pool) + 1)
+        found = [t for t in pool if _glob_match(parts, t)]
+        found.sort(key=self.order.__getitem__)
+        return found
+
+
+class _Overlays:
     """The target-specific variable values (`test: ARGS := -k add`, `%.o: CFLAGS = -g`) each target
     runs with: its own, then those of the targets it is a prerequisite of. A command-line
-    assignment beats them unless they are `override`."""
-    own: dict[str, list[tuple[str, str, str, bool]]] = {}
-    for pattern, name, op, value, override in scoped:
-        regex = re.escape(pattern).replace("%", ".*")
-        for target in rules:
-            if re.fullmatch(regex, target):
-                own.setdefault(target, []).append((name, op, value, override))
-    scopes: dict[str, list[tuple[str, str, str, bool]]] = {t: list(a) for t, a in own.items()}
-    for root, assignments in own.items():
-        queue, seen = list(rules[root].prereqs), {root}
-        while queue:
-            node = queue.pop(0)
-            if node in seen or node not in rules:
+    assignment beats them unless they are `override`.
+
+    A value is worked out when a recipe line asks for it, once per target and name: a target's own
+    assignments of the name, or the first target in file order that has one and reaches it through
+    prerequisites (found by one walk per name, not per target). What the reader spends is counted
+    (`_Budget.visit`), so a Makefile of many targets and variables cannot make it quadratic."""
+
+    def __init__(
+        self,
+        variables: Mapping[str, str],
+        rules: Mapping[str, _Target],
+        scoped: Sequence[tuple[str, str, str, str, bool]],
+        cli: Collection[str],
+        budget: _Budget,
+    ) -> None:
+        self.variables = variables
+        self.rules = rules
+        self.cli = cli
+        self.budget = budget
+        self.own: dict[str, dict[str, list[tuple[str, str, bool]]]] = {}
+        matched: dict[str, list[str]] = {}
+        index: _PatternIndex | None = None
+        for pattern, name, op, value, override in scoped:
+            if pattern not in matched:
+                if "%" in pattern:
+                    index = index or _PatternIndex(rules)
+                    matched[pattern] = index.matching(pattern, budget)
+                else:
+                    budget.visit()
+                    matched[pattern] = [pattern] if pattern in rules else []
+            budget.visit(len(matched[pattern]))
+            for target in matched[pattern]:
+                self.own.setdefault(target, {}).setdefault(name, []).append((op, value, override))
+        self.names = {name for per in self.own.values() for name in per}
+        self._roots: dict[str, list[str]] = {}
+        for root, per in self.own.items():
+            for name in per:
+                self._roots.setdefault(name, []).append(root)
+        self._owners: dict[str, dict[str, str]] = {}
+        self._memo: dict[tuple[str, str], str | None] = {}
+        self._busy: set[tuple[str, str]] = set()
+
+    def _owner(self, name: str) -> dict[str, str]:
+        """For each target without an assignment of `name` of its own that one reaches, the first
+        target (in file order) whose assignment it inherits."""
+        if name in self._owners:
+            return self._owners[name]
+        owner: dict[str, str] = {}
+        seen: set[str] = set()
+        for root in self._roots.get(name, ()):
+            if root in seen:  # an earlier root reaches it, and so everything it does
                 continue
-            seen.add(node)
-            defined = {a[0] for a in scopes.get(node, ())}
-            scopes.setdefault(node, []).extend(a for a in assignments if a[0] not in defined)
-            queue.extend(rules[node].prereqs)
-    out: dict[str, dict[str, str]] = {}
-    for target, assignments in scopes.items():
-        view: dict[str, str] = {}
-        merged = ChainMap(view, variables)
-        for name, op, value, override in assignments:
-            if name in cli and not override:
-                continue
-            if op in (":=", "::="):
-                view[name] = _expand_vars(value, merged, 0, budget)
-            elif op == "?=":
-                if name not in merged:
-                    view[name] = value
-            elif op == "+=" and name in merged:
-                view[name] = f"{merged[name]} {value}".strip()
-            else:
-                view[name] = value
-        out[target] = view
-    return out
+            seen.add(root)
+            queue = deque(self.rules[root].prereqs)
+            while queue:
+                node = queue.popleft()
+                self.budget.visit()
+                if node in seen or node not in self.rules:
+                    continue
+                seen.add(node)
+                if name not in self.own.get(node, ()):
+                    owner[node] = root
+                queue.extend(self.rules[node].prereqs)
+        self._owners[name] = owner
+        return owner
+
+    def value(self, node: str, name: str) -> str | None:
+        """What the target-specific assignments say `name` is for `node`; None when none applies."""
+        if name not in self.names:
+            return None
+        key = (node, name)
+        if key in self._memo:
+            return self._memo[key]
+        if key in self._busy:  # a value defined through itself: the base value stands
+            return None
+        per = self.own.get(node)
+        if per is not None and name in per:
+            entries = per[name]
+        elif (root := self._owner(name).get(node)) is not None:
+            entries = self.own[root][name]
+        else:
+            entries = []
+        self._busy.add(key)
+        try:
+            current: str | None = None
+            base = self.variables
+            scope = _Scope(self, node)
+            for op, text, override in entries:
+                if name in self.cli and not override:
+                    continue
+                if op in (":=", "::="):
+                    current = _expand_vars(text, scope, 0, self.budget)
+                elif op == "?=":
+                    if current is None and name not in base:
+                        current = text
+                elif op == "+=" and (current is not None or name in base):
+                    previous = current if current is not None else base[name]
+                    current = f"{previous} {text}".strip()
+                else:
+                    current = text
+        finally:
+            self._busy.discard(key)
+        self._memo[key] = current
+        return current
+
+
+class _Scope(Mapping[str, str]):
+    """The variables one target runs with: its target-specific values over the Makefile's."""
+
+    def __init__(self, overlays: _Overlays, node: str) -> None:
+        self._overlays = overlays
+        self._node = node
+
+    def __getitem__(self, name: str) -> str:
+        found = self._overlays.value(self._node, name)
+        return found if found is not None else self._overlays.variables[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._overlays.variables)
+
+    def __len__(self) -> int:
+        return len(self._overlays.variables)
 
 
 def _targets(
@@ -3243,13 +3569,14 @@ def _targets(
     `_variables`). A `define ... endef` body is a macro, not a recipe, and is skipped, but is
     read where a recipe line uses it; a recipe line's `for` loops are written out (`_unroll`);
     target-specific variables apply to a target's recipe and its prerequisites'. The result's
-    `stopped` is set, and it has no rules, when the Makefile outgrows the reader's limits."""
+    `stopped` is set when the Makefile outgrows the reader's limits: the rules and recipe lines read
+    before that stay, and a line that needs a variable expanded past the limit is left out."""
     found = _Targets()
     variables = _variables(text, env, cli)
-    if variables.stopped:
-        found.stopped = variables.stopped
-        return found
     budget = _Budget()
+    if variables.stopped:  # what needs no expansion is still read (see `_read_rules`)
+        found.stopped = variables.stopped
+        budget.dead, budget.why = True, variables.stopped
     try:
         _read_rules(text or "", variables, cli, budget, found)
     except _Unreadable as e:
@@ -3261,12 +3588,31 @@ def _targets(
 def _read_rules(
     text: str, variables: _Vars, cli: Sequence[str], budget: _Budget, found: _Targets
 ) -> None:
+
+    def expand(text: str, scope: Mapping[str, str] = variables) -> str | None:
+        """`text` with its variables expanded; None when the budget is spent or it is over a
+        limit (`found.stopped` says so). Text with nothing to expand is always read."""
+        if budget.dead and "$" in text:
+            found.stopped = found.stopped or budget.why
+            return None
+        try:
+            return _expand_vars(text, scope, 0, budget)
+        except _Unreadable as e:
+            found.stopped = found.stopped or str(e)
+            return None
+
+    def head_text(text: str) -> str:
+        """What a rule head, `.PHONY` list or target-specific pattern expands to; the text as it
+        is (its `$(...)` stays) when that cannot be told."""
+        out = expand(text)
+        return text if out is None else out
+
     flags = variables.get(".SHELLFLAGS", "")
     found.errexit = bool(re.search(r"(?:^|\s)-[A-Za-z]*e|errexit", flags))
     found.variables = variables
     found.flags_ignore = make_ignores(variables.get("MAKEFLAGS", ""))
     shell = variables.get("SHELL")
-    found.shell = None if shell is None else _expand_vars(shell, variables, 0, budget).strip()
+    found.shell = None if shell is None else head_text(shell).strip()
     # a recipe runs under `/bin/sh -c`: its pipelines keep the last stage's status unless SHELL
     # is bash and `.SHELLFLAGS` adds `-o pipefail`
     found.pipefail = "bash" in (found.shell or "") and bool(
@@ -3288,25 +3634,25 @@ def _read_rules(
             continue
         indented = line.startswith((" ", "\t"))
         if not indented and (m := re.match(r"^\.PHONY\s*:(.*)$", line)):
-            found.phony |= _phony_names(m[1], variables, budget)
+            found.phony |= _phony_names(m[1], head_text)
         elif not indented and re.match(r"^\.ONESHELL\s*:", line):
             found.oneshell = True
         elif not indented and (m := re.match(r"^\.IGNORE\s*:(.*)$", line)):
-            names = _phony_names(m[1], variables, budget)
+            names = _phony_names(m[1], head_text)
             found.ignore |= names
             found.ignore_all = found.ignore_all or not names
         elif not indented and (m := _ASSIGN.match(line)):
             if m[2] == ".DEFAULT_GOAL":
-                goal = _expand_vars(re.sub(r"\s+#.*$", "", m[4]), variables, 0, budget).split()
+                goal = head_text(re.sub(r"\s+#.*$", "", m[4])).split()
                 explicit = goal[0] if goal else None
                 first = None if not goal else first
             current = None
         elif not indented and (m := _TARGET_VAR.match(line)):
             value = re.sub(r"\s+#.*$", "", m[5]).strip()
-            for pattern in _expand_vars(m[1], variables, 0, budget).split():
+            for pattern in head_text(m[1]).split():
                 scoped.append((pattern, m[3], m[4], value, "override" in m[2]))
         elif not indented and (m := _RULE.match(line)):
-            head, _, inline = _expand_vars(m[2], variables, 0, budget).partition(";")
+            head, _, inline = head_text(m[2]).partition(";")
             prereqs = [t for t in re.sub(r"#.*$", "", head).split() if re.fullmatch(r"[\w.-]+", t)]
             name = m[1]
             current = name
@@ -3327,17 +3673,22 @@ def _read_rules(
         elif current is not None and line.strip() and not line.startswith(("#", ".")):
             current = None
     found.default = explicit if explicit is not None else first
-    overlays = _overlays(
-        variables, found, scoped, {m[1] for w in cli if (m := _CLI_ASSIGN.match(w))}, budget
-    )
-    for name, lines in raw.items():
-        view: Mapping[str, str] = (
-            ChainMap(overlays[name], variables) if name in overlays else variables
-        )
-        for ln in lines:
-            found[name].lines.extend(
-                _split_recipe(ln, _expand_vars(ln, view, 0, budget), found.errexit)
+    overlays: _Overlays | None = None
+    if scoped:
+        try:
+            overlays = _Overlays(
+                variables, found, scoped, {m[1] for w in cli if (m := _CLI_ASSIGN.match(w))}, budget
             )
+        except _Unreadable as e:
+            found.stopped = found.stopped or str(e)
+    for name, lines in raw.items():
+        for ln in lines:
+            if "$" in ln and overlays is not None:
+                expanded = expand(ln, _Scope(overlays, name))
+            else:
+                expanded = expand(ln)
+            if expanded is not None:
+                found[name].lines.extend(_split_recipe(ln, expanded, found.errexit))
 
 
 def _shadowed(targets: _Targets, tree: Collection[str]) -> set[str]:
@@ -3625,16 +3976,6 @@ def _make_reasons(
 ) -> list[tuple[int | None, str]]:
     names, bare = _goals(commands)
     old, new = _targets(f.old_text), _targets(f.new_text)
-    if new.stopped and (names or bare):
-        return [
-            (
-                None,
-                _Warn(
-                    f"{posixpath.basename(f.path)} could not be read ({new.stopped}): the reader "
-                    "stopped, so what its targets run was not compared"
-                ),
-            )
-        ]
     extra = list(commands.values())
     old_shadow: set[str] = set()
     new_shadow: set[str] = set()
@@ -3652,11 +3993,18 @@ def _make_reasons(
     ctx = _Ctx(extra, resolve)
     ignoring = new.ignore_all or new.flags_ignore or _policy_ignores(extra)
     unread: set[str] = set()
+
+    # past a limit of the reader (`stopped`, `cut`) a line that is missing may only be unread: what
+    # a change took away is then a warning, and what it added or narrowed is still a block
+    def partial() -> bool:  # `cut` is set as the chains are followed, so it is asked late
+        return bool(old.stopped or new.stopped or old.cut or new.cut)
+
     for name, old_name, new_name in goals:
         if old_name not in old:
             continue
         if new_name not in new:
-            out.append((None, f"target `{name}` was removed from {posixpath.basename(f.path)}"))
+            gone = f"target `{name}` was removed from {posixpath.basename(f.path)}"
+            out.append((None, _Warn(gone) if partial() else gone))
             continue
         base_lines = _effective(old, old_name, old_shadow)
         cand_lines = _effective(new, new_name, new_shadow)
@@ -3691,6 +4039,8 @@ def _make_reasons(
         if why and not cand_lines and _effective(new, new_name):
             why = _SHADOW_WHY
         why = why or _oneshell_reason(old, new, new_name, ctx)
+        if why and partial() and not isinstance(why, _Warn) and _absence(why):
+            why = _Warn(why)
         if why:
             out.append(
                 (
@@ -3715,16 +4065,28 @@ def _make_reasons(
         if why := _shell_reason(old, new):
             at = _first_line_with(f.new_text or "", "SHELL")
             out.append((at, _carry(why, f"{why}")))
-        if new.cut:
-            out = [
+        base_name = posixpath.basename(f.path)
+        if old.stopped or new.stopped:
+            why_stopped = new.stopped or old.stopped
+            out.append(
                 (
                     None,
                     _Warn(
-                        f"{posixpath.basename(f.path)} was read only up to a point ({new.cut}): "
+                        f"{base_name} could not be read in full ({why_stopped}): the lines the "
+                        "reader kept were compared, the rest was not"
+                    ),
+                )
+            )
+        if old.cut or new.cut:
+            out.append(
+                (
+                    None,
+                    _Warn(
+                        f"{base_name} was read only up to a point ({new.cut or old.cut}): "
                         "what its targets run was not fully compared"
                     ),
                 )
-            ]
+            )
     if (
         names
         and _makefile_sets_autoload_off(f.new_text)
@@ -3737,6 +4099,16 @@ def _make_reasons(
             out.append((_first_line_with(f.new_text or "", var), _Warn(_UNREADABLE_WHY)))
             break
     return out
+
+
+def _absence(why: str) -> bool:
+    """Whether a reason says something is missing from what was read (a recipe emptied, a step or
+    a kind of check gone): when the reader stopped short, it may only be unread."""
+    return why in (
+        "it was emptied",
+        "it was replaced by a no-op",
+        "it runs fewer steps than before",
+    ) or why.startswith("it no longer runs")
 
 
 _PYTEST_WORDS = frozenset({"pytest", "py.test"})
