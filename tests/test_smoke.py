@@ -181,7 +181,11 @@ def test_the_group_is_killed_even_when_it_ignores_sigterm(tmp_path: Path) -> Non
     result = smoke.run_smoke(config, tmp_path)
     assert not result.ok
     assert time.monotonic() - started < 15  # 2 s timeout, 5 s grace
-    assert not alive(int(pidfile.read_text()))
+    # A killed process answers kill(pid, 0) until it is reaped, so give the reaping a moment.
+    pid, deadline = int(pidfile.read_text()), time.monotonic() + 2
+    while alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not alive(pid)
 
 
 def test_the_overall_timeout_covers_the_probes(run, tmp_path: Path, server: Server) -> None:
