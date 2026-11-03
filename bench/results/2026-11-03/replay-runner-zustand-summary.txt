@@ -1,0 +1,9 @@
+repo: /private/tmp/gp-replay-030/zustand
+commits scanned: 200
+blocked: 6 (3.0%)
+blocked commits per rule:
+  ci.tampered: 5
+  tests.deleted: 1
+  tests.removed: 1
+  tests.replaced: 1
+  tests.skipped: 1

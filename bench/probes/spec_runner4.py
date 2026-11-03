@@ -52,12 +52,14 @@ PROBES = [
         "block runner.tampered",
         **ST,
     ),
+    # tests/test_shop.py is the fixture's only test file, so the same tests still run: a warn
+    # that files added later will not (fewer files than the path selected block, spec_make9).
     p(
         "py-make-pytest-given-a-test-file",
         "py",
         "pymake",
         [("Makefile", f"{RUN}\n", f"{RUN} tests/test_shop.py\n")],
-        "block runner.tampered",
+        "warn runner.tampered",
         **ST,
     ),
     p(

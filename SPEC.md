@@ -951,7 +951,15 @@ Selection
 
 Shell and CI
 - `ci.tampered` reads a script or action file up to 64 KiB; `runner.tampered` reads a policy
-  script up to 200,000 characters.
+  script up to 200,000 characters. A check, or the `exit $rc` that keeps its status, past the
+  cut is not seen, so the step blocks as if the check were removed or swallowed, next to a
+  warning that the script was read only up to a point.
+- A step that copies a file into the test tree (`cp ci/settings.py tests/settings.py`) blocks as
+  a test rewrite, even when the file is a settings file or a fixture.
+- A CI step that already rewrote tests, edited (a `sed -i` expression changed), is read as a
+  new rewrite and blocks, though the base rewrote the same files.
+- `pytest | tee out.log` blocks as a swallowed check under the default `run:` shell, which
+  has no `pipefail` (0.2.0 passed it).
 - A single line nested about 400 `{ ... }` deep takes over 2 s of CPU (cost grows with depth
   times size). On a very large Go test file (about 165 kB) the masking pass takes about 1 s.
 - Very deeply nested input in some readers can hit Python's recursion limit. That exits 5

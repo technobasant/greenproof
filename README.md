@@ -453,7 +453,7 @@ greenproof reports patterns, not proofs. Read these before relying on it.
   That is why the noisier rules default to `warn`, and why there is a way to accept a
   finding.
 - **It blocks some honest changes.** Replaying 698 test-touching commits from four
-  projects, 20 were blocked although the checking was still there in another form, for
+  projects, 21 were blocked although the checking was still there in another form, for
   example moved into a helper or merged into one larger assertion. MEASUREMENTS.md lists
   the patterns.
 - **The revert check supports four runners:** pytest, jest, vitest and `go test`. A make or

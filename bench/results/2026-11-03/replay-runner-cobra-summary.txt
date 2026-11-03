@@ -1,0 +1,7 @@
+repo: /private/tmp/gp-replay-030/cobra
+commits scanned: 64
+blocked: 3 (4.7%)
+blocked commits per rule:
+  runner.tampered: 2
+  tests.deleted: 1
+  tests.weakened: 1

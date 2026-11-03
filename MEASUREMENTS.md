@@ -1,12 +1,109 @@
 # Measurements
 
-Everything here except the agent runs, which are dated in their own section, was measured
-on 2026-11-01 at commit `0b4b3c4`, on an Apple M5 (10 cores)
-running macOS, with Python 3.13 and uv 0.13.5. The raw results are in
+The first section compares 0.3.0 with 0.2.0 on the same inputs. It was measured on
+2026-11-03 at commit `1c59c8c`, whose code is the 0.3.0 release, and its raw results are in
+[`bench/results/2026-11-03/`](bench/results/2026-11-03/).
+
+The sections after it are the 0.2.0 measurements. Everything there except the agent runs,
+which are dated in their own section, was measured on 2026-11-01 at commit `0b4b3c4`, on an
+Apple M5 (10 cores) running macOS, with Python 3.13 and uv 0.13.5. Their raw results are in
 [`bench/results/2026-11-01/`](bench/results/2026-11-01/), and the commands to reproduce
 them are at the end.
 
-## Summary
+## 0.3.0 against 0.2.0
+
+Both builds were run on the same inputs on the same day. The machine was heavily loaded by
+other work, so check times were not measured again. Exit codes and findings do not depend
+on the load.
+
+| what | 0.2.0 | 0.3.0 |
+|---|---|---|
+| Benchmark: tamper cases reported as expected | 67 of 67 | 67 of 67 |
+| Benchmark: control cases blocked | 0 of 40 (5 warn) | 0 of 40 (5 warn) |
+| Probes, tamper: blocked, warned | 187 and 42 of 684 | 638 and 46 of 684 |
+| Probes, honest: blocked | 87 of 450 | 2 of 450 |
+| Review cases, tamper: blocked, warned | 128 and 22 of 434 | 423 and 11 of 434 |
+| Review cases, honest: blocked | 122 of 603 | 11 of 603 |
+| Real history, test-touching commits blocked | 70 of 698 | 75 of 698 |
+| Real history, runner-touching commits blocked | 21 of 394 | 18 of 394 |
+| Test suite | 904 tests, 95.88% coverage | 3,595 tests, 92% coverage |
+
+**Benchmark.** The 107 cases of `bench/run.py`, described below, give the same result on
+both builds.
+
+**Probes.** [`bench/probes/`](bench/probes/) holds 1,134 probes in 27 files, written during
+the 0.3.0 review rounds. Each is one edit to a small fixture: a tamper that must block or
+warn, or an honest change (named `HONEST-`) that must pass or warn.
+`bench/probes/harness.py` runs them against any greenproof binary. On 0.3.0 no tamper probe
+passes. Of the 46 that warn, 45 were written to expect a warning, and one is a pytest run
+narrowed to the fixture's only test file, which 0.3.0 warns on by design (see CHANGELOG). Of
+the 450 honest probes, 381 pass and 67 warn. Two block, as on 0.2.0: a feature deleted with
+its tests, written to block until the change is accepted, and a `testing.Short()` skip added
+inside a Go table test, which the probe expects to warn. The verdict of every probe on each
+build is in `probes-0.2.0.tsv` and `probes-0.3.0.tsv`.
+
+**Review cases.** 1,214 cases came from the same review rounds: tampers, honest edits
+and stress inputs (very long, very deep or malformed files). The case files are not in the
+repository; the verdict of each case on both builds is, in `review-cases.tsv`. Cases are
+counted as tamper or honest by their names, and 177 cases named neither way are left out of
+the table.
+
+- Of the 434 tampers, none passes on 0.3.0. The 11 that warn were written to expect a
+  warning: a `branches-ignore` filter that takes the default branch off `push` (4),
+  `nx run-many` becoming `nx affected` in a package script, jest, vitest and mocha settings
+  whose value is computed at run time (3), a mocha spec argument in a workflow that leaves out
+  a subdirectory (2), and a workflow step that appends to a test file.
+- Of the 603 honest edits, 11 block on 0.3.0. Eight blocked on 0.2.0 too. Three are new:
+  `pytest | tee out.log` in a workflow step, which does lose the test status without
+  `pipefail`; `cp ci/settings.py tests/settings.py` in a step, read as a test rewrite; and
+  `.PHONY += test` in a Makefile, which assigns a variable instead of declaring the target, so
+  with a file named `test` present the recipe never runs. The first two are in SPEC's known
+  limits; the third is a correct block of a case written as honest.
+- 82 honest edits warn on 0.3.0: 53 that 0.2.0 blocked, 16 that it passed and 13 it warned
+  on too.
+
+**Real history.** The four projects were replayed on both builds as described below, with
+the same 698 test-touching commits. A second selection, `--select runner`, replays commits
+that touch CI workflows, runner configuration, `package.json`, Makefiles or shell scripts,
+with each project's test command configured (`pytest`, `make test`, `scripts/test`,
+`pnpm test`).
+
+Test-touching commits: 5 new blocks, none cleared.
+
+| commit | 0.3.0 | verdict |
+|---|---|---|
+| cobra `9388e79fb` | `tests.weakened` | correct: error rows and their checks removed |
+| zustand `f37530fc3` | `ci.tampered` | correct: a CI step rewrites a test to `it.skip` |
+| zustand `5b938fbbf` | `ci.tampered` | correct: CI steps rewrite `[DEV-ONLY]` and `[PRD-ONLY]` tests to `it.skip` |
+| zustand `93b5a43e8` | `ci.tampered` | ambiguous: a CI step strips `@ts-expect-error` lines from the tests for older TypeScript |
+| zustand `350d9ec6b` | `ci.tampered` | false: an existing rewrite of the tests was edited, read as a new one (a known limit) |
+
+With these, the triage of the 698 commits is 45 correct, 21 false and 9 ambiguous blocks,
+against 42, 20 and 8 on 0.2.0.
+
+Runner-touching commits: 8 blocks cleared, 5 new.
+
+- **Cleared:** click `b471d346e` (tox `make test` became `{env:TEST_RUNNER:pytest}
+  {posargs}`), `3ded26d60` (`-p no:warnings`, now a warning); httpx `1f4b8dd05`
+  (`*session.posargs` passed to pytest), `e51b2125c` (tool configuration moved to
+  `setup.cfg`); zustand `45974540d` (a test job moved into a renamed `test.yml`), `6d6383054`
+  (a move to pnpm), `4f64985b5` (the test step dropped from the publish workflow, now a
+  warning), `47649176e` (an example's test script removed, now a warning).
+- **New:** zustand `f37530fc3` (correct, as above), `93b5a43e8` (ambiguous, as above),
+  `350d9ec6b` (false, as above), `1808bf4d3` (ambiguous: a workflow with a syntax error was
+  fixed, so its `it.skip` rewrite runs for the first time), and httpx `80dc3e274`, which
+  deletes `scripts/test`. Today's `scripts/test` is the replay's configured command, so the
+  block is right for that configuration, though the project ran its tests another way then.
+
+The commits and verdicts are in `triage-changes.tsv`. The per-commit milliseconds in the
+replay TSVs were taken under the load and are not timings.
+
+**Test suite.** 3,595 tests: 3,591 passed and 3 were skipped (actionlint, zizmor and jest
+not installed). One failed: `test_judging_a_4000_step_workflow_takes_seconds` asserts a
+wall-time bound, and under the load it took 47 s of wall time for about 3.6 s of CPU. Line
+and branch coverage is 92%. ruff and mypy (strict) pass.
+
+## 0.2.0 summary
 
 | what | result |
 |---|---|

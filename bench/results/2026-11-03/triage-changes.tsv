@@ -1,0 +1,19 @@
+selection	project	sha	0.2.0	0.3.0	verdict	cause
+tests	cobra	9388e79fb	pass	block	correct	error rows of a table test and their checks removed (tests.weakened)
+tests	zustand	f37530fc3	pass	block	correct	a CI step added that rewrites a test to it.skip with sed -i (ci.tampered)
+tests	zustand	5b938fbbf	pass	block	correct	CI steps added that rewrite [DEV-ONLY] and [PRD-ONLY] tests to it.skip with sed -i (ci.tampered)
+tests	zustand	93b5a43e8	pass	block	ambiguous	a CI step added that strips @ts-expect-error lines from the tests for older TypeScript (ci.tampered)
+tests	zustand	350d9ec6b	pass	block	false	an existing sed -i rewrite of tests/*.tsx edited, read as a new rewrite (ci.tampered; SPEC known limit)
+runner	zustand	f37530fc3	pass	block	correct	as in the tests selection
+runner	zustand	93b5a43e8	pass	block	ambiguous	as in the tests selection
+runner	zustand	350d9ec6b	pass	block	false	as in the tests selection
+runner	zustand	1808bf4d3	pass	block	ambiguous	a workflow with a syntax error fixed, so its it.skip rewrite runs for the first time (ci.tampered)
+runner	httpx	80dc3e274	pass	block	correct for the configuration	scripts/test deleted while the replay's configured command is scripts/test; the project ran its tests through nox from then (runner.tampered)
+runner	click	b471d346e	block	pass	cleared	tox commands `make test` became `{env:TEST_RUNNER:pytest} {posargs}`
+runner	click	3ded26d60	block	warn	cleared	`-p no:warnings` added in setup.cfg
+runner	httpx	1f4b8dd05	block	pass	cleared	nox session passes *session.posargs to pytest
+runner	httpx	e51b2125c	block	pass	cleared	tool configuration moved from noxfile.py to setup.cfg
+runner	zustand	45974540d	block	pass	cleared	the test job moved from test-multiple-versions.yml into the renamed test.yml
+runner	zustand	6d6383054	block	pass	cleared	workflows moved to pnpm
+runner	zustand	4f64985b5	block	warn	cleared	the test step dropped from the publish workflow
+runner	zustand	47649176e	block	warn	cleared	an example's package.json test script removed
