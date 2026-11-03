@@ -785,6 +785,27 @@ def _is_rewrite(removed: list[Unit], added: list[Unit]) -> bool:
     return _group_pinned(added, literal) >= _group_pinned(removed, literal)
 
 
+def _row_gaps(pairs: list[tuple[Unit, Unit]], added: list[Unit]) -> tuple[str, bool]:
+    """Why a parametrized Python test that took the place of removed tests does not earn the fold
+    warning (SPEC 5.7): a row can finish without asserting its values, or a row new to it is
+    marked skip or xfail; a body too large to read is said (not blocking), never guessed. Returns
+    (the text, whether it blocks)."""
+    big = ""
+    for before, c in [*pairs, *((None, u) for u in added)]:
+        old = set(before.param_forms) if before is not None else set()
+        why = c.row_gap
+        if not why and any(f not in old for f in c.param_marked):
+            why = "a row marked skip or xfail never asserts"
+        if why:
+            return f"the parametrized test {c.name} was not credited as a fold: {why}", True
+        if c.row_big and not big:
+            big = (
+                f"the parametrized test {c.name} is too large to check for rows that "
+                "leave before asserting"
+            )
+    return big, False
+
+
 def _absorbing(pairing: _Pairing, path: str) -> list[tuple[Unit, Unit]]:
     """Paired Python tests of `path` whose effective check count grew (SPEC 5.7): removed tests
     were often folded into them."""
@@ -949,6 +970,10 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
         else:
             rewrite = bool(names and added) and _is_rewrite(names, added)
             folded = ""
+        if rewrite:
+            gap, blocks = _row_gaps(absorbing, added)
+            not_credited = not_credited or gap
+            rewrite = rewrite and not blocks
         for i, removed in enumerate(names):
             if rewrite and folded:
                 line = added[min(i, len(added) - 1)].line if added else absorbing[0][1].line
