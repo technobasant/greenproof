@@ -853,8 +853,8 @@ time linear in its input.
 
 *Known limits.* Flow-style `steps: [...]`, a `runs-on` computed by `fromJSON`, a `make`
 and `always() && false` are not read. Expansion stops at depth 4, 32 files or 512 KiB per step
-(a `warn`); GitLab CI and CircleCI scripts are not followed; a Makefile `include`, several rules
-for one target and `npm -w`/`--workspace` are not read (monorepo filters of turbo, pnpm, nx
+(a `warn`); GitLab CI and CircleCI scripts are not followed; a Makefile `include` whose path uses `$(shell ...)`,
+`$(wildcard ...)` or an unset variable, and `npm -w`/`--workspace` are not read (monorepo filters of turbo, pnpm, nx
 `run-many`, lerna and yarn are: see `runner.tampered` above); `cd` is not scoped, so a
 subshell's `cd` carries on; a `working-directory` expression resolves from the repo root; a make
 target or script with content the rule cannot classify stays opaque.
@@ -923,8 +923,13 @@ Makefiles
 - `set -o pipefail` is honoured only when `SHELL` is bash.
 - A target with thousands of recipe commands costs about 1 ms per command (linear).
 - The CI path sees the union of conditional branches, and warns past 32 conditional worlds.
-- A deleted root Makefile, and a `GNUmakefile` that shadows an edited `Makefile`, are not
-  followed. A Makefile `include` is not read.
+- A deleted root Makefile is not followed.
+- An `include` whose path uses `$(shell ...)`, `$(wildcard ...)`, `$(realpath ...)` or an unset
+  variable warns; so do more than 16 included files, more than 64 variable-path readings, and
+  macros nested past depth 16. `$(call)` of a recursively expanded (`=`) variable warns.
+- `include .env` inside `ifneq (,$(wildcard ./.env))` is read as the world where the file is
+  absent, so it warns (exit 0).
+- A Makefile of 3,000 double-colon rules takes about 5 s of CPU (linear).
 - `.PHONY +=` is a variable assignment in GNU make, so it is read as one.
 
 Config
