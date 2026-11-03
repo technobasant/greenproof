@@ -22,9 +22,11 @@ from typing import Any, NamedTuple
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import Finding
 from greenproof.rules import runner_config as rc
+from greenproof.rules import toxnox
 from greenproof.rules._common import finding, split_lines, warn_finding
 from greenproof.rules.collect import DEFAULT_CLASSES, DEFAULT_FILES, DEFAULT_FUNCTIONS
 from greenproof.rules.shell import (
+    FLAG_ALIASES,
     NEXTEST,
     NOOP_FLAGS,
     SELECT_FLAGS,
@@ -38,6 +40,7 @@ from greenproof.rules.shell import (
     early_exit,
     find_swallows,
     is_non_check,
+    narrowed_scope,
     narrowed_selection,
     scripts_in,
     selection_flags,
@@ -70,6 +73,7 @@ _TOOL_NARROW: dict[str, frozenset[str]] = {
     "mocha": _LONG_NARROW | SELECT_FLAGS["mocha"] | {"-f", "--fgrep", "--only"},
     "none": frozenset(),
 }
+_UNION_FLAGS = ("--testPathPattern",)  # repeated, they run what any one of them matches
 _NARROW_RUNNERS = {
     "pytest": "pytest",
     "py.test": "pytest",
@@ -1780,6 +1784,7 @@ def neutering_reason(
         return None
     unread = False
     narrow_base, narrow_cand = _statements(base_e, script), _statements(cand_e, script)
+    unexpanded = base_e, cand_e  # a task runner read into its commands loses `nx affected`
     if tasks is not None:
         base_c, _ = _read_tasks(base_c, tasks[0])
         cand_c, unread = _read_tasks(cand_c, tasks[1])
@@ -1794,8 +1799,11 @@ def neutering_reason(
     after = _check_tokens(cand_e, script, ctx, known[1], base_texts)
     if added := sorted(after - before):
         return f"it now passes {added[0]}"
-    if flag := _new_selection_flag(base_e, cand_e):
+    if flag := _new_selection_flag(base_e, cand_e) or _new_selection_flag(*unexpanded):
         return f"it now passes {flag}"
+    scope, scope_unread = narrowed_scope(narrow_base, narrow_cand)
+    if scope:
+        return f"it now runs less ({scope})"
     if narrowed := narrowed_selection(
         narrow_base,
         narrow_cand,
@@ -1830,6 +1838,8 @@ def neutering_reason(
         _statements(base_c, script)
     ):
         return _Warn(_UNREADABLE_WHY)
+    if scope_unread:
+        return _Warn(scope_unread)
     return None
 
 
@@ -1953,12 +1963,15 @@ def _check_tokens(
 ) -> Counter[str]:
     """The narrowing flags of the check statements: `ls -t` or `tar --exclude` are not narrowing
     a run, and each flag counts for the tool it is given to (see `_TOOL_NARROW`)."""
-    return Counter(
+    found = Counter(
         flag
         for st in _statements(lines, script)
         if _counts(st, ctx, known, base_texts)
         for flag in _narrow_flags(st)
     )
+    for union in _UNION_FLAGS:  # a second `--testPathPatterns` adds a pattern: that widens
+        found[union] = min(found[union], 1)
+    return +found
 
 
 def _narrow_flags(statement: str) -> list[str]:
@@ -1981,7 +1994,11 @@ def _narrow_flags(statement: str) -> list[str]:
             "jest",
         )
     flags = _TOOL_NARROW.get(family or "", _LONG_NARROW)
-    found = [t.partition("=")[0] for t in toks[1:] if t.partition("=")[0] in flags]
+    found = [
+        FLAG_ALIASES.get(name, name)
+        for t in toks[1:]
+        if (name := t.partition("=")[0]) in flags and not (name == "-o" and head == "vitest")
+    ]
     if family == "pytest":
         found.extend("-k" for t in toks[1:] if re.match(r"^-k.+", t))
     return found
@@ -3786,6 +3803,10 @@ _MAX_RESOLVE_DEPTH = 8
 _Env = dict[str, list[str] | None]
 
 
+def _is_posargs(node: ast.expr) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "posargs"
+
+
 def _resolve_words(node: ast.expr, env: _Env, depth: int = 0) -> list[str] | None:
     """The strings an expression stands for, when that can be told from the file: string and
     list or tuple literals (starred parts included), names bound once to one of those, `a + b`
@@ -3798,6 +3819,15 @@ def _resolve_words(node: ast.expr, env: _Env, depth: int = 0) -> list[str] | Non
         return _split_words(node.value) if " " in node.value else [node.value]
     if isinstance(node, ast.Attribute) and node.attr == "posargs":
         return []
+    if (  # `session.posargs or [D]`: D, the words when the caller passes none
+        isinstance(node, ast.BoolOp)
+        and isinstance(node.op, ast.Or)
+        and len(node.values) == 2
+        and _is_posargs(node.values[0])
+    ):
+        return _resolve_words(node.values[1], env, nxt)
+    if isinstance(node, ast.IfExp) and _is_posargs(node.test):
+        return _resolve_words(node.orelse, env, nxt)
     if isinstance(node, ast.Name):
         return env.get(node.id)
     if isinstance(node, (ast.List, ast.Tuple)):
@@ -4533,7 +4563,7 @@ def _file_reasons(
     if name in ("Makefile", "makefile", "GNUmakefile", "justfile", "Justfile"):
         return _make_reasons(f, commands, changes, tests)
     if name == "noxfile.py":
-        return _noxfile_reasons(f)
+        return [*_noxfile_reasons(f), *_toxnox_reasons(f, name, commands, changes)]
     if re.match(r"^\.mocharc(\.\w+)?$", name):
         return _mocha_reasons(f.old_text or "", f.new_text or "")
     if re.match(r"^(\.nycrc(\.\w+)?|nyc\.config\.\w+)$", name):
@@ -4543,8 +4573,47 @@ def _file_reasons(
     if _ENV_FILE.match(name):
         return _envfile_reasons(f, name, commands, changes)
     if name == "tox.ini":
-        return _noxfile_reasons(f)
+        return [*_noxfile_reasons(f), *_toxnox_reasons(f, name, commands, changes)]
+    if name in toxnox.CONFIG_NAMES:
+        return _toxnox_reasons(f, name, commands, changes)
     return []
+
+
+def _toxnox_reasons(
+    f: ChangedFile, name: str, commands: Mapping[str, str], changes: ChangeSet
+) -> list[tuple[int | None, str]]:
+    """A tox or nox configuration that now runs less by default (see `toxnox`), judged for the
+    policy commands, and the recipes and scripts beside the file, that run `tox` or `nox`."""
+    old, new = toxnox.read_defaults(name, f.old_text), toxnox.read_defaults(name, f.new_text)
+    if old is None or new is None or f.old_text == f.new_text:
+        return []
+    where = posixpath.dirname(f.path)
+    statements = [*commands.values(), *_recipe_statements(changes, where)]
+    text = f.new_text or ""
+    anchor = "sessions" if new.tool == "nox" else ("env_list" if "env_list" in text else "envlist")
+    line = _first_line_with(text, anchor)
+    return [(line, _Warn(why) if warn else why) for why, warn in toxnox.judge(old, new, statements)]
+
+
+def _recipe_statements(changes: ChangeSet, directory: str) -> list[str]:
+    """The recipe lines of a Makefile or justfile and the scripts of a package.json in the
+    directory (candidate tree): what a policy command such as `make test` may run."""
+    lines: list[str] = []
+    for name in ("Makefile", "GNUmakefile", "makefile", "justfile", "Justfile"):
+        text = changes.cand_text(posixpath.join(directory, name))
+        lines.extend(
+            _RECIPE_PREFIX.sub("", ln.strip(), count=1)
+            for ln in (text or "").splitlines()
+            if ln[:1] in (" ", "\t")
+        )
+    try:
+        data = json.loads(changes.cand_text(posixpath.join(directory, "package.json")) or "{}")
+    except ValueError:
+        data = {}
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if isinstance(scripts, dict):
+        lines.extend(v for v in scripts.values() if isinstance(v, str))
+    return lines[:2000]
 
 
 _ENV_FILE = re.compile(r"^(?:\.env(?:\..+)?|.+\.env)$")
