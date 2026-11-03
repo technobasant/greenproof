@@ -29,7 +29,7 @@ import posixpath
 import re
 import shlex
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from functools import lru_cache
@@ -3068,6 +3068,7 @@ _SCOPE_LABELS = {
     "targets": "target",
     "features": "feature",
     "tags": "build tag",
+    "filter": "package",
 }
 _UNREAD = re.compile(r"[$`]")
 
@@ -3134,6 +3135,85 @@ def _go_scope(args: Sequence[str]) -> dict[str, _Dim]:
     return {"tags": _Dim(False, frozenset(tags))}
 
 
+# Task runners whose name filters pick the packages a test run covers: the flags that name
+# packages, the flags that leave some out, and the flags that take every following word.
+_MONOREPO_FLAGS: dict[str, tuple[tuple[str, ...], tuple[str, ...], bool]] = {
+    "turbo": (("--filter", "-F"), (), False),
+    "pnpm": (("--filter", "-F", "--filter-prod"), (), False),
+    "nx": (("--projects", "-p"), ("--exclude",), True),
+    "lerna": (("--scope",), ("--ignore",), False),
+    "yarn": (("--include",), ("--exclude",), False),
+}
+_TEST_TASK = re.compile(r"^(?:test|tests|check|lint|typecheck|verify|ci|e2e)(?:[:_-]\S*)?$")
+
+
+def _runs_tests(args: Sequence[str]) -> bool:
+    """Whether a task runner's words name a test-like task (`test`, `-t test`, `--target=check`)."""
+    return any(_TEST_TASK.match(t.rpartition("=")[2]) for t in args)
+
+
+def _flag_words(args: Sequence[str], names: Sequence[str], several: bool) -> list[str]:
+    """The values of the flags `names` among `args`: `--flag=a,b`, `--flag a`, `-Fa`, repeated;
+    with `several`, every word up to the next flag (`-p a b`). Split at commas."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        name, eq, value = args[i].partition("=")
+        i += 1
+        if name in names:
+            words = [value] if eq else []
+            while (
+                not eq and i < len(args) and not args[i].startswith("-") and (several or not words)
+            ):
+                words.append(args[i])
+                i += 1
+            out.extend(w for word in words for w in word.split(",") if w)
+        elif len(args[i - 1]) > 2 and args[i - 1][:2] in names and not args[i - 1].startswith("--"):
+            out.append(args[i - 1][2:])
+    return out
+
+
+def _monorepo_scope(tokens: Sequence[str]) -> tuple[str, dict[str, _Dim]] | None:
+    """The packages one `turbo`, `pnpm`, `nx run-many`, `lerna run` or `yarn workspaces foreach`
+    test run covers: its name filters (`!x` and the excluding flags leave packages out). A filter
+    by git ref is `_changed_only`'s."""
+    for i, tok in enumerate(tokens[:4]):
+        tool = _cmd_name(tok)
+        if tool not in _MONOREPO_FLAGS:
+            continue
+        args = list(tokens[i + 1 :])
+        if "--" in args:
+            args = args[: args.index("--")]
+        head = args[:3]
+        if (
+            (tool == "nx" and "run-many" not in head)
+            or (tool == "lerna" and not any(t in ("run", "exec") for t in head))
+            or (tool == "yarn" and "foreach" not in args)
+            or not _runs_tests(args)
+        ):
+            return None
+        flags, excluding, several = _MONOREPO_FLAGS[tool]
+        named: list[str] = []
+        left: list[str] = []
+        for value in _flag_words(args, flags, several):
+            if value.startswith("!"):
+                left.append(value[1:])
+            elif not _GIT_FILTER.search(value):
+                named.append(value)
+        left.extend(_flag_words(args, excluding, several))
+        return tool, {
+            "filter": _Dim(not named, frozenset(named)),
+            "excludes": _Dim(False, frozenset(left)),
+        }
+    return None
+
+
+def runs_monorepo_tests(text: str, defs: Mapping[str, str] | None = None) -> bool:
+    """Whether a statement is a `turbo`, `nx run-many`, `lerna run`, `pnpm` or `yarn workspaces
+    foreach` run of a test task: the step a name filter changes without it being another step."""
+    return _monorepo_scope(_without_redirects(command_tokens(text, defs))) is not None
+
+
 def _scopes(commands: Sequence[str], defs: Mapping[str, str] | None) -> dict[str, dict[str, _Dim]]:
     """Per runner (`cargo`, `go`) the dimensions its runs together cover: a dimension is
     unrestricted when any run leaves it so, else it is the union of the runs' items."""
@@ -3154,13 +3234,20 @@ def _scopes(commands: Sequence[str], defs: Mapping[str, str] | None) -> dict[str
                 if _cmd_name(tokens[0]) == "gotestsum":  # its own flags end at `--`
                     args = args[args.index("--") + 1 :] if "--" in args else []
                 runs.setdefault("go", []).append(_go_scope(args))
+            elif (found := _monorepo_scope(_without_redirects(tokens))) is not None:
+                runs.setdefault(found[0], []).append(found[1])
     return {
-        family: {
-            dim: _Dim(any(r[dim].top for r in rs), frozenset().union(*(r[dim].items for r in rs)))
-            for dim in rs[0]
-        }
+        family: {dim: _merge(dim, [r[dim] for r in rs]) for dim in rs[0]}
         for family, rs in runs.items()
     }
+
+
+def _merge(dim: str, parts: list[_Dim]) -> _Dim:
+    """One dimension over several runs: it is unrestricted when any run leaves it so, and covers
+    the items of every run; a package is left out (`excludes`) only when every run leaves it out."""
+    if dim == "excludes":
+        return _Dim(False, frozenset.intersection(*(p.items for p in parts)))
+    return _Dim(any(p.top for p in parts), frozenset().union(*(p.items for p in parts)))
 
 
 def _item_covers(cand: str, base: str) -> bool:
@@ -3169,6 +3256,68 @@ def _item_covers(cand: str, base: str) -> bool:
     if cand == base or ((prefix := _TARGET_GROUPS.get(cand)) and base.startswith(prefix)):
         return True
     return "*" in cand and len(cand) < 200 and fnmatchcase(base, cand)
+
+
+def _filter_parts(item: str) -> tuple[str, bool, bool, bool]:
+    """`web...` and `...web` also run what the package needs or what needs it, `^web` leaves the
+    package itself out: the name, and whether each of those is there."""
+    before, after = item.startswith("..."), item.endswith("...")
+    core = item[3 * before : len(item) - 3 * after]
+    caret = core.startswith("^") or core.endswith("^")
+    return core.strip("^"), before, after, caret
+
+
+def _filter_covers(cand: str, base: str) -> bool:
+    """Whether the candidate's package filter covers the base's: the same name or a glob over it,
+    reaching at least as far (`web...` and `...web` also run what the package needs or what
+    needs it) and leaving the package itself in when the base did."""
+    (c, c_before, c_after, c_caret), (b, b_before, b_after, b_caret) = (
+        _filter_parts(cand),
+        _filter_parts(base),
+    )
+    return (
+        _item_covers(c, b)
+        and (c_before or not b_before)
+        and (c_after or not b_after)
+        and (b_caret or not c_caret)
+    )
+
+
+_COVER_BUDGET = 200_000  # item-against-item comparisons of one dimension
+
+
+def _filter_name(item: str) -> str:
+    return _filter_parts(item)[0]
+
+
+def _uncovered(
+    items: Iterable[str],
+    by: frozenset[str],
+    covers: Callable[[str, str], bool],
+    name: Callable[[str], str] = str,
+) -> list[str] | None:
+    """The `items` that none of `by` covers (`covers(by_item, item)`); None when there are too
+    many to compare. An item is covered by itself, by a glob or a target group, or by one with
+    the same name (`name`): those are the only ones compared, so the cost follows the input."""
+    named: dict[str, list[str]] = {}
+    wild: list[str] = []
+    for c in by:
+        if "*" in name(c) or c in _TARGET_GROUPS:
+            wild.append(c)
+        else:
+            named.setdefault(name(c), []).append(c)
+    budget = _COVER_BUDGET
+    out: list[str] = []
+    for item in sorted(items):
+        if item in by:
+            continue
+        pool = [*named.get(name(item), ()), *wild]
+        budget -= len(pool) + 1
+        if budget < 0:
+            return None
+        if not any(covers(c, item) for c in pool):
+            out.append(item)
+    return out
 
 
 def narrowed_scope(
@@ -3180,9 +3329,13 @@ def narrowed_scope(
     cargo: packages (`-p`, against `--workspace` or none), targets (`--lib`, `--bins`, `--bin X`,
     `--test X`, `--example X`, `--benches`; none and `--all-targets` are everything), features
     (`--features`, `--all-features`) and `--no-default-features`. go: `-tags`, whose files stop
-    being built when a tag goes. A run covers a dimension when it covers every item the base
-    did; more items, or an unrestricted dimension, is not a narrowing. A value that is a
-    variable cannot be read: the warning, when it differs from the base's.
+    being built when a tag goes. turbo, pnpm, `nx run-many`, `lerna run` and `yarn workspaces
+    foreach`: the packages their name filters pick (none is every package) and the ones they
+    leave out (`!x`, `--exclude`, `--ignore`); a filter that names other packages than the base's
+    (a rename, a glob) is the warning, as it cannot be judged without the workspace. A run covers
+    a dimension when it covers every item the base did; more items, or an unrestricted dimension,
+    is not a narrowing. A value that is a variable cannot be read: the warning, when it differs
+    from the base's.
     """
     base = _scopes(base_cmds, defs)
     cand = _scopes(cand_cmds, defs)
@@ -3192,6 +3345,13 @@ def narrowed_scope(
             continue
         for dim, before in dims.items():
             after = cand[family][dim]
+            if dim == "excludes":  # packages left out: one more is a run that covers less
+                added = _uncovered(after.items, before.items, _filter_covers, _filter_name)
+                if added is None or any(_UNREAD.search(c) for c in added):
+                    warn = warn or f"{family} leaves out a package that cannot be read here"
+                elif added:
+                    return f"{family} now leaves out {_listing(added)}", warn
+                continue
             if after.top or any(_UNREAD.search(i) for i in after.items):
                 if not after.top and after != before:
                     warn = warn or (
@@ -3199,9 +3359,23 @@ def narrowed_scope(
                         " here: check that it still covers what the base did"
                     )
                 continue
-            lost = sorted(
-                b for b in before.items if not any(_item_covers(c, b) for c in after.items)
-            )
+            covers = _filter_covers if dim == "filter" else _item_covers
+            name = _filter_name if dim == "filter" else str
+            lost = _uncovered(before.items, after.items, covers, name)
+            if lost is None:
+                warn = warn or f"{family} has too many {_SCOPE_LABELS.get(dim, dim)}s to compare"
+                continue
+            if (
+                lost
+                and dim == "filter"
+                and not before.top
+                and _uncovered(after.items, before.items, covers, name)
+            ):
+                warn = warn or (  # renamed, or a glob: not a subset of what the base ran
+                    f"{family} package filter changed from {_listing(sorted(before.items))}"
+                    f" to {_listing(sorted(after.items))}: check that it still covers them"
+                )
+                continue
             if dim == "defaults" and lost:
                 return f"{family} now runs with `--no-default-features`", warn
             noun = _SCOPE_LABELS.get(dim, dim)
@@ -3246,4 +3420,6 @@ def selection_changed_warning(
 
 
 def _listing(words: Sequence[str]) -> str:
-    return ", ".join(f"`{w}`" for w in dict.fromkeys(words))
+    names = list(dict.fromkeys(words))
+    more = f" and {len(names) - 8} more" if len(names) > 8 else ""
+    return ", ".join(f"`{w}`" for w in names[:8]) + more
