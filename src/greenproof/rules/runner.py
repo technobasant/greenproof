@@ -1783,11 +1783,11 @@ def neutering_reason(
     cand_e = _with_exports(cand_c, script, exports[1] if exports else None)
     if base_c == cand_c and base_e == cand_e and (modes is None or modes[0] == modes[1]):
         return None
-    unread = False
+    unread = base_unread = False
     narrow_base, narrow_cand = _statements(base_e, script), _statements(cand_e, script)
     unexpanded = base_e, cand_e  # a task runner read into its commands loses `nx affected`
     if tasks is not None:
-        base_c, _ = _read_tasks(base_c, tasks[0])
+        base_c, base_unread = _read_tasks(base_c, tasks[0])
         cand_c, unread = _read_tasks(cand_c, tasks[1])
         base_e = _with_exports(base_c, script, exports[0] if exports else None)
         cand_e = _with_exports(cand_c, script, exports[1] if exports else None)
@@ -1833,6 +1833,13 @@ def neutering_reason(
         if unread:
             return _Warn(_UNREAD_TASKS_WHY)
         return "it runs fewer steps than before"
+    if (
+        unread
+        and not base_unread
+        and not script
+        and any(runs_monorepo_tests(st) for st in _statements(unexpanded[1], script))
+    ):
+        return _Warn(_UNREAD_TASKS_WHY)
     if gone:
         return gone
     if _autoload_sets(_statements(cand_c, script)) > _autoload_sets(_statements(base_c, script)):

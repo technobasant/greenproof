@@ -375,9 +375,24 @@ def _words(node: ast.AST) -> list[str] | None:
     return None
 
 
+_OPAQUE = "<?>"  # stands in the lines of a session for a `session.run` that cannot be read
+
+
 def _starred_default(value: ast.AST) -> list[str]:
     """What `*session.posargs`, `*(session.posargs or [D])` and `*(session.posargs if
-    session.posargs else [D])` add to a command when nothing follows `--`: D."""
+    session.posargs else [D])` add to a command when nothing follows `--`: D. A literal list
+    or `"a b".split()` adds its words."""
+    if isinstance(value, ast.Call) and not value.args and not value.keywords:
+        f = value.func
+        if (
+            isinstance(f, ast.Attribute)
+            and f.attr == "split"
+            and isinstance(f.value, ast.Constant)
+            and isinstance(f.value.value, str)
+        ):
+            return f.value.value.split()
+    if (literal := _words(value)) is not None:
+        return literal
     if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or) and len(value.values) == 2:
         return _words(value.values[1]) or []
     if isinstance(value, ast.IfExp):
@@ -429,8 +444,8 @@ def _session_runs(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in ("run", "run_always")
-            and (line := _run_line(node))
         ):
+            line = _run_line(node) or _OPAQUE
             lines.append(line)
             if guarded or _widened(node):
                 swallowed.append(line)
@@ -659,7 +674,18 @@ def _command_reasons(
                 )
             )
     if lost := sorted(_kinds(old, names) - _kinds(new, now)):
-        out.append((f"`{old.tool}` no longer runs {', '.join(lost)} in {_listing(names)}", False))
+        if any(_OPAQUE in new.lines.get(n, ()) for n in now):  # a command it cannot read may run it
+            out.append(
+                (
+                    f"`{old.tool}` runs a command that cannot be read in {_listing(names)}: check"
+                    f" that it still runs {', '.join(lost)}",
+                    True,
+                )
+            )
+        else:
+            out.append(
+                (f"`{old.tool}` no longer runs {', '.join(lost)} in {_listing(names)}", False)
+            )
     return out
 
 
