@@ -569,8 +569,12 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `--bins`, `--bin`, `--test`, `--doc`, `--example`), `--workspace` replaced by `-p`, and a
   dropped `--features` or `--all-features`; widening passes. Monorepo package filters are
   selection too: turbo `--filter`/`-F` (including `!x`), pnpm `--filter`/`-F`/`--filter-prod`,
-  nx `run-many` `--projects`/`-p` and `--exclude`, lerna `--scope`/`--ignore`, and yarn
-  `workspaces foreach` `--include`/`--exclude`. A filter added where the base had none, or one
+  nx `run-many` `--projects`/`-p` and `--exclude`, lerna `--scope`/`--ignore`, yarn
+  `workspaces foreach` `--include`/`--exclude`, and (since 0.4.0) npm `-w`/`--workspace`, where
+  a plain run or `--workspaces`/`-ws` is every package and `--no-workspaces` the root package
+  alone. In a workflow step, the npm selection is the step's own (the words before `--`), and
+  the root script is not read in place of the package it selects, so `npm test` becoming
+  `npm test -w web` blocks whatever the root `test` script runs. A filter added where the base had none, or one
   that leaves out a package the base ran, blocks; a dropped or widened filter passes; a rename
   or a glob (`web` to `app-*`) passes when it still selects every package the old filter
   selected, read from the `package.json` names in the tree, and warns when it does not. In
@@ -685,7 +689,6 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `jest.config.*`/`vitest.config.*` (`testPathIgnorePatterns`,
   `exclude`, `coverageThreshold` lowered, `passWithNoTests`); `tsconfig*.json` (`strict`
   or `noImplicitAny` set false, `skipLibCheck` is ignored);
-<!-- F7: policy scripts, npm workspaces in CI -->
 - `Makefile`/`justfile` targets referenced by the base policy's commands (all targets are
   read, `define ... endef` bodies are not targets; a recipe emptied while gaining
   prerequisites, or either side has prerequisites, is judged by the recipes of those
@@ -733,8 +736,16 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
 - a file a base policy command runs (`sh scripts/test.sh`, `python scripts/run_tests.py`,
   `./ci/check`), and the files those run, one level deep: deleted, emptied, replaced by a
   no-op, given a swallow, a new selection flag or an unconditional `exit 0` before its
-  checks, or (for a non-shell script) given a top-level `sys.exit(0)`. Test files named as
-  arguments (`pytest tests/test_a.py`) are not scripts and are left to the test rules;
+  checks, or (for a non-shell script) given a top-level `sys.exit(0)`. A file that a recipe
+  of the base Makefile runs counts as run by the policy command that runs the target (`make
+  test` whose recipe is `sh scripts/test.sh`). A script that no longer runs a kind of check
+  its base ran blocks, as a package.json script does, even when other lines remain ("it no
+  longer runs `pytest`"); the lint kinds are one kind. The scripts a script calls (`sh
+  scripts/unit.sh`, `./unit.sh`, looked for from the repository root and from the script's
+  directory) are read into it, to depth 4, 64 files per side and 1 MiB per file. A call that
+  cannot be read (a missing file, or one past those limits) might run any check, so the
+  script is then not judged by kind. Test files named as arguments (`pytest
+  tests/test_a.py`) are not scripts and are left to the test rules;
 - a Go `TestMain(<name> *testing.M)` (the parameter name is the one in the signature, and
   strings, raw strings, runes and comments are skipped when matching braces) that gains a
   body which never calls `<name>.Run()` or calls `os.Exit(0)` unconditionally after it: a
@@ -906,8 +917,8 @@ time linear in its input.
 *Known limits.* Flow-style `steps: [...]`, a `runs-on` computed by `fromJSON`, a `make`
 and `always() && false` are not read. Expansion stops at depth 4, 32 files or 2 MiB per step
 (a `warn`); GitLab CI and CircleCI scripts are not followed; a Makefile `include` whose path uses `$(shell ...)`
-or an unset variable, and `npm -w`/`--workspace` are not read (monorepo filters of turbo, pnpm, nx
-`run-many`, lerna and yarn are: see `runner.tampered` above); `cd` is not scoped, so a
+or an unset variable is not read (monorepo filters of turbo, pnpm, nx `run-many`, lerna, yarn
+and npm are: see `runner.tampered` above); `cd` is not scoped, so a
 subshell's `cd` carries on; a `working-directory` expression resolves from the repo root; a make
 target or script with content the rule cannot classify stays opaque.
 
@@ -1053,6 +1064,10 @@ Config and selection
 Shell and CI
 - Scripts, action files and policy scripts are read up to 1 MiB. Past that, a change to what
   they run warns that it was not read.
+- A policy script is compared by the kinds of check it runs, not by how many: a second `pytest`
+  run removed, or one lint tool swapped for another (`ruff` to `mypy`), passes. A script call
+  that cannot be read (a missing file, past depth 4, 64 files or 1 MiB) might run any check, so
+  a script with one is not judged by kind.
 - A changed `sed -i` or `perl -i` rewrite of tests the base already rewrote always blocks, even
   when it only swaps a name, as in 0.3.1. A rewrite with a variable path (`tests/$F`) is not
   seen.
