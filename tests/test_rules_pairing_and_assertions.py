@@ -539,7 +539,8 @@ def test_non_literal_argvalues_compare_without_the_case_factor(tmp_path: Path) -
     )
     new = base.replace("    assert make(a + 1) == 2\n", "")
     found = change(tmp_path, new, base)
-    assert "checks dropped from 2 to 1" in found[0].message
+    # a module-level literal table is read as rows (0.4.0): 2 asserts x 2 rows, then 1 x 2
+    assert "checks dropped from 4 to 2" in found[0].message
 
 
 def test_folding_asserts_into_cases_is_not_a_drop(tmp_path: Path) -> None:

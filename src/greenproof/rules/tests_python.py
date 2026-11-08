@@ -705,6 +705,171 @@ def _constructed(node: ast.AST) -> bool:
     )
 
 
+_MATCHER_LIBS = frozenset({"dirty_equals", "callee"})
+_MATCHER_NAMES = frozenset(
+    {
+        "Comparison",
+        "StringComparison",
+        "RoundComparison",
+        "SequenceComparison",
+        "SetComparison",
+        "MappingComparison",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _MatchEnv:
+    """What makes a value one whose `==` accepts whatever it is compared with, for one file:
+    the local names bound to a mock library, the ones bound to a matcher library (`IsInt`,
+    `StringComparison`), and the classes and functions (plain or `module.name`) that build such a
+    value."""
+
+    loose: frozenset[str] = frozenset()
+    roots: frozenset[str] = frozenset()
+    defs: frozenset[str] = frozenset()
+
+
+_NO_MATCHERS = _MatchEnv()
+_match_env: ContextVar[_MatchEnv] = ContextVar("match_env", default=_NO_MATCHERS)
+
+
+def _matcher_roots(tree: ast.AST) -> set[str]:
+    """The local names `tree` binds to a library of values that compare equal to many things."""
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            lib = (node.module or "").split(".")[0]
+            for a in node.names:
+                if lib in _MATCHER_LIBS or (lib == "testfixtures" and a.name in _MATCHER_NAMES):
+                    out.add(a.asname or a.name)
+        elif isinstance(node, ast.Import):
+            out.update(
+                a.asname or a.name.split(".")[0]
+                for a in node.names
+                if a.name.split(".")[0] in _MATCHER_LIBS
+            )
+    return out
+
+
+def _is_matcher(node: ast.AST, env: _MatchEnv) -> bool:
+    """`ANY`, `mock.ANY`, `IsInt()`, `StringComparison(".*")`, or a call of a class or function
+    `env.defs` names: a value that `==` accepts whatever the other side is."""
+    func = node.func if isinstance(node, ast.Call) else node
+    path = dotted(func)
+    if not path:
+        return False
+    root, last = path.split(".")[0], path.rsplit(".", 1)[-1]
+    if root in env.roots or (last == "ANY" and root in env.loose):
+        return True
+    return isinstance(node, ast.Call) and path in env.defs
+
+
+def _eq_ignores_other(fn: _FuncDef | ast.Lambda) -> bool:
+    """`fn`, an `__eq__`, never reads its second parameter and returns something (not only
+    `NotImplemented`, which refuses the comparison)."""
+    a = fn.args
+    params = [*a.posonlyargs, *a.args]
+    if len(params) >= 2:
+        other = params[1].arg
+    elif a.vararg is not None:
+        other = a.vararg.arg
+    else:
+        return False
+    body: list[ast.AST] = [fn.body] if isinstance(fn, ast.Lambda) else list(fn.body)
+    if any(isinstance(n, ast.Name) and n.id == other for b in body for n in ast.walk(b)):
+        return False
+    if isinstance(fn, ast.Lambda):
+        return dotted(fn.body) != "NotImplemented"
+    seen = _Returned()
+    for stmt in fn.body:
+        seen.visit(stmt)
+    return any(dotted(v) != "NotImplemented" for v in seen.values)
+
+
+def _loose_class(cls: ast.ClassDef) -> bool:
+    """A class with no base but `object` whose own `__eq__` never reads the other operand."""
+    if any(dotted(b) != "object" for b in cls.bases) or cls.keywords:
+        return False
+    for node in cls.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__eq__":
+            return _eq_ignores_other(node)
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Lambda)
+            and any(isinstance(t, ast.Name) and t.id == "__eq__" for t in node.targets)
+        ):
+            return _eq_ignores_other(node.value)
+    return False
+
+
+def _loose_defs(tree: ast.Module) -> set[str]:
+    """Classes of `tree` whose `__eq__` accepts anything, and its top-level functions that each
+    return such a value or a matcher (looking through other functions up to depth 3)."""
+    loose, roots = frozenset(_loose_imports(tree)), frozenset(_matcher_roots(tree))
+    defs = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and _loose_class(n)}
+    funcs = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for _ in range(3):
+        env = _MatchEnv(loose, roots, frozenset(defs))
+        found = set()
+        for fn in funcs:
+            seen = _Returned()
+            for stmt in fn.body:
+                seen.visit(stmt)
+            if (
+                fn.name not in defs
+                and seen.values
+                and all(_is_matcher(v, env) for v in seen.values)
+            ):
+                found.add(fn.name)
+        if not found:
+            break
+        defs |= found
+    return defs
+
+
+def _match_env_for(path: str, tree: ast.Module, sources: Sources | None) -> _MatchEnv:
+    """The `_MatchEnv` of the test file `tree`, with the matchers it imports from test modules."""
+    defs = set(_loose_defs(tree))
+    if sources is not None:
+        read: dict[str, set[str]] = {}  # each module is read once, however often it is imported
+
+        def add(local: str, found: tuple[str, ast.Module], only: str | None) -> bool:
+            theirs = read.get(found[0])
+            if theirs is None:
+                theirs = read[found[0]] = _loose_defs(found[1])
+            if only is None:
+                defs.update(f"{local}.{n}" for n in theirs)
+            elif only in theirs:
+                defs.add(local)
+            else:
+                return False
+            return True
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                found = _resolve_module(path, module, node.level, sources)
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    local = alias.asname or alias.name
+                    if found is not None and add(local, found, alias.name):
+                        continue
+                    name = f"{module}.{alias.name}" if module else alias.name
+                    sub = _resolve_module(path, name, node.level, sources)
+                    if sub is not None:
+                        add(local, sub, None)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    mod = _resolve_module(path, alias.name, 0, sources)
+                    if mod is not None:
+                        add(alias.asname or alias.name, mod, None)
+    return _MatchEnv(
+        frozenset(_loose_imports(tree)), frozenset(_matcher_roots(tree)), frozenset(defs)
+    )
+
+
 def _literal_params(fn: _FuncDef) -> set[str]:
     """Parametrize arguments whose cases are all literals."""
     names: dict[str, bool] = {}
@@ -1015,6 +1180,22 @@ class _Stats(ast.NodeVisitor):
             return self._pinned_side(arg)
         return _is_pinned(inlined)
 
+    def _matcher(self, node: ast.expr) -> bool:
+        env = _match_env.get()
+        return _is_matcher(node, env) or _is_matcher(self.consts.inline(node), env)
+
+    def _loose_eq(self, sides: Sequence[ast.expr], src: str) -> bool:
+        """An equality check one of whose top-level operands accepts anything (`ANY`,
+        `IsInt()`, an object whose `__eq__` returns True) checks nothing on the other: it is a
+        loose check there. True when it was handled so."""
+        flags = [self._matcher(s) for s in sides]
+        if not any(flags):
+            return False
+        for side, flag in zip(sides, flags, strict=True):
+            if not flag:
+                self._loosen(side, src)
+        return True
+
     def _pinned_check(self, sides: Sequence[ast.expr]) -> None:
         """Count an exact check one of whose sides is pinned to a literal."""
         if any(self._pinned_side(s) for s in sides):
@@ -1081,6 +1262,8 @@ class _Stats(ast.NodeVisitor):
         elif isinstance(op, _ORDER_OPS) or neg:
             exact = False
         else:  # `in`: neither an exact nor a loose check
+            return
+        if exact and isinstance(op, ast.Eq) and not neg and self._loose_eq((left, right), src):
             return
         if exact:
             self._pinned_check((left, right))
@@ -1331,6 +1514,8 @@ class _Stats(ast.NodeVisitor):
             band = self._almost_band(node) if tail in _ALMOST else None
             if band is not None or tail not in _ALMOST:
                 self._numeric_pair(args[0], args[1], band)
+        if tail in _EQUAL_METHODS and len(args) >= 2 and self._loose_eq(args[:2], src):
+            return
         if tail in _EXACT_METHODS:
             if tail == "assertIsNone":
                 self.pinned += 1  # `is None`: pinned to the constant None
@@ -1790,8 +1975,52 @@ def _param_columns(dec: ast.Call) -> tuple[str, ...]:
     return ("?",)
 
 
+def _all_tables(
+    live: _FuncDef,
+    tables: Mapping[str, ast.expr],
+    altered: AbstractSet[str],
+    bound: AbstractSet[str],
+) -> list[RowTab]:
+    """`assert all(<check> for <names> in <table>)` (or `self.assertTrue(all(...))`): one
+    assertion that checks every row of the table, read like a loop of one assert."""
+    out: list[RowTab] = []
+    for node in sorted(_own_nodes(live), key=lambda n: getattr(n, "lineno", 0)):
+        test: ast.expr | None = None
+        if isinstance(node, ast.Assert):
+            test = node.test
+        elif (
+            isinstance(node, ast.Call)
+            and dotted(node.func).rsplit(".", 1)[-1] == "assertTrue"
+            and node.args
+        ):
+            test = node.args[0]
+        if not (
+            isinstance(test, ast.Call)
+            and dotted(test.func) == "all"
+            and len(test.args) == 1
+            and isinstance(test.args[0], (ast.GeneratorExp, ast.ListComp))
+            and len(test.args[0].generators) == 1
+        ):
+            continue
+        comp = test.args[0]
+        gen = comp.generators[0]
+        names = tuple(dict.fromkeys(_stores(gen.target)))
+        if gen.ifs or gen.is_async or not names:
+            continue
+        rows, why, name, keys = _table_rows(gen.iter, tables, altered, bound)
+        reads = _mentions(comp.elt, set(names))
+        out.append(RowTab("loop", names, "all", rows, reads, why, name, keys, asserts=1))
+        if len(out) >= _MAX_TABLES:
+            break
+    return out
+
+
 def _row_tables(
-    fn: _FuncDef, live: _FuncDef, helpers: dict[str, _FuncDef], forms: Sequence[str]
+    fn: _FuncDef,
+    live: _FuncDef,
+    helpers: dict[str, _FuncDef],
+    forms: Sequence[str],
+    fold: _Fold | None = None,
 ) -> tuple[RowTab, ...]:
     """The literal tables that drive the test's checks: each `for` loop whose body asserts, read
     from a literal list or tuple or a module-level name bound once to one, and each parametrize
@@ -1824,9 +2053,25 @@ def _row_tables(
         # a loop that can stop early runs only its first row for certain
         rows, why, name, keys = _table_rows(loop.iter, tables, altered, bound, _leaves_row(loop))
         reads = _row_reads(loop.body, _taint(loop.body, names), helpers, 0)
-        out.append(
-            RowTab("loop", names, digest("\n".join(inner.forms)), rows, reads, why, name, keys)
+        counted = fold is not None and (loop.lineno, loop.col_offset) == (
+            fold.loop.lineno,
+            fold.loop.col_offset,
         )
+        out.append(
+            RowTab(
+                "loop",
+                names,
+                digest("\n".join(inner.forms)),
+                rows,
+                reads,
+                why,
+                name,
+                keys,
+                asserts=inner.asserts,
+                counted=counted,
+            )
+        )
+    out.extend(_all_tables(live, tables, altered, bound))
     sig = digest("\n".join(forms))
     for dec in fn.decorator_list:
         if not (isinstance(dec, ast.Call) and dotted(dec.func).endswith("mark.parametrize")):
@@ -2026,7 +2271,7 @@ def _unit(
         param_forms=case_forms,
         row_gap=gap,
         row_big=big,
-        row_tabs=_row_tables(fn, live, helpers, stats.forms),
+        row_tabs=_row_tables(fn, live, helpers, stats.forms, fold),
         param_marked=_marked(fn),
         mark_kinds=_mark_kinds(fn),
         subjects=_subjects(live) | _helper_subjects(live, helpers),
@@ -2662,6 +2907,7 @@ def _analyse_python(path: str, text: str, sources: Sources | None) -> FileAnalys
     outside, defined = _pin_imports(path, tree, sources)
     pin_token = _pin_locals.set(outside)
     def_token = _defined_locals.set(defined)
+    match_token = _match_env.set(_match_env_for(path, tree, sources))
     try:
         helpers, imports = _module_helpers(path, tree, sources)
         loose = set(_loose_locals.get())
@@ -2673,6 +2919,7 @@ def _analyse_python(path: str, text: str, sources: Sources | None) -> FileAnalys
         _loose_locals.set(frozenset(loose))
         return _analysed(path, tree, helpers, imports)
     finally:
+        _match_env.reset(match_token)
         _defined_locals.reset(def_token)
         _pin_locals.reset(pin_token)
         _loose_locals.reset(token)
