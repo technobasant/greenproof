@@ -17,11 +17,13 @@ from collections import ChainMap, Counter, deque
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
+from functools import lru_cache
 from typing import Any, NamedTuple
 
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import Finding
 from greenproof.rules import runner_config as rc
+from greenproof.rules import shell as _shell
 from greenproof.rules import toxnox
 from greenproof.rules._common import finding, split_lines, warn_finding
 from greenproof.rules.collect import DEFAULT_CLASSES, DEFAULT_FILES, DEFAULT_FUNCTIONS
@@ -30,6 +32,7 @@ from greenproof.rules.shell import (
     NEXTEST,
     NOOP_FLAGS,
     SELECT_FLAGS,
+    Seg,
     Swallow,
     TestFiles,
     _group_inner,
@@ -37,7 +40,6 @@ from greenproof.rules.shell import (
     _top_level,
     check_kind,
     command_env,
-    command_tokens,
     covered_test_files,
     early_exit,
     find_swallows,
@@ -46,11 +48,72 @@ from greenproof.rules.shell import (
     narrowed_selection,
     runs_monorepo_tests,
     scripts_in,
-    selection_flags,
-    shell_c_body,
-    split_segments,
 )
 from greenproof.rules.tasks import Opaque, Reader, task_reader
+
+_SEGMENT_MEMO_CHARS = 4096  # a longer script is split again each time, not kept
+
+
+@lru_cache(maxsize=32768)
+def _segments_memo(script: str) -> tuple[Seg, ...]:
+    return tuple(_shell.split_segments(script))
+
+
+def split_segments(script: str) -> list[Seg]:
+    """`shell.split_segments` of a short statement, read once however many passes ask for it (a
+    recipe is judged by many passes, each of which splits every line)."""
+    if len(script) > _SEGMENT_MEMO_CHARS:
+        return _shell.split_segments(script)
+    return list(_segments_memo(script))
+
+
+@lru_cache(maxsize=32768)
+def _tokens_memo(text: str) -> tuple[str, ...]:
+    return tuple(_shell.command_tokens(text))
+
+
+def command_tokens(text: str, defs: Mapping[str, str] | None = None) -> list[str]:
+    """`shell.command_tokens`, kept for a short statement read with no definitions."""
+    if defs is not None or len(text) > _SEGMENT_MEMO_CHARS:
+        return _shell.command_tokens(text, defs)
+    return list(_tokens_memo(text))
+
+
+@lru_cache(maxsize=32768)
+def _c_body_memo(text: str) -> str | None:
+    return _shell.shell_c_body(text)
+
+
+def shell_c_body(text: str, defs: Mapping[str, str] | None = None) -> str | None:
+    """`shell.shell_c_body`, kept for a short statement read with no definitions."""
+    if defs is not None or len(text) > _SEGMENT_MEMO_CHARS:
+        return _shell.shell_c_body(text, defs)
+    return _c_body_memo(text)
+
+
+@lru_cache(maxsize=32768)
+def _flags_memo(line: str) -> tuple[tuple[str, str], ...]:
+    return tuple(_shell.selection_flags(line))
+
+
+def selection_flags(line: str, defs: Mapping[str, str] | None = None) -> list[tuple[str, str]]:
+    """`shell.selection_flags` of a short line read with no definitions, read once."""
+    if defs is not None or len(line) > _SEGMENT_MEMO_CHARS:
+        return list(_shell.selection_flags(line, defs))
+    return list(_flags_memo(line))
+
+
+def _short_memo(fn: Callable[[str], bool]) -> Callable[[str], bool]:
+    """`fn` of a short statement, read once; a longer one is read each time (nothing large is
+    kept)."""
+    memo = lru_cache(maxsize=32768)(fn)
+
+    def call(text: str) -> bool:
+        return fn(text) if len(text) > _SEGMENT_MEMO_CHARS else memo(text)
+
+    call.__doc__ = fn.__doc__
+    return call
+
 
 _HINT = "Restore the original configuration; fix the code or the test instead of the check."
 _ADOPTION = " (a new linter or type-checker configuration: adoption, not a loosening)"
@@ -877,8 +940,19 @@ class _Ctx:
         self.scripts: Collection[str] = frozenset(p for e in extra for p in scripts_in(e, ""))
         self.make_check = make_check
         self.script_check = script_check
+        self._checks: dict[str, bool] = {}
+        self._kinds: dict[str, str | None] = {}
 
     def is_check(self, statement: str) -> bool:
+        """Whether a statement is a check; each distinct statement is judged once."""
+        if len(statement) > _SEGMENT_MEMO_CHARS:
+            return self._is_check(statement)
+        found = self._checks.get(statement)
+        if found is None:
+            found = self._checks[statement] = self._is_check(statement)
+        return found
+
+    def _is_check(self, statement: str) -> bool:
         kind = check_kind(
             statement,
             literals=self.literals,
@@ -900,6 +974,13 @@ class _Ctx:
 
     def kind(self, statement: str) -> str | None:
         """The kind of check a statement is (`pytest`, `eslint`, ...), None when it is none."""
+        if len(statement) > _SEGMENT_MEMO_CHARS:
+            return self._kind(statement)
+        if statement not in self._kinds:
+            self._kinds[statement] = self._kind(statement)
+        return self._kinds[statement]
+
+    def _kind(self, statement: str) -> str | None:
         for text in (statement, _unwrap(statement)):
             kind = check_kind(
                 text, literals=self.literals, scripts=self.scripts, make_check=self.make_check
@@ -1718,6 +1799,7 @@ _ENV_WORDS = frozenset(
 )
 
 
+@_short_memo
 def _sets_autoload_off(statement: str) -> bool:
     """Whether a statement sets `PYTEST_DISABLE_PLUGIN_AUTOLOAD` to something: `VAR=1 pytest`,
     `env VAR=1 pytest`, `export VAR=1`, also inside `sh -c`. pytest reads any value that is not
@@ -1848,6 +1930,7 @@ def _unreadable_sets(statements: Sequence[str]) -> int:
     return sum(_unreadable_flags(st) for st in statements)
 
 
+@_short_memo
 def _unreadable_flags(statement: str) -> bool:
     """Whether a statement gives `PYTEST_ADDOPTS` or `GOFLAGS` a value greenproof cannot read
     (`$(...)`, `${VAR}`, a backtick)."""
@@ -1858,6 +1941,27 @@ def _unreadable_flags(statement: str) -> bool:
     return any(_UNREADABLE.search(values.get(name, "")) for name in _FLAG_VARS)
 
 
+_SUBSTITUTION = re.compile(r"\$[({]|`")
+_SINGLE_QUOTED = re.compile(r"'[^']*'")
+
+
+def _substituted_runs(statements: Sequence[str], ctx: _Ctx) -> int:
+    """The check statements with a command substitution (`pytest $(echo -k x)`, a backtick) or an
+    expansion greenproof could not resolve in the arguments, after the check's own words: what it
+    hands the runner is unknown, and it may be a selection flag. A substitution that is the
+    command itself (`node $(yarn bin jest)`) is not read here."""
+    count = 0
+    for st in statements:
+        text = _SINGLE_QUOTED.sub("", st)
+        if (m := _SUBSTITUTION.search(text)) and ctx.is_check(text[: m.start()].strip()):
+            count += 1
+    return count
+
+
+_SUBSTITUTED_WHY = (
+    "a check now takes arguments from a command substitution or an expansion greenproof cannot "
+    "read, and it may hand the runner a selection flag"
+)
 _UNREADABLE_WHY = (
     "`PYTEST_ADDOPTS` or `GOFLAGS` is now set from a value greenproof cannot read, and it may "
     "hand the runner a selection flag"
@@ -2239,6 +2343,10 @@ def neutering_reason(
         _statements(base_c, script)
     ):
         return _Warn(_UNREADABLE_WHY)
+    if _substituted_runs(_statements(cand_c, script), ctx) > _substituted_runs(
+        _statements(base_c, script), ctx
+    ):
+        return _Warn(_SUBSTITUTED_WHY)
     if scope_unread:
         return _Warn(scope_unread)
     return pending
@@ -2442,6 +2550,7 @@ _RUN_FILES = frozenset(
     {*rc.CONFIG_NAMES, "package.json", ".greenproof.toml", "GNUmakefile", "makefile", "Makefile"}
     | {"justfile", "Justfile"}
 )
+_MAX_SCRIPT = 1 << 20  # characters of a script read for the scripts and runs it names
 _MAX_RUNS = 8  # distinct pytest runs compared per tree (each base run against each candidate run)
 
 
@@ -2559,7 +2668,7 @@ def _make_runs(
                 )
             for script in scripts_in(seg.text, cwd):
                 text = read(script)
-                if text is not None and script not in files and len(text) < 200_000:
+                if text is not None and script not in files and len(text) < _MAX_SCRIPT:
                     files.add(script)
                     lines = _with_exports(split_lines(text), True)
                     queue.extend((ln, script, posixpath.dirname(script), depth + 1) for ln in lines)
@@ -2794,8 +2903,17 @@ def _swallow_counts(
         chunks = [joined if mode.bash else re.sub(r"\bpipefail\b", "no-pipefail", joined)]
     else:
         chunks = ["\n".join(lines)] if script else stripped
-    per_chunk = [
-        find_swallows(
+    seen: dict[str, list[Swallow]] = {}  # the same chunk (a repeated recipe line) reads the same
+
+    def swallows(chunk: str) -> list[Swallow]:
+        if len(chunk) > _SEGMENT_MEMO_CHARS:
+            return read_chunk(chunk)
+        if chunk not in seen:
+            seen[chunk] = read_chunk(chunk)
+        return seen[chunk]
+
+    def read_chunk(chunk: str) -> list[Swallow]:
+        return find_swallows(
             chunk,
             ctx.literals,
             opaque=True,
@@ -2807,8 +2925,8 @@ def _swallow_counts(
             pipefail=mode.pipefail,
             strict_status=mode.strict,
         )
-        for chunk in chunks
-    ]
+
+    per_chunk = [swallows(chunk) for chunk in chunks]
     dead = [_dead_check(chunk, ctx) if given else None for chunk in chunks]
     per_chunk = [
         [*found, Swallow(0, "early", text, f"`{text}` ends the shell before a check")]
@@ -2816,7 +2934,20 @@ def _swallow_counts(
         else found
         for found, text in zip(per_chunk, dead, strict=True)
     ]
-    if mode.credit and not script and any(per_chunk):
+    if mode.credit and mode.oneshell and not script and per_chunk[0] and len(lines) > 1:
+        # `.ONESHELL` without `-e`: the recipe's status is its last line's, so a masked copy of the
+        # check is let off only by the last line running the same check, alone and unmasked
+        mine = _last_checks(lines, ctx)
+        if mine and not swallows(stripped[-1]):
+            keep = [
+                st
+                for ln, st in zip(lines[:-1], stripped[:-1], strict=True)
+                if not (swallows(st) and not _ignores_status(ln) and _line_checks(ln, ctx) == mine)
+            ]
+            reduced = "\n".join([*keep, stripped[-1]])
+            reduced = reduced if mode.bash else re.sub(r"\bpipefail\b", "no-pipefail", reduced)
+            per_chunk[0] = swallows(reduced)
+    elif mode.credit and not script and any(per_chunk):
         clean = [
             _line_checks(ln, ctx)
             for ln, found in zip(lines, per_chunk, strict=True)
@@ -5049,6 +5180,26 @@ def _errexit_set(text: str) -> bool | None:
     return flip
 
 
+_SHELL_STATE = frozenset(
+    {"cd", "pushd", "popd", "export", "unset", "source", ".", "eval", "exec", "trap", "alias"}
+    | {"umask", "shopt", "ulimit", "exit", "return"}
+)
+
+
+def _last_checks(lines: Sequence[str], ctx: _Ctx) -> Any:
+    """The checks of the last recipe line when it is one plain command that is not `-`-prefixed:
+    under `.ONESHELL` without `-e` its status is the recipe's. Empty when it is not."""
+    if len(lines) < 2 or _ignores_status(lines[-1]):
+        return None
+    if len(split_segments(_RECIPE_PREFIX.sub("", lines[-1], count=1))) != 1:
+        return None
+    for ln in lines[:-1]:  # one shell: a line that changes it changes what the last line runs
+        for seg in split_segments(_RECIPE_PREFIX.sub("", ln, count=1)):
+            if (command_tokens(seg.text) or [""])[0] in _SHELL_STATE:
+                return None
+    return _line_checks(lines[-1], ctx) or None
+
+
 def _oneshell_reason(old: _Targets, new: _Targets, name: str, ctx: _Ctx) -> str | None:
     """`.ONESHELL` without `-e` in `.SHELLFLAGS` newly puts a target's recipe lines in one shell
     script, in which a failing check followed by another line does not fail the target, unless a
@@ -5057,7 +5208,10 @@ def _oneshell_reason(old: _Targets, new: _Targets, name: str, ctx: _Ctx) -> str 
         return None
     for node in _chain(new, name):
         errexit = False
+        twin = _last_checks(node.lines, ctx)
         for line in node.lines[:-1]:
+            if twin and _line_checks(line, ctx) == twin and not _ignores_status(line):
+                continue  # the last line runs the same check, and its status is the target's
             for st in _statements([line], False):
                 if (flip := _errexit_set(st)) is not None:
                     errexit = flip
@@ -5188,7 +5342,7 @@ def _make_reasons(
                     new.errexit,
                     new.pipefail,
                     True,
-                    not ((new.oneshell and not new.errexit) or ignoring or new.ignore),
+                    not ((new.oneshell and new.errexit) or ignoring or new.ignore),
                     new.oneshell,
                     _is_bash(new.shell),
                 ),
@@ -5266,8 +5420,56 @@ _MAX_INCLUDE_VARS = 64  # readings of the variables above include lines with a v
 _THIS_DIR = re.compile(r"\$[({]dir\s+\$[({]lastword\s+\$[({]MAKEFILE_LIST[)}][)}][)}]")
 
 
+_WILDCARD = re.compile(r"\$[({]wildcard[ \t]+([^$(){}]*)[)}]")
+_GUARD_OPERANDS = re.compile(
+    r"""^\s*(?:\(\s*(.*?)\s*,\s*(.*?)\s*\)|"(.*?)"\s*"(.*?)"|'(.*?)'\s*'(.*?)')\s*$"""
+)
+_MAX_WILDCARD_FILES = 256
+
+
+def _glob_hits(paths: Collection[str], pattern: str) -> list[str]:
+    """The paths a make glob matches: `*`, `?` and `[...]` stay in one path segment, and a
+    leading dot is only matched by a dot in the pattern."""
+    want = pattern.split("/")
+    hits = []
+    for path in paths:
+        have = path.split("/")
+        if len(have) == len(want) and all(
+            fnmatchcase(h, w) and (w.startswith(".") or not h.startswith("."))
+            for h, w in zip(have, want, strict=True)
+        ):
+            hits.append(path)
+    return hits
+
+
+def _guard_path(rest: str, equal: bool) -> tuple[str, bool] | None:
+    """For `ifneq (,$(wildcard P))` (`rest` is what follows `ifneq`), the path `P` and whether its
+    `then` branch is the one where the file exists; for `ifeq ($(wildcard P),P)` too. None when
+    the line is no test of one literal path."""
+    m = _GUARD_OPERANDS.match(rest)
+    if m is None:
+        return None
+    left, right = next(
+        ((m[i], m[i + 1]) for i in (1, 3, 5) if m[i] is not None and m[i + 1] is not None),
+        ("", ""),
+    )
+    for call, other in ((left, right), (right, left)):
+        w = _WILDCARD.fullmatch(call.strip())
+        if w is None or not w[1].strip() or len(w[1].split()) != 1 or re.search(r"[*?\[%~]", w[1]):
+            continue
+        path = w[1].strip()
+        if not other.strip():
+            return path, not equal  # `ifneq (,...)`: the file exists; `ifeq (,...)`: it does not
+        if other.strip() == path:
+            return path, equal
+    return None
+
+
 def expand_includes(
-    text: str, directory: str, read: Callable[[str], str | None]
+    text: str,
+    directory: str,
+    read: Callable[[str], str | None],
+    files_of: Callable[[], Collection[str]] | None = None,
 ) -> tuple[str, list[str]]:
     """A Makefile with each `include`, `-include` and `sinclude` of a literal path replaced by the
     file it names (read through `read`, a path from the repository root; a relative path is
@@ -5279,7 +5481,14 @@ def expand_includes(
     not be read: a name with a function, a variable the Makefile does not assign there, a wildcard
     or `~` in it, a path outside the repository, a file that is not there (not for `-include`,
     which make skips), a file too deep or past the budget. A Makefile with no include is
-    returned as it is."""
+    returned as it is.
+
+    `$(wildcard ...)` of a literal path or glob in an include is replaced by the files of the
+    revision that match (`files_of` lists them; without it only a literal path is looked up through
+    `read`): none is no include, as make reads it. An `include P` whose file is not in the
+    repository is no note where an enclosing conditional tests that very file's existence
+    (`ifneq (,$(wildcard P))`, `ifeq ($(wildcard P),P)`, the `else` of `ifeq (,$(wildcard P))`):
+    the line only runs when the file is there."""
     if not re.search(r"^ *(?:-include|sinclude|include)[ \t]", text, re.M):
         return text, []
     notes: list[str] = []
@@ -5317,15 +5526,65 @@ def expand_includes(
                 found.append(one)
         return found
 
+    listed: list[Collection[str]] = []
+
+    def wildcard(match: re.Match[str]) -> str:
+        """The files of the revision a `$(wildcard ...)` of literal patterns matches, relative to
+        `directory`; the call itself when they cannot be listed or are too many to follow."""
+        found: list[str] = []
+        for pat in match[1].split():
+            pat = posixpath.normpath(posixpath.join(directory, pat))
+            if not re.search(r"[*?\[]", pat):
+                if read(pat) is not None:
+                    found.append(pat)
+                continue
+            if files_of is None:
+                return match[0]
+            if not listed:
+                listed.append(files_of())
+            hits = _glob_hits(listed[0], pat)
+            if not hits:
+                return match[0]  # a glob that matches nothing is left unread, as it always was
+            found.extend(hits)
+        if len(found) > _MAX_WILDCARD_FILES:
+            return match[0]
+        return " ".join(sorted({posixpath.relpath(p, directory or ".") for p in found}))
+
     def walk(body: str, depth: int, chain: tuple[str, ...]) -> None:
         nonlocal files, size
+        frames: list[
+            list[Any]
+        ] = []  # open conditionals: [guard (path, then_exists) | None, branch]
         for line in _joined(body):
+            head = re.match(r"^ *(ifdef|ifndef|ifeq|ifneq)(?=[\s(\"'])(?!\s*[:?+]?=)(.*)$", line)
+            if head is not None:
+                guard = (
+                    _guard_path(head[2], head[1] == "ifeq")
+                    if head[1] in ("ifeq", "ifneq")
+                    else None
+                )
+                frames.append([guard, 0])
+            elif frames and (e := _ELSE_LINE.match(line)):
+                frames[-1][1] += 1
+                if frames[-1][1] == 1 and not e[1].strip():
+                    pass
+                else:
+                    frames[-1][0] = None  # `else ifeq ...` is a test of its own: not read
+            elif frames and _ENDIF_LINE.match(line):
+                frames.pop()
             m = _INCLUDE.match(line)
             if m is None:
                 out.append(line)
                 continue
             optional = m[1] != "include"
             arg = re.sub(r"(?:^|\s)#.*$", "", m[2]).strip()
+            if "wildcard" in arg:
+                arg = _WILDCARD.sub(wildcard, arg)
+            present = {
+                posixpath.normpath(posixpath.join(directory, f[0][0]))
+                for f in frames
+                if f[0] is not None and (f[0][1] if f[1] == 0 else not f[0][1])
+            }
             args = [arg] if "$" not in arg else named(arg, chain)
             if args is None:
                 notes.append(f"`{m[1]} {arg[:60]}` names a file that cannot be read here")
@@ -5339,7 +5598,7 @@ def expand_includes(
                 elif path in chain:
                     continue  # make stops at a file that includes itself
                 elif (sub := read(path)) is None:
-                    if not optional:
+                    if not optional and path not in present:
                         notes.append(f"`{m[1]} {tok}` names a file that is not in the repository")
                 elif files >= _MAX_INCLUDE_FILES or size + len(sub) > _MAKE_TOTAL:
                     notes.append(
@@ -5396,8 +5655,12 @@ def _makefile_reasons(
         return _make_reasons(f, commands, changes, tests)
     before = _make_root(changes, directory, True)
     old_raw = f.old_text if before in (None, f.path) else changes.base_text(before)
-    old_text, _ = expand_includes(old_raw or "", directory, changes.base_text)
-    new_text, notes = expand_includes(f.new_text or "", directory, changes.cand_text)
+    old_text, _ = expand_includes(
+        old_raw or "", directory, changes.base_text, changes.listing(True)
+    )
+    new_text, notes = expand_includes(
+        f.new_text or "", directory, changes.cand_text, changes.listing(False)
+    )
     out: list[tuple[int | None, str]] = []
     names, bare = _goals(commands)
     if notes and (names or bare):
@@ -5775,8 +6038,12 @@ _SHELL_EXT = (".sh", ".bash", ".zsh")
 _MAX_INVOKED = 24
 
 
-def _invoked_files(changes: ChangeSet, commands: Mapping[str, str]) -> dict[str, str]:
-    """Files at the base that a policy command runs, or that those files run: path -> command."""
+def _invoked_files(
+    changes: ChangeSet, commands: Mapping[str, str], oversize: list[str] | None = None
+) -> dict[str, str]:
+    """Files at the base that a policy command runs, or that those files run: path -> command.
+    A script of `_MAX_SCRIPT` characters or more is not read for the scripts it runs; its path is
+    added to `oversize`."""
     out: dict[str, str] = {}
     queue: list[tuple[str, str, int]] = []  # path, the policy command, depth
     for command in commands.values():
@@ -5788,8 +6055,10 @@ def _invoked_files(changes: ChangeSet, commands: Mapping[str, str]) -> dict[str,
         if path in out or text is None:
             continue
         out[path] = command
-        if depth == 0 and len(text) < 200_000:
+        if depth == 0 and len(text) < _MAX_SCRIPT:
             queue.extend((p, command, 1) for p in scripts_in(text, posixpath.dirname(path)))
+        elif depth == 0 and oversize is not None:
+            oversize.append(path)
     return out
 
 
@@ -6211,7 +6480,7 @@ def _reads(text: str, directory: str, changes: ChangeSet) -> set[str]:
         seen.add(path)
         return changes.cand_text(path)
 
-    expand_includes(text, directory, read)
+    expand_includes(text, directory, read, changes.listing(False))
     return seen
 
 
@@ -6249,17 +6518,34 @@ def _including_roots(changes: ChangeSet) -> list[ChangedFile]:
 # -- driver ------------------------------------------------------------------------------
 def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Finding]:
     out: list[Finding] = []
-    invoked = _invoked_files(changes, commands)
+    oversize: list[str] = []
+    invoked = _invoked_files(changes, commands, oversize)
+    if oversize and any(not (f.is_test or f.was_test) for f in changes.files):
+        out.append(
+            warn_finding(
+                "runner.tampered",
+                oversize[0],
+                None,
+                f"{oversize[0]} is over {_MAX_SCRIPT // 1024} KiB: the scripts it runs were not "
+                "read, so a change to them was not checked",
+                _HINT,
+            )
+        )
     extra = list(commands.values())
     tests = _BaseTests(changes)
     for f in changes.files:
         run_by = invoked.get(f.old_path or f.path)
-        if f.new_content is None and run_by is None:
-            continue
         name = posixpath.basename(f.path)
+        gone = f.new_content is None and _is_vanished_root(f, name, commands, changes)
+        if f.new_content is None and run_by is None and not gone:
+            continue
         try:
             reasons = (
-                [] if f.new_content is None else _file_reasons(f, name, commands, changes, tests)
+                _make_reasons(f, commands, changes, tests)
+                if gone
+                else []
+                if f.new_content is None
+                else _file_reasons(f, name, commands, changes, tests)
             )
             if run_by is not None and not (f.is_test or f.was_test):
                 reasons = [*reasons, *_invoked_reasons(f, run_by, extra, tests)]
@@ -6302,6 +6588,24 @@ def check_runner(changes: ChangeSet, commands: Mapping[str, str]) -> list[Findin
         for why in _dropped_members(changes):
             out.append(finding("runner.tampered", where, None, f"{where}: {why}", _HINT))
     return out
+
+
+def _is_vanished_root(
+    f: ChangedFile, name: str, commands: Mapping[str, str], changes: ChangeSet
+) -> bool:
+    """Whether `f` is the Makefile `make` read in its directory at the base, deleted with no other
+    Makefile left there to read, while the policy's commands run `make`. Where another one is
+    left (a `GNUmakefile` that takes over, a `makefile` that was shadowed) it is compared as a
+    change of its own, so only a directory with no Makefile at all is a removal here."""
+    if name not in ("Makefile", "makefile", "GNUmakefile") or not commands:
+        return False
+    directory = posixpath.dirname(f.path)
+    if directory and not any(directory in c for c in commands.values()):
+        return False  # a Makefile in a directory the policy never names is not its `make`
+    return (
+        _make_root(changes, directory, True) == f.path
+        and _make_root(changes, directory, False) is None
+    )
 
 
 def _file_reasons(
