@@ -347,3 +347,52 @@ def test_a_helper_called_in_a_swallowing_try_is_a_swallow(tmp_path: Path) -> Non
     head = 'def go(session):\n    session.run("pytest", "tests")\n'
     body = "    try:\n        go(session)\n    except Exception:\n        pass\n"
     assert judge_nox(tmp_path, head, body) == "block"
+
+
+# ---- D1: `.ONESHELL`, the last line's status is the recipe's ------------------------------------
+
+LOG = "pytest tests 2>&1 | tee pytest.log"
+
+
+def oneshell(*lines: str, head: str = ".ONESHELL:\n") -> str:
+    return head + "test:\n" + "".join(f"\t{ln}\n" for ln in lines)
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        oneshell(LOG, "pytest tests"),
+        oneshell("echo start", LOG, "pytest tests"),
+        oneshell(LOG, "pytest tests", head=".POSIX:\n.ONESHELL:\n"),
+    ],
+)
+def test_oneshell_an_unmasked_last_line_twin_is_credited(tmp_path: Path, recipe: str) -> None:
+    assert (
+        judge(tmp_path, {"Makefile": "test:\n\tpytest tests\n"}, {"Makefile": recipe}, MAKE)
+        == "pass"
+    )
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        oneshell("pytest tests", LOG),
+        oneshell(LOG, "pytest tests", "echo done"),
+        oneshell(LOG, "pytest tests || true"),
+        oneshell(LOG, "pytest tests; true"),
+        oneshell(LOG, "-pytest tests"),
+        oneshell(LOG, "pytest -k fast"),
+        oneshell(LOG, "cd tests && pytest"),
+        oneshell("cd sub", LOG, "pytest tests"),
+        oneshell("exit 0", LOG, "pytest tests"),
+        oneshell(LOG, "pytest tests", head=".ONESHELL:\n.IGNORE:\n"),
+        oneshell("pytest tests || true", "pytest tests || true"),
+    ],
+)
+def test_oneshell_a_twin_that_is_not_the_whole_status_still_blocks(
+    tmp_path: Path, recipe: str
+) -> None:
+    assert (
+        judge(tmp_path, {"Makefile": "test:\n\tpytest tests\n"}, {"Makefile": recipe}, MAKE)
+        == "block"
+    )

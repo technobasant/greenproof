@@ -2934,7 +2934,20 @@ def _swallow_counts(
         else found
         for found, text in zip(per_chunk, dead, strict=True)
     ]
-    if mode.credit and not script and any(per_chunk):
+    if mode.credit and mode.oneshell and not script and per_chunk[0] and len(lines) > 1:
+        # `.ONESHELL` without `-e`: the recipe's status is its last line's, so a masked copy of the
+        # check is let off only by the last line running the same check, alone and unmasked
+        mine = _last_checks(lines, ctx)
+        if mine and not swallows(stripped[-1]):
+            keep = [
+                st
+                for ln, st in zip(lines[:-1], stripped[:-1], strict=True)
+                if not (swallows(st) and not _ignores_status(ln) and _line_checks(ln, ctx) == mine)
+            ]
+            reduced = "\n".join([*keep, stripped[-1]])
+            reduced = reduced if mode.bash else re.sub(r"\bpipefail\b", "no-pipefail", reduced)
+            per_chunk[0] = swallows(reduced)
+    elif mode.credit and not script and any(per_chunk):
         clean = [
             _line_checks(ln, ctx)
             for ln, found in zip(lines, per_chunk, strict=True)
@@ -5167,6 +5180,26 @@ def _errexit_set(text: str) -> bool | None:
     return flip
 
 
+_SHELL_STATE = frozenset(
+    {"cd", "pushd", "popd", "export", "unset", "source", ".", "eval", "exec", "trap", "alias"}
+    | {"umask", "shopt", "ulimit", "exit", "return"}
+)
+
+
+def _last_checks(lines: Sequence[str], ctx: _Ctx) -> Any:
+    """The checks of the last recipe line when it is one plain command that is not `-`-prefixed:
+    under `.ONESHELL` without `-e` its status is the recipe's. Empty when it is not."""
+    if len(lines) < 2 or _ignores_status(lines[-1]):
+        return None
+    if len(split_segments(_RECIPE_PREFIX.sub("", lines[-1], count=1))) != 1:
+        return None
+    for ln in lines[:-1]:  # one shell: a line that changes it changes what the last line runs
+        for seg in split_segments(_RECIPE_PREFIX.sub("", ln, count=1)):
+            if (command_tokens(seg.text) or [""])[0] in _SHELL_STATE:
+                return None
+    return _line_checks(lines[-1], ctx) or None
+
+
 def _oneshell_reason(old: _Targets, new: _Targets, name: str, ctx: _Ctx) -> str | None:
     """`.ONESHELL` without `-e` in `.SHELLFLAGS` newly puts a target's recipe lines in one shell
     script, in which a failing check followed by another line does not fail the target, unless a
@@ -5175,7 +5208,10 @@ def _oneshell_reason(old: _Targets, new: _Targets, name: str, ctx: _Ctx) -> str 
         return None
     for node in _chain(new, name):
         errexit = False
+        twin = _last_checks(node.lines, ctx)
         for line in node.lines[:-1]:
+            if twin and _line_checks(line, ctx) == twin and not _ignores_status(line):
+                continue  # the last line runs the same check, and its status is the target's
             for st in _statements([line], False):
                 if (flip := _errexit_set(st)) is not None:
                     errexit = flip
@@ -5306,7 +5342,7 @@ def _make_reasons(
                     new.errexit,
                     new.pipefail,
                     True,
-                    not ((new.oneshell and not new.errexit) or ignoring or new.ignore),
+                    not ((new.oneshell and new.errexit) or ignoring or new.ignore),
                     new.oneshell,
                     _is_bash(new.shell),
                 ),
