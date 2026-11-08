@@ -1020,7 +1020,7 @@ class _World:
     base_swallows: Counter[tuple[str, str]] = field(default_factory=Counter)
     base_flags: set[tuple[str, str]] = field(default_factory=set)
     base_has_tests: bool = False
-    base_rewrites: list[tuple[str, tuple[str, ...]]] | None = None  # `sed -i` of base steps
+    base_rewrites: list[tuple[str, str, tuple[str, ...]]] | None = None  # `sed -i` of base steps
     base_tree: tuple[set[str], set[str], set[str]] | None = None  # files, their dirs, test dirs
     collection: Any = None  # the base revision's pytest collection rules, read when needed
     base_monorepo: bool = False  # a base step runs a monorepo task runner (nx, turbo, lerna ...)
@@ -2032,10 +2032,11 @@ def _inplace_words(stmt: str, cwd: str | None) -> list[str] | None:
     return out or None
 
 
-def _base_rewrites(world: _World) -> list[tuple[str, tuple[str, ...]]]:
-    """Every `sed -i` or `perl -i` statement the base workflows run, with the paths it edits."""
+def _base_rewrites(world: _World) -> list[tuple[str, str, tuple[str, ...]]]:
+    """Every `sed -i` or `perl -i` statement the base workflows run, with its workflow and the
+    paths it edits."""
     if world.base_rewrites is None:
-        found: list[tuple[str, tuple[str, ...]]] = []
+        found: list[tuple[str, str, tuple[str, ...]]] = []
         for path, text in world.base.items():
             if not _GITHUB.match(path):
                 continue
@@ -2046,7 +2047,7 @@ def _base_rewrites(world: _World) -> list[tuple[str, tuple[str, ...]]]:
                         body.text, body.defs, (body.cwd, _Dir(body.cwd))
                     ):
                         if words := _inplace_words(stmt, where.path):
-                            found.append((stmt, tuple(words)))
+                            found.append((path, stmt, tuple(words)))
         world.base_rewrites = found
     return world.base_rewrites
 
@@ -2057,117 +2058,17 @@ def _covered_path(path: str, by: str) -> bool:
     return bool(_GLOBBY & set(by)) and len(by) < 400 and _glob_regex(by).fullmatch(path) is not None
 
 
-# What a rewrite of tests may say and still only be a warning: words a test is made of. A
-# substitution that mentions one can skip, delete or weaken a test.
-_TEST_WORDS = re.compile(
-    r"assert|expect|skip|xfail|only|todo|\bx(?:it|test|describe)|raises|fail|fatal|Error\(?f"
-    r"|should|mark\.|t\.Run",
-    re.IGNORECASE,
-)
-_TEST_MATCHER = re.compile(r"\bto[A-Z]")  # `toBe`, `toEqual`: a jest matcher
-_SUB_FLAGS = re.compile(r"[gI0-9]*")
-# Options of a plain in-place rewrite: `-i` with or without a backup suffix, extended regexps.
-_SED_OPTION = re.compile(r"-i.*|--in-place(?:=.*)?|-[Ers]|--regexp-extended|--separate|--")
-# A pattern or replacement that is a name or a path, once `\.` and an escaped delimiter are read
-# as the plain character. Anything else (`^`, `*`, `&`, `(`, `;`, quotes, spaces) can delete,
-# comment out or inject code.
-_LITERAL = re.compile(r"[A-Za-z0-9_./@-]+")
-# Words that, put in place of a name, end or skip a test: `check(x)` becoming `return(x)`.
-_CODE_WORDS = re.compile(
-    r"(?<![A-Za-z0-9_])(?:return|exit|_exit|quit|abort|kill|process|sys|os|pass|continue|break"
-    r"|yield|throw|raise|panic|goto|lambda|not|and|or|true|false|none|null|nil|undefined)"
-    r"(?![A-Za-z0-9_])",
-    re.IGNORECASE,
-)
-
-
-def _sed_script(stmt: str) -> str | None:
-    """The one expression of a `sed` statement (`sed -i "s/a/b/" f`, `sed -i -e 's/a/b/' f`);
-    None for a second `-e`, a script file or any other command."""
-    toks = command_tokens(stmt)
-    if not toks or posixpath.basename(toks[0]) != "sed":
-        return None
-    rest = toks[1:]
-    given = [i for i, t in enumerate(rest) if t == "-e" or t.startswith("--expression")]
-    if len(given) > 1:
-        return None
-    script_at = given[0] + 1 if given and "=" not in rest[given[0]] else -1
-    for i, t in enumerate(rest):  # an option it does not know (`-n` empties the file) is not read
-        if t.startswith("-") and i != script_at and i not in given and not _SED_OPTION.fullmatch(t):
-            return None
-    if given:
-        t = rest[given[0]]
-        if "=" in t:
-            return t.partition("=")[2]
-        return rest[given[0] + 1] if given[0] + 1 < len(rest) else None
-    operands = [t for t in rest if not t.startswith("-")]
-    return operands[0] if operands else None
-
-
-def _substitution(script: str | None) -> tuple[str, str] | None:
-    """`(pattern, replacement)` of a script that is one `s` command: no address, flags only
-    from g, I and digits, nothing after them. None for anything else."""
-    if not script or len(script) < 4 or script[0] != "s":
-        return None
-    delim = script[1]
-    if delim.isalnum() or delim.isspace() or delim == "\\":
-        return None
-    parts: list[str] = []
-    cur: list[str] = []
-    i = 2
-    while i < len(script) and len(parts) < 2:
-        c = script[i]
-        if c == "\\":
-            cur.append(script[i : i + 2])
-            i += 2
-            continue
-        if c == "\n":
-            return None
-        if c == delim:
-            parts.append("".join(cur))
-            cur = []
-        else:
-            cur.append(c)
-        i += 1
-    if len(parts) != 2 or not _SUB_FLAGS.fullmatch(script[i:]):
-        return None
-    return parts[0], parts[1]
-
-
-def _literal(text: str, delim: str) -> str | None:
-    """`text` of an `s` command with `\\.` and an escaped delimiter read as the plain character;
-    None when what is left is not a name or a path (see `_LITERAL`)."""
-    plain = text.replace("\\" + delim, delim).replace("\\.", ".")
-    return plain if _LITERAL.fullmatch(plain) else None
-
-
-def _modest_rewrite(old: str, new: str) -> bool:
-    """Whether a rewrite of tests that changed from `old` to `new` is only a warning: each is one
-    plain `s` command, neither mentions a word a test is made of, and the new one swaps a name or
-    a path for another (two or more name characters in the pattern, a replacement that is not
-    empty and puts no word in place that ends or skips a test)."""
-    script = _sed_script(new)
-    a, b = _substitution(_sed_script(old)), _substitution(script)
-    if a is None or b is None or script is None:
-        return False
-    if any(_TEST_WORDS.search(x) or _TEST_MATCHER.search(x) for x in (*a, *b)):
-        return False
-    pattern, replacement = _literal(b[0], script[1]), _literal(b[1], script[1])
-    if pattern is None or replacement is None or len(re.findall(r"[A-Za-z0-9_]", pattern)) < 2:
-        return False
-    return not _CODE_WORDS.search(replacement)
-
-
-def _repeated_rewrite(world: _World, stmt: str, where: _Dir) -> str | None:
-    """The base statement that already rewrote every file this `sed -i` statement edits (the
-    same files, or a glob over them), when the edit changed and both are plain substitutions that
-    mention no test word (see `_modest_rewrite`); None otherwise."""
+def _repeated_rewrite(world: _World, stmt: str, where: _Dir, base_path: str | None) -> str | None:
+    """The base statement, in the workflow this one replaces, that already rewrote every file
+    this `sed -i` or `perl -i` statement edits (the same files, or a glob over them): the rewrite
+    changed, which only names what it was. A changed rewrite of tests is always a block, since a
+    swap of a name can still weaken a test."""
     words = _inplace_words(stmt, where.path)
     if not words:
         return None
-    for old, targets in _base_rewrites(world):
-        if all(any(_covered_path(w, t) for t in targets) for w in words):
-            return old if _modest_rewrite(old, stmt) else None
+    for path, old, targets in _base_rewrites(world):
+        if path == base_path and all(any(_covered_path(w, t) for t in targets) for w in words):
+            return old
     return None
 
 
@@ -2267,7 +2168,7 @@ def _copy_verdict(world: _World, stmt: str, where: _Dir) -> tuple[str, bool] | N
     )
 
 
-def _github_step_reasons(text: str, world: _World) -> list[Reason]:
+def _github_step_reasons(text: str, world: _World, base_path: str | None) -> list[Reason]:
     out: list[Reason] = []
     lines = split_lines(text)
     wf = _wf(text)
@@ -2346,14 +2247,12 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                     if copy is not None:
                         soft = gone is None and not hard  # a hit by the scan keeps its verdict
                     elif getattr(gone, "how", "") == "rewrites" and (
-                        old := _repeated_rewrite(world, stmt, where)
+                        old := _repeated_rewrite(world, stmt, where, base_path)
                     ):
                         why = (
-                            "a rewrite of tests the base already ran has changed: "
-                            f"was `{old[:120]}`, now `{stmt[:120]}`. Check that it does not "
-                            "skip or weaken a test"
+                            "it now rewrites tests differently from the base: "
+                            f"was `{old[:120]}`, now `{stmt[:120]}`"
                         )
-                        soft = True
                     if (at, why) not in reported:
                         reported.add((at, why))
                         warns = not hard and (soft or isinstance(why, _Warn))
@@ -2584,7 +2483,7 @@ def _reasons(f: ChangedFile, world: _World) -> list[Reason]:
         elif not github and (why := _line_swallow(line, world)):
             out.append(_block(number, f"{why}: {line[:80]}"))
     if github:
-        out.extend(_github_step_reasons(new, world))
+        out.extend(_github_step_reasons(new, world, base_path))
         blocks, warns = _trigger_reasons(world, f, base_path)
         out.extend(blocks + warns)
     else:

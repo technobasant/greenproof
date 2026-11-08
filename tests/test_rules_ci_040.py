@@ -215,18 +215,18 @@ REWRITE_BASE = {
 PLAIN = "sed -i~ 's/old/new/' tests/*.tsx"
 
 
-def test_a_changed_rewrite_of_the_same_files_is_a_warning(tmp_path: Path) -> None:
+def test_a_changed_rewrite_of_the_same_files_blocks(tmp_path: Path) -> None:
     edited = PLAIN.replace("/new/", "/newer/g")
     found = run(tmp_path, f"yarn test\n{PLAIN}", f"yarn test\n{edited}", REWRITE_BASE)
-    assert verdict(found) == "warn", messages(found)
-    why = messages(found, "warn")[0]
+    assert verdict(found) == "block", messages(found)
+    why = messages(found, "block")[0]
     assert "was `sed" in why and "now `sed" in why
 
 
-def test_a_changed_rewrite_of_a_narrower_set_is_a_warning(tmp_path: Path) -> None:
+def test_a_changed_rewrite_of_a_narrower_set_blocks(tmp_path: Path) -> None:
     narrow = "sed -i~ 's/old/newer/' tests/a.test.tsx"
     found = run(tmp_path, f"yarn test\n{PLAIN}", f"yarn test\n{narrow}", REWRITE_BASE)
-    assert verdict(found) == "warn", messages(found)
+    assert verdict(found) == "block", messages(found)
 
 
 @pytest.mark.parametrize(
@@ -260,11 +260,11 @@ def test_a_workflow_moved_with_its_rewrite_and_a_script_alias_passes(tmp_path: P
     assert verdict(scene(fresh(tmp_path), files, new)) == "pass"
 
 
-def test_a_moved_workflow_with_a_changed_rewrite_warns(tmp_path: Path) -> None:
+def test_a_moved_workflow_with_a_changed_rewrite_blocks(tmp_path: Path) -> None:
     edited = PLAIN.replace("/new/", "/newer/")
     new = {WF: None, W2: flow(f"yarn test:ci\n{edited}")}
     files = {WF: flow(f"yarn test\n{PLAIN}"), "tests/test_a.py": TEST, **REWRITE_BASE}
-    assert verdict(scene(fresh(tmp_path), files, new)) == "warn"
+    assert verdict(scene(fresh(tmp_path), files, new)) == "block"
 
 
 def test_a_moved_workflow_that_drops_the_test_run_still_blocks(tmp_path: Path) -> None:
@@ -456,9 +456,9 @@ def sub(tmp_path: Path, new_sed: str) -> list:
         'sed -i "s,old,newer,I" tests/*.py',
     ],
 )
-def test_a_changed_plain_substitution_warns(tmp_path: Path, new_sed: str) -> None:
+def test_a_changed_plain_substitution_blocks(tmp_path: Path, new_sed: str) -> None:
     found = sub(tmp_path, new_sed)
-    assert verdict(found) == "warn", [(f.severity, f.message) for f in found]
+    assert verdict(found) == "block", [(f.severity, f.message) for f in found]
 
 
 @pytest.mark.parametrize(
@@ -498,9 +498,9 @@ def test_a_changed_rewrite_that_is_not_a_plain_substitution_blocks(
         'sed -i -E "s|old|@scope/new-name|" tests/*.py',  # a scoped package
     ],
 )
-def test_a_name_or_path_swap_warns(tmp_path: Path, new_sed: str) -> None:
+def test_a_name_or_path_swap_blocks(tmp_path: Path, new_sed: str) -> None:
     found = sub(tmp_path, new_sed)
-    assert verdict(found) == "warn", [(f.severity, f.message) for f in found]
+    assert verdict(found) == "block", [(f.severity, f.message) for f in found]
 
 
 @pytest.mark.parametrize(
@@ -539,25 +539,6 @@ def test_a_rewrite_whose_base_form_has_a_test_word_blocks_when_it_changes(tmp_pa
         tmp_path, f"{base}\npytest tests", 'sed -i "s/old/skipper/" tests/*.py\npytest tests'
     )
     assert verdict(found) == "block"
-
-
-@pytest.mark.parametrize(
-    ("script", "expected"),
-    [
-        ("s/a/b/", ("a", "b")),
-        ("s|a/b|c|g", ("a/b", "c")),
-        ("s/a\\/b/c/2", ("a\\/b", "c")),
-        ("1s/a/b/", None),
-        ("s/a/b/;p", None),
-        ("s/a/b/w x", None),
-        ("s/a/b", None),
-        ("d", None),
-    ],
-)
-def test_one_substitution_is_read_as_its_pattern_and_replacement(script, expected) -> None:
-    from greenproof.rules import ci
-
-    assert ci._substitution(script) == expected
 
 
 # ---- fix round: groups where errexit is ignored -------------------------------------------------
