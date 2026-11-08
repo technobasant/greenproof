@@ -5,6 +5,12 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- The release workflow publishes the OpenCode plugin to npm as `opencode-greenproof` after PyPI
+  accepts the release, with npm trusted publishing from the `npm` environment: no token is
+  stored, and a tag that does not match the package's version fails before anything is published.
+
 ## [0.3.1] - 2026-11-08
 
 ### Fixed
