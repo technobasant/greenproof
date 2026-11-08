@@ -444,6 +444,16 @@ def _only_loose_dropped(b: Unit, c: Unit, added: _Added) -> bool:
     )
 
 
+def _literals_kept(b: Unit, c: Unit) -> bool:
+    """Every number and string the base test's checks compared (and its table rows) is still in the
+    candidate test, counted as a multiset: in a check, a row, a helper call or helper body. A
+    literal the candidate reads through a file-level constant (`c:` entries) counts at any
+    multiplicity."""
+    anywhere = {t[2:] for t in c.credit_lits if t.startswith("c:")}
+    short = Counter(b.check_lits) - Counter(c.credit_lits)
+    return all(t in anywhere for t in short)
+
+
 def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> list[_Reason]:
     if b.engine != c.engine:
         return []
@@ -461,7 +471,9 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
                 )
             )
     elif count_drop_allowed and c.asserts < b.asserts:
-        if c.credited >= b.credited:  # helper bodies or table rows make up the lines (SPEC 5.4)
+        # helper bodies or table rows make up the lines, and every literal the removed checks
+        # compared is still somewhere in the test (SPEC 5.4)
+        if c.credited >= b.credited and _literals_kept(b, c):
             note = f"; helper checks or table rows give {c.credited} against {b.credited}"
             out.append(
                 (f"assertions dropped from {b.asserts} to {c.asserts} by line{note}", c.line, WARN)

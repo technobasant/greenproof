@@ -10,12 +10,23 @@ from __future__ import annotations
 import functools
 import re
 from bisect import bisect_right
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from greenproof.rules._common import digest, split_lines
 from greenproof.rules.tests_model import FileAnalysis, Marker, Table, Unit
-from greenproof.rules.tests_tables import RowTable, go_unit, js_table, rust_unit, tokens
+from greenproof.rules.tests_tables import (
+    RowTable,
+    go_consts,
+    go_credit_literals,
+    go_header_chains,
+    go_headers,
+    go_unit,
+    js_table,
+    rust_unit,
+    tokens,
+)
 
 _NUM = r"-?\d+(?:\.\d+)?"
 # A Rust char literal (`'}'`, `'"'`, `'\n'`): masked like a string so its bracket or quote is not
@@ -1149,15 +1160,22 @@ _HELPER_LINES = 150  # a helper longer than this is not read for the checks it m
 
 
 def _go_helper_weights(
-    masked: list[str], code: list[str], helpers: frozenset[str]
-) -> dict[str, int]:
-    """How many checks one call of each of this file's assertion helpers makes (SPEC 5.4).
+    src: _Src,
+    masked: list[str],
+    code: list[str],
+    helpers: frozenset[str],
+    consts: dict[str, tuple[str, ...]],
+) -> dict[str, tuple[int, tuple[str, ...]]]:
+    """(how many checks one call makes, the literals those checks compare) for each of this
+    file's assertion helpers (SPEC 5.4).
 
-    A call counts as the helper's own checks (its lines with an assertion; a call it makes to
+    A call counts as the helper's own checks (its live lines with an assertion, leaving out the
+    dead ones and the vacuous ones that `analyse_lines` leaves out of a test; a call it makes to
     another helper still counts as one) only when the body reads straight through: no `return`,
     `goto`, `panic`, `os.Exit` or skip, no `bool` parameter that could switch a check off, and at
-    most `_HELPER_LINES` lines. Any other helper counts as one."""
-    bodies: dict[str, tuple[str, frozenset[str]]] = {}
+    most `_HELPER_LINES` lines. Any other helper counts as one. The literals are those of the
+    body outside messages and dead lines."""
+    out: dict[str, tuple[int, tuple[str, ...]]] = {}
     for i, line in enumerate(code):
         fm = _GO_FUNC.match(line)
         if fm is None or fm.group(1) not in helpers or _GO_UNIT.match(line):
@@ -1170,16 +1188,28 @@ def _go_helper_weights(
             for g in re.findall(r"((?:\w+\s*,\s*)*\w+)\s+bool\b", fm.group(2))
             for n in g.split(",")
         )
-        bodies[fm.group(1)] = ("\n".join([masked[i][fm.end() :], *masked[i + 1 : end + 1]]), flags)
-    if not bodies:
-        return {}
-    out: dict[str, int] = {}
-    for name, (body, flags) in bodies.items():
+        body = "\n".join([masked[i][fm.end() :], *masked[i + 1 : end + 1]])
+        live, dead = _live_checks(src, masked, i, end)
+        lits = go_credit_literals(src, src.starts[i], src.starts[end] + len(code[end]), dead)
         if _GO_LEAVES.search(body) or any(re.search(rf"\b{re.escape(f)}\b", body) for f in flags):
-            out[name] = 1
+            out[fm.group(1)] = (1, lits)
         else:
-            out[name] = max(len(_ASSERTS["go"].findall(body)), 1)
+            out[fm.group(1)] = (max(live, 1), lits)
     return out
+
+
+def _live_checks(
+    src: _Src, masked: list[str], start: int, end: int
+) -> tuple[int, list[tuple[int, int]]]:
+    """(the checks of the Go function on lines [start, end] that can fire, the offsets of its dead
+    lines): a check in a dead branch (`if 1 == 2`) or a comparison of a value with itself cannot."""
+    dead = _dead_lines(src, _Span(start, end, "", start))
+    selfeq = _self_equal_lines(src, src.starts[start], src.starts[end] + len(src.code[end]), dead)
+    total = 0
+    for k in range(start, end + 1):
+        if k not in dead:
+            total += max(len(_ASSERTS["go"].findall(masked[k])) - selfeq.vacuous.get(k, 0), 0)
+    return total, [(src.starts[k], src.starts[k] + len(src.code[k])) for k in dead]
 
 
 def go_call_pattern(names: set[str] | frozenset[str]) -> re.Pattern[str]:
@@ -1320,11 +1350,13 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
     src = _Src.build(lang, masked, code) if lang != "python-lines" else None
     spans = _find_spans(lang, raw, masked, code, src)
     helper_call: re.Pattern[str] | None = None
-    weights: dict[str, int] = {}
+    weights: dict[str, tuple[int, tuple[str, ...]]] = {}
+    consts: dict[str, tuple[str, ...]] = {}
     analysis = FileAnalysis(path, lang)
     if lang == "go":
         helper_call, analysis.helpers = _go_helper_calls(masked, code, siblings)
-        weights = _go_helper_weights(masked, code, analysis.helpers)
+        consts = go_consts(code)
+        weights = _go_helper_weights(src, masked, code, analysis.helpers, consts) if src else {}
     elif lang == "js" and src is not None:
         helper_call = _js_helper_calls(src, spans)
     owner: dict[int, _Span] = {}
@@ -1368,15 +1400,38 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
         if src is not None and lang == "go":
             lo, hi = src.starts[span.start], src.starts[span.end] + len(code[span.end])
             unit.table, unit.literals = go_unit(src, lo, hi)
+            unit.credit_lits = go_credit_literals(
+                src,
+                lo,
+                hi,
+                [(src.starts[k], src.starts[k] + len(code[k])) for k in dead],
+                None,
+                consts,
+            )
             if isinstance(unit.table, RowTable):
                 for blo, bhi, rows in unit.table.loops:
                     for ln in range(src.line_of(blo), src.line_of(bhi) + 1):
                         times[ln] = times.get(ln, 1) * rows
+                # a row-conditional return or break outside a t.Run closure ends every later row
+                for ln, kind in unit.table.leaves:
+                    analysis.markers.append(
+                        Marker(
+                            span.key,
+                            f"row-{kind}",
+                            f"if <row> {{ {kind} }}",
+                            ln,
+                            "tests.skipped",
+                            True,
+                        )
+                    )
         elif src is not None and lang == "rust" and span.fn_line >= 0:
             unit.table, unit.literals = rust_unit(src, span.start, span.fn_line)
         unit.self_calls = selfeq.calls
         unit.compared = selfeq.compared
         live: list[str] = []
+        called: list[str] = []  # literals of the helper bodies this test calls
+        chains = go_header_chains(masked, span.start, span.end) if lang == "go" else {}
+        checks: set[int] = set()  # lines of the checks, with the `if`s they sit in
         for k in lines:
             query = int(
                 lang == "js"
@@ -1390,7 +1445,10 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
             if helper_call:
                 for hm in helper_call.finditer(masked[k]):
                     hits += 1
-                    weighed += weights.get(hm.group(0).split("(")[0].strip(), 1)
+                    callee = hm.group(0).split("(")[0].strip()
+                    weighed += weights.get(callee, (1, ()))[0]
+                    if k not in dead:
+                        called.extend(weights.get(callee, (1, ()))[1])
             vac = const_hits[k] + selfeq.vacuous.get(k, 0)
             if k in dead:
                 if hits:
@@ -1398,6 +1456,8 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
                     unit.unreachable_line = unit.unreachable_line or k + 1
                 continue
             live.append(masked[k])
+            if hits and lang == "go":
+                checks.update((k, *go_headers(masked, chains[k])))
             once = max(hits - vac, 0)
             unit.asserts += once
             unit.credited += max(weighed - vac, 0) * times.get(k, 1)
@@ -1406,6 +1466,27 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
                 unit.vacuous_line = unit.vacuous_line or k + 1
             if once > 0:
                 unit.assertion_forms.extend([digest("".join(code[k].split()))] * once)
+        if src is not None and lang == "go":
+            lo, hi = src.starts[span.start], src.starts[span.end] + len(code[span.end])
+            dead_spans = [(src.starts[k], src.starts[k] + len(code[k])) for k in dead]
+            dead_all = dead_spans
+            need = go_credit_literals(src, lo, hi, dead_spans, checks)
+            if isinstance(unit.table, RowTable) and unit.table.loops:
+                row_lits = Counter(t for row in unit.table.rows for t in row if t[0] != "k")
+                need = tuple(sorted((Counter(need) | row_lits).elements()))
+            unit.check_lits = need
+        if called:
+            unit.credit_lits = tuple(sorted([*unit.credit_lits, *called]))
+        if src is not None and lang == "go" and isinstance(unit.table, RowTable):
+            # a check inside a credited loop compares its literals once per row it runs on
+            extra: list[str] = []
+            for blo, bhi, n_rows in unit.table.loops:
+                inside = {k for k in checks if blo <= src.starts[k] < bhi and k not in dead}
+                if inside and n_rows > 1:
+                    in_loop = go_credit_literals(src, blo, bhi, dead_all, inside, consts)
+                    extra.extend(in_loop * (n_rows - 1))
+            if extra:
+                unit.credit_lits = tuple(sorted([*unit.credit_lits, *extra]))
         if unit.table is not None and unit.table.implicit and unit.asserts == 0:
             unit.asserts = 1  # a `test_case` row checks its `=>` value
             unit.credited = max(unit.credited, 1)
