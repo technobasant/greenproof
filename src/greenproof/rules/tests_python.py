@@ -10,6 +10,7 @@ import posixpath
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -590,12 +591,51 @@ def _pinned_expr(node: ast.AST) -> bool:
     return _is_pinned(node) or _constructed(node)
 
 
+_LOOSE_MODULES = frozenset({"dirty_equals", "hamcrest", "callee", "mock", "pytest_mock"})
+_LOOSE_NAME = re.compile(r"(?:(?:Is|Has|Any|Contains|Matches|Like)[A-Z]|Any$)")
+_MOCKS = frozenset(
+    {"Mock", "MagicMock", "AsyncMock", "NonCallableMock", "NonCallableMagicMock", "PropertyMock"}
+)
+# Local names bound by an import from a matcher or mock library, for the file being analysed.
+_loose_locals: ContextVar[frozenset[str]] = ContextVar("loose_locals", default=frozenset())
+
+
+def _loose_module(module: str) -> bool:
+    return module.split(".")[0] in _LOOSE_MODULES or module.startswith("unittest.mock")
+
+
+def _loose_imports(tree: ast.AST) -> set[str]:
+    """The local names `tree` binds to a matcher or mock library (dirty-equals, hamcrest, callee,
+    unittest.mock, mock, pytest-mock): a call of one is not a value the test spells out."""
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and _loose_module(node.module or ""):
+            out.update(a.asname or a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module == "unittest":
+            out.update(a.asname or a.name for a in node.names if a.name == "mock")
+        elif isinstance(node, ast.Import):
+            out.update(
+                a.asname or a.name.split(".")[0] for a in node.names if _loose_module(a.name)
+            )
+    return out
+
+
 def _constructed(node: ast.AST) -> bool:
     """`QueryParams("a=1")`, `Decimal("1.5")`: a capitalised callable built from literals alone, a
-    value the test spells out. A call of a lower-case function is computed, not pinned."""
+    value the test spells out. A call of a lower-case function is computed, not pinned, and so is
+    a matcher or a mock (`IsInt(gt=0)`, `HasLen(3)`, `Mock("x")`), which accepts many values."""
     if not (isinstance(node, ast.Call) and (node.args or node.keywords)):
         return False
-    name = dotted(node.func).rsplit(".", 1)[-1]
+    path = dotted(node.func)
+    name = path.rsplit(".", 1)[-1]
+    loose = _loose_locals.get()
+    if (
+        _LOOSE_NAME.match(name)
+        or name in _MOCKS
+        or path.split(".")[0] in loose
+        or path.split(".")[0] in _LOOSE_MODULES
+    ):
+        return False
     return (
         name[:1].isupper()
         and not name.isupper()
@@ -1731,25 +1771,57 @@ class _Markers(ast.NodeVisitor):
         self._function(node)
 
 
+_IGNORE_NAMES = frozenset({"collect_ignore", "collect_ignore_glob"})
+
+
+def _ignore_edit(node: ast.AST) -> tuple[str, ast.AST | None] | None:
+    """(name, the entries it sets or adds) when `node` writes `collect_ignore` or
+    `collect_ignore_glob`: an assignment (also to a slice), `+=`, `append`, `extend` or `insert`.
+    The entries are None when the statement has no readable argument, which fails closed."""
+    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Subscript):
+                target = target.value
+            if isinstance(target, ast.Name) and target.id in _IGNORE_NAMES:
+                return target.id, node.value
+    elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+        call = node.value
+        func = call.func
+        if (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id in _IGNORE_NAMES
+            and func.attr in {"append", "extend", "insert"}
+        ):
+            index = 1 if func.attr == "insert" else 0
+            if len(call.args) <= index or isinstance(call.args[index], ast.Starred):
+                return func.value.id, None
+            arg = call.args[index]
+            return func.value.id, arg if func.attr == "extend" else ast.List([arg], ast.Load())
+    return None
+
+
 def _conftest_markers(path: str, tree: ast.Module) -> list[Marker]:
     scope = f"{path}::<module>"
     out: list[Marker] = []
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name == "pytest_collection_modifyitems":
-                out.append(Marker(scope, node.name, node.name, node.lineno, "tests.skipped"))
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                if isinstance(target, ast.Name) and target.id in {
-                    "collect_ignore",
-                    "collect_ignore_glob",
-                }:
-                    value = node.value
-                    text = target.id
-                    if value is not None:  # the paths, for `collect.live_ignores`
-                        text = f"{target.id} = {ast.unparse(value)[:200]}"
-                    out.append(Marker(scope, target.id, text, node.lineno, "tests.skipped"))
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "pytest_collection_modifyitems"
+        ):
+            out.append(Marker(scope, node.name, node.name, node.lineno, "tests.skipped"))
+    # Every write to the ignore lists, wherever it sits (an `if` or a function included), so a
+    # file hidden by `collect_ignore.append("test_x.py")` does not pass; `collect.live_ignores`
+    # keeps only the entries that hide a test file.
+    for found in ast.walk(tree):
+        edit = _ignore_edit(found)
+        if edit is None:
+            continue
+        name, value = edit
+        text = name if value is None else f"{name} = {ast.unparse(value)[:2000]}"
+        out.append(Marker(scope, name, text, getattr(found, "lineno", 1), "tests.skipped"))
+    out.sort(key=lambda m: m.line)
     return out
 
 
@@ -2097,7 +2169,22 @@ def _analyse_python(path: str, text: str, sources: Sources | None) -> FileAnalys
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError):
         return None
-    helpers, imports = _module_helpers(path, tree, sources)
+    token = _loose_locals.set(frozenset(_loose_imports(tree)))
+    try:
+        helpers, imports = _module_helpers(path, tree, sources)
+        loose = set(_loose_locals.get())
+        if sources is not None:
+            for used in imports - {path}:
+                other = sources.module(used)
+                if other is not None:
+                    loose |= _loose_imports(other)
+        _loose_locals.set(frozenset(loose))
+        return _analysed(path, tree, helpers, imports)
+    finally:
+        _loose_locals.reset(token)
+
+
+def _analysed(path: str, tree: ast.Module, helpers: _Helpers, imports: set[str]) -> FileAnalysis:
     analysis = FileAnalysis(path, "python", tree=tree)
     analysis.imports = imports
     _fixtures(path, tree.body, "", analysis.fixtures)

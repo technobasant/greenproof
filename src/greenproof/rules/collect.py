@@ -18,7 +18,7 @@ from typing import Any
 
 from greenproof.changeset import ChangeSet, matches_glob
 from greenproof.rules import runner_config as rc
-from greenproof.rules.tests_model import FileAnalysis, Unit
+from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
 
 DEFAULT_FILES = ("test_*.py", "*_test.py")
 DEFAULT_CLASSES = ("Test",)
@@ -96,7 +96,8 @@ _IGNORES = ("collect_ignore", "collect_ignore_glob")
 
 def _ignored(text: str) -> tuple[str, list[str]] | None:
     """(`collect_ignore` or `collect_ignore_glob`, its entries) of a marker's text, or None when
-    the value is not a literal list or tuple of strings."""
+    the value is not a literal list or tuple of strings. The text is `<name> = <value>`; an
+    `append`, `extend`, `insert`, `+=` or slice assignment is written as the entries it adds."""
     name, _, value = text.partition(" = ")
     if name not in _IGNORES:
         return None
@@ -109,11 +110,21 @@ def _ignored(text: str) -> tuple[str, list[str]] | None:
     return None
 
 
-def _entry_live(name: str, entry: str, here: str, cfg: Collection, files: set[str]) -> bool:
-    """Whether one `collect_ignore` entry hides, or could hide, a collected test file."""
-    rel = posixpath.normpath(entry) if entry else "."
+def _target(name: str, entry: str, here: str) -> str:
+    """The path (`collect_ignore`) or pattern (`collect_ignore_glob`) an entry names, from the
+    repository root: two spellings of one entry resolve to one string."""
     if name == "collect_ignore":
-        target = posixpath.normpath(posixpath.join(here, rel))
+        return posixpath.normpath(posixpath.join(here, posixpath.normpath(entry) if entry else "."))
+    return posixpath.join(here, entry) if here != "." else entry
+
+
+def _entry_live(name: str, entry: str, here: str, cfg: Collection, files: set[str] | None) -> bool:
+    """Whether one `collect_ignore` entry hides, or could hide, a collected test file. With no
+    tree listing every entry might."""
+    if files is None:
+        return True
+    target = _target(name, entry, here)
+    if name == "collect_ignore":
         if target.startswith(".."):
             return True
         if target != "." and cfg.file_collected(target):
@@ -121,7 +132,6 @@ def _entry_live(name: str, entry: str, here: str, cfg: Collection, files: set[st
         prefix = "" if target == "." else target + "/"
         return any(f.startswith(prefix) and cfg.file_collected(f) for f in files)
     # pytest matches the glob against the full path of a file or a directory
-    pattern = posixpath.join(here, entry) if here != "." else entry
     if not re.search(r"[*?\[]", entry):
         return True  # a plain name in a glob list: no sound reading, count it
     for f in files:
@@ -129,7 +139,7 @@ def _entry_live(name: str, entry: str, here: str, cfg: Collection, files: set[st
             continue
         parts = f.split("/")
         paths = ["/".join(parts[: i + 1]) for i in range(len(parts))]
-        if any(fnmatchcase(p, pattern) for p in paths):
+        if any(fnmatchcase(p, target) for p in paths):
             return True
     return False  # it matches no test file, and no directory holding one
 
@@ -137,22 +147,32 @@ def _entry_live(name: str, entry: str, here: str, cfg: Collection, files: set[st
 def live_ignores(
     analysis: FileAnalysis, cfg: Collection, listing: Callable[[], set[str]] | None
 ) -> None:
-    """Drop the `collect_ignore` markers of a conftest.py that hide no test file.
+    """Replace the `collect_ignore` markers of a conftest.py by one marker per live entry.
 
-    A `collect_ignore = ["setup.py"]` skips nothing the runner would collect. An entry counts
-    when it is a collected test file, a directory holding one, or a glob matching one; an entry
-    that is not a literal string, or any entry when the tree listing is unknown, counts too, so
-    the check fails closed. A marker with no live entry is dropped."""
-    if listing is None or not any(m.kind in _IGNORES for m in analysis.markers):
+    A `collect_ignore = ["setup.py"]` skips nothing the runner would collect, so its entry
+    makes no marker. An entry counts when it is a collected test file, a directory holding one,
+    or a glob matching one; with the tree listing unknown every entry counts. Each live entry is
+    a marker of its own, its kind naming the resolved path, so the base and the candidate are
+    compared entry by entry: a newly hidden file is a new marker, a removed or reordered entry
+    is not. A value that is not a literal list of strings stays one marker, which fails closed."""
+    if not any(m.kind in _IGNORES for m in analysis.markers):
         return
-    files = listing()
+    files = listing() if listing is not None else None
     here = posixpath.dirname(analysis.path) or "."
     kept = []
+    seen: set[tuple[str, str]] = set()
     for m in analysis.markers:
         parsed = _ignored(m.text) if m.kind in _IGNORES else None
-        if parsed is not None:
-            name, entries = parsed
-            if not any(_entry_live(name, e, here, cfg, files) for e in entries):
-                continue
-        kept.append(m)
+        if parsed is None:
+            kept.append(m)
+            continue
+        name, entries = parsed
+        for entry in entries:
+            if _entry_live(name, entry, here, cfg, files):
+                kind = f"{name}:{_target(name, entry, here)}"
+                if (m.scope, kind) in seen:
+                    continue  # the same entry twice hides nothing more
+                seen.add((m.scope, kind))
+                text = f"{name} = [{entry!r}]"
+                kept.append(Marker(m.scope, kind, text, m.line, m.rule, m.conditional))
     analysis.markers = kept

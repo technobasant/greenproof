@@ -479,3 +479,195 @@ def test_a_value_built_from_literals_is_pinned(tmp_path: Path):
 def test_a_value_that_is_computed_is_not_pinned(tmp_path: Path, check: str):
     cand = params_cand("assert q == httpx.QueryParams('a=1')", check)
     assert blocked(verdict(tmp_path, PARAMS_BASE, cand))
+
+
+LOOSE_BASE = (
+    "def test_set():\n    q = make()\n    assert q == 1\n\n\n"
+    "def test_add():\n    q = make()\n    assert q == 2\n"
+)
+
+
+def loose_cand(imports: str, check: str) -> str:
+    return f"{imports}def test_set():\n    q = make()\n    assert q == 1\n    {check}\n"
+
+
+@pytest.mark.parametrize(
+    ("imports", "check"),
+    [
+        ("from dirty_equals import IsInt\n\n\n", "assert q == IsInt(gt=0)"),
+        ("from dirty_equals import IsApprox\n\n\n", "assert q == IsApprox(1, delta=100)"),
+        ("from dirty_equals import IsStr\n\n\n", "assert q == IsStr(regex='.*')"),
+        ("from hamcrest import HasLength\n\n\n", "assert q == HasLength(3)"),
+        ("from dirty_equals import Contains\n\n\n", "assert q == Contains(1)"),
+        ("from dirty_equals import IsPartialDict\n\n\n", "assert q == IsPartialDict(a=1)"),
+        ("from unittest.mock import Mock\n\n\n", "assert q == Mock('x')"),
+        ("from unittest.mock import MagicMock\n\n\n", "assert q == MagicMock(spec=1)"),
+        ("from unittest.mock import ANY\n\n\n", "assert q == ANY(1)"),
+        ("from typing import Any\n\n\n", "assert q == AnyStr('x')"),
+        # not caught by name, caught by the library the name comes from
+        ("from callee import Captor\n\n\n", "assert q == Captor(1)"),
+        ("from hamcrest import Anything as Foo\n\n\n", "assert q == Foo(1)"),
+        ("import dirty_equals as de\n\n\n", "assert q == de.Whatever(1)"),
+        ("import hamcrest\n\n\n", "assert q == hamcrest.Whatever(1)"),
+        ("import unittest.mock as um\n\n\n", "assert q == um.Whatever(1)"),
+        ("from unittest import mock\n\n\n", "assert q == mock.Whatever(1)"),
+        ("from pytest_mock import Thing\n\n\n", "assert q == Thing(1)"),
+        ("import dirty_equals as de\n\n\n", "assert q == Wrap(de.Whatever(1))"),
+    ],
+)
+def test_a_matcher_or_mock_is_not_a_pinned_value(tmp_path: Path, imports: str, check: str):
+    """An exact literal that becomes a loose matcher stays a weakened check (0.3.1's verdict)."""
+    assert blocked(verdict(tmp_path, LOOSE_BASE, loose_cand(imports, check)))
+
+
+def test_the_same_shape_from_an_unrelated_library_is_still_pinned(tmp_path: Path):
+    cand = (
+        "from decimal import Decimal\n\n\ndef test_set():\n    q = make()\n    assert q == 1\n"
+        "    assert q == Decimal('2')\n"
+    )
+    assert not blocked(verdict(tmp_path, LOOSE_BASE, cand))
+
+
+# ---- A6: collect_ignore, entry by entry -------------------------------------------------------
+
+TESTS_B = "tests/test_b.py"
+
+
+def entry_verdict(tmp_path: Path, base: str, cand: str, conftest: str = "tests/conftest.py"):
+    repo = init_repo(tmp_path / uuid.uuid4().hex[:8])
+    repo.write(conftest, base)
+    repo.write("tests/test_a.py", TESTFILE)
+    repo.write("tests/test_b.py", TESTFILE)
+    repo.write("tests/helper_data.py", "x = 1\n")
+    repo.write("setup.py", "from setuptools import setup\n")
+    repo.commit("base")
+    repo.write(conftest, cand)
+    return [(f.rule, f.severity) for f in static_findings(repo)]
+
+
+@pytest.mark.parametrize(
+    ("base", "cand"),
+    [
+        ("collect_ignore = ['test_a.py']\n", "collect_ignore = ['test_a.py', 'test_b.py']\n"),
+        ("collect_ignore = ['test_a.py']\n", "collect_ignore = ['test_b.py']\n"),
+        ("collect_ignore = ['test_a.py']\n", "collect_ignore = ['test_a.py', './test_b.py']\n"),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore.append('test_b.py')\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore.extend(['setup.py', 'test_b.py'])\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore += ['test_b.py']\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore.insert(0, 'test_b.py')\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore[1:] = ['test_b.py']\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\nimport sys\nif sys.platform == 'win32':\n"
+            "    collect_ignore.append('test_b.py')\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore.append(name)\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore.extend(*names)\n",
+        ),
+        ("collect_ignore = ['test_a.py']\n", "collect_ignore = ['test_a.py'] + ['test_b.py']\n"),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore += more\n",
+        ),
+        (
+            "collect_ignore = ['setup.py']\n",
+            "collect_ignore = ['setup.py']\ncollect_ignore.append('test_b.py')\n",
+        ),
+        ("", "collect_ignore = ['test_b.py']\n"),
+        ("collect_ignore_glob = ['test_a*']\n", "collect_ignore_glob = ['test_a*', 'test_b*']\n"),
+        (
+            "collect_ignore_glob = ['*.json']\n",
+            "collect_ignore_glob = ['*.json', 'test_*.py']\n",
+        ),
+        (
+            "collect_ignore_glob = ['*.json']\n",
+            "collect_ignore_glob = ['*.json']\ncollect_ignore_glob.append('test_b*')\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore_glob = ['test_b*']\n",
+        ),
+    ],
+)
+def test_a_newly_hidden_test_file_blocks(tmp_path: Path, base: str, cand: str):
+    assert entry_verdict(tmp_path, base, cand) == [("tests.skipped", "block")]
+
+
+@pytest.mark.parametrize(
+    ("base", "cand"),
+    [
+        ("collect_ignore = ['test_a.py', 'test_b.py']\n", "collect_ignore = ['test_a.py']\n"),
+        (
+            "collect_ignore = ['test_a.py', 'test_b.py']\n",
+            "collect_ignore = ['test_b.py', 'test_a.py']\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py', 'test_b.py']\n",
+            "collect_ignore = ('./test_a.py', 'test_b.py')\n",
+        ),
+        ("collect_ignore = ['test_a.py']\n", "collect_ignore = ['test_a.py', 'setup.py']\n"),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore.append('setup.py')\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore.append('test_a.py')\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore += ['setup.py']\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore.extend(['nothing'])\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore.remove('test_a.py')\n",
+        ),
+        ("collect_ignore_glob = ['test_a*']\n", "collect_ignore_glob = ['test_a*', '*.json']\n"),
+        ("collect_ignore = ['test_a.py', 'test_b.py']\n", "collect_ignore = []\n"),
+        (
+            "collect_ignore = ['test_a.py']\ncollect_ignore.append('test_b.py')\n",
+            "collect_ignore = ['test_a.py']\ncollect_ignore.append('test_b.py')\n",
+        ),
+        (
+            "collect_ignore = ['test_a.py']\ncollect_ignore += ['test_b.py']\n",
+            "collect_ignore = ['test_b.py', 'test_a.py']\n",
+        ),
+    ],
+)
+def test_a_removed_reordered_or_non_test_entry_passes(tmp_path: Path, base: str, cand: str):
+    assert entry_verdict(tmp_path, base, cand) == []
+
+
+def test_the_block_names_the_entry(tmp_path: Path):
+    repo = init_repo(tmp_path / "r")
+    repo.write("tests/conftest.py", "collect_ignore = ['test_a.py']\n")
+    repo.write("tests/test_a.py", TESTFILE)
+    repo.write("tests/test_b.py", TESTFILE)
+    repo.commit("base")
+    repo.write("tests/conftest.py", "collect_ignore = ['test_a.py', 'test_b.py']\n")
+    (found,) = static_findings(repo)
+    assert "test_b.py" in found.message and "test_a.py" not in found.message
