@@ -2551,7 +2551,7 @@ _RUN_FILES = frozenset(
     | {"justfile", "Justfile"}
 )
 _MAX_SCRIPT = 1 << 20  # characters of a script read for the scripts and runs it names
-_MAX_RUNS = 8  # distinct pytest runs compared per tree (each base run against each candidate run)
+_MAX_RUNS = 32  # distinct pytest runs compared per tree (each base run against each candidate run)
 
 
 @dataclass

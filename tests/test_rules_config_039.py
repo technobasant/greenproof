@@ -187,12 +187,12 @@ def test_options_that_move_between_config_and_command(
 
 
 def test_more_runs_than_are_compared_warn(tmp_path: Path) -> None:
-    """Past eight different pytest commands the runs are not compared one by one: a change to
-    them says so, instead of passing as if it had been read."""
+    """Past `_MAX_RUNS` (32 since 0.4.0, 8 before) different pytest commands the runs are not
+    compared one by one: a change to them says so, instead of passing as if it had been read."""
 
     def recipe(first: str) -> str:
         lines = [f"pytest -o norecursedirs={first}"]
-        lines += [f"pytest -o norecursedirs=x{i}" for i in range(1, 12)]
+        lines += [f"pytest -o norecursedirs=x{i}" for i in range(1, 40)]
         return "test:\n" + "".join(f"\t{ln}\n" for ln in lines)
 
     base = {**PY, **MAKE, "Makefile": recipe("x0")}
