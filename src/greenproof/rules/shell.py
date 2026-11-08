@@ -1441,6 +1441,12 @@ def nest_depth(text: str) -> int:
 
 
 _LEAVES_SHELL = re.compile(r"\b(?:exit|return|trap)\b")
+# What can stand before a group as a statement: `if { ...; }`, `while ( ... )`, `! { ...; }`.
+_GROUP_HEAD = re.compile(
+    r"^(?P<then>(?:(?:then|else|do)\b\s*)?)(?P<pre>(?:(?:if|elif|while|until)\b\s*|!\s*)*)"
+    r"(?P<grp>[({].*)$",
+    re.DOTALL,
+)
 
 
 def ungroup(segs: list[Seg], exact: bool = False) -> list[Seg]:
@@ -1461,7 +1467,10 @@ def ungroup(segs: list[Seg], exact: bool = False) -> list[Seg]:
     work.reverse()
     while work:
         seg, depth, chained_after = work.pop()
-        inner = None if seg.text.lstrip().startswith("((") else group_inner(seg.text)  # `(( x ))`
+        head, text = "", seg.text
+        if not exact and (m := _GROUP_HEAD.match(text.lstrip())):
+            head, text = m["then"] + m["pre"], m["grp"]  # the words kept on the first statement
+        inner = None if text.lstrip().startswith("((") else group_inner(text)  # `(( x ))`
         if inner is not None and exact:
             alone = seg.sep not in ("&&", "||") and not chained_after and not seg.bg
             if not alone or (seg.text.lstrip().startswith("(") and _LEAVES_SHELL.search(inner)):
@@ -1471,13 +1480,13 @@ def ungroup(segs: list[Seg], exact: bool = False) -> list[Seg]:
         elif depth >= _NEST_BUDGET or (depth == 0 and nest_depth(inner) >= _NEST_BUDGET):
             pieces = [p.strip() for p in _FLAT_SPLIT.split(inner) if p.strip()]
             out.extend(
-                replace(seg, sep=seg.sep if i == 0 else ";", text=piece)
+                replace(seg, sep=seg.sep if i == 0 else ";", text=(head if i == 0 else "") + piece)
                 for i, piece in enumerate(pieces)
             )
         else:
             inside = split_segments(inner)
             if inside:
-                inside[0] = replace(inside[0], sep=seg.sep)
+                inside[0] = replace(inside[0], sep=seg.sep, text=head + inside[0].text)
                 last = len(inside) - 1
                 work.extend(
                     reversed(
@@ -1876,6 +1885,7 @@ def _flat_swallows(
     defs: Mapping[str, str] | None = None,
     pipefail: bool = False,
     scope: Scope | None = None,
+    _gdepth: int = 0,
 ) -> list[Swallow]:
     """The places where `script` can fail a check and still exit 0 (see the module docstring).
 
@@ -1900,7 +1910,8 @@ def _flat_swallows(
     otherwise it is a swallow (kind `or`). Functions and `case` are read as `split_segments`
     reads them, a `case` through all of its arms. `scope` carries the functions and arguments.
     """
-    segs = ungroup(split_segments(script, scope, all_arms=True), exact=True)
+    raw = split_segments(script, scope, all_arms=True)
+    segs = ungroup(raw, exact=True)
     literals = [e for e in extra if len(e) >= 6]
     kinds = [
         check_kind(s.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs)
@@ -1908,6 +1919,30 @@ def _flat_swallows(
     ]
     is_check = [k is not None for k in kinds]
     has_check = any(is_check) if known is None else known
+    ignored = _ignored_groups(
+        raw,
+        _gdepth,
+        lambda body, depth: _flat_swallows(
+            body,
+            extra,
+            opaque=opaque,
+            errexit=False,
+            scripts=scripts,
+            make_check=make_check,
+            base_segments=base_segments,
+            known=has_check,
+            strict_status=True,
+            powershell=powershell,
+            defs=defs,
+            pipefail=pipefail,
+            scope=scope,
+            _gdepth=depth,
+        ),
+        lambda body: any(
+            check_kind(s.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs)
+            for s in ungroup(split_segments(body))
+        ),
+    )
 
     def check(i: int) -> bool:
         if is_check[i]:
@@ -2143,6 +2178,40 @@ def _flat_swallows(
                     label,
                     f"the {label} command `{_short(seg.text)}` is followed by more commands and"
                     " this shell's exit status is the last command's",
+                )
+            )
+    return ignored + out
+
+
+def _ignored_groups(
+    raw: Sequence[Seg],
+    depth: int,
+    judge: Callable[[str, int], list[Swallow]],
+    holds_check: Callable[[str], bool],
+) -> list[Swallow]:
+    """The swallows inside a `( ... )` or `{ ...; }` that runs where `set -e` is off: a statement
+    before the end of an `&&` / `||` list, the condition of `if`, `elif`, `while` and `until`,
+    or after `!`. The group's status is its last command's, so a check followed by anything inside
+    it is dropped (`( pytest; true ) && echo ok`), and `! group` inverts the check's status."""
+    out: list[Swallow] = []
+    for i, seg in enumerate(raw):
+        m = _GROUP_HEAD.match(seg.text.lstrip())
+        if not m or m["grp"].startswith("((") or (inner := group_inner(m["grp"])) is None:
+            continue
+        chained = i + 1 < len(raw) and raw[i + 1].sep in ("&&", "||")
+        if not (m["pre"] or chained) or seg.bg:
+            continue
+        if depth >= _NEST_BUDGET:
+            out.append(Swallow(seg.line, "noerr", _short(seg.text), "a group nested too deeply"))
+            continue
+        out.extend(replace(w, line=seg.line + w.line - 1) for w in judge(inner, depth + 1))
+        if "!" in m["pre"] and holds_check(inner):
+            out.append(
+                Swallow(
+                    seg.line,
+                    "or",
+                    _short(seg.text),
+                    f"`{_short(seg.text)}` negates the check's status: a failing run exits 0",
                 )
             )
     return out
@@ -2609,6 +2678,20 @@ def _runner_end(family: str, tokens: list[str]) -> int | None:
     return None
 
 
+def _statement_words(tokens: list[str]) -> list[str]:
+    """`tokens` up to the pipe, and up to where a group that is not read whole ends (`{ pytest
+    tests; } | tee log`): a word that ends in `;` is the last of its statement, and a bare `}` or
+    `)` is no argument."""
+    if "|" in tokens:
+        tokens = tokens[: tokens.index("|")]
+    for i, tok in enumerate(tokens):
+        if tok in ("}", ")", ";"):
+            return tokens[:i]
+        if tok.endswith(";"):
+            return tokens[:i] + ([tok[:-1]] if tok[:-1] else [])
+    return tokens
+
+
 def _calls(command: str, defs: Mapping[str, str] | None = None) -> list[tuple[Seg, list[str], str]]:
     """`(statement, its command words, how it joins the previous one)` for each statement of a
     script, descending into the body of `sh -c "..."`."""
@@ -2617,10 +2700,7 @@ def _calls(command: str, defs: Mapping[str, str] | None = None) -> list[tuple[Se
         if (body := shell_c_body(seg.text, defs)) is not None:
             out.extend(_calls(body, defs))
             continue
-        tokens = command_tokens(seg.text, defs)
-        if "|" in tokens:
-            tokens = tokens[: tokens.index("|")]
-        out.append((seg, tokens, seg.sep))
+        out.append((seg, _statement_words(command_tokens(seg.text, defs)), seg.sep))
     return out
 
 
@@ -2697,9 +2777,7 @@ def selection_uses(
         retry = retries_ok and seg.sep == "||" and kind is not None and kind in chain
         if kind is not None:
             chain.append(kind)
-        tokens = command_tokens(seg.text, defs)
-        if "|" in tokens:
-            tokens = tokens[: tokens.index("|")]
+        tokens = _statement_words(command_tokens(seg.text, defs))
         for family, flags in _ALL_FLAGS.items():
             start = _runner_end(family, tokens)
             if start is not None:

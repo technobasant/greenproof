@@ -118,17 +118,35 @@ def copy(tmp_path: Path, line: str) -> list:
 @pytest.mark.parametrize(
     "line",
     [
+        "cp ci/settings.py tests/new_settings.py",
+        "cp -f ci/settings.py tests/fixtures_new.json",
+        "install ci/settings.py tests/extra.json",
+        "cd tests && cp ../ci/settings.py new.json",
+    ],
+)
+def test_a_copy_that_adds_a_new_non_test_file_warns(tmp_path: Path, line: str) -> None:
+    found = copy(tmp_path, line)
+    assert verdict(found) == "warn", messages(found)
+    assert "adds" in messages(found, "warn")[0]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
         "cp ci/settings.py tests/settings.py",
         "cp -f ci/settings.py tests/helpers.py",
         "install ci/settings.py tests/settings.py",
-        "cp ci/settings.py tests/",
+        "cp ci/settings.py tests/data.json",
         "cd tests && cp ../ci/settings.py settings.py",
+        "ln -sf ../ci/settings.py tests/settings.py",
+        "cp ci/settings.py tests/",  # lands on the file of the same name
     ],
 )
-def test_a_copy_onto_a_non_test_file_warns(tmp_path: Path, line: str) -> None:
+def test_a_copy_onto_an_existing_tracked_file_of_the_test_tree_blocks(
+    tmp_path: Path, line: str
+) -> None:
     found = copy(tmp_path, line)
-    assert verdict(found) == "warn", messages(found)
-    assert "overwrites" in messages(found, "warn")[0]
+    assert verdict(found) == "block", [(f.severity, f.message) for f in found]
 
 
 @pytest.mark.parametrize(
@@ -154,11 +172,35 @@ def test_a_copy_that_can_land_on_a_test_or_a_runner_file_still_blocks(
     assert verdict(found) == "block", [(f.severity, f.message) for f in found]
 
 
-def test_a_copy_onto_conftest_is_not_a_pass(tmp_path: Path) -> None:
-    files = {**TREE, "tests/conftest.py": "import pytest\n"}
-    found = run(tmp_path, "pytest", "cp ci/settings.py tests/conftest.py\npytest", files)
-    assert verdict(found) in ("warn", "block")
-    assert verdict(found) != "pass"
+@pytest.mark.parametrize("exists", [True, False])
+@pytest.mark.parametrize("name", ["conftest.py", "pytest.ini", "setup_local.py", "__init__.py"])
+def test_a_copy_onto_conftest_or_a_runner_file_of_the_test_tree_blocks(
+    tmp_path: Path, name: str, exists: bool
+) -> None:
+    files = {**TREE, f"tests/{name}": "import pytest\n"} if exists else dict(TREE)
+    found = run(tmp_path, "pytest", f"cp ci/settings.py tests/{name}\npytest", files)
+    assert verdict(found) == "block", [(f.severity, f.message) for f in found]
+
+
+GOLDEN = {**TREE, "tests/data/expected.json": '{"v": 3}\n', "ci/expected.json": '{"v": 4}\n'}
+
+
+def test_a_copy_onto_a_golden_file_blocks_and_a_new_data_file_warns(tmp_path: Path) -> None:
+    over = "cp ci/expected.json tests/data/expected.json"
+    assert verdict(run(tmp_path, "pytest", f"{over}\npytest", GOLDEN)) == "block"
+    new = "cp ci/expected.json tests/data/new_settings.json"
+    found = run(fresh(tmp_path), "pytest", f"{new}\npytest", GOLDEN)
+    assert verdict(found) == "warn", messages(found)
+
+
+def test_a_copy_onto_a_test_file_still_blocks(tmp_path: Path) -> None:
+    found = run(tmp_path, "pytest", "cp ci/expected.json tests/test_a.py\npytest", GOLDEN)
+    assert verdict(found) == "block"
+
+
+def test_a_copy_outside_the_test_tree_is_no_finding(tmp_path: Path) -> None:
+    found = run(tmp_path, "pytest", "cp ci/settings.py build/settings.py\npytest", GOLDEN)
+    assert verdict(found) == "pass", messages(found)
 
 
 # ---- E4 and E5: a rewrite the base already ran ---------------------------------------------------
@@ -170,17 +212,20 @@ REWRITE_BASE = {
 }
 
 
+PLAIN = "sed -i~ 's/old/new/' tests/*.tsx"
+
+
 def test_a_changed_rewrite_of_the_same_files_is_a_warning(tmp_path: Path) -> None:
-    edited = SED.replace("import React", "import  React")
-    found = run(tmp_path, f"yarn test\n{SED}", f"yarn test\n{edited}", REWRITE_BASE)
+    edited = PLAIN.replace("/new/", "/newer/g")
+    found = run(tmp_path, f"yarn test\n{PLAIN}", f"yarn test\n{edited}", REWRITE_BASE)
     assert verdict(found) == "warn", messages(found)
     why = messages(found, "warn")[0]
     assert "was `sed" in why and "now `sed" in why
 
 
 def test_a_changed_rewrite_of_a_narrower_set_is_a_warning(tmp_path: Path) -> None:
-    narrow = "sed -i~ '1s/^/import  React from \"react\";/' tests/a.test.tsx"
-    found = run(tmp_path, f"yarn test\n{SED}", f"yarn test\n{narrow}", REWRITE_BASE)
+    narrow = "sed -i~ 's/old/newer/' tests/a.test.tsx"
+    found = run(tmp_path, f"yarn test\n{PLAIN}", f"yarn test\n{narrow}", REWRITE_BASE)
     assert verdict(found) == "warn", messages(found)
 
 
@@ -216,9 +261,9 @@ def test_a_workflow_moved_with_its_rewrite_and_a_script_alias_passes(tmp_path: P
 
 
 def test_a_moved_workflow_with_a_changed_rewrite_warns(tmp_path: Path) -> None:
-    edited = SED.replace("import React", "import  React")
+    edited = PLAIN.replace("/new/", "/newer/")
     new = {WF: None, W2: flow(f"yarn test:ci\n{edited}")}
-    files = {WF: flow(f"yarn test\n{SED}"), "tests/test_a.py": TEST, **REWRITE_BASE}
+    files = {WF: flow(f"yarn test\n{PLAIN}"), "tests/test_a.py": TEST, **REWRITE_BASE}
     assert verdict(scene(fresh(tmp_path), files, new)) == "warn"
 
 
@@ -392,3 +437,145 @@ def test_ungroup_is_iterative_and_keeps_the_chain() -> None:
     assert [s.text for s in out] == ["pytest"]
     chained = shell.ungroup(shell.split_segments("a && { b || c; d; }"))
     assert [(s.sep, s.text) for s in chained] == [("", "a"), ("&&", "b"), ("||", "c"), (";", "d")]
+
+
+# ---- fix round: a rewrite that may only warn is a plain substitution without a test word --------
+SUB_BASE = 'sed -i "s/old/new/" tests/*.py'
+
+
+def sub(tmp_path: Path, new_sed: str) -> list:
+    return run(tmp_path, f"{SUB_BASE}\npytest tests", f"{new_sed}\npytest tests")
+
+
+@pytest.mark.parametrize(
+    "new_sed",
+    [
+        'sed -i "s/old/newer/" tests/*.py',
+        'sed -i "s/old/newer/g" tests/*.py',
+        'sed -i -e "s|old|new/er|2" tests/*.py',
+        'sed -i "s,old,newer,I" tests/*.py',
+    ],
+)
+def test_a_changed_plain_substitution_warns(tmp_path: Path, new_sed: str) -> None:
+    found = sub(tmp_path, new_sed)
+    assert verdict(found) == "warn", [(f.severity, f.message) for f in found]
+
+
+@pytest.mark.parametrize(
+    "new_sed",
+    [
+        'sed -i "/assert/d" tests/*.py',  # sed_delete_asserts
+        'sed -i "s/assert /assert True or /" tests/*.py',  # sed_assert_vacuous
+        'sed -i "1s/old/new/" tests/*.py',  # an address
+        'sed -i "s/old/new/;s/x/y/" tests/*.py',  # a second command
+        'sed -i -e "s/old/new/" -e "/x/d" tests/*.py',  # a second -e
+        'sed -i "s/old/new/w out.txt" tests/*.py',  # a w flag
+        'sed -i "s/old/new/e" tests/*.py',  # an e flag
+        'sed -i "y/abc/xyz/" tests/*.py',
+        'sed -i "s/old/skip/" tests/*.py',  # a test word in the replacement
+        'sed -i "s/def test_x/def xtest_x/" tests/*.py',
+        'sed -i "s/old/new\\nassert True/" tests/*.py',
+        'sed -i "s/toBe(/toBeDefined(/" tests/*.py',
+        'sed -i "s/old/new/" tests/*.py; sed -i "/x/d" tests/*.py',
+        "perl -pi -e 's/old/newer/' tests/*.py",  # only sed is read
+        'sed -i "c\\x" tests/*.py',
+    ],
+)
+def test_a_changed_rewrite_that_is_not_a_plain_substitution_blocks(
+    tmp_path: Path, new_sed: str
+) -> None:
+    found = sub(tmp_path, new_sed)
+    assert verdict(found) == "block", [(f.severity, f.message) for f in found]
+
+
+def test_a_rewrite_whose_base_form_has_a_test_word_blocks_when_it_changes(tmp_path: Path) -> None:
+    base = 'sed -i "s/old/skip/" tests/*.py'
+    found = run(
+        tmp_path, f"{base}\npytest tests", 'sed -i "s/old/skipper/" tests/*.py\npytest tests'
+    )
+    assert verdict(found) == "block"
+
+
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        ("s/a/b/", ("a", "b")),
+        ("s|a/b|c|g", ("a/b", "c")),
+        ("s/a\\/b/c/2", ("a\\/b", "c")),
+        ("1s/a/b/", None),
+        ("s/a/b/;p", None),
+        ("s/a/b/w x", None),
+        ("s/a/b", None),
+        ("d", None),
+    ],
+)
+def test_one_substitution_is_read_as_its_pattern_and_replacement(script, expected) -> None:
+    from greenproof.rules import ci
+
+    assert ci._substitution(script) == expected
+
+
+# ---- fix round: groups where errexit is ignored -------------------------------------------------
+@pytest.mark.parametrize(
+    "new_run",
+    [
+        "( pytest tests; true ) && echo ok",  # subshell_and
+        "if { pytest tests; true; }; then echo ok; fi",  # if_group
+        "while { pytest tests; true; }; do break; done",  # while_group
+        "until { pytest tests; true; }; do break; done",
+        "! { pytest tests; }",  # bang_group
+        "! ( pytest tests )",
+        "{ pytest tests; echo done; } && echo ok",
+        "{ pytest tests || echo failed; } || exit 3",
+        "( pytest tests; true ) || echo no",
+        "if ( pytest tests; echo x ); then echo ok; fi",
+        "if ( cd . && pytest tests ); then echo ok; fi",  # `if` itself takes the failure
+        "{ ( pytest tests; true ) && echo a; } && echo b",
+        "pytest tests\n{ pytest tests; } && echo ok\necho more",
+    ],
+)
+def test_a_check_followed_by_anything_in_a_group_where_errexit_is_off_blocks(
+    tmp_path: Path, new_run: str
+) -> None:
+    found = run(tmp_path, "pytest tests", new_run)
+    assert verdict(found) == "block", [(f.severity, f.message) for f in found]
+    assert not any("narrower selection" in m for m in messages(found))
+
+
+@pytest.mark.parametrize(
+    "new_run",
+    [
+        "{ pytest tests; } && echo ok",  # group_and_honest
+        "{ pytest tests; }",  # group_honest
+        "( cd . && pytest tests )",  # subshell_honest
+        "( cd . && pytest tests ) && echo ok",
+        "{ pytest tests; true; }",  # group_true_flat: errexit is on, the group is not chained
+        "{ pytest tests || exit 1; } && echo ok",
+        "{ echo hi; true; } && echo ok\npytest tests",
+    ],
+)
+def test_an_honest_group_still_passes(tmp_path: Path, new_run: str) -> None:
+    found = run(tmp_path, "pytest tests", new_run)
+    assert verdict(found) == "pass", [(f.severity, f.message) for f in found]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "{ pytest tests; } | tee log",
+        "if { pytest tests; true; }; then echo ok; fi",
+        "while { pytest tests; }; do break; done",
+        "! { pytest tests; }",
+        "( pytest tests ) 2>&1 | tee log",
+    ],
+)
+def test_a_selection_never_contains_a_group_bracket_or_a_semicolon(command: str) -> None:
+    runs = shell._invocations([command], None)["pytest"]
+    words = [w for r in runs for w in r.words]
+    assert words == ["tests"], words
+
+
+def test_a_deep_chained_group_is_not_read_past_the_budget() -> None:
+    deep = "( " * 80 + "pytest tests" + " ) && echo ok" * 80
+    found = shell.find_swallows(deep, errexit=True)
+    assert isinstance(found, list)

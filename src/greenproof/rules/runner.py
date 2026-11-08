@@ -49,6 +49,7 @@ from greenproof.rules.shell import (
     selection_flags,
     shell_c_body,
     split_segments,
+    workspaces_of,
 )
 from greenproof.rules.tasks import Opaque, Reader, task_reader
 
@@ -2190,7 +2191,11 @@ def neutering_reason(
         if flag == _AFFECTED:  # an ordinary speed-up, but it runs only what the diff touches
             return _Warn(f"it now passes {flag}: check that every package is still tested")
         return f"it now passes {flag}"
-    scope, scope_unread = narrowed_scope(narrow_base, narrow_cand)
+    scope, scope_unread = narrowed_scope(
+        narrow_base,
+        narrow_cand,
+        workspaces=(lambda: workspaces_of(tests.changes)) if tests is not None else None,
+    )
     if scope:
         return f"it now runs less ({scope})"
     pending: str | None = None
