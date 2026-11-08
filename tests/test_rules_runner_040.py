@@ -209,9 +209,12 @@ def test_a_wildcard_include_reads_the_files_it_matches(tmp_path: Path) -> None:
     assert judge(tmp_path / "b", base, {"mk/test.mk": TESTS + LINT}, MAKE) == "pass"
 
 
-def test_a_wildcard_include_of_nothing_is_no_include(tmp_path: Path) -> None:
-    assert mk_warn(tmp_path, "include $(wildcard local/*.mk)\n") == "pass"
+def test_a_wildcard_include_of_a_missing_file_is_no_include(tmp_path: Path) -> None:
     assert mk_warn(tmp_path, "include $(wildcard local.mk)\n") == "pass"
+
+
+def test_a_glob_that_matches_nothing_is_still_unread_and_warns(tmp_path: Path) -> None:
+    assert mk_warn(tmp_path, "include $(wildcard local/*.mk)\n") == "warn"
 
 
 def test_a_wildcard_with_a_variable_in_it_still_warns(tmp_path: Path) -> None:

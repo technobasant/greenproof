@@ -1946,14 +1946,16 @@ _SINGLE_QUOTED = re.compile(r"'[^']*'")
 
 
 def _substituted_runs(statements: Sequence[str], ctx: _Ctx) -> int:
-    """The check statements whose arguments hold a command substitution (`pytest $(echo -k x)`,
-    a backtick) or an expansion greenproof could not resolve: what it hands the runner is unknown,
-    and it may be a selection flag."""
-    return sum(
-        1
-        for st in statements
-        if _SUBSTITUTION.search(_SINGLE_QUOTED.sub("", st)) and ctx.is_check(st)
-    )
+    """The check statements with a command substitution (`pytest $(echo -k x)`, a backtick) or an
+    expansion greenproof could not resolve in the arguments, after the check's own words: what it
+    hands the runner is unknown, and it may be a selection flag. A substitution that is the
+    command itself (`node $(yarn bin jest)`) is not read here."""
+    count = 0
+    for st in statements:
+        text = _SINGLE_QUOTED.sub("", st)
+        if (m := _SUBSTITUTION.search(text)) and ctx.is_check(text[: m.start()].strip()):
+            count += 1
+    return count
 
 
 _SUBSTITUTED_WHY = (
@@ -5504,7 +5506,10 @@ def expand_includes(
                 return match[0]
             if not listed:
                 listed.append(files_of())
-            found.extend(_glob_hits(listed[0], pat))
+            hits = _glob_hits(listed[0], pat)
+            if not hits:
+                return match[0]  # a glob that matches nothing is left unread, as it always was
+            found.extend(hits)
         if len(found) > _MAX_WILDCARD_FILES:
             return match[0]
         return " ".join(sorted({posixpath.relpath(p, directory or ".") for p in found}))
