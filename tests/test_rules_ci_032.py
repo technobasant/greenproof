@@ -155,7 +155,7 @@ def test_a_missing_script_does_not_keep_the_step(tmp_path: Path) -> None:
 
 
 def test_a_script_over_the_size_cap_is_not_read(tmp_path: Path) -> None:
-    body = "#!/bin/sh\n" + "# padding\n" * 8000 + "pytest -q\n"
+    body = "#!/bin/sh\n" + "# padding\n" * 120_000 + "pytest -q\n"  # past the 1 MiB cap (0.4.0)
     found = scene(
         tmp_path, {PATH: CI}, {PATH: with_run("./scripts/test.sh"), "scripts/test.sh": body}
     )

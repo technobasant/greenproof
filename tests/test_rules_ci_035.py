@@ -312,7 +312,7 @@ def test_a_cap_cuts_the_candidate_with_a_warning(tmp_path: Path) -> None:
 
 
 def test_an_oversized_nested_script_warns(tmp_path: Path) -> None:
-    big = SET_E + "# pad\n" * 20000 + "ruff check .\n"
+    big = SET_E + "# pad\n" * 200_000 + "ruff check .\n"
     assert len(big) > ci_rule._MAX_SCRIPT
     base = {SH: SET_E + "pytest\n./lint.sh\n", "lint.sh": SET_E + "ruff check .\n"}
     found = run(tmp_path, "./ci.sh", base, {"lint.sh": big})
