@@ -446,8 +446,8 @@ greenproof reports patterns, not proofs. Read these before relying on it.
 - **Some rules are Python only.** `code.hardcoded` works on Python syntax trees only, and
   so do the finest `tests.weakened` checks (an exact check loosened, a vacuous assertion).
 - **Known limits in 0.4.0.** SPEC 5.6, "Known limits (0.4.0)", lists them by area, and the
-  0.3.0 list below it stays for what 0.4.0 did not touch. The main ones: with more than 32 different pytest runs on the policy path the runs are not
-  compared one by one (the configuration alone is judged, with a warning); a check that moves
+  0.3.0 list below it stays for what 0.4.0 did not touch. The main ones: with more than 32
+  different pytest runs on the policy path the runs are not compared one by one (the configuration alone is judged, with a warning); a check that moves
   to a different subject blocks as weakened; and among the line-level engines only Go credits
   a table loop or helper that replaces separate checks (it warns), while a Rust or JS loop
   that replaces them blocks.
@@ -455,9 +455,9 @@ greenproof reports patterns, not proofs. Read these before relying on it.
   That is why the noisier rules default to `warn`, and why there is a way to accept a
   finding.
 - **It blocks some honest changes.** Replaying 698 test-touching commits from four
-  projects, 21 were blocked although the checking was still there in another form, for
-  example moved into a helper or merged into one larger assertion. MEASUREMENTS.md lists
-  the patterns.
+  projects, 12 were blocked although the checking was still there in another form, for
+  example moved to another file or merged into one larger assertion (21 on 0.3.1).
+  MEASUREMENTS.md lists them.
 - **The revert check supports four runners:** pytest, jest, vitest and `go test`. A make or
   just target, or any other runner, is skipped with a note.
 - **Hooks are advisory,** as described above, and CI is where the gate holds.
