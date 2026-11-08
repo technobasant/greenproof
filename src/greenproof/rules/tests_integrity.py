@@ -27,7 +27,7 @@ from greenproof.rules.collect import (
 from greenproof.rules.self_mocked import check_autouse_fixtures, check_self_mocked
 from greenproof.rules.tests_data import check_expected_data
 from greenproof.rules.tests_lines import analyse_lines, go_call_pattern
-from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
+from greenproof.rules.tests_model import FileAnalysis, Marker, RowTab, Unit
 from greenproof.rules.tests_python import (
     HelperEffect,
     Sources,
@@ -393,10 +393,21 @@ def _added_cases(pairing: _Pairing) -> set[str]:
     return universe
 
 
+def _added_rows(pairing: _Pairing) -> set[str]:
+    """Distinct table rows the change adds: those of the tables of new tests, and each paired
+    test's gain."""
+    universe = {k for u in pairing.left_cand for t in u.row_tabs for k in t.keys}
+    for b, c in pairing.pairs:
+        have = Counter(k for t in b.row_tabs for k in t.keys)
+        universe.update((Counter(k for t in c.row_tabs for k in t.keys) - have).keys())
+    return universe
+
+
 @dataclass
 class _Added:
     forms: set[str]
     cases: set[str]
+    rows: set[str] = field(default_factory=set)
 
 
 def _loosened(b: Unit, c: Unit) -> list[tuple[str, str]]:
@@ -457,6 +468,75 @@ def _literals_kept(b: Unit, c: Unit) -> bool:
     anywhere = {t[2:] for t in c.credit_lits if t.startswith("c:")}
     short = Counter(b.check_lits) - Counter(c.credit_lits)
     return all(t in anywhere for t in short)
+
+
+def _effective_rows(t: RowTab) -> int:
+    """The rows a table runs: none for an empty one, the distinct rows when an assertion reads
+    them, else one (the check does not depend on the row)."""
+    return 0 if t.rows == 0 else (t.rows or 0) if t.reads else 1
+
+
+def _pair_tables(base: tuple[RowTab, ...], cand: tuple[RowTab, ...]) -> list[tuple[RowTab, RowTab]]:
+    """Each base table with the candidate table that drives the same checks: first by loop or
+    column names and the assertion forms of the body, then by the names alone. Among tables of
+    one kind, equal numbers pair by size (a reorder pairs the same), unequal numbers in order, so
+    a table the change adds never lends its rows to one it cut."""
+    pairs: list[tuple[RowTab, RowTab]] = []
+    left_b, left_c = list(base), list(cand)
+    for key in (lambda t: (t.names, t.sig), lambda t: t.names):
+        groups: dict[object, tuple[list[RowTab], list[RowTab]]] = {}
+        for t in left_b:
+            groups.setdefault(key(t), ([], []))[0].append(t)
+        for t in left_c:
+            groups.setdefault(key(t), ([], []))[1].append(t)
+        used_b: set[int] = set()
+        used_c: set[int] = set()
+        for bs, cs in groups.values():
+            if not bs or not cs:
+                continue
+            if len(bs) == len(cs):
+                bs = sorted(bs, key=lambda t: -_effective_rows(t))
+                cs = sorted(cs, key=lambda t: -_effective_rows(t))
+            for x, y in zip(bs, cs, strict=False):
+                pairs.append((x, y))
+                used_b.add(id(x))
+                used_c.add(id(y))
+        left_b = [t for t in left_b if id(t) not in used_b]
+        left_c = [t for t in left_c if id(t) not in used_c]
+    return pairs
+
+
+def _table_reasons(b: Unit, c: Unit, added: _Added, param_hit: bool) -> list[_Reason]:
+    """Literal row tables (loops, and parametrize over a module-level name) that drive the same
+    checks at the base and the candidate, compared by distinct rows (SPEC 5.4)."""
+    out: list[_Reason] = []
+    for x, y in _pair_tables(b.row_tabs, c.row_tabs):
+        if x.kind == "param" and y.kind == "param" and ((x.literal and y.literal) or param_hit):
+            continue  # the parametrize case count covers it
+        shown = f"`{y.name}`" if y.name else "the table"
+        if y.rows is None:
+            if x.rows is None:
+                continue
+            if y.why == "altered":
+                out.append(
+                    (
+                        f"{shown} is re-bound or changed in place after its literal: its rows"
+                        " can no longer be read, and may be fewer",
+                        c.line,
+                        BLOCK,
+                    )
+                )
+            else:
+                out.append((f"table rows could not be read ({shown})", c.line, WARN))
+        elif x.reads and not y.reads:
+            out.append(("the loop's check no longer reads its rows", c.line, BLOCK))
+        elif x.rows is not None:
+            before, after = _effective_rows(x), _effective_rows(y)
+            if after < before and not set(x.keys) <= set(y.keys) | added.rows:
+                if param_hit:
+                    continue
+                out.append((f"table rows reduced from {before} to {after}", c.line, BLOCK))
+    return out
 
 
 def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> list[_Reason]:
@@ -534,12 +614,15 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
     places = (b.tolerances.get("places"), c.tolerances.get("places"))
     if places[0] is not None and places[1] is not None and places[1] < places[0]:
         out.append((f"`places` lowered to {places[1]:g}", c.line, BLOCK))
-    if (
+    param_hit = (
         b.param_cases is not None
         and c.param_cases is not None
         and c.param_cases < b.param_cases
         and not set(b.param_forms) <= set(c.param_forms) | added.cases
-    ):
+    )
+    if b.engine == "python":
+        out.extend(_table_reasons(b, c, added, param_hit))
+    if param_hit:
         out.append(
             (
                 f"parametrize cases reduced from {b.param_cases} to {c.param_cases}",
@@ -1293,7 +1376,7 @@ def _deleted_and_removed(sides: list[_Side], pairing: _Pairing) -> list[Finding]
 
 def _weakened(sides: list[_Side], pairing: _Pairing, changes: ChangeSet) -> list[Finding]:
     out: list[Finding] = []
-    added = _Added(_added_forms(pairing), _added_cases(pairing))
+    added = _Added(_added_forms(pairing), _added_cases(pairing), _added_rows(pairing))
     added_asserts: dict[str, int] = {}
     for u in pairing.left_cand:
         added_asserts[u.path] = added_asserts.get(u.path, 0) + u.asserts

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from greenproof.rules._common import digest
-from greenproof.rules.tests_model import FileAnalysis, Fixture, Marker, Unit
+from greenproof.rules.tests_model import FileAnalysis, Fixture, Marker, RowTab, Unit
 from greenproof.rules.tests_pyrows import param_names, row_gap
 
 _MARK_SUFFIXES = ("mark.skip", "mark.skipif", "mark.xfail")
@@ -772,6 +772,8 @@ class _Helpers(dict[str, _FuncDef]):
         # module-level names bound once to a literal list or tuple (a table of rows).
         self.unique: set[str] = set()
         self.tables: dict[str, ast.expr] = {}
+        # module-level names bound to a literal list or tuple that the module re-binds or mutates
+        self.altered: set[str] = set()
         self.numbers: dict[str, float] = {}  # module-level names bound once to a number
 
 
@@ -1606,6 +1608,241 @@ def _fold_loop(fn: _FuncDef, helpers: dict[str, _FuncDef]) -> _Fold | None:
     return _Fold(loop, names, tuple(rows))
 
 
+_MAX_TABLES = 100  # loops of one test recorded as row tables
+_ONE_ARG = frozenset({"assertTrue", "assertFalse", "assertIsNone", "assertIsNotNone"})
+
+
+def _stores(node: ast.AST) -> list[str]:
+    return [
+        n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+    ]
+
+
+def _mentions(node: ast.AST, names: AbstractSet[str]) -> bool:
+    return any(isinstance(n, ast.Name) and n.id in names for n in ast.walk(node))
+
+
+def _taint(body: Sequence[ast.stmt], names: Sequence[str]) -> set[str]:
+    """`names` and the locals the body assigns from them, in one pass in source order: after
+    `got = square(n)`, an assertion about `got` still reads the row."""
+    tainted = set(names)
+    binds: list[tuple[ast.AST, ast.expr | None, ast.AST]] = []
+    for stmt in body:
+        for n in ast.walk(stmt):
+            if isinstance(n, ast.Assign):
+                binds.extend((n, n.value, t) for t in n.targets)
+            elif isinstance(n, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                binds.append((n, n.value, n.target))
+            elif isinstance(n, ast.For):
+                binds.append((n, n.iter, n.target))
+            elif isinstance(n, ast.comprehension):
+                binds.append((n.target, n.iter, n.target))
+            elif isinstance(n, ast.withitem) and n.optional_vars is not None:
+                binds.append((n, n.context_expr, n.optional_vars))
+    binds.sort(key=lambda b: (getattr(b[0], "lineno", 0), getattr(b[0], "col_offset", 0)))
+    for _, value, target in binds:
+        if value is not None and _mentions(value, tainted):
+            tainted.update(_stores(target))
+    return tainted
+
+
+def _row_reads(
+    stmts: Sequence[ast.stmt], names: AbstractSet[str], helpers: Mapping[str, _FuncDef], depth: int
+) -> bool:
+    """An assertion in `stmts` reads one of `names`: an `assert`, a unittest or mock `assert*`
+    call, a `with raises` block, or a call of a file helper that always asserts and reads, in an
+    assertion of its own, the parameter that receives it (`depth` helpers deep)."""
+    todo: list[ast.AST] = list(stmts)
+    while todo:
+        node = todo.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Assert):
+            if _mentions(node.test, names):
+                return True
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            raising = any(
+                isinstance(i.context_expr, ast.Call)
+                and dotted(i.context_expr.func).rsplit(".", 1)[-1] in _RAISING
+                for i in node.items
+            )
+            if raising and _mentions(node, names):
+                return True
+        elif isinstance(node, ast.Call):
+            tail = dotted(node.func).rsplit(".", 1)[-1]
+            if tail.startswith("assert"):
+                if tail in _ONE_ARG:
+                    args = node.args[:1]
+                elif tail.startswith(("assertRaises", "assertWarns", "assert_")):
+                    args = node.args
+                else:
+                    args = node.args[:2]
+                kws = [k.value for k in node.keywords if k.arg != "msg"]
+                if any(_mentions(a, names) for a in (*args, *kws)):
+                    return True
+            elif _helper_reads(node, names, helpers, depth):
+                return True
+        todo.extend(ast.iter_child_nodes(node))
+    return False
+
+
+_RAISING = frozenset({"raises", "warns", "assertRaises", "assertWarns", "assertRaisesRegex"})
+
+
+def _helper_reads(
+    call: ast.Call, names: AbstractSet[str], helpers: Mapping[str, _FuncDef], depth: int
+) -> bool:
+    func = call.func
+    target = (
+        func.id
+        if isinstance(func, ast.Name)
+        else func.attr
+        if isinstance(func, ast.Attribute) and dotted(func.value) in {"self", "cls"}
+        else None
+    )
+    helper = helpers.get(target) if target and depth < 3 else None
+    if helper is None or not _always_asserts(helper):
+        return False
+    a = helper.args
+    params = [p.arg for p in (*a.posonlyargs, *a.args)]
+    if params and params[0] in {"self", "cls"} and isinstance(func, ast.Attribute):
+        params = params[1:]
+    bound = list(zip(params, call.args, strict=False))
+    bound += [(k.arg, k.value) for k in call.keywords if k.arg]
+    return any(
+        _mentions(value, names) and _row_reads(helper.body, {param}, helpers, depth + 1)
+        for param, value in bound
+    )
+
+
+def _local_tables(fn: _FuncDef) -> dict[str, ast.expr]:
+    """The names the test binds once, at the top of its body, to a literal list or tuple that
+    nothing changes in place or passes to a call: tables of rows the test owns."""
+    stores: dict[str, int] = {}
+    touched: set[str] = set()
+    for n in _own_nodes(fn):
+        if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load):
+            stores[n.id] = stores.get(n.id, 0) + 1
+        elif (
+            isinstance(n, ast.Attribute)
+            or (isinstance(n, ast.Subscript) and not isinstance(n.ctx, ast.Load))
+        ) and isinstance(n.value, ast.Name):
+            touched.add(n.value.id)
+        elif isinstance(n, ast.Call):
+            touched.update(a.id for a in n.args if isinstance(a, ast.Name))
+            touched.update(k.value.id for k in n.keywords if isinstance(k.value, ast.Name))
+            touched.update(
+                a.value.id
+                for a in n.args
+                if isinstance(a, ast.Starred) and isinstance(a.value, ast.Name)
+            )
+    out: dict[str, ast.expr] = {}
+    for stmt in fn.body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, (ast.List, ast.Tuple))
+        ):
+            name = stmt.targets[0].id
+            if stores.get(name) == 1 and name not in touched and name not in _param_names(fn):
+                out[name] = stmt.value
+    return out
+
+
+def _table_rows(
+    it: ast.expr,
+    tables: Mapping[str, ast.expr],
+    altered: AbstractSet[str],
+    bound: AbstractSet[str],
+    first: bool = False,
+) -> tuple[int | None, str, str, tuple[str, ...]]:
+    """(distinct rows or None, why unreadable, module-level name, row keys) of the iterable of a
+    loop or the argvalues of a parametrize. `bound` are the names the test binds itself and
+    `tables` has no reading of: they shadow a module-level table."""
+    name = ""
+    node: ast.expr = it
+    if isinstance(it, ast.Name):
+        name = it.id
+        if it.id in tables:
+            node = tables[it.id]
+        elif it.id in bound:
+            return None, "opaque", name, ()
+        else:
+            return None, ("altered" if it.id in altered else "opaque"), name, ()
+    if isinstance(node, (ast.List, ast.Tuple)) and not any(
+        isinstance(e, ast.Starred) for e in node.elts
+    ):
+        rows = node.elts[:1] if first and node.elts else node.elts
+        keys = tuple(sorted({digest(_row_key(r)) for r in rows}))
+        return len(keys), "", name, keys
+    return None, "opaque", name, ()
+
+
+def _param_columns(dec: ast.Call) -> tuple[str, ...]:
+    first = dec.args[0] if dec.args else None
+    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+        return tuple(n.strip() for n in first.value.split(",") if n.strip())
+    if isinstance(first, (ast.List, ast.Tuple)) and all(
+        isinstance(e, ast.Constant) and isinstance(e.value, str) for e in first.elts
+    ):
+        return tuple(str(e.value) for e in first.elts if isinstance(e, ast.Constant))
+    return ("?",)
+
+
+def _row_tables(
+    fn: _FuncDef, live: _FuncDef, helpers: dict[str, _FuncDef], forms: Sequence[str]
+) -> tuple[RowTab, ...]:
+    """The literal tables that drive the test's checks: each `for` loop whose body asserts, read
+    from a literal list or tuple or a module-level name bound once to one, and each parametrize
+    decorator. A loop whose assertions read none of its variables is recorded as not reading."""
+    bound = _param_names(live) | {
+        n.id
+        for n in _own_nodes(live)
+        if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load)
+    }
+    local = _local_tables(live)
+    tables: dict[str, ast.expr] = {
+        k: v for k, v in getattr(helpers, "tables", {}).items() if k not in bound
+    }
+    tables.update(local)
+    altered: AbstractSet[str] = getattr(helpers, "altered", set())
+    out: list[RowTab] = []
+    loops = sorted(
+        (n for n in _own_nodes(live) if isinstance(n, ast.For)),
+        key=lambda n: (n.lineno, n.col_offset),
+    )
+    consts = _Consts(live)
+    for loop in loops[:_MAX_TABLES]:
+        names = tuple(dict.fromkeys(_stores(loop.target)))
+        inner = _Stats(helpers, consts=consts)
+        inner.referenced = _loaded_names(live)
+        for stmt in loop.body:
+            inner.visit(stmt)
+        if not names or not inner.asserts:
+            continue
+        # a loop that can stop early runs only its first row for certain
+        rows, why, name, keys = _table_rows(loop.iter, tables, altered, bound, _leaves_row(loop))
+        reads = _row_reads(loop.body, _taint(loop.body, names), helpers, 0)
+        out.append(
+            RowTab("loop", names, digest("\n".join(inner.forms)), rows, reads, why, name, keys)
+        )
+    sig = digest("\n".join(forms))
+    for dec in fn.decorator_list:
+        if not (isinstance(dec, ast.Call) and dotted(dec.func).endswith("mark.parametrize")):
+            continue
+        values: ast.expr | None = dec.args[1] if len(dec.args) > 1 else None
+        for kw in dec.keywords:
+            if kw.arg == "argvalues":
+                values = kw.value
+        if values is None:
+            continue
+        rows, why, name, keys = _table_rows(values, tables, altered, bound)
+        literal = isinstance(values, (ast.List, ast.Tuple))
+        out.append(RowTab("param", _param_columns(dec), sig, rows, True, why, name, keys, literal))
+    return tuple(out)
+
+
 def _marked(fn: _FuncDef) -> list[tuple[str, tuple[str, ...]]]:
     """The exact form of each literal row of a parametrize decorator that carries a skip or xfail
     mark (`pytest.param(..., marks=pytest.mark.skip)`), with the kinds of its marks: such a row
@@ -1789,6 +2026,7 @@ def _unit(
         param_forms=case_forms,
         row_gap=gap,
         row_big=big,
+        row_tabs=_row_tables(fn, live, helpers, stats.forms),
         param_marked=_marked(fn),
         mark_kinds=_mark_kinds(fn),
         subjects=_subjects(live) | _helper_subjects(live, helpers),
@@ -2308,6 +2546,11 @@ def _bound_once(tree: ast.Module) -> set[str]:
     return {name for name, n in count.items() if n == 1}
 
 
+_MUTATORS = frozenset(
+    {"append", "extend", "insert", "pop", "remove", "clear", "sort", "reverse", "__setitem__"}
+)
+
+
 def _plain_helper(fn: _FuncDef) -> bool:
     """A function whose call runs its body: not async, not a generator, not decorated."""
     if isinstance(fn, ast.AsyncFunctionDef) or fn.decorator_list:
@@ -2326,14 +2569,22 @@ def _module_tables(helpers: _Helpers, tree: ast.Module) -> None:
     """Fill `helpers.unique` and `helpers.tables` from the module's top level."""
     once = _bound_once(tree)
     handled: set[str] = set()  # names the module touches in a way that could change a table
+    mutated: set[str] = set()  # names the module changes in place
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)) or (
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            handled.add(node.value.id)
+            if node.attr in _MUTATORS:
+                mutated.add(node.value.id)
+        elif (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Name)
             and not isinstance(node.ctx, ast.Load)
         ):
             handled.add(node.value.id)
+            mutated.add(node.value.id)
         elif isinstance(node, ast.Call):
+            if dotted(node.func).endswith("mark.parametrize"):
+                continue  # reads its argvalues, never changes them
             handled.update(a.id for a in node.args if isinstance(a, ast.Name))
             handled.update(
                 a.value.id
@@ -2366,6 +2617,17 @@ def _module_tables(helpers: _Helpers, tree: ast.Module) -> None:
             and isinstance(node.value, (ast.List, ast.Tuple))
         ):
             helpers.tables[node.target.id] = node.value
+    literal: set[str] = set()
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and isinstance(
+            stmt.value, (ast.List, ast.Tuple)
+        ):
+            for t in stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]:
+                if isinstance(t, ast.Name):
+                    literal.add(t.id)
+    helpers.altered = {
+        n for n in literal if n not in helpers.tables and (n not in once or n in mutated)
+    }
 
 
 def _module_helpers(
