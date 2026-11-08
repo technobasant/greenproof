@@ -375,10 +375,96 @@ def _words(node: ast.AST) -> list[str] | None:
     return None
 
 
+class _Scope:
+    """The names of one scope (a module's, a function's) that are bound exactly once, to a string
+    or a list or tuple of strings. A name that is bound again (assigned twice, a loop or `with`
+    target, an import, a `def`, a walrus, an argument), declared `global` or `nonlocal` anywhere in
+    the file, or a list that is changed in place (a method called on it, an item set, handed to
+    a call) is not one: its value at a `session.run` is not known."""
+
+    def __init__(self, body: Sequence[ast.stmt], params: Sequence[str], shared: set[str]) -> None:
+        total: Counter[str] = Counter(params)
+        values: dict[str, ast.expr] = {}
+        stack: list[ast.AST] = list(body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                total[node.name] += 1
+                stack.extend(node.decorator_list)  # the body is a scope of its own
+                continue
+            if isinstance(node, ast.Lambda):
+                continue
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    total[(alias.asname or alias.name).partition(".")[0]] += 1
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                total[node.name] += 1
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                total[node.id] += 1
+            if isinstance(node, ast.Assign):
+                one = len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                if one and isinstance(node.targets[0], ast.Name):
+                    values[node.targets[0].id] = node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                if isinstance(node.target, ast.Name):
+                    values[node.target.id] = node.value
+            stack.extend(ast.iter_child_nodes(node))
+        self.total = total
+        self.values = {
+            name: value
+            for name, value in values.items()
+            if total[name] == 1 and name not in shared and _literal(value) is not None
+        }
+
+    def binds(self, name: str) -> bool:
+        return self.total[name] > 0
+
+
+def _literal(value: ast.AST) -> list[str] | str | None:
+    """A string, or the words of a list or tuple of strings."""
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return value.value
+    return _words(value)
+
+
+def _changed_in_place(tree: ast.AST) -> set[str]:
+    """The names a list could be changed through anywhere in the file: the receiver of a method
+    or an item, or an argument of a call."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.value, ast.Name):
+            names.add(node.value.id)
+        elif isinstance(node, ast.Call):
+            names.update(
+                a.id
+                for a in [*node.args, *(k.value for k in node.keywords)]
+                if isinstance(a, ast.Name)
+            )
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+    return names
+
+
+class _Lookup:
+    """What a name stands for in a function: its own scope first, then the module's."""
+
+    def __init__(self, module: _Scope | None, local: _Scope | None, unsafe: set[str]) -> None:
+        self.module, self.local, self.unsafe = module, local, unsafe
+
+    def __call__(self, name: str) -> list[str] | str | None:
+        scope = self.local if self.local is not None and self.local.binds(name) else self.module
+        if scope is None or name not in scope.values:
+            return None
+        value = _literal(scope.values[name])
+        if isinstance(value, list) and name in self.unsafe:
+            return None
+        return value
+
+
 _OPAQUE = "<?>"  # stands in the lines of a session for a `session.run` that cannot be read
 
 
-def _starred_default(value: ast.AST) -> list[str]:
+def _starred_default(value: ast.AST, look: _Lookup | None = None) -> list[str]:
     """What `*session.posargs`, `*(session.posargs or [D])` and `*(session.posargs if
     session.posargs else [D])` add to a command when nothing follows `--`: D. A literal list
     or `"a b".split()` adds its words."""
@@ -393,6 +479,8 @@ def _starred_default(value: ast.AST) -> list[str]:
             return f.value.value.split()
     if (literal := _words(value)) is not None:
         return literal
+    if look is not None and isinstance(value, ast.Name) and isinstance(got := look(value.id), list):
+        return got
     if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or) and len(value.values) == 2:
         return _words(value.values[1]) or []
     if isinstance(value, ast.IfExp):
@@ -400,13 +488,17 @@ def _starred_default(value: ast.AST) -> list[str]:
     return []
 
 
-def _run_line(call: ast.Call) -> str | None:
+def _run_line(call: ast.Call, look: _Lookup | None = None) -> str | None:
     words: list[str] = []
     for arg in call.args:
         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
             words.append(arg.value)
+        elif (
+            look is not None and isinstance(arg, ast.Name) and isinstance(got := look(arg.id), str)
+        ):
+            words.append(got)
         elif isinstance(arg, ast.Starred):
-            words.extend(_starred_default(arg.value))
+            words.extend(_starred_default(arg.value, look))
         else:
             words.append("<?>")
     return " ".join(words) if words and words[0] != "<?>" else None
@@ -429,13 +521,25 @@ def _widened(call: ast.Call) -> bool:
 
 
 def _session_runs(
-    fn: ast.FunctionDef | ast.AsyncFunctionDef, budget: list[int]
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    budget: list[int],
+    module: _Scope | None = None,
+    unsafe: set[str] | None = None,
+    helpers: Mapping[str, ast.FunctionDef | ast.AsyncFunctionDef] | None = None,
+    depth: int = 0,
 ) -> tuple[list[str], list[str]]:
     """The `session.run` lines of a session, and those that go on whatever they exit with (in a
     `try` that swallows the failure, or with widened `success_codes`). `budget` counts the syntax
     nodes left to read across the file."""
     lines: list[str] = []
     swallowed: list[str] = []
+    params = [a.arg for a in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)]
+    if fn.args.vararg:
+        params.append(fn.args.vararg.arg)
+    if fn.args.kwarg:
+        params.append(fn.args.kwarg.arg)
+    look = _Lookup(module, _Scope(fn.body, params, set()), unsafe or set())
+    session = fn.args.args[0].arg if fn.args.args else None
     stack: list[tuple[ast.AST, bool]] = [(n, False) for n in reversed(fn.body)]
     while stack and budget[0] > 0:
         node, guarded = stack.pop()
@@ -445,10 +549,27 @@ def _session_runs(
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in ("run", "run_always")
         ):
-            line = _run_line(node) or _OPAQUE
+            line = _run_line(node, look) or _OPAQUE
             lines.append(line)
             if guarded or _widened(node):
                 swallowed.append(line)
+        elif (
+            isinstance(node, ast.Call)
+            and depth == 0
+            and helpers
+            and session is not None
+            and isinstance(node.func, ast.Name)
+            and node.func.id in helpers
+            and not look.local.binds(node.func.id)  # type: ignore[union-attr]
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == session
+        ):
+            inner, inner_swallowed = _session_runs(
+                helpers[node.func.id], budget, module, unsafe, helpers, depth + 1
+            )
+            lines.extend(inner)
+            swallowed.extend(inner if guarded else inner_swallowed)
         if isinstance(node, ast.Try):
             rest = [*node.handlers, *node.orelse, *node.finalbody]
             stack.extend((n, guarded) for n in reversed(rest))
@@ -456,6 +577,16 @@ def _session_runs(
         else:
             stack.extend((n, guarded) for n in reversed(list(ast.iter_child_nodes(node))))
     return lines[:_MAX_LINES], swallowed[:_MAX_LINES]
+
+
+def _declared(tree: ast.AST) -> set[str]:
+    """The names declared `global` or `nonlocal` somewhere in the file."""
+    return {
+        n
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Global, ast.Nonlocal))
+        for n in node.names
+    }
 
 
 def _nox_defaults(text: str) -> Defaults | None:
@@ -466,12 +597,21 @@ def _nox_defaults(text: str) -> Defaults | None:
     listed: list[str] | None = None
     unread = False
     source = ""  # what the options are set to, for a list that cannot be read
+    unsafe = _changed_in_place(tree)
+    module = _Scope(tree.body, (), {n for n in unsafe if n in _declared(tree)})
+    helpers = {
+        n.name: n
+        for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and _session_name(n) is None
+        and not n.decorator_list
+    }
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             name = _session_name(node)
             if name is None:
                 continue
-            sessions[name], swallowed[name] = _session_runs(node, budget)
+            sessions[name], swallowed[name] = _session_runs(node, budget, module, unsafe, helpers)
         elif isinstance(node, (ast.Assign, ast.AugAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for t in targets:
