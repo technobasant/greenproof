@@ -238,3 +238,43 @@ def test_a_workspace_flag_after_the_script_name_is_the_steps_own(tmp_path: Path)
 
     assert _own_args(["npm", "test", "-w", "web", "--", "-w"]) == ["npm", "test", "-w", "web"]
     assert _own_args(["npm", "test"]) == ["npm", "test"]
+
+
+# `npm ci` installs the packages a job then tests. It is not a test task named `ci`, so it does
+# not stand for a run of every package beside a step that narrows the selection.
+@pytest.mark.parametrize(
+    ("base", "new"),
+    [
+        ("npm ci\nnpm test", "npm ci\nnpm test -w packages/web"),
+        ("npm ci\nnpm test --workspaces", "npm ci\nnpm test -w packages/web"),
+        ("npm --prefix . ci\nnpm test", "npm --prefix . ci\nnpm test -w packages/web"),
+    ],
+)
+def test_npm_ci_beside_a_narrowed_selection_still_blocks(
+    tmp_path: Path, base: str, new: str
+) -> None:
+    found = npm(tmp_path, base, new, "node --test")
+    assert ci_verdict(found) == "block", messages(found, "warn")
+
+
+def test_npm_ci_in_a_step_of_its_own_does_not_hide_a_narrowed_selection(tmp_path: Path) -> None:
+    def two(run: str) -> str:
+        return flow("npm ci") + f"      - run: {run}\n"
+
+    files = {WF: two("npm test"), "tests/test_a.py": TEST, **npm_tree("node --test")}
+    found = ci_scene(fresh(tmp_path), files, {WF: two("npm test -w packages/web")})
+    assert ci_verdict(found) == "block", messages(found, "warn")
+
+
+def test_npm_ci_beside_a_widened_selection_passes(tmp_path: Path) -> None:
+    found = npm(tmp_path, "npm ci\nnpm test -w packages/web", "npm ci\nnpm test -ws", "node --test")
+    assert ci_verdict(found) == "pass", messages(found, "warn")
+
+
+def test_npm_ci_is_not_a_test_run_and_a_ci_script_is() -> None:
+    from greenproof.rules.shell import runs_monorepo_tests
+
+    assert not runs_monorepo_tests("npm ci")
+    assert not runs_monorepo_tests("npm --prefix web ci")
+    assert runs_monorepo_tests("npm run ci")
+    assert runs_monorepo_tests("npm run ci -w web")
