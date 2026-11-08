@@ -9,6 +9,8 @@ import re
 import time
 from pathlib import Path
 
+import pytest
+
 from greenproof.rules.tests_lines import analyse_lines, mask_source
 from tests.helpers import Repo, init_repo, rule_ids, static_findings
 
@@ -565,7 +567,19 @@ def test_masking_gives_the_same_lines_as_the_per_character_pass() -> None:
         assert mask_source(tricky, lang) == _per_char_mask(tricky, lang)
 
 
+def _measured_by_coverage() -> bool:
+    try:
+        import coverage
+    except ImportError:
+        return False
+    return coverage.Coverage.current() is not None
+
+
 def test_masking_is_markedly_faster_than_the_per_character_pass() -> None:
+    # Coverage's tracer slows a Python loop and a regular expression by different amounts, so
+    # under it (as in CI) the ratio says nothing; the linear test below still runs there.
+    if _measured_by_coverage():
+        pytest.skip("speed ratio is not meaningful under coverage")
     assert _best(mask_source, BIG, "go") * 2 < _best(_per_char_mask, BIG, "go")
 
 
