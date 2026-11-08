@@ -2324,7 +2324,7 @@ def neutering_reason(
         return "it now exits 0 before its checks run"
     if not script and (why := _dash_reason(base_c, cand_c, ctx, known[1], base_texts)):
         return why
-    if not script and (lost := _lost_kind(base_c, cand_c, ctx, expanders)):
+    if lost := _lost_kind(base_c, cand_c, ctx, expanders, script):
         return f"it no longer runs {lost}"
     side = names or ((), ())
     if not script and _check_steps(cand_c, ctx, known[1], base_texts, side[1]) < _check_steps(
@@ -2395,16 +2395,21 @@ _WRAPPER_KINDS = frozenset({"make test", "package test", "tox/nox"})
 
 
 def _kinds(
-    lines: Sequence[str], ctx: _Ctx, expand: Expander | None, depth: int = 0
+    lines: Sequence[str],
+    ctx: _Ctx,
+    expand: Expander | None,
+    depth: int = 0,
+    script: bool = False,
 ) -> tuple[Counter[str], bool]:
-    """The kinds of check a recipe or script runs, with `npm run x` and `make x` read into their
-    bodies; and whether a statement is one the rule cannot classify (it might run any check)."""
+    """The kinds of check a recipe or script runs, with `npm run x` and `make x` (or the scripts a
+    script calls) read into their bodies; and whether a statement is one the rule cannot classify
+    (it might run any check)."""
     found: Counter[str] = Counter()
     opaque = False
-    for st in _statements(lines, False):
+    for st in _statements(lines, script):
         body = expand(st) if expand is not None and depth < _MAX_DEPTH else None
         if body is not None:
-            inner, inner_opaque = _kinds(body, ctx, expand, depth + 1)
+            inner, inner_opaque = _kinds(body, ctx, expand, depth + 1, script)
             found.update(inner)
             opaque = opaque or inner_opaque
             continue
@@ -2427,13 +2432,16 @@ def _lost_kind(
     cand: Sequence[str],
     ctx: _Ctx,
     expanders: tuple[Expander, Expander] | None,
+    script: bool = False,
 ) -> str | None:
     """A kind of check the base ran that the candidate no longer does. Only judged when every
     statement of the candidate is classified (an unknown script might run it) and it runs some
-    check; the lint kinds are one category, a wrapper (`make test`) stands for any test runner."""
-    before, _ = _kinds(base, ctx, expanders[0] if expanders else None)
-    after, opaque = _kinds(cand, ctx, expanders[1] if expanders else None)
-    if opaque or not after:
+    check; the lint kinds are one category, a wrapper (`make test`) stands for any test runner.
+    A script left with no check at all, and nothing it could hide one in, lost them all (a recipe
+    left with none is caught by its step count)."""
+    before, _ = _kinds(base, ctx, expanders[0] if expanders else None, script=script)
+    after, opaque = _kinds(cand, ctx, expanders[1] if expanders else None, script=script)
+    if opaque or (not after and not (script and before)):
         return None
     present = {_category(k) for k in after}
     for kind in sorted(before):
@@ -6349,8 +6357,24 @@ def _invoked_files(
     added to `oversize`."""
     out: dict[str, str] = {}
     queue: list[tuple[str, str, int]] = []  # path, the policy command, depth
+    expand: list[Expander | None] = []  # the base Makefile's `make x`, read at first use
+
+    def made(statement_text: str) -> list[str]:
+        """The scripts the recipes of the `make x` statements of a text run."""
+        if not expand:
+            root = _make_root(changes, "", True)
+            text = changes.base_text(root) if root else None
+            expand.append(_make_expander(_targets(text)) if text else None)
+        if (reader := expand[0]) is None:
+            return []
+        found: list[str] = []
+        for seg in split_segments(statement_text):
+            if (lines := reader(seg.text)) is not None:
+                found.extend(scripts_in("\n".join(lines), ""))
+        return found
+
     for command in commands.values():
-        for path in scripts_in(command, ""):
+        for path in dict.fromkeys([*scripts_in(command, ""), *made(command)]):
             queue.append((path, command, 0))
     while queue and len(out) < _MAX_INVOKED:
         path, command, depth = queue.pop(0)
@@ -6381,6 +6405,36 @@ _TRIVIAL = re.compile(
 )
 
 
+_MAX_CALLS = 64  # scripts read into a script's statements, per side, before the rest stay unread
+
+
+def _calls_expander(read: Callable[[str], str | None], here: str) -> Expander:
+    """A statement that runs a script (`sh scripts/unit.sh`, `./unit.sh`) read into the commands
+    of that file in this tree, where it is there; anything else, a file that is missing or one of
+    `_MAX_SCRIPT` characters, stays as it is (a statement that stays is not read as a check). A
+    path is looked for from the repository root and from the directory of the script that runs
+    it; each file is read once, and past `_MAX_CALLS` of them no more are."""
+    memo: dict[str, list[str] | None] = {}
+
+    def lines_of(path: str) -> list[str] | None:
+        if path not in memo:
+            text = read(path) if len(memo) < _MAX_CALLS else None
+            memo[path] = (
+                None
+                if text is None or len(text) >= _MAX_SCRIPT
+                else [ln for ln in map(str.strip, split_lines(text)) if ln and ln[0] != "#"]
+            )
+        return memo[path]
+
+    def expand(statement: str) -> list[str] | None:
+        for path in scripts_in(statement, here):
+            if (body := lines_of(path)) is not None:
+                return body
+        return None
+
+    return expand
+
+
 def _invoked_reasons(
     f: ChangedFile, command: str, extra: list[str], tests: _BaseTests | None = None
 ) -> list[tuple[int | None, str]]:
@@ -6396,6 +6450,14 @@ def _invoked_reasons(
             extra=extra,
             tests=tests,
             cwds=tuple(dict.fromkeys(("", posixpath.dirname(f.path)))),
+            expanders=(
+                (
+                    _calls_expander(tests.changes.base_text, posixpath.dirname(f.path)),
+                    _calls_expander(tests.changes.cand_text, posixpath.dirname(f.path)),
+                )
+                if tests is not None
+                else None
+            ),
         )
     else:
         why = _program_neutering(split_lines(old), split_lines(new))

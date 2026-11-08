@@ -312,6 +312,7 @@ class _Body(NamedTuple):
     ignored: str = ""  # a recipe line whose failure make ignores: why
     scope: Scope | None = None  # the functions and arguments its text was read with
     arms: str = ""  # its text with every arm of each `case` kept, "" when `text` already is
+    picked: bool = False  # read below `npm test -w web`, whose workspace runs it, not this script
 
 
 _MAX_DEPTH = 4  # levels of scripts, recipes and package.json scripts followed below a step
@@ -471,6 +472,11 @@ def _selects_package(toks: list[str]) -> bool:
     return any(t.partition("=")[0] in _PICKS for t in toks) or toks[1:2] == ["workspace"]
 
 
+def _own_args(toks: list[str]) -> list[str]:
+    """The words of a command before a bare `--`: the ones after it go to the script it runs."""
+    return toks[: toks.index("--")] if "--" in toks else toks
+
+
 @dataclass
 class _Walk:
     """Follows what a step runs: the local scripts a script calls (`./x.sh`, `bash x.sh`,
@@ -615,6 +621,7 @@ class _Walk:
         if depth + 1 > _MAX_DEPTH:
             self.cut(f"`{stmt[:60]}` is {_MAX_DEPTH} levels below the step")
             return
+        picked = body.picked or _selects_package(_own_args(command_tokens(stmt, body.defs)))
         first = children[0]
         key = (*first.key, first.cwd)
         if key in self.seen:
@@ -632,6 +639,7 @@ class _Walk:
                 child.cwd,
                 child.kind,
                 child.ignored or body.ignored,
+                picked=picked,
             )
             self.out.append(sub)
             self.descend(sub, depth + 1)
@@ -691,6 +699,7 @@ class _Walk:
             body.ignored,
             scope,
             arms,
+            body.picked,
         )
         self.out.append(sub)
         self.descend(sub, depth + 1)
@@ -2603,6 +2612,8 @@ def _commands(world: _World, base: bool) -> tuple[list[str], dict[str, str]]:
             if _disabled(step) or (job and _job_disabled(job)):
                 continue
             for body in _bodies(world, wf, step, base):
+                if body.picked:  # the script of a package the step does not run
+                    continue
                 cmds.append(body.text)
                 defs.update(body.defs)
     return cmds, defs
