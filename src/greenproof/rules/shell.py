@@ -25,6 +25,7 @@ or, given the statements it had at the base, as those statements only.
 
 from __future__ import annotations
 
+import json
 import posixpath
 import re
 import shlex
@@ -34,6 +35,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from functools import lru_cache
+from typing import Any
 
 from greenproof.changeset import _glob_to_regex
 
@@ -1425,6 +1427,73 @@ _NEST_BUDGET = 32
 _FLAT_SPLIT = re.compile(r"[;&|(){}\n]+")
 
 
+def nest_depth(text: str) -> int:
+    """The deepest run of open `(` and `{` in `text`, in one pass (quotes are not told apart, so
+    a quoted bracket can only make it larger: the safe side)."""
+    depth = deepest = 0
+    for c in text:
+        if c in "({":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif c in ")}" and depth:
+            depth -= 1
+    return deepest
+
+
+_LEAVES_SHELL = re.compile(r"\b(?:exit|return|trap)\b")
+
+
+def ungroup(segs: list[Seg], exact: bool = False) -> list[Seg]:
+    """`segs` with each `( ... )` and `{ ...; }` statement replaced by the statements inside it,
+    the first one joined to what came before the group the way the group was. A group runs in
+    order, so reading it flat reads the same chains. Past `_NEST_BUDGET` levels the rest is cut at
+    its brackets, with no operators kept: one pass over the text, not one per level, and never a
+    recursion.
+
+    With `exact`, only a group that stands alone is opened, as a reader of exit statuses needs: a
+    group in an `&&` / `||` chain or in the background keeps its own status, and a subshell that
+    runs `exit`, `return` or `trap` ends only itself."""
+    out: list[Seg] = []
+    work = [
+        (seg, 0, i + 1 < len(segs) and segs[i + 1].sep in ("&&", "||"))
+        for i, seg in enumerate(segs)
+    ]
+    work.reverse()
+    while work:
+        seg, depth, chained_after = work.pop()
+        inner = None if seg.text.lstrip().startswith("((") else group_inner(seg.text)  # `(( x ))`
+        if inner is not None and exact:
+            alone = seg.sep not in ("&&", "||") and not chained_after and not seg.bg
+            if not alone or (seg.text.lstrip().startswith("(") and _LEAVES_SHELL.search(inner)):
+                inner = None
+        if inner is None:
+            out.append(seg)
+        elif depth >= _NEST_BUDGET or (depth == 0 and nest_depth(inner) >= _NEST_BUDGET):
+            pieces = [p.strip() for p in _FLAT_SPLIT.split(inner) if p.strip()]
+            out.extend(
+                replace(seg, sep=seg.sep if i == 0 else ";", text=piece)
+                for i, piece in enumerate(pieces)
+            )
+        else:
+            inside = split_segments(inner)
+            if inside:
+                inside[0] = replace(inside[0], sep=seg.sep)
+                last = len(inside) - 1
+                work.extend(
+                    reversed(
+                        [
+                            (
+                                replace(s, line=seg.line + s.line - 1, bg=s.bg or seg.bg),
+                                depth + 1,
+                                chained_after if k == last else inside[k + 1].sep in ("&&", "||"),
+                            )
+                            for k, s in enumerate(inside)
+                        ]
+                    )
+                )
+    return out
+
+
 def check_kind(
     text: str,
     *,
@@ -1469,7 +1538,7 @@ def _check_kind(
     assignments) a `$VAR` command word may be defined by. Past `_NEST_BUDGET` levels of groups the
     statement is read flat: its first piece that is a check, without descending into any `sh -c`.
     """
-    if _depth > _NEST_BUDGET:
+    if _depth > _NEST_BUDGET or (_depth == 0 and nest_depth(text) > _NEST_BUDGET):
         for piece in _FLAT_SPLIT.split(text):
             if kind := classify(command_tokens(piece, defs), make_check):
                 return kind
@@ -1831,7 +1900,7 @@ def _flat_swallows(
     otherwise it is a swallow (kind `or`). Functions and `case` are read as `split_segments`
     reads them, a `case` through all of its arms. `scope` carries the functions and arguments.
     """
-    segs = split_segments(script, scope, all_arms=True)
+    segs = ungroup(split_segments(script, scope, all_arms=True), exact=True)
     literals = [e for e in extra if len(e) >= 6]
     kinds = [
         check_kind(s.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs)
@@ -2544,7 +2613,7 @@ def _calls(command: str, defs: Mapping[str, str] | None = None) -> list[tuple[Se
     """`(statement, its command words, how it joins the previous one)` for each statement of a
     script, descending into the body of `sh -c "..."`."""
     out: list[tuple[Seg, list[str], str]] = []
-    for seg in split_segments(command):
+    for seg in ungroup(split_segments(command)):
         if (body := shell_c_body(seg.text, defs)) is not None:
             out.extend(_calls(body, defs))
             continue
@@ -2618,7 +2687,7 @@ def selection_uses(
     """
     found: list[tuple[str, str, str]] = []
     chain: list[str] = []  # the kinds of check on the current `&&` / `||` chain
-    for seg in split_segments(command):
+    for seg in ungroup(split_segments(command)):
         if (body := shell_c_body(seg.text, defs)) is not None:
             found.extend(selection_uses(body, retries_ok=retries_ok, defs=defs))
             continue
@@ -3311,7 +3380,9 @@ _MONOREPO_FLAGS: dict[str, tuple[tuple[str, ...], tuple[str, ...], bool]] = {
     "nx": (("--projects", "-p"), ("--exclude",), True),
     "lerna": (("--scope",), ("--ignore",), False),
     "yarn": (("--include",), ("--exclude",), False),
+    "npm": (("--workspace", "-w"), (), False),
 }
+_NPM_ALL = frozenset({"-ws", "--workspaces"})
 _TEST_TASK = re.compile(r"^(?:test|tests|check|lint|typecheck|verify|ci|e2e)(?:[:_-]\S*)?$")
 
 
@@ -3354,12 +3425,23 @@ def _monorepo_scope(tokens: Sequence[str]) -> tuple[str, dict[str, _Dim]] | None
             args = args[: args.index("--")]
         head = args[:3]
         if (
+            tool == "yarn" and args[:1] == ["workspace"] and len(args) > 2
+        ):  # yarn workspace web test
+            if not _runs_tests(args[2:]):
+                return None
+            return tool, {
+                "filter": _Dim(False, frozenset({args[1]})),
+                "excludes": _Dim(False, frozenset()),
+            }
+        if (
             (tool == "nx" and "run-many" not in head)
             or (tool == "lerna" and not any(t in ("run", "exec") for t in head))
             or (tool == "yarn" and "foreach" not in args)
             or not _runs_tests(args)
         ):
             return None
+        if tool == "npm":  # `-ws` is every workspace; it is not `-w s`
+            args = [t for t in args if t not in _NPM_ALL and not t.startswith("--workspaces=")]
         flags, excluding, several = _MONOREPO_FLAGS[tool]
         named: list[str] = []
         left: list[str] = []
@@ -3488,8 +3570,74 @@ def _uncovered(
     return out
 
 
+Workspaces = tuple[Mapping[str, str], Mapping[str, str]]  # {directory: package name}, per tree
+_NAME_FILTERS = frozenset(
+    {"pnpm", "npm", "yarn", "turbo", "lerna"}
+)  # they filter on package.json names
+_UNRESOLVED = re.compile(r"[!^\[\]{}()$`]|^\.|\.\.\.")
+
+
+_MAX_PACKAGES = 5000  # package.json files read to name the packages of a tree
+
+
+def workspaces_of(changes: Any) -> Workspaces:
+    """`({directory: name}, {directory: name})` of every package.json (not under `node_modules`)
+    of the base tree and of the candidate tree, for `narrowed_scope`'s `workspaces`."""
+    trees: list[dict[str, str]] = []
+    for lister, read in (
+        (changes.list_base, changes.base_text),
+        (changes.list_cand, changes.cand_text),
+    ):
+        found: dict[str, str] = {}
+        for path in lister() if lister is not None else []:
+            if posixpath.basename(path) != "package.json" or "node_modules" in path.split("/"):
+                continue
+            if len(found) >= _MAX_PACKAGES:
+                break
+            try:
+                data = json.loads(read(path) or "null")
+            except (ValueError, OSError):
+                continue
+            if isinstance(data, dict) and isinstance(data.get("name"), str):
+                found[posixpath.dirname(path)] = data["name"]
+        trees.append(found)
+    return trees[0], trees[1]
+
+
+def _name_pattern(item: str) -> re.Pattern[str]:
+    """A package-name filter as a regex: `*` and `?` stay inside a path segment."""
+    out = "".join("[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c) for c in item)
+    return re.compile(out)
+
+
+def _filter_dirs(items: Iterable[str], table: Mapping[str, str]) -> set[str] | None:
+    """The directories of the packages a set of name filters selects in one tree; None when an
+    item is not a plain name or glob (`web...`, `!x`, a path) or names no package there."""
+    found: set[str] = set()
+    for item in items:
+        if not item or len(item) > 200 or _UNRESOLVED.search(item):
+            return None
+        pattern = _name_pattern(item)
+        hits = {d for d, name in table.items() if pattern.fullmatch(name)}
+        if not hits:
+            return None
+        found |= hits
+    return found
+
+
+def _filter_superset(before: Iterable[str], after: Iterable[str], spaces: Workspaces) -> bool:
+    """Whether the candidate's package filter provably selects every package the base's did: the
+    packages (by directory, so a rename of one is followed) of the base tree the old filter
+    names are all among those the new filter names in the candidate tree."""
+    old, new = _filter_dirs(before, spaces[0]), _filter_dirs(after, spaces[1])
+    return old is not None and new is not None and old <= new
+
+
 def narrowed_scope(
-    base_cmds: Sequence[str], cand_cmds: Sequence[str], defs: Mapping[str, str] | None = None
+    base_cmds: Sequence[str],
+    cand_cmds: Sequence[str],
+    defs: Mapping[str, str] | None = None,
+    workspaces: Callable[[], Workspaces] | None = None,
 ) -> tuple[str | None, str | None]:
     """`(block, warning)`: a description when the candidate runs `cargo test` or `go test` over
     less than the base did, and a warning when it cannot be told.
@@ -3503,7 +3651,8 @@ def narrowed_scope(
     (a rename, a glob) is the warning, as it cannot be judged without the workspace. A run covers
     a dimension when it covers every item the base did; more items, or an unrestricted dimension,
     is not a narrowing. A value that is a variable cannot be read: the warning, when it differs
-    from the base's.
+    from the base's. With `workspaces` (the package directories and names of each tree), a rename or
+    glob that selects every package the base's filter did is not a finding.
     """
     base = _scopes(base_cmds, defs)
     cand = _scopes(cand_cmds, defs)
@@ -3539,6 +3688,12 @@ def narrowed_scope(
                 and not before.top
                 and _uncovered(after.items, before.items, covers, name)
             ):
+                if family in _NAME_FILTERS and workspaces is not None:
+                    try:
+                        if _filter_superset(before.items, after.items, workspaces()):
+                            continue  # a rename or a glob that provably still selects them all
+                    except OSError:  # an unreadable tree: the warning below
+                        pass
                 warn = warn or (  # renamed, or a glob: not a subset of what the base ran
                     f"{family} package filter changed from {_listing(sorted(before.items))}"
                     f" to {_listing(sorted(after.items))}: check that it still covers them"

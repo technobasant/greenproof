@@ -28,11 +28,16 @@ from greenproof.rules.ci_expand import (
     pm_children,
     tox_children,
 )
+from greenproof.rules.collect import collection_from_base
 from greenproof.rules.runner import (
     _FLAG_VARS,
+    _RUNNER_FILE,
+    _TEST_NAME,
     _UNREADABLE,
     _BaseTests,
     _Dir,
+    _glob_regex,
+    _in_place_how,
     _tree_names,
     _Warn,
     _with_exports,
@@ -51,6 +56,7 @@ from greenproof.rules.shell import (
     is_non_check,
     narrowed_scope,
     narrowed_selection,
+    nest_depth,
     script_token,
     scripts_in,
     selection_changed_warning,
@@ -58,6 +64,7 @@ from greenproof.rules.shell import (
     selection_uses,
     shell_c_body,
     split_segments,
+    workspaces_of,
 )
 
 _GITHUB = re.compile(r"^\.github/workflows/[^/]+\.ya?ml$")
@@ -106,7 +113,7 @@ def _wf(text: str) -> workflow.Workflow:
     return workflow.parse(text)
 
 
-_MAX_SCRIPT = 64 * 1024  # bytes of a local script or action file the rule will read
+_MAX_SCRIPT = 1024 * 1024  # bytes of a local script or action file the rule will read
 _SCRIPT_EXTS = frozenset({"", ".sh", ".bash", ".zsh"})
 _ACTION_NAMES = ("action.yml", "action.yaml")
 # `uses:` of actions that run no check. Anything else a step can `uses:` may run the tests.
@@ -309,7 +316,7 @@ class _Body(NamedTuple):
 
 _MAX_DEPTH = 4  # levels of scripts, recipes and package.json scripts followed below a step
 _MAX_FILES = 32  # distinct files read for one step
-_MAX_BYTES = 512 * 1024  # bytes of them
+_MAX_BYTES = 2 * 1024 * 1024  # bytes of them
 _SOURCE = frozenset({".", "source"})
 _AUTOLOAD = re.compile(r"\bPYTEST_DISABLE_PLUGIN_AUTOLOAD=[^\s;&|]")
 
@@ -333,6 +340,12 @@ _TOO_DEEP = (
 )
 
 
+_SCAN_DEPTH = (
+    512  # past this a statement is not handed to the test scan: it would only hit the stack
+)
+_SWALLOWISH = re.compile(r"\|\|\s*(?:true|:|exit\s+0)\b|;\s*exit\s+0\b")
+
+
 def _walk_leaves(
     text: str, defs: Defs, at: tuple[str, _Dir], depth: int = 0
 ) -> Generator[tuple[str, str, _Dir], None, tuple[str, _Dir]]:
@@ -342,8 +355,8 @@ def _walk_leaves(
     cwd, where = at
     for seg in split_segments(text):
         before = where
-        inner = shell_c_body(seg.text, defs)
-        group = None if inner is not None else group_inner(seg.text)
+        group = group_inner(seg.text)  # a group is not a `sh -c`: no need to tokenize all of it
+        inner = None if group is not None else shell_c_body(seg.text, defs)
         if depth >= _GROUP_DEPTH and (inner is not None or group is not None):
             yield seg.text, cwd, where
             continue
@@ -1007,6 +1020,9 @@ class _World:
     base_swallows: Counter[tuple[str, str]] = field(default_factory=Counter)
     base_flags: set[tuple[str, str]] = field(default_factory=set)
     base_has_tests: bool = False
+    base_rewrites: list[tuple[str, tuple[str, ...]]] | None = None  # `sed -i` of base steps
+    collection: Any = None  # the base revision's pytest collection rules, read when needed
+    base_monorepo: bool = False  # a base step runs a monorepo task runner (nx, turbo, lerna ...)
     other_ci: bool = False
     hands_off: bool = False
     triggers: dict[str, tuple[workflow.Triggers, int] | None] = field(default_factory=dict)
@@ -1255,6 +1271,7 @@ def _world(
                 world.base_if_false.add(_sig(step))
             for body in _bodies(world, wf, step, True):
                 world.base_flags.update(selection_flags(body.text, body.defs))
+                world.base_monorepo = world.base_monorepo or bool(_MONOREPO.search(body.text))
                 world.base_statements.update(_flat(body.text, body.defs))
                 world.base_autoload = world.base_autoload or _autoload(body)
             world.base_swallows.update(
@@ -1281,6 +1298,14 @@ def _world(
         k not in _NOT_TESTS for counts in world.base_kinds.values() for k in counts
     )
     return world
+
+
+# `nx run-many -t test`, `turbo run test`, `lerna run test`: runners `check_kind` does not call a
+# test, but whose `nx affected` / `--since` form runs fewer packages than the base did.
+_MONOREPO = re.compile(
+    r"(?:^|[\s;&|(])(?:npx\s+|pnpm\s+(?:exec\s+|dlx\s+)?|yarn\s+)?(?:nx|turbo|lerna)\s"
+    r"|\byarn\s+workspaces\s+foreach\b|\bpnpm\s+(?:-r|--recursive|--filter)\b",
+)
 
 
 def _triggers_of(world: _World, path: str, base: bool) -> tuple[workflow.Triggers, int] | None:
@@ -1982,6 +2007,113 @@ def _shard_verdict(stmt: str, job: workflow.Job | None) -> str | None:
     return ""
 
 
+# -- a rewrite or a copy in the test tree: when it is only a warning ------------------------------
+_COPY_HEADS = frozenset({"cp", "install", "ln", "rsync"})
+# A file that decides what runs or how, whatever its name says about collection.
+_DECIDES_RUN = re.compile(r"(?i)^__init__\.py$|setup|teardown|sitecustomize|\.pth$")
+_GLOBBY = frozenset("*?[{")
+
+
+def _inplace_words(stmt: str, cwd: str | None) -> list[str] | None:
+    """The repo paths a `sed -i` or `perl -i` statement edits; None for any other statement, a
+    path that is not plain (a variable, an absolute path) or a shell whose directory is unknown."""
+    toks = command_tokens(stmt)
+    if cwd is None or not toks or any(">" in t or t == "|" for t in toks):
+        return None
+    head = posixpath.basename(toks[0])
+    if head not in ("sed", "perl") or _in_place_how(toks) != "rewrites":
+        return None
+    out: list[str] = []
+    for word in _BaseTests._in_place_files(head, toks[1:]):
+        if "$" in word or "`" in word or word.startswith(("/", "~")):
+            return None
+        out.append(posixpath.normpath(posixpath.join(cwd, word)))
+    return out or None
+
+
+def _base_rewrites(world: _World) -> list[tuple[str, tuple[str, ...]]]:
+    """Every `sed -i` or `perl -i` statement the base workflows run, with the paths it edits."""
+    if world.base_rewrites is None:
+        found: list[tuple[str, tuple[str, ...]]] = []
+        for path, text in world.base.items():
+            if not _GITHUB.match(path):
+                continue
+            wf = _wf(text)
+            for step in wf.steps:
+                for body in _bodies(world, wf, step, True):
+                    for stmt, _, where in _walk_leaves(
+                        body.text, body.defs, (body.cwd, _Dir(body.cwd))
+                    ):
+                        if words := _inplace_words(stmt, where.path):
+                            found.append((stmt, tuple(words)))
+        world.base_rewrites = found
+    return world.base_rewrites
+
+
+def _covered_path(path: str, by: str) -> bool:
+    if path == by:
+        return True
+    return bool(_GLOBBY & set(by)) and len(by) < 400 and _glob_regex(by).fullmatch(path) is not None
+
+
+def _repeated_rewrite(world: _World, stmt: str, where: _Dir) -> str | None:
+    """The base statement that already rewrote every file this `sed -i` statement edits (the
+    same files, or a glob over them): the edit changed, the set of files did not."""
+    words = _inplace_words(stmt, where.path)
+    if not words:
+        return None
+    for old, targets in _base_rewrites(world):
+        if all(any(_covered_path(w, t) for t in targets) for w in words):
+            return old
+    return None
+
+
+def _decides_run(world: _World, path: str) -> bool:
+    """Whether a file of the test tree is a test by the collection patterns, or decides what
+    runs or how (`conftest.py`, a runner config, a setup file, `__init__.py`)."""
+    name = posixpath.basename(path)
+    if _RUNNER_FILE.match(name) or _DECIDES_RUN.search(name):
+        return True
+    changes = world.changes
+    if changes.test_patterns:  # the policy says what a test is
+        return changes.is_test(path)
+    if world.collection is None:
+        world.collection = collection_from_base(changes)
+    parts = path.split("/")
+    return bool(
+        world.collection.file_collected(path)
+        or _TEST_NAME.match(name)
+        or "__tests__" in parts[:-1]
+        or (name.endswith(".rs") and "tests" in parts[:-1])
+    )
+
+
+def _plain_copy_over(world: _World, stmt: str, found: str, where: _Dir) -> str | None:
+    """The file a plain `cp`, `install`, `ln` or `rsync` (without `--delete`) overwrites in the
+    test tree when it is neither a test by the collection patterns nor a file that decides what
+    runs: a settings file, a fixture, a data file. None when it is anything else."""
+    tests = world.tests
+    toks = command_tokens(stmt)
+    if tests is None or not toks or any(">" in t or t == "|" for t in toks):
+        return None
+    if posixpath.basename(toks[0]) not in _COPY_HEADS:
+        return None
+    if any(t.startswith(("--del", "--remove", "--target-dir")) or t == "-t" for t in toks):
+        return None
+    if len([t for t in toks[1:] if not t.startswith("-")]) != 2:
+        return None  # several sources: the hit names only the first file they land on
+    if _GLOBBY & set(found) or "$" in found:
+        return None
+    if where.path is not None:
+        resolved = tests._resolve(found, where.path)
+        paths = [resolved] if resolved is not None else []
+    else:
+        paths = tests._suffixed(found, True)
+    if not paths or any(p not in tests.files or _decides_run(world, p) for p in paths):
+        return None
+    return paths[0]
+
+
 def _github_step_reasons(text: str, world: _World) -> list[Reason]:
     out: list[Reason] = []
     lines = split_lines(text)
@@ -2026,6 +2158,17 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                 )
             here: set[str] = set()  # variables holding the directory of the script itself
             src = body.src if body.kind == "script" else ""
+            if (
+                _SWALLOWISH.search(body.text)
+                and nest_depth(body.text) > _GROUP_DEPTH
+                and check_kind(
+                    body.text, literals=world.literals, scripts=world.scripts, defs=body.defs
+                )
+            ):  # a check beside `|| true` or `exit 0` in a nest that is not read: fail closed
+                if (at, _TOO_DEEP) not in reported:
+                    reported.add((at, _TOO_DEEP))
+                    out.append(_block(at, _TOO_DEEP))
+                continue
             for stmt, cwd, where in _walk_leaves(body.text, body.defs, (body.cwd, _Dir(body.cwd))):
                 path_stmt = _self_dir(stmt, src, cwd, here)
                 if pending[stmt] > 0:
@@ -2034,6 +2177,8 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                 if tests is None:
                     continue
                 try:
+                    if nest_depth(path_stmt) > _SCAN_DEPTH:
+                        raise RecursionError  # the same answer, without walking to the stack's end
                     gone, _ = tests.scan(path_stmt, where)
                 except RecursionError:  # a nest `_walk_leaves` left whole is too deep to read
                     if (at, _TOO_DEEP) not in reported:
@@ -2042,9 +2187,26 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                     continue
                 if gone is not None:
                     why = removal_reason(stmt[:80], gone)
+                    soft = False
+                    if getattr(gone, "how", "") == "rewrites":
+                        if old := _repeated_rewrite(world, stmt, where):
+                            why = (
+                                "a rewrite of tests the base already ran has changed: "
+                                f"was `{old[:120]}`, now `{stmt[:120]}`. Check that it does not "
+                                "skip or weaken a test"
+                            )
+                            soft = True
+                        elif over := _plain_copy_over(world, stmt, gone, where):
+                            why = (
+                                f"`{stmt[:80]}` overwrites `{over}` in the test tree: it is not a "
+                                "test or a file that decides what runs, so check that it does "
+                                "not change what the tests check"
+                            )
+                            soft = True
                     if (at, why) not in reported:
                         reported.add((at, why))
-                        out.append(_warn(at, why) if isinstance(why, _Warn) else _block(at, why))
+                        warns = soft or isinstance(why, _Warn)
+                        out.append(_warn(at, why) if warns else _block(at, why))
         for kind, stmt, at, why in _swallow_keys(wf, step, world):
             if remaining[(kind, stmt)] > 0:
                 remaining[(kind, stmt)] -= 1
@@ -2067,7 +2229,8 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                 if flag == "--doc" and with_nextest:
                     continue  # nextest in another step: `cargo test --doc` completes it
                 noop = any(flag in flags for flags in NOOP_FLAGS.values())
-                if not noop and not world.base_has_tests:
+                monorepo = family == "monorepo" and world.base_monorepo
+                if not noop and not world.base_has_tests and not monorepo:
                     continue
                 base_flags.add((family, flag))
                 at = _line_of(lines, step.run_line, step.stop, flag) if body.own else step.line
@@ -2406,7 +2569,7 @@ def _selection_reasons(world: _World, path: str) -> list[tuple[str, int | None, 
     files = world.tests.selectable() if world.tests is not None else None
     if why := narrowed_selection(base_cmds, cand_cmds, defs, files):
         out.append((path, None, f"the tests run on a narrower selection: {why}", False))
-    scope, unread = narrowed_scope(base_cmds, cand_cmds, defs)
+    scope, unread = narrowed_scope(base_cmds, cand_cmds, defs, lambda: workspaces_of(world.changes))
     if scope:
         out.append((path, None, f"the tests run on a narrower scope: {scope}", False))
     elif unread:
