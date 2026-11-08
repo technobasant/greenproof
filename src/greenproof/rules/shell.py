@@ -1942,6 +1942,23 @@ def _flat_swallows(
             check_kind(s.text, literals=literals, scripts=scripts, make_check=make_check, defs=defs)
             for s in ungroup(split_segments(body))
         ),
+        lambda body, depth: _flat_swallows(
+            body,
+            extra,
+            opaque=opaque,
+            errexit=errexit,
+            scripts=scripts,
+            make_check=make_check,
+            base_segments=base_segments,
+            known=has_check,
+            strict_status=strict_status,
+            powershell=powershell,
+            defs=defs,
+            pipefail=pipefail,
+            scope=scope,
+            _gdepth=depth,
+        ),
+        errexit,
     )
 
     def check(i: int) -> bool:
@@ -2188,18 +2205,30 @@ def _ignored_groups(
     depth: int,
     judge: Callable[[str, int], list[Swallow]],
     holds_check: Callable[[str], bool],
+    leaving: Callable[[str, int], list[Swallow]],
+    errexit: bool,
 ) -> list[Swallow]:
     """The swallows inside a `( ... )` or `{ ...; }` that runs where `set -e` is off: a statement
     before the end of an `&&` / `||` list, the condition of `if`, `elif`, `while` and `until`,
-    or after `!`. The group's status is its last command's, so a check followed by anything inside
-    it is dropped (`( pytest; true ) && echo ok`), and `! group` inverts the check's status."""
+    or after `!`; with `errexit` off, also the last operand of a list. The group's status is its
+    last command's, so a check followed by anything inside it is dropped (`( pytest; true ) &&
+    echo ok`), and `! group` inverts the check's status. A subshell that runs `exit` or `trap` is
+    judged by `leaving` as a script of its own."""
     out: list[Swallow] = []
     for i, seg in enumerate(raw):
         m = _GROUP_HEAD.match(seg.text.lstrip())
         if not m or m["grp"].startswith("((") or (inner := group_inner(m["grp"])) is None:
             continue
         chained = i + 1 < len(raw) and raw[i + 1].sep in ("&&", "||")
-        if not (m["pre"] or chained) or seg.bg:
+        operand = seg.sep in ("&&", "||")  # in a list: the last operand's status is the list's
+        if seg.bg:
+            continue
+        if not (m["pre"] or chained or (operand and not errexit)):
+            # `exit 0` or `trap` inside a subshell (or a group that is not read flat) ends only
+            # that group, so it is read as a script of its own
+            if _LEAVES_SHELL.search(inner) and (m["grp"].startswith("(") or operand):
+                inside = leaving(inner, depth + 1)
+                out.extend(replace(w, line=seg.line + w.line - 1) for w in inside)
             continue
         if depth >= _NEST_BUDGET:
             out.append(Swallow(seg.line, "noerr", _short(seg.text), "a group nested too deeply"))
@@ -2678,18 +2707,64 @@ def _runner_end(family: str, tokens: list[str]) -> int | None:
     return None
 
 
-def _statement_words(tokens: list[str]) -> list[str]:
-    """`tokens` up to the pipe, and up to where a group that is not read whole ends (`{ pytest
-    tests; } | tee log`): a word that ends in `;` is the last of its statement, and a bare `}` or
-    `)` is no argument."""
+_SHIELD = {";": "\ue000", "}": "\ue001", ")": "\ue002", "|": "\ue003"}
+_UNSHIELD = str.maketrans({v: k for k, v in _SHIELD.items()})
+
+
+def _shielded(text: str) -> str:
+    """`text` with the characters that would end a statement once the quotes are gone (`;` at the
+    end of a word, a lone `}`, `)` or `|`) replaced by private marks when they are quoted or
+    escaped (`"r;"`, `"}"`, `\\;`): a quoted `;` is an argument, not the end of the statement."""
+    if '"' not in text and "'" not in text and "\\" not in text:
+        return text
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            out.append(_SHIELD[";"] if nxt == ";" else ch + nxt)
+            i += 2
+            continue
+        if ch in "\"'":
+            end = i + 1
+            while end < n and text[end] != ch:
+                end += 2 if ch == '"' and text[end] == "\\" else 1
+            if end >= n:
+                out.append(text[i:])
+                break
+            body = text[i + 1 : end]
+            alone = (i == 0 or text[i - 1].isspace()) and (end + 1 >= n or text[end + 1].isspace())
+            if body.endswith(";"):
+                body = body[:-1] + _SHIELD[";"]
+            elif alone and body in ("}", ")", "|"):
+                body = _SHIELD[body]
+            out.append(ch + body + ch)
+            i = end + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _unshielded(words: list[str]) -> list[str]:
+    return [w.translate(_UNSHIELD) for w in words]
+
+
+def _statement_words(text: str, defs: Mapping[str, str] | None = None) -> list[str]:
+    """The command words of statement `text`, up to the pipe, and up to where a group that is not
+    read whole ends (`{ pytest tests; } | tee log`): an unquoted word that ends in `;` is the
+    last of its statement, and an unquoted `}` or `)` is no argument. A quoted `;`, `}`, `)` or
+    `|` is an argument (`--junitxml "r;"`)."""
+    tokens = command_tokens(_shielded(text), defs)
     if "|" in tokens:
         tokens = tokens[: tokens.index("|")]
     for i, tok in enumerate(tokens):
         if tok in ("}", ")", ";"):
-            return tokens[:i]
+            return _unshielded(tokens[:i])
         if tok.endswith(";"):
-            return tokens[:i] + ([tok[:-1]] if tok[:-1] else [])
-    return tokens
+            return _unshielded(tokens[:i] + ([tok[:-1]] if tok[:-1] else []))
+    return _unshielded(tokens)
 
 
 def _calls(command: str, defs: Mapping[str, str] | None = None) -> list[tuple[Seg, list[str], str]]:
@@ -2700,7 +2775,7 @@ def _calls(command: str, defs: Mapping[str, str] | None = None) -> list[tuple[Se
         if (body := shell_c_body(seg.text, defs)) is not None:
             out.extend(_calls(body, defs))
             continue
-        out.append((seg, _statement_words(command_tokens(seg.text, defs)), seg.sep))
+        out.append((seg, _statement_words(seg.text, defs), seg.sep))
     return out
 
 
@@ -2777,7 +2852,7 @@ def selection_uses(
         retry = retries_ok and seg.sep == "||" and kind is not None and kind in chain
         if kind is not None:
             chain.append(kind)
-        tokens = _statement_words(command_tokens(seg.text, defs))
+        tokens = _statement_words(seg.text, defs)
         for family, flags in _ALL_FLAGS.items():
             start = _runner_end(family, tokens)
             if start is not None:
@@ -3490,6 +3565,20 @@ def _flag_words(args: Sequence[str], names: Sequence[str], several: bool) -> lis
     return out
 
 
+def _npm_root_only(args: Sequence[str]) -> bool:
+    """Whether the last workspaces flag of an `npm` run turns the workspaces off
+    (`--workspaces=false`, `--no-workspaces`, `--workspaces false`): only the root script runs."""
+    off = False
+    for i, tok in enumerate(args):
+        name, eq, value = tok.partition("=")
+        if tok == "--no-workspaces":
+            off = True
+        elif name in _NPM_ALL:
+            nxt = args[i + 1] if i + 1 < len(args) else ""
+            off = (value if eq else nxt) in ("false", "0")
+    return off
+
+
 def _monorepo_scope(tokens: Sequence[str]) -> tuple[str, dict[str, _Dim]] | None:
     """The packages one `turbo`, `pnpm`, `nx run-many`, `lerna run` or `yarn workspaces foreach`
     test run covers: its name filters (`!x` and the excluding flags leave packages out). A filter
@@ -3518,8 +3607,11 @@ def _monorepo_scope(tokens: Sequence[str]) -> tuple[str, dict[str, _Dim]] | None
             or not _runs_tests(args)
         ):
             return None
+        root_only = False
         if tool == "npm":  # `-ws` is every workspace; it is not `-w s`
+            root_only = _npm_root_only(args)
             args = [t for t in args if t not in _NPM_ALL and not t.startswith("--workspaces=")]
+            args = [t for t in args if t != "--no-workspaces"]
         flags, excluding, several = _MONOREPO_FLAGS[tool]
         named: list[str] = []
         left: list[str] = []
@@ -3529,6 +3621,11 @@ def _monorepo_scope(tokens: Sequence[str]) -> tuple[str, dict[str, _Dim]] | None
             elif not _GIT_FILTER.search(value):
                 named.append(value)
         left.extend(_flag_words(args, excluding, several))
+        if root_only and not named:  # only the root package's script runs
+            return tool, {
+                "filter": _Dim(False, frozenset({"<root package>"})),
+                "excludes": _Dim(False, frozenset(left)),
+            }
         return tool, {
             "filter": _Dim(not named, frozenset(named)),
             "excludes": _Dim(False, frozenset(left)),
