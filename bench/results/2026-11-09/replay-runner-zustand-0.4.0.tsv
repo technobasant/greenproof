@@ -1,0 +1,200 @@
+382d29c48	0	-	341	v5.0.16
+b48832394	0	-	531	chore(deps): update dev dependencies (#3593)
+f094eebe9	0	-	313	ci: build the docs with pmndrs/docs@v4 (#3570)
+2115efb9e	0	-	420	v5.0.15
+1f531ba45	0	-	523	chore(deps): update dev dependencies (#3560)
+04a8487ae	0	-	488	chore(workflows): remove resolutions (#3514)
+bfb2a9e7c	0	-	331	5.0.14
+62b2aff30	0	-	863	chore(deps): update dev dependencies (#3513)
+8476d2ca2	0	ci.tampered(warn)	550	update pnpm etc (#3512)
+6784d1e5b	0	-	366	workflow: stricter permissions 2
+889077ce6	0	-	365	workflow: stricter permissions
+6bc451efd	0	-	328	5.0.13
+8ec2169e8	0	-	681	chore(deps): update dev dependencies (#3486)
+00f96a389	0	-	337	chore(deps): bump actions/deploy-pages from 4.0.5 to 5.0.0 (#3447)
+206012dbd	0	-	455	5.0.12
+d714065f1	0	-	482	chore(deps): update dev dependencies (#3427)
+da381c39c	0	-	383	Fix README internal links for GitHub rendering (#3403)
+71469ea62	0	-	297	fix: update deploy-pages action commit hash (#3396)
+1bd914a58	0	-	377	Pin actions/deploy-pages to commit SHA for supply-chain security (#339
+49ac892e7	0	-	294	Upgrade workflow to use build.yml v3 and deploy-pages v4 (#3393)
+8eae4e971	0	-	367	Revamping docs - file restructuring (#3392)
+dbf43673b	0	-	316	Update build workflow reference to use latest version (#3385)
+7fc3991ab	0	-	344	ci(.github/workflows): pin GitHub Actions to commit hashes (#3381)
+99379a6ee	0	-	480	5.0.11
+c81b4eb1e	0	-	709	chore(deps): update dev dependencies (#3375)
+e7d459359	0	-	312	Revert "chore(deps): bump pmndrs/docs/.github/workflows/build.yml from
+0f49ad8d6	0	-	334	chore(deps): bump pmndrs/docs/.github/workflows/build.yml from 2 to 3 
+b0ea6ea01	0	-	327	chore(package.json): add 'build-watch' script for watch mode builds (#
+003b0a734	0	-	404	5.0.10
+9bb7f3ba2	0	-	484	chore(deps): update dev dependencies (#3353)
+bf07ccd2a	0	-	278	chore(deps): bump preactjs/compressed-size-action from 2 to 3 (#3316)
+32a3698e9	0	-	313	5.0.9
+350d9ec6b	1	ci.tampered(block)	866	chore(deps): update dev dependencies (#3309)
+2cfb6a72d	0	-	424	chore: publish.yml (#3307)
+82806501c	0	-	388	chore(deps): bump actions/checkout from 5 to 6 (#3306)
+18ab9e261	0	suppress.added(warn)	1182	chore: update dev dependencies (#3279)
+d0a1cae75	0	-	319	ci(.github/workflows): update 'actions/setup-node' to v6 (#3267)
+612d5c464	0	-	541	chore(eslint.config): replace deprecated 'tseslint.config' with 'defin
+fd1ea8ca9	0	-	381	ci(.github/workflows): update 'actions/checkout' and 'actions/setup-no
+4db616e1f	0	-	320	chore: upgrade pnpm to v10.15.0 (#3223)
+0ea8be27d	0	-	251	5.0.8
+cadcd3eb9	0	-	577	chore: update dev dependencies (#3218)
+463c9e3ea	0	-	470	5.0.7
+30e36798a	0	-	446	chore: udpate dev dependencies (#3194)
+b5845a9da	0	-	295	5.0.6
+4a5e814a0	0	-	538	chore: update dev dependencies (#3159)
+01749b01c	0	-	338	5.0.5
+ceb9744ac	0	-	475	chore: update dev dependencies (#3128)
+9a58ca9c9	0	-	526	chore(eslint): update to 'eslint-plugin-react-hooks@6.0.0-rc.1', remov
+312a7076f	0	-	398	5.0.4
+2a53f2ec7	0	-	467	chore(deps): update dev dependencies (#3104)
+850777bbf	0	-	304	react-native condition for CJS (#3087)
+473cfbf5a	0	-	258	ci(.github/workflows): rename 'cr' to 'preview-release' (#3069)
+35f5cbff1	0	-	342	ci(.github/workflows): rename 'compressed-size-action' to 'compressed-
+45974540d	0	-	418	ci(.github/workflows): add 'test.yml' and rename job (#3059)
+f85898fdb	0	-	532	chore(eslint.config.mjs): update 'eslint-plugin-react-hooks', 'eslint-
+90f45eb07	0	-	500	Chore/enhance prettier config (#3022)
+6a6ef4cea	0	-	290	chore(package.json): update fix script to run sequentially (#3020)
+ae32ca6be	0	-	538	chore(package.json): upgrade pnpm from v8 to v9 (#3012)
+08ec9441b	0	-	338	chore(package.json): reorder 'fix' scripts to run 'lint' before 'forma
+7df487420	0	-	319	add pnpm run fix script and update pr template (#2996)
+49ee6313d	0	-	320	chore(*): replace 'pnpm <command>' with 'pnpm run <command>' (#2991)
+4f64985b5	0	ci.tampered(warn)	356	do not run test before publish
+f42e67047	0	-	306	docs: rename readme file to uppercase (#2956)
+2fc9f8d9f	0	-	319	chore(package.json): use double quotes in scripts (#2954)
+fc104c2c1	0	-	421	chore(examples): remove 'pnpm-lock.yaml' (#2951)
+524a7b5d5	0	-	320	chore(rollup): migrate commonjs to esmodule (#2946)
+3f9127f4e	0	-	271	5.0.3
+6eff6e7ee	0	-	459	chore(deps): update dev dependencies (#2944)
+07b32d68a	0	-	279	change prettier to fix:format (#2936)
+6759fcbb5	0	-	410	chore(.github/workflows): change 'node-version' to 'lts/*' in 'actions
+55a7d0a15	0	suppress.added(warn)	529	chore(eslint): migrate to flat config and simplify (#2912)
+ebf2b7ab1	0	-	361	feat: starter example (#2913)
+5d92ad276	0	-	335	chore(.github/workflows/test-multiple-versions.yml): improve workflow 
+a7f51283a	0	-	464	chore(.github/workflows): improve workflow with removing duplicated co
+382eeaca0	0	-	260	chore: pkg.pr.new (#2904)
+fb6fb3595	0	-	270	chore(.github/workflows): unify format style (#2894)
+afe9c6161	0	-	306	chore(.github/workflows): update actions/setup-node's node-version 18 
+5a4d77127	0	ci.tampered(warn)	273	feat(vitest): update vitest config (#2881)
+2b7b09e2f	0	-	584	5.0.2
+d4549134e	0	-	384	chore(deps): update dev dependencies (#2880)
+5a8842fbc	0	-	482	test: add jest-dom matchers and eslint plugin (#2850)
+8b9c37456	0	-	714	test: use @vitest/eslint-plugin (#2845)
+f689d78a3	0	-	517	test: incorporate eslint-plugin-testing-library and fix reported issue
+c87a5d69a	0	-	661	5.0.1
+1068ff9d7	0	-	527	chore(deps): update dev dependencies (#2826)
+0007ef43a	0	-	460	remove tag:next packageConfig
+5408e012c	0	-	311	5.0.0
+803d1c8e4	0	-	525	chore: update dev dependencies (#2787)
+b93e11681	0	-	361	5.0.0-rc.2
+d77974992	0	-	457	chore(deps): update dev dependencies (#2743)
+88ee69f3e	0	-	585	chore: enable isolatedDeclarations (#2738)
+9e8b7a5ee	0	-	348	chore: using pmndrs/docs v2
+eea066426	0	-	356	5.0.0-rc.1
+08aadaffc	0	-	413	chore(deps): update dev dependencies (#2702)
+e051a8254	0	-	571	fixing pmndrs/docs workflow to @v1
+4c5cb7c6c	0	-	271	website: add github link (#2687)
+f9e6f815c	0	-	271	5.0.0-rc.0
+9b26718d6	0	-	262	chore: bear.jpg in ./docs (#2684)
+e247220ec	1	suppress.added(warn),tests.deleted(block),tests.removed(block),tests.replaced(block)	1028	v5 (#2138)
+24542f666	0	-	235	chore: `pmndrs/docs` workflow (#2674)
+ded02e9f6	0	-	271	4.5.5
+a00f3fa1f	0	suppress.added(warn)	644	chore(deps): update dependencies (#2680)
+66f3a029f	0	-	911	chore: enable verbatimModuleSyntax in tsconfig (#2649)
+688ddc9f9	0	-	319	update compressed-size-action.yml
+33cd0c0dd	0	-	573	ci: fix pnpm setup (#2628)
+f8403fc57	0	-	424	4.5.4
+b9d8ddd72	0	-	266	fix: no type field in package.json (#2622)
+b3684b31d	0	-	278	4.5.3
+48a4d8742	0	-	445	chore(deps): update dev dependencies (#2620)
+2af021801	0	-	623	chore: add react compiler eslint rules (#2612)
+88ef3407e	0	-	578	chore(deps): update dev dependencies (#2582)
+6750ac19c	0	-	357	chore: publish workflow (#2569)
+92a340a31	0	-	390	chore(deps): update dev dependencies (#2565)
+6d6383054	0	-	589	Migrate to pnpm (#2545)
+e00c69f82	0	-	219	chore: old ts versions to test in ci (#2469)
+d57072caf	0	ci.tampered(warn),suppress.added(warn)	773	update vitest (#2462)
+6f61b76fa	0	-	226	4.5.2
+96d6bb2ae	0	-	420	chore(deps): update dev dependencies (#2379)
+16b0ebf1b	0	-	281	Enable usage of Corepack (#2366)
+6109bc3bd	0	-	224	4.5.1
+e174cc891	0	-	393	chore(deps): update dependencies (#2345)
+13830c113	0	-	291	4.5.0
+d12b4fb13	0	-	375	chore(deps): update dev dependencies (#2297)
+fa04478ab	0	-	339	chore(immer): fix security issue (#2228)
+50a8677db	0	-	251	4.4.7
+15635ab78	0	-	524	chore(deps): update dev dependencies (#2217)
+9857a676a	0	-	992	refactor: revisit prettier config to be minimal (#2193)
+a836356b5	0	-	271	4.4.6
+efc8f6814	0	-	262	Update export types (#2170)
+e138de70b	0	-	315	4.4.5
+5ec9c0d83	0	-	349	chore(deps): update dev dependencies (#2162)
+91157db38	0	-	212	Apply publint recommendations (#2157)
+93c8ca564	0	-	253	4.4.4
+a67bc2483	0	-	494	chore(deps): update dev dependencies (#2134)
+90915ad1b	0	-	440	4.4.3
+e414f7ccf	0	-	239	fix(shallow): Extract shallow vanilla and react (#2097)
+ec538e9d4	0	-	276	4.4.2
+0504d4376	0	-	443	chore(deps): update dev dependencies (#2093)
+8b242ce82	0	suppress.added(warn)	217	fix(types)(middleware/devtools): avoid copying types (#1991)
+504aa40e0	0	-	335	upgrade @react-three/fiber (#2042)
+dc32aee6f	0	-	361	upgrade @types/tree (#2043)
+5062de131	0	suppress.added(warn)	222	chore: fix ide complaints (#2032)
+042697849	0	-	214	4.4.1
+29e182078	0	-	474	chore(deps): update dev dependencies (#1981)
+2778e71c8	0	-	261	4.4.0
+5777a65cf	0	-	653	chore(deps): update dev dependencies (#1965)
+a2ad77090	0	-	258	fix: declare @types/react as peerDep to avoid phantom dep (#1963)
+c6900a456	0	suppress.added(warn)	318	feat: deprecate equalityFn and add createWithEqualityFn (#1945)
+47649176e	0	runner.tampered(warn)	657	update example, move to vite
+ea40986e4	0	-	274	4.3.9
+16cafcaea	0	-	360	chore(deps): update dev dependencies (#1919)
+0784028ed	0	-	181	4.3.8
+c4e2809b6	0	-	387	chore(deps): update dev dependencies (#1789)
+496a466c2	0	suppress.added(warn)	862	chore(tests): migrate to vitest (#1753)
+1808bf4d3	1	ci.tampered(block)	231	fix: workflow file syntax error (#1786)
+f37530fc3	1	ci.tampered(block),suppress.added(warn)	723	chore: add extentsion in imports (#1678)
+da450384a	0	-	329	fix: sample startup failure issue fix (#1762)
+7cdb5f5bb	0	-	169	chore: prevent merging eslint configs (#1754)
+6b716fbdc	0	suppress.added(warn)	337	feature(demo): update demo to support copying typescript code (#1740)
+142b60025	0	-	153	4.3.7
+034572699	0	-	231	chore(deps): update dev dependencies (#1725)
+962f83e01	0	-	170	4.3.6
+cfcac01a9	0	-	347	chore(deps): update dev dependencies (#1677)
+6f8eca329	0	-	166	4.3.5
+6be46fd90	0	-	155	4.3.4
+7a0927aaf	0	-	257	chore(deps): update dev dependencies (#1660)
+8e3cc002e	0	-	184	4.3.3
+35a1e1047	0	-	332	chore(deps): update dev dependencies (#1618)
+b857d5e79	0	-	171	fix(build): reorder the types field in package.json (#1600)
+9062ca634	1	ci.tampered(block),ci.tampered(warn),suppress.added(warn),tests.skipped(block)	596	chore: remove `__DEV__` with ts-jest (#1598)
+05c41d040	0	-	168	fix(build): improve patch scripts (#1593)
+52e9feb2a	0	-	295	fix(demo): use named exports (#1554)
+35e275adf	0	-	178	4.3.2
+374ed7713	0	-	288	chore(deps): update dev dependencies (#1542)
+013a1ca5f	0	-	153	4.3.1
+a1d403490	0	-	192	4.3.0
+65290ba9c	0	-	291	chore(deps): update dev dependencies (#1522)
+e2e383ec3	0	-	168	4.2.0
+94d038428	0	-	314	chore(deps): update dev dependencies (#1501)
+0736a1c8b	0	-	207	4.1.5
+60b745817	0	-	355	chore(deps): update dev dependencies (#1467)
+c2248fd56	0	-	218	4.1.4
+b81adbb6a	0	-	480	chore(deps): update dev dependencies (#1402)
+296bb4bc9	0	-	214	fix(build): use *.d.mts for esm ('import' condition only) (#1387)
+d6f01e7aa	0	-	203	4.1.3
+d81881d40	0	-	329	chore(deps): update dev dependencies (#1379)
+509175c0b	0	-	208	4.1.2
+a576b3c96	0	-	460	chore(deps): update dev dependencies (#1351)
+93b5a43e8	1	ci.tampered(block),suppress.added(warn)	267	Rewrite `TakeTwo`, `SkipTwo` and `Mutate` to make them work for older 
+f0ff30f7c	0	-	378	chore(examples): move to demo subdir and eliminate rewired (#1305)
+4ed81bc11	0	-	175	Add usage with context to docs (#1291)
+9cfad3eae	0	-	158	4.1.1
+604930988	0	-	133	4.1.0
+d55b92f55	0	-	252	chore(deps): update dev dependencies (#1201)
+cf46b4245	0	-	127	4.0.0
+f98d18672	0	-	319	chore(deps): update dev dependencies (#1132)
+0fa3abd66	0	-	212	4.0.0-rc.4
+f5490a151	0	-	203	4.0.0-rc.3
+b794308b7	0	-	344	chore(deps): update dev dependencies (#1116)

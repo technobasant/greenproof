@@ -1,0 +1,9 @@
+repo: replay/cobra
+commits scanned: 64
+blocked: 3 (4.7%)
+blocked commits per rule:
+  runner.tampered: 2
+  tests.deleted: 1
+  tests.weakened: 1
+check duration ms: median 573, p95 5913
+process wall time ms: median 3770, p95 8630

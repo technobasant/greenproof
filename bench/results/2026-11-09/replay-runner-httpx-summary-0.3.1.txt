@@ -1,0 +1,11 @@
+repo: replay/httpx
+commits scanned: 96
+blocked: 9 (9.4%)
+blocked commits per rule:
+  runner.tampered: 4
+  tests.removed: 4
+  tests.weakened: 3
+  tests.deleted: 1
+  tests.replaced: 1
+check duration ms: median 705, p95 7623
+process wall time ms: median 3680, p95 9965

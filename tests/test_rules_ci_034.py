@@ -287,7 +287,7 @@ def test_a_commit_with_no_script_or_action_never_builds_the_world(
 
 def test_an_oversized_script_is_not_read(tmp_path: Path) -> None:
     base = {SH: SET_E}
-    big = "#!/bin/sh\nset -e\n" + "# pad\n" * 20000 + "pytest\n"
+    big = "#!/bin/sh\nset -e\n" + "# pad\n" * 200_000 + "pytest\n"
     assert len(big) > ci_rule._MAX_SCRIPT
     found = run(tmp_path, base, {SH: big})
     assert verdict(found) == "block"  # the base ran two checks; the candidate's script is unread

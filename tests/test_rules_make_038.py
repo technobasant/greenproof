@@ -177,10 +177,18 @@ def test_twin_that_is_narrower_or_also_masked_still_blocks(tmp_path: Path, recip
 
 @pytest.mark.parametrize(
     "head",
-    [".IGNORE:\n", ".IGNORE: test\n", "MAKEFLAGS += -i\n", ".ONESHELL:\n"],
+    # .ONESHELL left out in 0.4.0: without .POSIX the joined recipe runs under `sh -c` with no -e,
+    # so its status is the last line's, and an unmasked last-line twin keeps the check (see
+    # tests/test_rules_runner_040.py; spec_make8 `twin-oneshell` was relabelled the same way)
+    [".IGNORE:\n", ".IGNORE: test\n", "MAKEFLAGS += -i\n"],
 )
 def test_twin_is_not_credited_where_make_ignores_or_joins_lines(tmp_path: Path, head: str) -> None:
     new = f"{head}test:\n\tmkdir -p out && pytest > out/log.txt; true\n\tpytest\n"
+    assert mk(tmp_path, new) == "block"
+
+
+def test_oneshell_twin_that_is_not_the_last_line_still_blocks(tmp_path: Path) -> None:
+    new = ".ONESHELL:\ntest:\n\tpytest\n\tmkdir -p out && pytest > out/log.txt; true\n"
     assert mk(tmp_path, new) == "block"
 
 

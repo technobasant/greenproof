@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from greenproof.rules.tests_flow import DEAD, MAX_DEPTH, PathState, join_states
 
 MAX_NODES = 20_000
+MAX_HELPER_DEPTH = 3  # how many helper calls deep a row value is followed into
 _MARKER = re.compile(r"request\s*\.\s*node|PYTEST_CURRENT_TEST|\bnodeid\b|callspec")
 _FAILS = frozenset({"fail"})
 _SKIPS = frozenset({"skip", "skipTest", "xfail"})
@@ -90,7 +91,20 @@ def _swallowing(handler: ast.ExceptHandler) -> bool:
 
 
 class _Walk:
-    def __init__(self, fn: ast.FunctionDef | ast.AsyncFunctionDef, names: set[str]) -> None:
+    def __init__(
+        self,
+        fn: ast.AST,
+        names: set[str],
+        helpers: Mapping[str, ast.FunctionDef | ast.AsyncFunctionDef] | None = None,
+        stack: tuple[str, ...] = (),
+    ) -> None:
+        self.helpers = helpers
+        self.unique: set[str] = set(getattr(helpers, "unique", ())) if helpers else set()
+        self.stack = stack
+        # In a helper: a `return` ends the call, not the test; its state is kept here.
+        self.sink: list[PathState] | None = None
+        self.fold = False  # walking the body of a fold loop: `continue` and `break` leave the row
+        self.inner = 0  # loops entered inside it
         self.names = set(names)
         for _ in range(2):
             for n in ast.walk(fn):
@@ -196,7 +210,13 @@ class _Walk:
         depth: int,
     ) -> PathState:
         if isinstance(node, ast.Return):
+            if self.sink is not None:
+                self.sink.append(st)
+                return DEAD
             self.report(st, "return", guards)
+            return DEAD
+        if isinstance(node, (ast.Continue, ast.Break)) and self.fold and not self.inner:
+            self.report(st, "continue" if isinstance(node, ast.Continue) else "break", guards)
             return DEAD
         if isinstance(node, ast.Raise):
             return DEAD
@@ -213,6 +233,9 @@ class _Walk:
                 if tail in _SKIPS:
                     self.report(st, ast.unparse(v.func), guards)
                     return DEAD
+                inlined = self.helper_call(v, st, guards)
+                if inlined is not None:
+                    return inlined
             if isinstance(v, ast.BoolOp) and not isinstance(v.values[0], ast.Call):
                 after = st
                 for rest in v.values[1:]:
@@ -227,7 +250,9 @@ class _Walk:
         if isinstance(node, ast.If):
             return self.if_(node, st, guards, rescue, depth)
         if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            self.inner += 1
             end = self.body(node.body, st, guards, rescue, depth + 1)
+            self.inner -= 1
             return st if not (end.u or end.a) else end
         if isinstance(node, (ast.Try, ast.TryStar)):
             return self.try_(node, st, guards, rescue, depth)
@@ -238,6 +263,50 @@ class _Walk:
         if isinstance(node, ast.Match):
             return self.match(node, st, guards, rescue, depth)
         return st
+
+    def helper_call(
+        self, call: ast.Call, st: PathState, guards: list[tuple[str, bool]]
+    ) -> PathState | None:
+        """Read a call of one of the file's own plain helpers, defined once at module level, as if
+        its body stood here: the parameters that receive a row value carry it. None when the call
+        is not such a call, or no argument uses a row value (the name test then decides)."""
+        func = call.func
+        if (
+            self.helpers is None
+            or not isinstance(func, ast.Name)
+            or func.id not in self.unique
+            or func.id in self.stack
+            or len(self.stack) >= MAX_HELPER_DEPTH
+            or any(isinstance(a, ast.Starred) for a in call.args)
+            or any(k.arg is None for k in call.keywords)
+        ):
+            return None
+        fn = self.helpers[func.id]
+        a = fn.args
+        positional = [p.arg for p in (*a.posonlyargs, *a.args)]
+        known = {*positional, *(p.arg for p in a.kwonlyargs)}
+        bound = {n for n, arg in zip(positional, call.args, strict=False) if _has(arg, self.names)}
+        bound |= {k.arg for k in call.keywords if k.arg in known and _has(k.value, self.names)}
+        if not bound:
+            return None
+        sub = _Walk(fn, bound, self.helpers, (*self.stack, func.id))
+        sub.sink = []
+        sub.count = self.count
+        sub.uniform = self.uniform
+        sub.strong = sub.strong_exists(fn)
+        end = sub.body(fn.body, st, guards, False, 0)
+        self.count = sub.count
+        if sub.bad and not self.bad:
+            self.bad = sub.bad
+        for early in sub.sink:
+            end = join_states(end, early, True, func.id, "if")
+        if any(early.u for early in sub.sink):
+            end = end._replace(
+                u=True, why=end.why or f"`{func.id}` can return before asserting a row value"
+            )
+        if end.u and not end.why and not end.weak:
+            end = end._replace(why=f"`{func.id}` does not assert a row value on every path")
+        return end
 
     def assert_cond(self, node: ast.Assert, st: PathState, rescue: bool) -> PathState:
         """`assert a or b` and `assert x if c else True` check the row value only when the left
@@ -336,17 +405,34 @@ class _Walk:
         return join_states(res, st, dep, f"{shown} matches a case", "switch")
 
 
-def row_gap(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, bool]:
+def row_gap(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    helpers: Mapping[str, ast.FunctionDef | ast.AsyncFunctionDef] | None = None,
+    fold: tuple[set[str], ast.For] | None = None,
+) -> tuple[str, bool]:
     """(why a row of the parametrized test can finish without asserting a row value else "",
-    whether the body was too large to read)."""
-    names = param_names(fn)
-    if not names:
-        return "", False
-    w = _Walk(fn, names)
-    w.strong = w.strong_exists(fn)
+    whether the body was too large to read). `helpers` are the functions of the file a call may be
+    read through; `fold` is a `subTest` loop that stands for the rows: its variables and the loop,
+    whose body is then the walked body."""
+    if fold is not None:
+        names, loop = fold
+        w = _Walk(loop, names, helpers)
+        w.fold = True
+        stmts: Sequence[ast.stmt] = loop.body
+        w.strong = w.strong_exists(loop)
+    else:
+        names = param_names(fn)
+        if not names:
+            return "", False
+        w = _Walk(fn, names, helpers)
+        stmts = fn.body
+        w.strong = w.strong_exists(fn)
     try:
-        end = w.body(fn.body, PathState(True, False, "", ""), [], False, 0)
+        end = w.body(stmts, PathState(True, False, "", ""), [], False, 0)
     except _TooBig:
         return "", True
     w.finish(end)
+    if fold is not None and not w.bad and end.u:
+        # A new fold is read strictly: a loop body that never asserts a row value is no fold.
+        w.bad = "the loop body does not assert a row value on every path"
     return w.bad, False

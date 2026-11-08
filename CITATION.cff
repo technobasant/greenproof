@@ -6,7 +6,7 @@ authors:
   - family-names: Bhattarai
     given-names: Basant
     website: "https://basantbhattarai.com.np"
-version: 0.3.1
-date-released: "2026-11-08"
+version: 0.4.0
+date-released: "2026-11-09"
 license: Apache-2.0
 repository-code: "https://github.com/technobasant/greenproof"

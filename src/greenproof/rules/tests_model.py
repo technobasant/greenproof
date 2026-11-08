@@ -56,6 +56,27 @@ class Table:
         return ""
 
 
+@dataclass(frozen=True)
+class RowTab:
+    """A literal table of rows that drives a Python test's checks: a `for` loop (a subTest fold
+    or a plain loop) or a `parametrize` decorator. `rows` is the number of distinct rows, None
+    when the table cannot be read (`why` is "altered" for a module-level name re-bound or mutated
+    after its literal, "opaque" otherwise). `reads` is whether an assertion reads the row's
+    variables; `sig` the assertion forms the loop body checks; `keys` the distinct rows."""
+
+    kind: str  # "loop" or "param"
+    names: tuple[str, ...]
+    sig: str
+    rows: int | None
+    reads: bool
+    why: str = ""
+    name: str = ""  # the module-level name the table is read through, else ""
+    keys: tuple[str, ...] = ()
+    literal: bool = True  # a parametrize whose argvalues are a literal (the case count covers it)
+    asserts: int = 0  # the assertions the loop body counts (once, not per row)
+    counted: bool = False  # the loop is the accepted fold whose rows `param_cases` already counts
+
+
 @dataclass
 class Unit:
     """One test. `key` is its qualified name without the path, so a move keeps its identity."""
@@ -66,6 +87,16 @@ class Unit:
     body_hash: str
     engine: str  # "python" (AST), "python-lines", "js", "go", "rust"
     asserts: int = 0
+    # JS, Go, Rust: the checks with each same-file helper call at what its body checks and each
+    # literal-table loop at its distinct rows. It never lowers a block; it only turns a drop of
+    # `asserts` into a warning when the candidate's is no lower than the base's (SPEC 5.4).
+    credited: int = 0
+    # Go: the sorted literals of the test outside messages and names (table rows and the bodies
+    # of the helpers it calls included), and those of its check lines and table rows. A credit
+    # turns a drop into a warning only when every literal of the base's checks is still among
+    # the candidate's (SPEC 5.4).
+    credit_lits: tuple[str, ...] = ()
+    check_lits: tuple[str, ...] = ()
     strong: int = 0
     weak: int = 0
     broad_raises: int = 0
@@ -80,6 +111,7 @@ class Unit:
     row_gap: str = ""
     row_big: bool = False
     param_marked: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
+    row_tabs: tuple[RowTab, ...] = ()  # Python: the literal row tables that drive its checks
     mark_kinds: set[str] = field(default_factory=set)  # skip, skipif, xfail marks on the test
     subjects: set[str] = field(default_factory=set)  # dotted names of the code under test called
     swallowed: int = 0

@@ -1,0 +1,166 @@
+da2706c3e	0	-	477	fix(persist): preserve external devtools action arguments (#3592)
+a1fea2e2a	0	-	448	fix(devtools): preserve shared connections during store cleanup (#3580
+d867e6f22	0	-	425	fix(devtools): apply serialize.reviver when parsing devtools messages 
+1f531ba45	0	-	597	chore(deps): update dev dependencies (#3560)
+3febf8c6d	0	-	338	fix(persist): clearStorage() should invalidate concurrent async rehydr
+f44cecc72	0	-	649	fix(devtools): correct V8 stack regex when source path contains spaces
+ad77bd3bb	0	suppress.added(warn)	213	fix(devtools): improve type inference for Devtools initializer (#3511)
+8ec2169e8	0	-	688	chore(deps): update dev dependencies (#3486)
+4e9bcf0c8	0	-	450	fix(devtools): support Firefox/Safari stack format in findCallerName (
+c7516c116	0	-	448	fix(tests): change parameters for 'expect' in test (#3483)
+95d3f338c	0	-	185	test(middleware/immer): add runtime tests for immer middleware (#3471)
+63300440c	0	-	178	test: expand React subscribe test coverage (#3442)
+6213fc11b	0	-	270	fix(persist): use latest state in post-rehydration callback (#3391)
+3871d5392	0	-	212	fix(immer): Proper typing for immer middleware in combination with sli
+3e329e5ac	0	-	212	test(ssr): remove 'skipIf' since all CI React versions are 18+ (#3356)
+3cb547d5e	0	-	174	test(middlewareTypes): replace 'void' with 'expectTypeOf' for type ass
+d0cb549ff	0	-	177	fix(persist): prevent race condition during concurrent rehydrate calls
+59e8783db	0	-	295	test: remove eslint-disable for no-unused-expressions (#3349)
+376af7887	0	-	321	test: migrate 'findByText' and 'waitFor' to fake timers with 'getByTex
+234a948a0	0	suppress.added(warn)	267	chore(eslint): enable 'testing-library', 'jest-dom', 'vitest' plugins 
+350d9ec6b	1	ci.tampered(block)	973	chore(deps): update dev dependencies (#3309)
+18ab9e261	0	suppress.added(warn)	1167	chore: update dev dependencies (#3279)
+d25a4d226	0	suppress.added(warn)	405	docs and tests: filter out specific actions from being sent to Redux D
+ab5a98b18	0	-	411	test: fix for node 24 (#3278)
+feddc0c21	0	-	269	feat(middleare/persist): return storage promise from setState (#3206)
+2cc19881f	0	-	144	fix(shallow): undefined value (#3205)
+295bf970a	0	-	265	test(*): add 'expect' with 'toBeInTheDocument' (#3162)
+73b91d370	0	-	193	refactor: remove unused import in example & fix typo in tests (#3161)
+a6143e0f2	0	-	185	test(shallow): update 'shallow' and 'useShallow' imports to use 'zusta
+9d5882031	0	-	345	chore: fix some typos in comment (#3139)
+a03acc388	0	-	128	test(vanilla/subscribe): add test for covering fireImmediately option 
+ad32cdf7a	0	-	109	test(vanilla/basic): add test for 'getInitialState' (#3130)
+670b60e19	0	-	512	feat(devtool): inferred action type (#2987)
+6953c29dc	0	-	128	test(vanilla/shallow): add test for pure iterable with different value
+b4177b317	0	suppress.added(warn)	372	feat: add devtools.cleanup() method (#3111)
+a56a3e4bd	0	-	103	feat(vanilla): update shallow compare function and tests (#3108)
+9a58ca9c9	0	-	605	chore(eslint): update to 'eslint-plugin-react-hooks@6.0.0-rc.1', remov
+9bae06922	0	-	293	fix(persist): fix async migrate on persist middleware (#2877)
+af7ff2119	0	-	260	fix(middleware): devtools type error #2700 (#2875)
+5a8842fbc	0	-	450	test: add jest-dom matchers and eslint plugin (#2850)
+8b9c37456	0	-	685	test: use @vitest/eslint-plugin (#2845)
+f689d78a3	0	-	748	test: incorporate eslint-plugin-testing-library and fix reported issue
+dcc4c098a	0	-	319	test: use screen exposed by React Testing Library (#2832)
+9525f9264	0	-	115	fix(shallow): iterable-like insensitive keys order comparison (alterna
+259c19ff2	0	-	151	fix(shallow): fallback map-like iterator comparison (#2795)
+d7345da7c	0	suppress.added(warn)	162	Fix Immer type inference for `setState` (#2696)
+e247220ec	1	suppress.added(warn),tests.deleted(block),tests.removed(block),tests.replaced(block)	1093	v5 (#2138)
+a00f3fa1f	0	suppress.added(warn)	798	chore(deps): update dependencies (#2680)
+dad36416d	0	-	184	fix(storage): avoid calling setItem with the state just retrieved (#26
+66f3a029f	0	-	665	chore: enable verbatimModuleSyntax in tsconfig (#2649)
+d57072caf	0	ci.tampered(warn),suppress.added(warn)	902	update vitest (#2462)
+c092d7626	0	suppress.added(warn)	479	chore(tests): suppress expected warnings (#2398)
+740033cf3	0	suppress.added(warn)	214	feat: getInitialState (#2277)
+9baf0a5d3	0	-	258	chore(test): stop testing deprecated features and test subscribe in va
+949b505a4	0	-	131	fix(vanilla): unexpected null state update behavior (#2213)
+9857a676a	0	-	1265	refactor: revisit prettier config to be minimal (#2193)
+e414f7ccf	0	-	482	fix(shallow): Extract shallow vanilla and react (#2097)
+0504d4376	0	-	526	chore(deps): update dev dependencies (#2093)
+3cbd468fe	0	-	119	feat: add useShallow (#2090)
+1e846b39b	0	-	163	test(ssr): Validate state synchronization between server and client in
+5777a65cf	0	-	1043	chore(deps): update dev dependencies (#1965)
+c6900a456	0	suppress.added(warn)	373	feat: deprecate equalityFn and add createWithEqualityFn (#1945)
+496a466c2	0	suppress.added(warn)	1165	chore(tests): migrate to vitest (#1753)
+630ba1a3e	0	suppress.added(warn)	239	feat(middleware/persist): improve createJSONStorage for Maps (#1763)
+f37530fc3	1	ci.tampered(block),suppress.added(warn)	759	chore: add extentsion in imports (#1678)
+f54469551	0	-	229	fix(middleware/persist): ensure argument for `onRehydrateStorage` and 
+309c672fb	0	-	257	fix(middleware/persist): ensure `persist` does not drop updates in `on
+38c905564	0	-	291	feat(middleware/persist): add skip hydration option #405 (#1647)
+4517fed81	0	-	167	fix(react, types): relax react types (#1589)
+9062ca634	1	ci.tampered(block),ci.tampered(warn),suppress.added(warn),tests.skipped(block)	1127	chore: remove `__DEV__` with ts-jest (#1598)
+a5a8f2899	0	-	192	fix(middleware/persist): hydrate in sync (new impl with storage option
+0b55a3d74	0	suppress.added(warn)	723	feat: deprecate default export (#1514)
+1e986ec97	0	-	276	feat(middleware/persist): new storage option (#1463)
+633c7dd7a	0	suppress.added(warn)	326	feat(middleware/devtools): Better redux devtools. One connection for a
+ed526d074	0	-	138	feat(shallow): Add support of Maps and Sets to shallow comparator (#14
+ca059788d	0	-	188	fix(types): fix `StateCreator` subtyping (#1373)
+b36f29af3	0	-	131	fix(types): assume `getState` and `setState` will always exist on the 
+a576b3c96	0	-	721	chore(deps): update dev dependencies (#1351)
+93b5a43e8	1	ci.tampered(block),suppress.added(warn)	298	Rewrite `TakeTwo`, `SkipTwo` and `Mutate` to make them work for older 
+ae4cc7f1b	0	-	172	fix: should use Object.is to compare two value (#1314)
+5ca63d1d6	0	-	137	test: rename persistent (#1315)
+b3dc3d64b	0	-	231	chore(tests): enable StrictMode as much as possible (#1262)
+c60a535a4	0	-	261	feat(vanilla): non-object state (#1144)
+ed12c7eda	0	-	229	fix(types)(middleware/devtools): fix action type in devtools's setStat
+75d0886cd	1	tests.removed(block)	276	chore(tests): remove imperfectly working test added in #276 (#1184)
+fa581ddd9	0	suppress.added(warn)	590	fix(docs): useBoundStore instead of useStore (#1125)
+a4b08a10f	0	-	233	refactor(types): avoid using deprecated types in tests (#1126)
+0938b17a7	0	-	178	fix(shallow): types with useStore again (#1117)
+05a4c15ce	0	suppress.added(warn)	114	fix(shallow): types with useStore (#1108)
+060c09269	0	-	372	fix(types): use TS interfaces only for public api (#1106)
+37112e585	0	-	178	feature(persist): add method getOptions on persist api and update docu
+81d7c4fa1	0	-	155	fix(types): remove `Partial` typo from `persist` (#1051)
+f949d04ff	0	-	98	tests(shallow): Compare functions test was added (#1071)
+3d764b0a4	0	suppress.added(warn)	368	refactor: prefer interfaces (#1012)
+0ae0293e8	0	-	280	breaking(middleware/devtools): remove checking old string option (#933
+279bfb1e6	1	suppress.added(warn),tests.replaced(block)	218	fix(middleware/devtools): add `enabled` option and show devtools warni
+2a2c180c7	0	-	388	fix(middleware): separate immer middleware (#915)
+99cddcf76	0	suppress.added(warn)	392	breaking(types): Add higher kinded mutator types (#725)
+943af082a	0	suppress.added(warn)	211	breaking(middleware/devtools): remove deprecations and warnings (#892)
+a34649d35	0	suppress.added(warn)	487	feat: use-sync-external-store (#550)
+5eaffff31	0	-	250	fix(middleware/persist): Merge storage value with the latest store sta
+52cc17a9f	0	-	90	fix(context): revert removing overloads in `UseContextStore` (#817)
+a418fd748	0	suppress.added(warn)	197	Migrations regarding higher kinded mutators for v4 (#772)
+5b938fbbf	1	ci.tampered(block),suppress.added(warn)	697	feat(build): use __DEV__ to control development mode (#789)
+5b3b96318	0	suppress.added(warn)	143	fix(middleware): revert devtools extension connector with try-catch (#
+cb99a36c5	0	suppress.added(warn)	162	devtools: minor fixes (#720)
+c54d1df87	0	suppress.added(warn)	236	fix(middleware): devtools work in non-browser (#693)
+58baf2747	0	suppress.added(warn)	317	rewrite `devtools` (#675)
+30f5505cd	0	-	228	chore(eslint): add recommended rules and etc (#678)
+e3566f9b5	0	-	142	chore(tests): for issue 650 (#651)
+d28169d1b	0	-	199	feat(middleware): add onFinishHydration to persist api (#646)
+62238d492	0	-	143	fix(types): fix core types to better handle middleware types (#641)
+2bc4de3c6	0	-	260	feat(middleware): devtools to patch api.setState with namedSet and fix
+6f95f128b	0	tests.replaced(warn)	144	fix(tests): add #632 example and improve middleware types tests (#633)
+8665dd6cf	0	suppress.added(warn)	297	feat(middleware): add persist api (#624)
+3889419fb	0	-	144	chore(tests): more typing example with subscribeWithSelector (#621)
+7e94455d2	0	suppress.added(warn),tests.replaced(warn)	408	fix(middleware): simplify middleware types and allow explicit typing (
+ad318f3eb	0	suppress.added(warn)	136	fix(middleware): types and devtools (#613)
+ae888bdb0	0	-	157	fix(tests): immer middleware type test (#610)
+6ee3ed03b	0	-	109	fix(context): custom store type for createContext (#606)
+37ff96556	0	suppress.added(warn)	143	feat(middleware): subscribeWithSelector middleware (#603)
+5f5527d59	0	-	113	fix(types): Rename from UseStore to UseBoundStore (#595)
+10cb45c20	0	suppress.added(warn)	231	feat(types): better middleware support (#601)
+3d4297971	0	-	163	feat(persist): add persistFilter option & deprecate whitelist/blacklis
+2367abb18	1	ci.tampered(block),ci.tampered(warn)	268	chore(ci): multiple version tests (#575)
+12b611139	0	-	122	refactor(tests): cleaner tests (#580)
+ae86695c4	0	-	327	refactor(test): use aliases (#571)
+2a412500f	0	-	623	refactor: stricter tsconfig (#544)
+bbd379332	0	suppress.added(warn)	113	Allow optional REDUX DEVTOOLS "options" object (#540)
+e47ea038f	0	-	217	chore: update eslintrc and use react-jsx (#531)
+08f5d8339	0	-	143	fix(persist): #409 (#470)
+25a5e85c7	0	-	126	fix(persist): merge function not working with async storages (#469)
+3ca105eb6	0	suppress.added(warn)	207	feat(persist): add a merge function option (#466)
+d57f12377	0	-	138	fix(persist): #451 (#455)
+52519a30d	0	suppress.added(warn)	104	Fix/context create store (#447)
+107d1f12d	0	-	73	fix(context): stable storeApi (#444)
+fee7c590e	0	-	120	Fix failing test in persistAsync.test.tsx (#442)
+836aeaecc	0	-	450	make type NamedSet compatible with type SetState (#441)
+3b4b2b5f3	0	-	168	Pass correct argument to onRehydrateStorage when the migrate function 
+78ea66763	0	-	182	Extend test case for async perist middleware (#436)
+6e9fc69c4	0	-	120	Extend test case for perist middleware (#431)
+86721591c	0	-	124	Add test with missing migrate function to persistAsync.test.tsx (#430)
+df6fd1dcd	0	-	87	Change tests for subscribe() to use jest.fn() (#429)
+0da92ef24	1	tests.weakened(block)	103	Use jest.fn() to test callbacks (#423)
+4632b74ff	0	-	84	Split test for subscribe() into independent it() functions (#427)
+d6fa004c6	0	-	186	Move some tests out of basic.test.tsx into separate files (#424)
+b259c2a89	0	suppress.added(warn)	153	Remove usage of `any` from tests (#417)
+d2a587c51	0	-	249	Remove unnecessary console.error mocks from tests (#420)
+b528e1247	0	-	171	Rename persist.test.tsx to persistAsync.test.tsx and wrap in describe(
+eb808d498	0	-	94	Remove it.only() from test so that all tests get executed (#415)
+f62d4487b	1	tests.focused(block)	182	Migrating Async/Await to Promise (#403)
+9246dcec5	0	suppress.added(warn)	181	(types): improve types for setState (#397)
+e93b8ec33	0	-	98	Add useStoreApi context hook (#380)
+9d3a701e8	0	-	285	chore: rename to pmndrs from react-spring
+611551c40	0	-	295	#182 SSR data is shared (#375)
+f43d1127e	0	-	194	fix: remove mandatory index signature (#376)
+52e644860	0	suppress.added(warn)	143	(types): improve types for setState (#320)
+2ac38de04	0	suppress.added(warn)	194	Fix persist error forwarding (#292)
+ba0396ab6	0	-	140	feat: works with useLayoutEffect (#280)
+58c286e6c	0	-	228	fixed an issue in type infering while using eq function in hooks (#266
+38ddba491	0	-	188	Expose previous value in subscribe (#241)
+ca6328954	0	suppress.added(warn)	165	add equality check test (#237)
+af8ea5958	0	-	155	fix tests with toHaveBeenCalled as suggested in #234
+6d8e7ab20	0	-	161	fix eslint warnings in tests
+5ad795d5c	0	-	263	rename to basic.test.tsx
+97db4c5a1	0	-	217	Fix shallow types and add shallow test (#189)

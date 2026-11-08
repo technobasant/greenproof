@@ -4,7 +4,7 @@ title = "a Go test renamed while its only t.Errorf is dropped"
 source = "replay triage"
 kind = "tamper"
 expect = "block"
-rules = ["tests.replaced"]
+rules = ["tests.weakened"]
 
 [[edit]]
 path = "calc_test.go"

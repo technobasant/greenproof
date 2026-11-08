@@ -88,7 +88,9 @@ PROBES = [
     tamper("twin-dash", "pymake", mk(f"{RUN} || true", f"-{RUN}")),
     tamper("twin-ignore-all", "pymake", mk(f"{RUN} || true", RUN, head=".IGNORE:\n")),
     tamper("twin-ignore-flag", "pymake", mk(f"{RUN} || true", RUN, head="MAKEFLAGS += -i\n")),
-    tamper("twin-oneshell", "pymake", mk(f"{RUN} | tee log.txt", RUN, head=".ONESHELL:\n")),
+    # relabelled in 0.4.0: without .POSIX, a .ONESHELL recipe runs under `sh -c` with no -e, so
+    # its status is the last line's; an unmasked last-line twin keeps the check (was a tamper)
+    honest("twin-oneshell", "pymake", mk(f"{RUN} | tee log.txt", RUN, head=".ONESHELL:\n")),
     tamper("twin-other-tool", "pymake", mk(f"{RUN} || true", "flake8")),
     # ---- .ONESHELL: a `set` in the recipe holds for the lines after it
     honest("oneshell-set-e", "pymake", mk("set -e", RUN, "echo done", head=".ONESHELL:\n")),

@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from greenproof.rules.tests_flow import Flow, expanded, leaves_early, mentions, read_flow, rowish
-from greenproof.rules.tests_model import Table
+from greenproof.rules.tests_model import FileAnalysis, Marker, Table, Unit
 
 if TYPE_CHECKING:
     from greenproof.rules.tests_lines import _Src
@@ -153,12 +154,11 @@ def _split_at(shadow: str, sep: str) -> list[tuple[int, int]]:
     return out
 
 
-def _row_cells(
+def _row_parts(
     elem: str, lang: str, columns: Sequence[str]
-) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    """The values of one JS or Go row by column: `[1, 2, 3]` and `{1, 2, 3}` by position (named
-    by `columns` where known), `{a: 1, b: 2}` by key, a bare value as the first column. A row
-    that is not one of these has no cells."""
+) -> tuple[list[tuple[str, str]], bool, int] | None:
+    """The parts of one JS or Go row: ([(column, text)], whether they are keyed, where the
+    composite starts in `elem`), or None when the row is not a bracketed list."""
     sh = _shadow_text(elem, lang)
     start = len(sh) - len(sh.lstrip())
     if lang == "go":
@@ -166,11 +166,11 @@ def _row_cells(
         if mk is not None and "{" in sh[mk.end() :]:
             start = sh.index("{", mk.end())
     body = sh[start:].rstrip()
-    first = columns[0] if columns else "0"
     if not body or body[0] not in "[{" or body[-1] != {"[": "]", "{": "}"}[body[0]]:
-        return ((first, tokens(elem[start:], lang)),) if body else ()
+        return None
     inner_sh, inner = body[1:-1], elem[start + 1 : start + len(body) - 1]
-    cells: list[tuple[str, tuple[str, ...]]] = []
+    parts: list[tuple[str, str]] = []
+    keyed = False
     for idx, (a, b) in enumerate(
         s for s in _split_at(inner_sh, ",") if inner_sh[s[0] : s[1]].strip()
     ):
@@ -178,10 +178,30 @@ def _row_cells(
         km = _KEY.match(part_sh) if lang != "rust" else None
         if km is not None:
             key = next(g for g in km.groups() if g is not None)
-            cells.append((key, tokens(part[km.end() :], lang)))
+            parts.append((key, part[km.end() :]))
+            keyed = True
         else:
-            cells.append((columns[idx] if idx < len(columns) else str(idx), tokens(part, lang)))
-    return tuple(cells)
+            parts.append((columns[idx] if idx < len(columns) else str(idx), part))
+    return parts, keyed, start
+
+
+def _row_cells(
+    elem: str, lang: str, columns: Sequence[str]
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """The values of one JS or Go row by column: `[1, 2, 3]` and `{1, 2, 3}` by position (named
+    by `columns` where known), `{a: 1, b: 2}` by key, a bare value as the first column. A row
+    that is not one of these has no cells."""
+    got = _row_parts(elem, lang, columns)
+    if got is None:
+        sh = _shadow_text(elem, lang)
+        start = len(sh) - len(sh.lstrip())
+        if lang == "go":
+            mk = re.compile(r"\s*(?:\"[^\"]*\"|`[^`]*`|[\w.]+)\s*:(?!=)").match(sh)
+            if mk is not None and "{" in sh[mk.end() :]:
+                start = sh.index("{", mk.end())
+        first = columns[0] if columns else "0"
+        return ((first, tokens(elem[start:], lang)),) if sh[start:].rstrip() else ()
+    return tuple((k, tokens(t, lang)) for k, t in got[0])
 
 
 def _bare(var: str, text: str) -> bool:
@@ -391,6 +411,13 @@ _GO_NAME_BRACE = re.compile(r"([A-Za-z_]\w*)\s*\{")
 _GO_TYPE = re.compile(r"(?:\[[^\]\n]*\]|[\w.*])+")
 _GO_LOG = re.compile(r"\b(?:t|b|tb)\.(?:Error|Errorf|Fatal|Fatalf|Log|Logf|Skip|Skipf)\s*\(")
 _GO_RUN = re.compile(r"\b(?:t|b|tb)\.Run\s*\(")
+# output that checks nothing, and statements that assign only to the blank identifier (`_ = row`,
+# which Go needs when a loop variable is otherwise unused)
+_GO_PRINT = re.compile(r"(?<![\w.])(?:(?:fmt|log)\.(?:Print|Println|Printf)|println|print)\s*\(")
+_GO_DISCARD = re.compile(
+    r"(?m)(?:^|(?<=[;{]))[ \t]*(?:var[ \t]+)?_(?:[ \t]*,[ \t]*_)*[ \t]*=(?!=)[^;\n]*"
+)
+_GO_ANY_EARLY = re.compile(r"\b(?:continue|break|return|goto)\b|\.Skip(?:Now|f)?\b")
 _GO_EARLY = re.compile(r"(?:^|[;\n])\s*(?:continue|break|return|goto)\b|\bt\.Skip(?:Now|f)?\s*\(")
 
 
@@ -494,6 +521,8 @@ def go_unit(src: _Src, a: int, b: int) -> tuple[Table | None, tuple[str, ...]]:
     ran: dict[int, bool] = {}
     inline: list[tuple[int, int, list[str], list[str]]] = []
     loops: list[tuple[int, int, list[str]]] = []  # body start, body end, row variables
+    # loops over a literal table: body start, body end, rows, table name, key variable, row variable
+    counted: list[tuple[int, int, list[str], str | None, str, str]] = []
     why = ""
     for m in _GO_RANGE.finditer(s, a, b):
         p = m.end()
@@ -524,6 +553,9 @@ def go_unit(src: _Src, a: int, b: int) -> tuple[Table | None, tuple[str, ...]]:
                 "the loop starts by leaving" if leaves else "the loop never reads its row"
             )
         loops.append((brace + 1, end, [v for v in (m.group(2),) if v and v != "_"]))
+        if fed and not leaves:
+            elems = decls[name][3] if name else inline[-1][2]
+            counted.append((brace + 1, end, elems, name, m.group(1) or "", m.group(2)))
     for name, (_start, _open, end, _elems, _f) in decls.items():
         rest = s[end + 1 : b]
         pat = (
@@ -532,6 +564,7 @@ def go_unit(src: _Src, a: int, b: int) -> tuple[Table | None, tuple[str, ...]]:
         )
         if re.search(pat, rest):
             tables = []
+            counted = [c for c in counted if c[3] is None]
             break
     tables = [*tables, *inline] if tables or inline else []
     text = src.text[a:b]
@@ -547,8 +580,34 @@ def go_unit(src: _Src, a: int, b: int) -> tuple[Table | None, tuple[str, ...]]:
         ran.get(-(i + 1), False) for i in range(len(inline))
     )
     if runs:
-        return _go_flow(src, a, b, tables, loops, lits)
-    return _table("go", elems, False, False, why or "the table is never ranged over"), lits
+        table, lits = _go_flow(src, a, b, tables, loops, lits)
+        if table is None:
+            return None, lits
+        one = tables[0] if len(tables) == 1 else None
+        owner = next((n for n, d in decls.items() if one and d[0] == one[0]), None)
+        skips = _go_row_skips(src, a, b, one, owner, loops)
+        fields_ = tuple(one[3]) if one else ()
+        spans = tuple(
+            (lo, hi, n)
+            for lo, hi, elems_, nm, kv, rv in counted
+            if (n := _loop_rows(src, lo, hi, elems_, fields_, skips, nm, kv, rv)) is not None
+        )
+    else:
+        table = _table("go", elems, False, False, why or "the table is never ranged over")
+        skips, spans = (), ()
+    fields = tuple(tables[0][3]) if len(tables) == 1 else ()
+    row_leaves = _go_row_leaves(src, loops, list(decls))
+    return (
+        RowTable(
+            **vars(table),
+            elems=tuple(elems),
+            fields=fields,
+            skips=skips,
+            loops=spans,
+            leaves=row_leaves,
+        ),
+        lits,
+    )
 
 
 def _go_flow(
@@ -590,6 +649,450 @@ def _go_flow(
     spans = flow.regions or ((brace + 1, close),)
     reach, reach_all = _reach(flow, spans, keys, sorted(acc) or keys, fields=True, rowvars=rowvars)
     return _table("go", elems, not reason, False, reason, note, cells, reach, reach_all), lits
+
+
+# ------------------------------------------------------------------------------ Go row skips
+
+
+@dataclass(frozen=True)
+class RowSkip:
+    """`if <row>.<field> <op> <literal> { t.Skip() }` in a table loop: `line` is the line of the
+    skip call, `kind` the literal's kind (s, n or k), `value` its content, `op` `==` or `!=`."""
+
+    line: int
+    field: str
+    op: str
+    kind: str
+    value: str
+
+
+@dataclass(frozen=True)
+class RowTable(Table):
+    """A Go table that keeps its rows' text and the struct's fields, so that a conditional skip
+    in the loop can be compared with the rows of the other revision (`row_skip_excused`)."""
+
+    elems: tuple[str, ...] = ()
+    fields: tuple[str, ...] = ()
+    skips: tuple[RowSkip, ...] = ()
+    # (body start, body end, rows) of each loop over a literal table whose rows all run its body
+    loops: tuple[tuple[int, int, int], ...] = ()
+    # (line, kind) of each `if <row ...> { return }` or `{ break }` in a loop over the table
+    # outside a `t.Run` closure: it ends every later row
+    leaves: tuple[tuple[int, str], ...] = ()
+
+
+_GO_ROWSKIP = re.compile(
+    r"\bif\s+(!?)\s*(\w+)\s*\.\s*(\w+)\s*(?:(==|!=)\s*(\"[^\"\n]*\"|`[^`]*`|-?\d[\d_]*"
+    r"|\btrue\b|\bfalse\b))?\s*\{\s*(?:(\w+)\s*\.\s*)?(Skip(?:f|Now)?)\s*\([^{}]*\)\s*;?\s*\}"
+)
+
+
+def _go_lit(raw: str) -> tuple[str, str] | None:
+    """(kind, content) of a Go string, integer or bool literal, else None (an escape in a
+    string is not read)."""
+    raw = raw.strip()
+    if raw in ("true", "false"):
+        return "k", raw
+    if raw[:1] == "`" and raw[-1:] == "`" and len(raw) >= 2:
+        return "s", raw[1:-1]
+    if raw[:1] == '"' and raw[-1:] == '"' and len(raw) >= 2 and "\\" not in raw:
+        return "s", raw[1:-1]
+    if re.fullmatch(r"-?\d[\d_]*", raw):
+        return "n", _number(raw)
+    return None
+
+
+_GO_ROWLEAVE = re.compile(
+    r"\bif\b([^{}\n]*)\{\s*(return\b[^{}\n;]*|break\b(?:[ \t]+\w+)?)\s*;?\s*\}"
+)
+_GO_CLOSURE_T = re.compile(r"\bfunc\s*\(\s*(\w+)\s+\*\s*testing\.(?:T|B)\b")
+_ZERO = {"s": "", "n": "0", "k": "false"}
+
+
+def _row_value(elem: str, fields: Sequence[str], field: str, kind: str) -> tuple[str, str] | None:
+    """What a row sets `field` to, as (kind, content): the zero value when a keyed row does not
+    mention a field the struct declares; None when it cannot be told."""
+    got = _row_parts(elem, "go", fields)
+    if got is None or field not in fields:
+        return None
+    parts, keyed, _ = got
+    for key, text in parts:
+        if key == field:
+            return _go_lit(text)
+    return (kind, _ZERO[kind]) if keyed else None
+
+
+def _may_match(value: tuple[str, str] | None, skip: RowSkip) -> bool:
+    if value is None or value[0] != skip.kind:
+        return True
+    same = value[1] == skip.value
+    return same if skip.op == "==" else not same
+
+
+def _sans(elem: str, fields: Sequence[str], field: str) -> tuple[tuple[str, str], ...] | None:
+    got = _row_parts(elem, "go", fields)
+    if got is None:
+        return None
+    return tuple(sorted((k, "".join(t.split())) for k, t in got[0] if k != field))
+
+
+def row_skip_excused(base: Unit | None, cand: Unit, line: int) -> bool:
+    """A skip at `line` of the candidate test that no row of the base test can reach.
+
+    The skip must read `if row.field == literal { t.Skip() }` (or `!=`, or a bare bool field)
+    inside the loop over the test's one literal table. It is excused only when every row of both
+    tables is read, and every base row, with the field left out, appears one to one among the
+    candidate rows that cannot satisfy the condition (a keyed row that leaves the field out holds
+    its zero value, so it cannot): every base row still runs, unchanged. Anything unclear (a row
+    that is not a keyed or positional literal, a value that is not a literal) is not excused."""
+    ct = cand.table
+    bt = base.table if base is not None else None
+    if not isinstance(ct, RowTable) or not isinstance(bt, RowTable) or not bt.elems:
+        return False
+    skip = next((k for k in ct.skips if k.line == line), None)
+    if skip is None or skip.field not in ct.fields:
+        return False
+    base_keys = Counter(_sans(e, bt.fields, skip.field) for e in bt.elems)
+    if None in base_keys:
+        return False
+    free: Counter[tuple[tuple[str, str], ...] | None] = Counter()
+    for e in ct.elems:
+        key = _sans(e, ct.fields, skip.field)
+        if key is None:
+            return False  # a row that is not a literal could be anything
+        if not _may_match(_row_value(e, ct.fields, skip.field, skip.kind), skip):
+            free[key] += 1
+    return not base_keys - free  # every base row still runs, one to one, beside the skip
+
+
+def marker_excused(base: FileAnalysis | None, cand: FileAnalysis, marker: Marker) -> bool:
+    """A new skip marker of a Go test that only the test's new rows can reach (see
+    `row_skip_excused`)."""
+    if base is None or marker.kind.startswith("go:build"):
+        return False
+    old = next((u for u in base.units if u.key == marker.scope), None)
+    new = next((u for u in cand.units if u.key == marker.scope), None)
+    return old is not None and new is not None and row_skip_excused(old, new, marker.line)
+
+
+def _loop_rows(
+    src: _Src,
+    lo: int,
+    hi: int,
+    elems: Sequence[str],
+    fields: Sequence[str],
+    skips: Sequence[RowSkip],
+    table: str | None = None,
+    keyvar: str = "",
+    rowvar: str = "",
+) -> int | None:
+    """How many distinct rows run the body of the loop [lo, hi) through to its checks: None when
+    the loop can leave early in any way but a recorded row-conditional skip, when its checks do
+    not read the row, or when a row cannot be read; and then only the rows that cannot satisfy
+    such a skip's condition.
+
+    Rows are distinct by what the checks read (SPEC 5.4): the fields of the row variable that the
+    loop reads outside messages (`t.Error*`, `t.Log*`), a `t.Run` name and a skip condition. When
+    the row goes on whole to a call, or the fields cannot be told apart, rows count by their
+    values with every string literal left out (a name column cannot make a row distinct)."""
+    first, last = src.line_of(lo) + 1, src.line_of(hi) + 1
+    here = [k for k in skips if first <= k.line <= last]
+    body = src.shadow[lo:hi]
+    for m in _GO_ROWSKIP.finditer(body):
+        if src.line_of(lo + m.start(7)) + 1 in {k.line for k in here}:
+            body = body[: m.start()] + " " * (m.end() - m.start()) + body[m.end() :]
+    if _GO_ANY_EARLY.search(body) is not None:
+        return None
+    fields_read, whole = _loop_reads(src, lo, hi, rowvar, table, _skip_spans(src, lo, hi, here))
+    if keyvar and keyvar != "_" and _loop_reads_key(src, lo, hi, keyvar):
+        return None
+    if not fields_read and not whole:
+        return None
+    rows: set[object] = set()
+    for e in elems:
+        if here:
+            if any(_sans(e, fields, k.field) is None for k in here):
+                continue
+            if any(_may_match(_row_value(e, fields, k.field, k.kind), k) for k in here):
+                continue
+        ident = _row_identity(e, fields, fields_read, whole)
+        if ident is None:
+            return None
+        rows.add(ident)
+    return len(rows)
+
+
+def _skip_spans(src: _Src, lo: int, hi: int, skips: Sequence[RowSkip]) -> list[tuple[int, int]]:
+    """Offsets of the `if <row>.<field> .. { t.Skip() }` statements of `skips` in [lo, hi)."""
+    lines = {k.line for k in skips}
+    return [
+        (m.start(), m.end())
+        for m in _GO_ROWSKIP.finditer(src.shadow, lo, hi)
+        if src.line_of(m.start(7)) + 1 in lines
+    ]
+
+
+def _run_name_ranges(src: _Src, a: int, b: int) -> list[tuple[int, int]]:
+    """The subtest name argument of each `t.Run(name, func)` call in [a, b)."""
+    out: list[tuple[int, int]] = []
+    for m in _GO_RUN.finditer(src.shadow, a, b):
+        open_at = m.end() - 1
+        close = src.close(open_at)
+        if close < 0:
+            continue
+        parts = src.split(open_at + 1, close, ",")
+        if parts:
+            out.append((open_at + 1, open_at + 1 + len(parts[0])))
+    return out
+
+
+def _loop_reads(
+    src: _Src,
+    lo: int,
+    hi: int,
+    rowvar: str,
+    table: str | None,
+    extra: Sequence[tuple[int, int]] = (),
+) -> tuple[set[str], bool]:
+    """(the fields of the row that the loop [lo, hi) reads, whether the row goes on whole). A
+    message (`t.Error*`, `t.Log*`, `t.Skip*`), printed output, an assignment to `_`, a `t.Run`
+    name and the `extra` spans are left out: a row value that only names, explains or discards a
+    check is not checked."""
+    blank = [
+        *_call_ranges(src, _GO_LOG, lo, hi, None),
+        *_call_ranges(src, _GO_PRINT, lo, hi, None),
+        *(m.span() for m in _GO_DISCARD.finditer(src.shadow, lo, hi)),
+        *_run_name_ranges(src, lo, hi),
+        *extra,
+    ]
+    shown = _blank(src.shadow[lo:hi], lo, blank)
+    reads: set[str] = set()
+    whole = False
+    if rowvar and rowvar != "_":
+        v = re.escape(rowvar)
+        reads.update(re.findall(rf"(?<![\w.]){v}\s*\.\s*(\w+)", shown))
+        whole = _bare(rowvar, shown)
+    if table:
+        t = re.escape(table)
+        ref = rf"(?<![\w.]){t}\s*\[[^\]\n]*\]"
+        reads.update(re.findall(rf"{ref}\s*\.\s*(\w+)", shown))
+        whole = whole or bool(re.search(rf"{ref}(?!\s*\.)", shown))
+    return reads, whole
+
+
+def _loop_reads_key(src: _Src, lo: int, hi: int, keyvar: str) -> bool:
+    """The key variable of `for k, row := range` is read outside messages and names."""
+    blank = [*_call_ranges(src, _GO_LOG, lo, hi, None), *_run_name_ranges(src, lo, hi)]
+    shown = _blank(src.shadow[lo:hi], lo, blank)
+    return bool(re.search(rf"(?<![\w$.]){re.escape(keyvar)}(?![\w$])", shown))
+
+
+def _value_id(text: str, strings: bool) -> tuple[tuple[str, ...], str]:
+    """A cell by its literal values (numbers normalised) and its shape, parentheses and spacing
+    aside; with `strings` False the string literals are not part of it."""
+    toks = tokens(text, "go")
+    if not strings:
+        toks = tuple(t for t in toks if not t.startswith("s:"))
+    return toks, re.sub(r"[\s()]+", "", _TOKEN["go"].sub(" ", text))
+
+
+def _row_identity(elem: str, fields: Sequence[str], read: set[str], whole: bool) -> object | None:
+    """What makes one row distinct for the loop's checks, else None when it cannot be read."""
+    got = _row_parts(elem, "go", fields)
+    if got is None:
+        # a bare value (a string, a number): the loop reads it, so it is the row
+        return _value_id(elem, True) if whole else None
+    parts, keyed, _ = got
+    named = {k for k, _t in parts}
+    if whole or not read or (not keyed and not set(read) <= named):
+        # the checks cannot be told apart from the row's other values: left-out strings
+        return tuple(sorted((k, _value_id(t, False)) for k, t in parts))
+    by = dict(parts)
+    return tuple(
+        (f, _value_id(by[f], "{" not in by[f]) if f in by else ((), "")) for f in sorted(read)
+    )
+
+
+def go_credit_literals(
+    src: _Src,
+    a: int,
+    b: int,
+    dead: Sequence[tuple[int, int]] = (),
+    only: Collection[int] | None = None,
+    consts: Mapping[str, tuple[str, ...]] | None = None,
+) -> tuple[str, ...]:
+    """The literals a Go test checks against, sorted: those of [a, b) outside messages
+    (`t.Error*`, `t.Log*`), `t.Run` names and the `dead` spans, table rows included; with `only`,
+    those of just the lines in `only`. A credit that replaces checks must keep every literal of
+    the removed checks (SPEC 5.4). A file-level constant of `consts` that the text reads adds its
+    literal as `c:<literal>`, which stands for any number of occurrences."""
+    blank = [*_call_ranges(src, _GO_LOG, a, b, None), *_run_name_ranges(src, a, b), *dead]
+    if only is not None:
+        for k in range(src.line_of(a), src.line_of(b) + 1):
+            if k not in only:
+                blank.append((src.starts[k], src.starts[k] + len(src.code[k])))
+    found = [t for t in tokens(_blank(src.text[a:b], a, blank), "go") if not t.startswith("k:")]
+    if consts:
+        shown = _blank(src.shadow[a:b], a, blank)
+        for name, lits in consts.items():
+            if re.search(rf"(?<![\w$.]){re.escape(name)}(?![\w$])", shown):
+                found.extend("c:" + t for t in lits)
+    return tuple(sorted(found))
+
+
+_GO_CONST = re.compile(r"^(?:(?:const|var)\s+)?([A-Za-z_]\w*)(?:\s+[\w.]+)?\s*=\s*(.+?)\s*$")
+
+
+def go_consts(code: Sequence[str]) -> dict[str, tuple[str, ...]]:
+    """The package-level `const` and `var` of one Go file that are one string or number literal,
+    by name: `const onetwo = "one two"`, or a line of a `const ( ... )` block."""
+    out: dict[str, tuple[str, ...]] = {}
+    block = False
+    lit = re.compile(rf"(?:{_STR['go']}|{_NUM})\Z")
+    for line in code:
+        if block:
+            if line.startswith(")"):
+                block = False
+                continue
+            m = _GO_CONST.match(line.strip())
+        elif re.match(r"(?:const|var)\s*\(\s*$", line):
+            block = True
+            continue
+        elif line.startswith(("const ", "var ")):
+            m = _GO_CONST.match(line)
+        else:
+            continue
+        if m is not None and lit.match(m.group(2)):
+            toks = tuple(t for t in tokens(m.group(2), "go") if t[0] != "k")
+            if len(toks) == 1:
+                out[m.group(1)] = toks
+    return out
+
+
+_GO_HEADER = re.compile(r"^\s*(?:\}\s*)?(?:else\s+)?(?:if|switch|for|select)\b")
+
+
+def go_header_chains(masked: Sequence[str], start: int, end: int) -> dict[int, tuple[Any, ...]]:
+    """For each line of [start, end], the chain of open blocks above it, innermost first, as
+    nested `(line, outer)` pairs. One pass, so a body of many checks costs a linear time."""
+    chains: dict[int, tuple[Any, ...]] = {}
+    stack: tuple[Any, ...] = ()
+    for j in range(start, end + 1):
+        chains[j] = stack  # only the lines above j open or close what holds j
+        for ch in masked[j]:
+            if ch == "{":
+                stack = (j, stack)
+            elif ch == "}" and stack:
+                stack = stack[1]
+    return chains
+
+
+def go_headers(masked: Sequence[str], chain: tuple[Any, ...]) -> list[int]:
+    """The lines of the `if`, `switch`, `for` and `select` headers in a `go_header_chains`
+    chain: what a check below them is conditional on."""
+    out: list[int] = []
+    while chain:
+        if _GO_HEADER.match(masked[chain[0]]):
+            out.append(chain[0])
+        chain = chain[1]
+    return out
+
+
+def _closures(src: _Src, a: int, b: int) -> list[tuple[int, int, str]]:
+    """(start, end, the testing handle's name) of each function literal passed to a `t.Run` in
+    [a, b); the name is "" when the literal has no readable handle."""
+    out: list[tuple[int, int, str]] = []
+    for m in _GO_RUN.finditer(src.shadow, a, b):
+        open_at = m.end() - 1
+        close = src.close(open_at)
+        if close < 0:
+            continue
+        pos = open_at + 1
+        for i, part in enumerate(src.split(open_at + 1, close, ",")):
+            if i >= 1:
+                cm = _GO_CLOSURE_T.search(src.shadow, pos, pos + len(part))
+                out.append((pos, pos + len(part), cm.group(1) if cm else ""))
+            pos += len(part) + 1
+    return out
+
+
+def _own_handle(closures: Sequence[tuple[int, int, str]], at: int) -> str:
+    """The handle of the innermost `t.Run` closure that holds offset `at`, else ""."""
+    inner = [c for c in closures if c[0] <= at < c[1]]
+    return max(inner, key=lambda c: c[0])[2] if inner else ""
+
+
+def _go_row_skips(
+    src: _Src,
+    a: int,
+    b: int,
+    table: tuple[int, int, list[str], list[str]] | None,
+    name: str | None,
+    loops: Sequence[tuple[int, int, list[str]]],
+) -> tuple[RowSkip, ...]:
+    """The row-conditional skips in the loops over the test's one table that can be excused: the
+    skip sits inside a `t.Run` closure and calls that closure's own handle (a skip of the outer
+    `t` ends the whole test), no check of the loop reads the skip's field, and the table is used
+    nowhere but its one `range` expression (it could be changed through a pointer, a call or an
+    alias before the loop)."""
+    if table is None:
+        return ()
+    s = src.shadow
+    rowvars = {v for _, _, vs in loops for v in vs}
+    if not rowvars:
+        return ()
+    body = s[a:b]
+    names = [re.escape(v) for v in rowvars]
+    if name:
+        n = re.escape(name)
+        names.append(rf"{n}\s*\[[^\]\n]*\]")
+        uses = len(re.findall(rf"(?<![\w.]){n}(?![\w])", body))
+        if len(re.findall(rf"\brange\s+{n}\b", body)) != 1 or uses != 2:
+            return ()  # address taken, passed on, aliased, appended to or indexed
+    if re.search(rf"(?<![\w.])(?:{'|'.join(names)})\s*(?:\.\s*\w+\s*)+[-+*/|&^%]?=(?!=)", body):
+        return ()  # a row is changed after it is written
+    out: list[RowSkip] = []
+    for lo, hi, vs in loops:
+        closures = _closures(src, lo, hi)
+        for m in _GO_ROWSKIP.finditer(s, lo, hi):
+            neg, var, fld, op, _lit, recv, call = m.groups()
+            if var not in vs or call is None:
+                continue
+            handle = _own_handle(closures, m.start(7))
+            if not handle or recv != handle:
+                continue  # outside a t.Run closure, or a skip of another test than the row's
+            if op is None:
+                parsed: tuple[str, str] | None = ("k", "false" if neg else "true")
+                op = "=="
+            else:
+                parsed = None if neg else _go_lit(src.text[m.start(5) : m.end(5)])
+            if parsed is None:
+                continue
+            read, whole = _loop_reads(src, lo, hi, var, name, [(m.start(), m.end())])
+            if whole or fld in read:
+                continue  # a check reads the field the skip tests
+            out.append(RowSkip(src.line_of(m.start(7)) + 1, fld, op, parsed[0], parsed[1]))
+    return tuple(out)
+
+
+def _go_row_leaves(
+    src: _Src, loops: Sequence[tuple[int, int, list[str]]], names: Sequence[str]
+) -> tuple[tuple[int, str], ...]:
+    """`if <row ...> { return }` and `{ break }` in a loop over a literal table, outside a
+    `t.Run` closure: from the first row it fires on, no later row runs."""
+    out: list[tuple[int, str]] = []
+    s = src.shadow
+    for lo, hi, vs in loops:
+        refs = [rf"(?<![\w.]){re.escape(v)}\b" for v in vs]
+        refs += [rf"(?<![\w.]){re.escape(n)}\s*\[" for n in names]
+        if not refs:
+            continue
+        reads = re.compile("|".join(refs))
+        closures = _closures(src, lo, hi)
+        for m in _GO_ROWLEAVE.finditer(s, lo, hi):
+            if reads.search(m.group(1)) and not any(c[0] <= m.start() < c[1] for c in closures):
+                out.append((src.line_of(m.start(2)) + 1, m.group(2).split()[0]))
+    return tuple(out)
 
 
 # -------------------------------------------------------------------------------------- Rust

@@ -121,11 +121,20 @@ def test_errexit_decides_whether_a_trailing_exit_zero_swallows() -> None:
     assert swallows("pytest || true", errexit=True) == ["or"]
 
 
+def _swallow_cpu(scale: int) -> float:
+    script = "\n".join(["pytest -q tests/a.py", "exit 0"] * scale + ["pytest -q"] * (6 * scale))
+    best = float("inf")
+    for _ in range(3):
+        started = time.process_time()
+        swallows(script, errexit=False, early=True)
+        best = min(best, time.process_time() - started)
+    return best
+
+
 def test_swallow_detection_is_linear() -> None:
-    script = "\n".join(["pytest -q tests/a.py", "exit 0"] * 1000 + ["pytest -q"] * 6000)
-    started = time.perf_counter()
-    swallows(script, errexit=False, early=True)
-    assert time.perf_counter() - started < 3.0
+    # A ratio, not a wall-clock budget: doubling the script at most triples the CPU time.
+    small, large = _swallow_cpu(500), _swallow_cpu(1000)
+    assert large < 3 * small + 0.05
 
 
 def test_command_tokens_strip_wrappers() -> None:

@@ -10,12 +10,23 @@ from __future__ import annotations
 import functools
 import re
 from bisect import bisect_right
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from greenproof.rules._common import digest, split_lines
 from greenproof.rules.tests_model import FileAnalysis, Marker, Table, Unit
-from greenproof.rules.tests_tables import go_unit, js_table, rust_unit, tokens
+from greenproof.rules.tests_tables import (
+    RowTable,
+    go_consts,
+    go_credit_literals,
+    go_header_chains,
+    go_headers,
+    go_unit,
+    js_table,
+    rust_unit,
+    tokens,
+)
 
 _NUM = r"-?\d+(?:\.\d+)?"
 # A Rust char literal (`'}'`, `'"'`, `'\n'`): masked like a string so its bracket or quote is not
@@ -120,6 +131,11 @@ _PY_DEF = re.compile(r"^(\s*)(?:async\s+)?def\s+(test\w*)\s*\(")
 _PY_CLASS = re.compile(r"^(\s*)class\s+(\w+)")
 
 
+def _plain_run(special: str) -> re.Pattern[str]:
+    """A run of one or more characters that are neither a newline nor one of `special`."""
+    return re.compile("[^\\n" + "".join("\\" + ch for ch in special) + "]+")
+
+
 def mask_source(text: str, lang: str) -> tuple[list[str], list[str]]:
     """(masked, code) per line: comments removed in both, string contents blanked in `masked`.
 
@@ -138,6 +154,9 @@ def mask_source(text: str, lang: str) -> tuple[list[str], list[str]]:
     i, n = 0, len(text)
     state = ""  # "", "block", "str", "multi", "triple"
     quote = ""
+    # Runs of characters that change nothing are copied whole (this pass dominated big files).
+    plain = _plain_run(quotes + multi + ("#" if py else "/") + ("'" if lang == "rust" else ""))
+    inside: dict[str, re.Pattern[str]] = {}
     while i < n:
         ch = text[i]
         if ch == "\n":
@@ -147,12 +166,32 @@ def mask_source(text: str, lang: str) -> tuple[list[str], list[str]]:
             i += 1
             continue
         if state == "block":
-            if text.startswith("*/", i):
-                state = ""
-                i += 2
+            close_at, nl = text.find("*/", i), text.find("\n", i)
+            if nl >= 0 and (close_at < 0 or nl < close_at):
+                i = nl
+            elif close_at < 0:
+                i = n
             else:
-                i += 1
+                state = ""
+                i = close_at + 2
             continue
+        if state == "":
+            run = plain.match(text, i)
+            if run is not None:
+                m.append(run.group())
+                c.append(run.group())
+                i = run.end()
+                continue
+        elif state != "block":
+            key = state + quote
+            pat = inside.get(key)
+            if pat is None:
+                pat = inside[key] = _plain_run(quote + ("" if state == "triple" else "\\"))
+            run = pat.match(text, i)
+            if run is not None:
+                c.append(run.group())
+                i = run.end()
+                continue
         if state in ("str", "multi", "triple"):
             if ch == "\\" and state != "triple" and i + 1 < n and text[i + 1] != "\n":
                 c.append(text[i : i + 2])
@@ -172,8 +211,8 @@ def mask_source(text: str, lang: str) -> tuple[list[str], list[str]]:
             i += 1
             continue
         if text.startswith(line_comment, i):
-            while i < n and text[i] != "\n":
-                i += 1
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl
             continue
         if block and text.startswith("/*", i):
             state = "block"
@@ -269,7 +308,15 @@ def _blank_strings(text: str, lang: str) -> str:
     quotes = _QUOTES[lang]
     out: list[str] = []
     i, n = 0, len(text)
+    plain = re.compile(
+        "[^" + "".join("\\" + q for q in quotes + ("'" if lang == "rust" else "")) + "]+"
+    )
     while i < n:
+        run = plain.match(text, i)
+        if run is not None:
+            out.append(run.group())
+            i = run.end()
+            continue
         ch = text[i]
         if lang == "rust" and ch == "'":
             cm = _RUST_CHAR.match(text, i)
@@ -1106,6 +1153,65 @@ def _go_helper_calls(
     return (_go_call(helpers) if helpers else None), mine
 
 
+_GO_LEAVES = re.compile(
+    r"\breturn\b|\bgoto\b|\bpanic\s*\(|\bos\.Exit\b|\bGoexit\b|\.Skip(?:f|Now)?\b"
+)
+_HELPER_LINES = 150  # a helper longer than this is not read for the checks it makes
+
+
+def _go_helper_weights(
+    src: _Src,
+    masked: list[str],
+    code: list[str],
+    helpers: frozenset[str],
+    consts: dict[str, tuple[str, ...]],
+) -> dict[str, tuple[int, tuple[str, ...]]]:
+    """(how many checks one call makes, the literals those checks compare) for each of this
+    file's assertion helpers (SPEC 5.4).
+
+    A call counts as the helper's own checks (its live lines with an assertion, leaving out the
+    dead ones and the vacuous ones that `analyse_lines` leaves out of a test; a call it makes to
+    another helper still counts as one) only when the body reads straight through: no `return`,
+    `goto`, `panic`, `os.Exit` or skip, no `bool` parameter that could switch a check off, and at
+    most `_HELPER_LINES` lines. Any other helper counts as one. The literals are those of the
+    body outside messages and dead lines."""
+    out: dict[str, tuple[int, tuple[str, ...]]] = {}
+    for i, line in enumerate(code):
+        fm = _GO_FUNC.match(line)
+        if fm is None or fm.group(1) not in helpers or _GO_UNIT.match(line):
+            continue
+        end = _brace_end(masked, i)
+        if end - i > _HELPER_LINES:
+            continue
+        flags = frozenset(
+            n.strip()
+            for g in re.findall(r"((?:\w+\s*,\s*)*\w+)\s+bool\b", fm.group(2))
+            for n in g.split(",")
+        )
+        body = "\n".join([masked[i][fm.end() :], *masked[i + 1 : end + 1]])
+        live, dead = _live_checks(src, masked, i, end)
+        lits = go_credit_literals(src, src.starts[i], src.starts[end] + len(code[end]), dead)
+        if _GO_LEAVES.search(body) or any(re.search(rf"\b{re.escape(f)}\b", body) for f in flags):
+            out[fm.group(1)] = (1, lits)
+        else:
+            out[fm.group(1)] = (max(live, 1), lits)
+    return out
+
+
+def _live_checks(
+    src: _Src, masked: list[str], start: int, end: int
+) -> tuple[int, list[tuple[int, int]]]:
+    """(the checks of the Go function on lines [start, end] that can fire, the offsets of its dead
+    lines): a check in a dead branch (`if 1 == 2`) or a comparison of a value with itself cannot."""
+    dead = _dead_lines(src, _Span(start, end, "", start))
+    selfeq = _self_equal_lines(src, src.starts[start], src.starts[end] + len(src.code[end]), dead)
+    total = 0
+    for k in range(start, end + 1):
+        if k not in dead:
+            total += max(len(_ASSERTS["go"].findall(masked[k])) - selfeq.vacuous.get(k, 0), 0)
+    return total, [(src.starts[k], src.starts[k] + len(src.code[k])) for k in dead]
+
+
 def go_call_pattern(names: set[str] | frozenset[str]) -> re.Pattern[str]:
     """Matches a call to any of the Go functions `names`."""
     return _go_call(set(names))
@@ -1244,9 +1350,13 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
     src = _Src.build(lang, masked, code) if lang != "python-lines" else None
     spans = _find_spans(lang, raw, masked, code, src)
     helper_call: re.Pattern[str] | None = None
+    weights: dict[str, tuple[int, tuple[str, ...]]] = {}
+    consts: dict[str, tuple[str, ...]] = {}
     analysis = FileAnalysis(path, lang)
     if lang == "go":
         helper_call, analysis.helpers = _go_helper_calls(masked, code, siblings)
+        consts = go_consts(code)
+        weights = _go_helper_weights(src, masked, code, analysis.helpers, consts) if src else {}
     elif lang == "js" and src is not None:
         helper_call = _js_helper_calls(src, spans)
     owner: dict[int, _Span] = {}
@@ -1256,6 +1366,7 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
     for span in spans:
         dead = _dead_lines(src, span) if src is not None else {}
         lines = range(span.start, span.end + 1)
+        times: dict[int, int] = {}  # how often a line runs: the rows of a literal table loop
         const_hits = {
             k: len(_JS_CONST_EXPECT.findall(code[k])) if lang == "js" else 0 for k in lines
         }
@@ -1289,11 +1400,38 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
         if src is not None and lang == "go":
             lo, hi = src.starts[span.start], src.starts[span.end] + len(code[span.end])
             unit.table, unit.literals = go_unit(src, lo, hi)
+            unit.credit_lits = go_credit_literals(
+                src,
+                lo,
+                hi,
+                [(src.starts[k], src.starts[k] + len(code[k])) for k in dead],
+                None,
+                consts,
+            )
+            if isinstance(unit.table, RowTable):
+                for blo, bhi, rows in unit.table.loops:
+                    for ln in range(src.line_of(blo), src.line_of(bhi) + 1):
+                        times[ln] = times.get(ln, 1) * rows
+                # a row-conditional return or break outside a t.Run closure ends every later row
+                for ln, kind in unit.table.leaves:
+                    analysis.markers.append(
+                        Marker(
+                            span.key,
+                            f"row-{kind}",
+                            f"if <row> {{ {kind} }}",
+                            ln,
+                            "tests.skipped",
+                            True,
+                        )
+                    )
         elif src is not None and lang == "rust" and span.fn_line >= 0:
             unit.table, unit.literals = rust_unit(src, span.start, span.fn_line)
         unit.self_calls = selfeq.calls
         unit.compared = selfeq.compared
         live: list[str] = []
+        called: list[str] = []  # literals of the helper bodies this test calls
+        chains = go_header_chains(masked, span.start, span.end) if lang == "go" else {}
+        checks: set[int] = set()  # lines of the checks, with the `if`s they sit in
         for k in lines:
             query = int(
                 lang == "js"
@@ -1303,8 +1441,14 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
                 and not _read_by_expect(masked, k, span.end)
             )
             hits = len(_ASSERTS[lang].findall(masked[k])) + query
+            weighed = hits  # the same line with each helper call at the checks its body makes
             if helper_call:
-                hits += len(helper_call.findall(masked[k]))
+                for hm in helper_call.finditer(masked[k]):
+                    hits += 1
+                    callee = hm.group(0).split("(")[0].strip()
+                    weighed += weights.get(callee, (1, ()))[0]
+                    if k not in dead:
+                        called.extend(weights.get(callee, (1, ()))[1])
             vac = const_hits[k] + selfeq.vacuous.get(k, 0)
             if k in dead:
                 if hits:
@@ -1312,15 +1456,40 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
                     unit.unreachable_line = unit.unreachable_line or k + 1
                 continue
             live.append(masked[k])
-            counted = max(hits - vac, 0)
-            unit.asserts += counted
+            if hits and lang == "go":
+                checks.update((k, *go_headers(masked, chains[k])))
+            once = max(hits - vac, 0)
+            unit.asserts += once
+            unit.credited += max(weighed - vac, 0) * times.get(k, 1)
             if vac and hits:
                 unit.vacuous += min(vac, hits)
                 unit.vacuous_line = unit.vacuous_line or k + 1
-            if counted > 0:
-                unit.assertion_forms.extend([digest("".join(code[k].split()))] * counted)
+            if once > 0:
+                unit.assertion_forms.extend([digest("".join(code[k].split()))] * once)
+        if src is not None and lang == "go":
+            lo, hi = src.starts[span.start], src.starts[span.end] + len(code[span.end])
+            dead_spans = [(src.starts[k], src.starts[k] + len(code[k])) for k in dead]
+            dead_all = dead_spans
+            need = go_credit_literals(src, lo, hi, dead_spans, checks)
+            if isinstance(unit.table, RowTable) and unit.table.loops:
+                row_lits = Counter(t for row in unit.table.rows for t in row if t[0] != "k")
+                need = tuple(sorted((Counter(need) | row_lits).elements()))
+            unit.check_lits = need
+        if called:
+            unit.credit_lits = tuple(sorted([*unit.credit_lits, *called]))
+        if src is not None and lang == "go" and isinstance(unit.table, RowTable):
+            # a check inside a credited loop compares its literals once per row it runs on
+            extra: list[str] = []
+            for blo, bhi, n_rows in unit.table.loops:
+                inside = {k for k in checks if blo <= src.starts[k] < bhi and k not in dead}
+                if inside and n_rows > 1:
+                    in_loop = go_credit_literals(src, blo, bhi, dead_all, inside, consts)
+                    extra.extend(in_loop * (n_rows - 1))
+            if extra:
+                unit.credit_lits = tuple(sorted([*unit.credit_lits, *extra]))
         if unit.table is not None and unit.table.implicit and unit.asserts == 0:
             unit.asserts = 1  # a `test_case` row checks its `=>` value
+            unit.credited = max(unit.credited, 1)
         body_masked = "\n".join(live)
         if lang == "js":
             unit.strong = len(_JS_STRONG.findall(body_masked))

@@ -1,0 +1,11 @@
+repo: replay/zustand
+commits scanned: 200
+blocked: 6 (3.0%)
+blocked commits per rule:
+  ci.tampered: 5
+  tests.deleted: 1
+  tests.removed: 1
+  tests.replaced: 1
+  tests.skipped: 1
+check duration ms: median 338, p95 709
+process wall time ms: median 1267, p95 1815

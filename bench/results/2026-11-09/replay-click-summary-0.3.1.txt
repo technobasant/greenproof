@@ -1,0 +1,10 @@
+repo: replay/click
+commits scanned: 132
+blocked: 8 (6.1%)
+blocked commits per rule:
+  tests.removed: 3
+  tests.skipped: 2
+  tests.weakened: 2
+  tests.replaced: 1
+check duration ms: median 409, p95 1963
+process wall time ms: median 1393, p95 3354

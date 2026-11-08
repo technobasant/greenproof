@@ -1,0 +1,132 @@
+c3535905c	1	tests.removed(block)	2028	Fix broken fish completion and multiline help string
+fc6c7c47e	0	-	774	`FuncParamType` should use `ValueError` message in `self.fail()` (#321
+831c8f094	0	-	4370	Add NoSuchCommand exception with suggestions for misspelled commands (
+19fd4d6e1	0	-	2079	Fix: Ensure fish completion handles multiline help strings correctly (
+2468b7099	0	tests.expected_changed(warn)	1136	Fix readline backspace/line-wrapping on linux (#2969)
+feffea5ca	0	-	330	fix windows import check
+701b31316	0	-	1966	Fix completions for quoted/escaped parameters in Fish (#3013)
+a1235aacb	0	-	2055	Fix Zsh completions with colons (#2846)
+f14b75063	0	suppress.added(warn)	1940	update dev dependencies
+4ece17a10	0	-	2278	Expand `Choice` token normalization + make generic (#2796)
+b5464b7e0	0	-	592	Only try to set flag_value if is_flag is true (#2829)
+88328fc87	0	-	932	Add CliRunner default `catch_exceptions` parameter (#2818)
+5961d31fb	0	-	2998	Introduce Parameter.deprecated + Command.deprecated message customizat
+3b06e0b75	0	-	1127	Improve echo_via_pager behaviour in face of errors (#2775)
+2cabbe317	0	-	311	specialize progressbar(length=...) as ProgressBar[int] (#2630)
+0d69b6ce8	0	-	1164	Adds support for editing multiple files (#2068)
+0ef55fda4	0	-	2294	Close contexts created during shell completion #2644. (#2800)
+d8763b930	0	tests.expected_changed(warn)	994	Help shown via no_args_is_help results in exit code 2, was 0 (#1489)
+4271fe283	0	-	661	feat: new method for choice fail (#2622)
+178749771	0	-	1023	Added functionality to set flag_value correctly when using envvar (#27
+380008389	0	-	2507	Give a UserWarning when Parameter is overriden by name (#2397)
+fcd85032c	0	-	837	Add functionality to hide the progress bar #2609 (#2727)
+c326df95e	0	-	932	Fix closing of callbacks on CLI exit (#2680)
+1b524bb30	0	-	1740	show env var in error hint (#2696)
+0e0c00324	1	tests.weakened(block)	1402	Keep track of `<stderr>` and `<stdout>` mix in `CliRunner` results (#2
+948d7a707	0	-	1692	Split generation of help extra items and rendering (#2517)
+a6e0d2936	0	-	984	Hide default value when show_default is False (#2509)
+1a4d8c1bb	0	suppress.added(warn)	1332	Fix metavar for Choice options when show_choices=False (#2365)
+15959d92f	0	-	621	update dev dependencies
+1cb860961	0	-	1303	Better error message for bad parameter default (#1805)
+acc91bc4f	0	-	771	skip frequent progress bar renders (#1698)
+fdceb39d3	0	-	1032	CliRunner: add stdout / stderr, allow separating standard streams (#86
+a87829d2c	0	-	356	feat: Move fcntl into outer scope for side effects
+d97c93fa8	0	-	359	Remove leftover print function in test used for previous debugging (#8
+54935507d	0	-	566	Fix invalid escape sequences discovered by running tests (#877)
+5d1df0e04	0	tests.expected_changed(warn)	753	Underscores are now replaced by dashes in commands
+37011e76a	0	-	221	bashcomplete: Adapt to changes for chain commands
+5f98f570c	0	-	817	Implemented defaults for args with nargs > 1.
+0a2919f34	0	-	550	Implemented nesting below chain commands.
+e68766c35	0	-	630	Support non optional arguments on commands.
+1c7e1d3f4	0	-	582	Disallow arguments in chain mode and no longer expose leftover args.
+64c4567d8	0	-	242	Added time as allowed import on windows
+bf1ddce0c	0	-	231	Add zlib as import to windows
+dde42ed3c	1	tests.skipped(block)	579	Added two xfails
+1a5b4e708	0	-	277	Allow colorama import
+262c275d8	1	tests.skipped(block)	979	Fixed broken tests and behavior on windows.
+c1d213ac3	0	-	478	Fixed tests for python 3
+7951a73dd	0	tests.expected_changed(warn)	833	Always work on Unicode in Python 2.
+89d3bfda5	0	-	666	Make it possible to define aliases for the secondary option of boolean
+851ce7fc5	0	-	547	Pop the context after closing and not before.  This fixes #412
+7f1d70c54	0	-	666	Disallow nargs=-1 with a default set.
+349875d79	0	-	461	Ignore broken PAGER values
+36f83d91e	0	-	615	Password prompt now prints a newline on `^C`.
+fe2f525e7	0	-	425	More defensive for scope depth management
+8e31125e7	0	-	631	Added Context.scope
+86facdb17	0	-	373	Added Context.meta
+0d9731e97	1	tests.removed(block)	651	Removed deprecated functionality.
+e948c6946	0	-	753	Fixed up tests for Python 3
+f7c124ed8	0	-	949	Added support for tuple types.  This fixes #239
+7c138a659	0	-	197	Fixed generated bash complete function name.  This fixes #221
+9da179147	0	-	893	Error on nargs=-1 for options.  This fixes #222
+65ca572d7	0	tests.expected_changed(warn)	508	Fixed up pausing tests and added doc information.
+da0132f90	0	-	344	Added a test for ignoring of unknown options.
+5cf7f2ddf	0	-	701	Added support for explicit color control.
+1318a207c	0	-	524	Added test for open_file
+60714161d	0	-	367	Added a test for pipelines
+f92c4f475	0	-	488	Added a test for multi command entering.
+aa89d5d19	0	-	582	Added support for return values from command callbacks.
+a939618ed	0	-	189	Added termui tests
+c8d3300a2	0	-	327	Added support for multiple defaults on options and nargs
+8d0dfa5c3	0	-	703	Added subcommand chaining.
+b62565406	0	-	680	Fixed a regression for echo_via_pager on 3.x.  This fixes #185
+1646647ed	0	-	760	Disallow empty options to help users find options that should be argum
+579262766	0	-	356	Improved automatic short help detection.  This fixes #165
+f1a846081	0	-	596	Added exc_info to result.
+1bc0a1995	0	-	324	defaults -> settings
+c2e187b73	0	-	526	User interface improvements.
+264fa24d4	0	-	571	Implemented extra info for missing choice parameters.  This fixes #120
+13ab804f5	0	-	136	Add test to ensure click does not import too much
+133c41739	0	-	516	Improved handling of dos/windows arguments greatly.
+88c97ef2f	0	-	317	Added getchar()
+236e09cd7	1	tests.removed(block)	407	Do not warn about callback changes until 3.0
+a6af25df9	0	-	422	Fixed a bug in argument handling
+c7299c431	0	-	379	yN->y/N
+71da0b4f5	0	-	564	setting a default for arguments now implicitly makes it non required
+ce1a41861	0	-	514	Customize required in arguments for nargs of -1
+3eb2c48e1	0	-	313	Added tests for styling
+bda39db61	0	-	510	Changed parameter callback signature.
+4a30d5cf2	0	-	371	Added a test for empty nargs
+b24e00471	0	tests.expected_changed(warn)	399	Fixed a test on python 3
+427492b2b	0	-	394	Ensure we do not strip color codes for bytes.
+537d6d578	0	-	327	Unbroke colorama integrated echo for unicode.
+aef16506b	0	tests.expected_changed(warn)	367	Refactored pager support to not rely on pydoc
+1407ecbb1	0	-	373	Added support for BadParameter exceptions.
+469ba25d5	0	-	433	Implemented atomic file opening support.
+a1f69d097	0	-	250	Added test for "--"
+31043c3dc	0	-	179	Added filename format function
+39b5df2b1	0	-	539	Fixed lack of clear reporting for paths
+eeb1378b0	0	-	485	Also added support for nargs != for values from environment.
+5105e6be4	0	-	309	Apply the same splitting logic for explicit envvars
+817ef3833	0	-	357	Added support for lists from envvars.  This fixes #87
+955beb8fd	0	-	446	Added a base command for dispatching to other parsers.
+4fd19ce09	0	-	263	Fixed argument handling for "-" and added test.  This fixes #77
+159ffc5b0	0	-	127	Added echo tests
+3e51448fb	0	-	195	Added docs for input stream testing.
+b3965e826	0	-	275	Added tests for prompts
+15f0e2238	0	-	327	Added tests for stream wrapping.
+c265355bc	0	-	236	Moved the test code into the API
+f3ee4e539	0	-	679	Added nicer error handling for group commands with arguments.
+7ebd3b948	0	-	320	Fixed a bug with forwarding and added a test
+2e7c39c42	0	-	424	Implemented the Path type
+5381d65d5	0	-	597	Added strong support for a defined parameter callback evaluation order
+848b664ed	0	-	323	Default count to 0
+4e2a32916	0	tests.expected_changed(warn)	194	Fixed a bug with whitespace preservation.
+fe89108c1	0	-	286	Added support for requiring with multiples.
+24d400f88	0	-	304	Added support for explicit terminal widths and disabling of rewrapping
+e77783dcd	0	-	310	Added support for default overrides.  This fixes #42
+85e466724	0	-	324	Added tests for lazy flags
+f270dd208	0	-	440	Added lazy file opening
+81930b58c	0	-	515	Added count support and int ranges
+38b3b4151	0	-	287	Added support for alternative prefix chars
+2e8354a82	0	-	338	Added support for nargs in other places
+a6f94010a	0	-	330	Added test for required
+e67212bc8	0	-	305	Added metavars for choice test
+4a8cf5696	0	-	424	Added tests for choice type
+4ed961d2f	0	-	347	Added UUID type support
+a25bf1300	0	-	245	Auto truncate short help instead of hiding it.  Fixes #53
+8512acdda	0	-	214	Added support for object ensuring
+506e4e7f4	0	-	285	Added support for command forwarding.
+14c9b1a0b	0	-	462	Made tests pass on 3.x
+7360097ec	0	-	327	Added some tests for some options
+3f695c6ec	0	-	275	Started a bit of test code
