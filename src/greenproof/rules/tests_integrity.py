@@ -12,7 +12,7 @@ import ast
 import posixpath
 import re
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 
 from greenproof.changeset import ChangedFile, ChangeSet
@@ -90,7 +90,64 @@ def _leaf(u: Unit) -> str:
     return u.key
 
 
-def pair_units(base: list[Unit], cand: list[Unit]) -> _Pairing:
+def _segments(u: Unit) -> tuple[str, ...]:
+    """The qualified name of a test as segments: describe titles then the test title (JS/TS),
+    classes then the function (Python); a single segment for Go and Rust."""
+    if u.engine.startswith("python"):
+        return tuple(u.key.split("::"))
+    if u.engine == "js":
+        return tuple(u.key.split(" > "))
+    return (u.key,)
+
+
+def _squash(name: str) -> str:
+    return re.sub(r"[\W_]+", "", name).lower()
+
+
+def _chain_depth(a: tuple[str, ...], b: tuple[str, ...]) -> int:
+    """How many trailing segments two qualified names share (the leaf counts as one)."""
+    depth = 0
+    for x, y in zip(reversed(a), reversed(b), strict=False):
+        if x != y:
+            break
+        depth += 1
+    return depth
+
+
+def _unique_best(
+    scores: dict[tuple[int, int], float], floor: float, margin: float = 0.0
+) -> list[tuple[int, int]]:
+    """Pairs (row, column) that are each other's single best score, at least `floor`, and
+    ahead of the runner-up on both sides by more than `margin`."""
+    best_row: dict[int, tuple[float, int]] = {}
+    second_row: dict[int, float] = {}
+    best_col: dict[int, tuple[float, int]] = {}
+    second_col: dict[int, float] = {}
+    for (r, c), v in scores.items():
+        for best, second, key, other in (
+            (best_row, second_row, r, c),
+            (best_col, second_col, c, r),
+        ):
+            top = best.get(key)
+            if top is None or v > top[0]:
+                if top is not None:
+                    second[key] = max(second.get(key, 0.0), top[0])
+                best[key] = (v, other)
+            else:
+                second[key] = max(second.get(key, 0.0), v)
+    out = []
+    for r, (v, c) in best_row.items():
+        if v < floor or best_col.get(c, (0.0, -1))[1] != r:
+            continue
+        if v - second_row.get(r, 0.0) <= margin or v - second_col.get(c, 0.0) <= margin:
+            continue
+        out.append((r, c))
+    return out
+
+
+def pair_units(
+    base: list[Unit], cand: list[Unit], text_of: Callable[[Unit, bool], str] | None = None
+) -> _Pairing:
     result = _Pairing()
     free = list(range(len(cand)))
     unmatched: list[Unit] = []
@@ -118,6 +175,44 @@ def pair_units(base: list[Unit], cand: list[Unit]) -> _Pairing:
             )
         else:
             unpaired.append(b)
+    # 2b. Titles that repeat in the file: several tests share a leaf name, so pass 2 cannot tell
+    # them apart, but each is told by its parents (a describe title edited above the group).
+    # A base test pairs with the candidate test of the same file and leaf name that shares
+    # the most trailing segments of the qualified name (at least one parent), when each is
+    # the other's single best and no other test of the group ties with it.
+    groups: dict[tuple[str, str], tuple[list[Unit], list[int]]] = {}
+    for b in unpaired:
+        groups.setdefault((b.path, _leaf(b)), ([], []))[0].append(b)
+    for i in free:
+        key = (cand[i].path, _leaf(cand[i]))
+        if key in groups:
+            groups[key][1].append(i)
+    for members, indexes in groups.values():
+        if not members or not indexes or (len(members) == 1 and len(indexes) == 1):
+            continue
+        depths = {
+            (r, c): float(_chain_depth(_segments(b), _segments(cand[i])))
+            for r, b in enumerate(members)
+            for c, i in enumerate(indexes)
+        }
+        for r, c in _unique_best(depths, 2.0):
+            result.pairs.append((members[r], take(indexes[c])))
+    paired_now = {id(b) for b, _ in result.pairs}
+    unpaired = [b for b in unpaired if id(b) not in paired_now]
+    # 2c. The same name written differently (`TestNoArgsWithArgs` and `TestNoArgs_WithArgs`:
+    # case and punctuation ignored), unique among the unpaired tests of the file on both sides.
+    base_names = Counter((b.path, _squash(_leaf(b))) for b in unpaired)
+    cand_names = Counter((cand[i].path, _squash(_leaf(cand[i]))) for i in free)
+    still: list[Unit] = []
+    for b in unpaired:
+        ident = (b.path, _squash(_leaf(b)))
+        if ident[1] and base_names[ident] == 1 and cand_names[ident] == 1:
+            result.pairs.append(
+                (b, take(next(i for i in free if (cand[i].path, _squash(_leaf(cand[i]))) == ident)))
+            )
+        else:
+            still.append(b)
+    unpaired = still
     remaining: list[Unit] = []
     for b in unpaired:  # 3. same key, another path: a move
         hits = [i for i in free if cand[i].key == b.key]
@@ -136,14 +231,129 @@ def pair_units(base: list[Unit], cand: list[Unit]) -> _Pairing:
     # 5. Same structure (identifiers alpha-renamed), only when the match is one-to-one.
     base_counts = Counter(b.struct_hash for b in leftover if b.struct_hash)
     cand_counts = Counter(cand[i].struct_hash for i in free if cand[i].struct_hash)
+    left: list[Unit] = []
     for b in leftover:
         h = b.struct_hash
         if h and base_counts[h] == 1 and cand_counts[h] == 1:
             result.pairs.append((b, take(next(i for i in free if cand[i].struct_hash == h))))
         else:
-            result.left_base.append(b)
+            left.append(b)
+    # 6. A test renamed while its body also changed: by body similarity, strictly.
+    if text_of is not None and left and free:
+        left = _pair_by_similarity(left, cand, free, result, take, text_of)
+    result.left_base.extend(left)
     result.left_cand = [cand[i] for i in free]
     return result
+
+
+_TOKEN = re.compile(
+    r"""[A-Za-z_$][\w$]*|\d+(?:\.\d+)?|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`[^`\n]*`"""
+)
+_MAX_TOKENS = 4000
+_MIN_TOKENS = 10  # a smaller body says too little to tell a rename from a replacement
+_SIMILAR_IN_FILE = 0.6
+_SIMILAR_ACROSS_FILES = 0.75
+_CONTAINED = 0.9  # share of a base test's tokens inside the larger test it grew into
+_SIMILAR_MARGIN = 0.05
+_SIMILAR_BUDGET = 40_000  # comparisons per check: the pass is skipped, never slowed, beyond it
+
+
+@dataclass
+class _Bag:
+    words: Counter[str]  # identifiers and keywords
+    values: Counter[str]  # numbers and string literals
+    size: int
+
+
+def _bag(u: Unit, text: str) -> _Bag:
+    """The tokens of a test body, without the test's own name."""
+    leaf = _leaf(u).rsplit("::", 1)[-1]
+    title = {f"{q}{leaf}{q}" for q in "'\"`"}
+    words: Counter[str] = Counter()
+    values: Counter[str] = Counter()
+    for n, tok in enumerate(_TOKEN.finditer(text)):
+        if n >= _MAX_TOKENS:
+            break
+        t = tok.group()
+        if t == leaf or t in title:
+            continue
+        (words if t[0].isalpha() or t[0] in "_$" else values)[t] += 1
+    return _Bag(words, values, sum(words.values()) + sum(values.values()))
+
+
+def _overlap(a: Counter[str], b: Counter[str]) -> float:
+    if len(a) > len(b):
+        a, b = b, a
+    shared = sum(min(n, b[k]) for k, n in a.items() if k in b)
+    total = sum(a.values()) + sum(b.values()) - shared
+    return shared / total if total else 1.0
+
+
+def _similarity(a: _Bag, b: _Bag) -> float:
+    """The lower of the overlap of identifier tokens and of all tokens (multiset Jaccard): a
+    body that keeps its words but not its values, or its values but not its words, is not the
+    same test."""
+    if b.size > a.size * 2:
+        # The candidate test grew to more than twice the base (a test extended while it was
+        # renamed): the base must sit inside it, words and literals both, and have literals.
+        if sum(a.values.values()) < 2:
+            return 0.0
+        words = sum(min(n, b.words[k]) for k, n in a.words.items()) / max(1, sum(a.words.values()))
+        values = sum(min(n, b.values[k]) for k, n in a.values.items()) / sum(a.values.values())
+        inside = min(words, values)
+        return inside if inside >= _CONTAINED else 0.0
+    if a.size > b.size * 2:
+        return 0.0
+    both_a, both_b = a.words + a.values, b.words + b.values
+    return min(_overlap(a.words, b.words), _overlap(both_a, both_b))
+
+
+def _pair_by_similarity(
+    left: list[Unit],
+    cand: list[Unit],
+    free: list[int],
+    result: _Pairing,
+    take: Callable[[int], Unit],
+    text_of: Callable[[Unit, bool], str],
+) -> list[Unit]:
+    """Pass 6 (SPEC 5.7): a removed test and an added test that are each other's single best
+    match by body similarity. First inside one file (at least 0.6), then across the files of
+    the change (at least 0.75, a move that also renamed and edited). The pair then goes
+    through the normal paired comparison, which still catches a weakening. Returns the base
+    tests that stay unpaired."""
+    bags: dict[int, _Bag] = {}
+
+    def bag_of(u: Unit, base: bool) -> _Bag:
+        key = id(u)
+        if key not in bags:
+            bags[key] = _bag(u, text_of(u, base))
+        return bags[key]
+
+    budget = _SIMILAR_BUDGET
+    for same_file, floor in ((True, _SIMILAR_IN_FILE), (False, _SIMILAR_ACROSS_FILES)):
+        rows: dict[object, list[Unit]] = {}
+        for b in left:
+            rows.setdefault(b.path if same_file else "", []).append(b)
+        for group, members in rows.items():
+            indexes = [i for i in free if not same_file or cand[i].path == group]
+            members = [b for b in members if bag_of(b, True).size >= _MIN_TOKENS]
+            indexes = [i for i in indexes if bag_of(cand[i], False).size >= _MIN_TOKENS]
+            if not members or not indexes or len(members) * len(indexes) > budget:
+                continue
+            budget -= len(members) * len(indexes)
+            scores = {}
+            for r, b in enumerate(members):
+                for c, i in enumerate(indexes):
+                    v = _similarity(bag_of(b, True), bag_of(cand[i], False))
+                    if v >= floor - _SIMILAR_MARGIN:
+                        scores[(r, c)] = v
+            for r, c in _unique_best(scores, floor, _SIMILAR_MARGIN):
+                result.pairs.append((members[r], take(indexes[c])))
+        paired = {id(b) for b, _ in result.pairs}
+        left = [b for b in left if id(b) not in paired]
+        if not left or not free:
+            break
+    return left
 
 
 def _added_forms(pairing: _Pairing) -> set[str]:
@@ -680,7 +890,7 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
                 live_ignores(analysis, cfg, changes.listing(analysis is s.base))
     base_units = _collected(sides, cfg, base=True)
     cand_units = _collected(sides, cfg, base=False)
-    pairing = pair_units(base_units, cand_units)
+    pairing = pair_units(base_units, cand_units, _text_reader(sides))
     universe = _added_forms(pairing)
     twins = {(u.body_hash, tuple(sorted(u.param_forms))) for u in cand_units}
     pairing.left_base = [
@@ -746,6 +956,29 @@ def _go_callers(changes: ChangeSet, sides: list[_Side]) -> list[_Side]:
                 )
             )
     return out
+
+
+def _text_reader(sides: list[_Side]) -> Callable[[Unit, bool], str]:
+    """The source text of a test (its decorators and body), read from the changed files."""
+    files: dict[tuple[str, bool], tuple[str | None, list[str] | None]] = {}
+    for s in sides:
+        files.setdefault((s.file.path, True), (s.file.old_text, None))
+        files.setdefault((s.file.path, False), (s.file.new_text, None))
+
+    def read(u: Unit, base: bool) -> str:
+        text, lines = files.get((u.path, base), (None, None))
+        if text is None:
+            return ""
+        if lines is None:
+            lines = text.splitlines()
+            files[(u.path, base)] = (text, lines)
+        start, end = u.line, u.end_line
+        if u.node is not None:
+            end = getattr(u.node, "end_lineno", None) or end
+            start = min([start, *(d.lineno for d in getattr(u.node, "decorator_list", []))])
+        return "\n".join(lines[start - 1 : end]) if end >= start else ""
+
+    return read
 
 
 def _collected(sides: list[_Side], cfg: Collection, base: bool) -> list[Unit]:
