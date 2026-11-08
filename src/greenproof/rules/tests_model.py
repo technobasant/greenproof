@@ -56,6 +56,25 @@ class Table:
         return ""
 
 
+@dataclass(frozen=True)
+class RowTab:
+    """A literal table of rows that drives a Python test's checks: a `for` loop (a subTest fold
+    or a plain loop) or a `parametrize` decorator. `rows` is the number of distinct rows, None
+    when the table cannot be read (`why` is "altered" for a module-level name re-bound or mutated
+    after its literal, "opaque" otherwise). `reads` is whether an assertion reads the row's
+    variables; `sig` the assertion forms the loop body checks; `keys` the distinct rows."""
+
+    kind: str  # "loop" or "param"
+    names: tuple[str, ...]
+    sig: str
+    rows: int | None
+    reads: bool
+    why: str = ""
+    name: str = ""  # the module-level name the table is read through, else ""
+    keys: tuple[str, ...] = ()
+    literal: bool = True  # a parametrize whose argvalues are a literal (the case count covers it)
+
+
 @dataclass
 class Unit:
     """One test. `key` is its qualified name without the path, so a move keeps its identity."""
@@ -90,6 +109,7 @@ class Unit:
     row_gap: str = ""
     row_big: bool = False
     param_marked: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
+    row_tabs: tuple[RowTab, ...] = ()  # Python: the literal row tables that drive its checks
     mark_kinds: set[str] = field(default_factory=set)  # skip, skipif, xfail marks on the test
     subjects: set[str] = field(default_factory=set)  # dotted names of the code under test called
     swallowed: int = 0
