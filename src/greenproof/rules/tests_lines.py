@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from greenproof.rules._common import digest, split_lines
 from greenproof.rules.tests_model import FileAnalysis, Marker, Table, Unit
-from greenproof.rules.tests_tables import go_unit, js_table, rust_unit, tokens
+from greenproof.rules.tests_tables import RowTable, go_unit, js_table, rust_unit, tokens
 
 _NUM = r"-?\d+(?:\.\d+)?"
 # A Rust char literal (`'}'`, `'"'`, `'\n'`): masked like a string so its bracket or quote is not
@@ -120,6 +120,11 @@ _PY_DEF = re.compile(r"^(\s*)(?:async\s+)?def\s+(test\w*)\s*\(")
 _PY_CLASS = re.compile(r"^(\s*)class\s+(\w+)")
 
 
+def _plain_run(special: str) -> re.Pattern[str]:
+    """A run of one or more characters that are neither a newline nor one of `special`."""
+    return re.compile("[^\\n" + "".join("\\" + ch for ch in special) + "]+")
+
+
 def mask_source(text: str, lang: str) -> tuple[list[str], list[str]]:
     """(masked, code) per line: comments removed in both, string contents blanked in `masked`.
 
@@ -138,6 +143,9 @@ def mask_source(text: str, lang: str) -> tuple[list[str], list[str]]:
     i, n = 0, len(text)
     state = ""  # "", "block", "str", "multi", "triple"
     quote = ""
+    # Runs of characters that change nothing are copied whole (this pass dominated big files).
+    plain = _plain_run(quotes + multi + ("#" if py else "/") + ("'" if lang == "rust" else ""))
+    inside: dict[str, re.Pattern[str]] = {}
     while i < n:
         ch = text[i]
         if ch == "\n":
@@ -147,12 +155,32 @@ def mask_source(text: str, lang: str) -> tuple[list[str], list[str]]:
             i += 1
             continue
         if state == "block":
-            if text.startswith("*/", i):
-                state = ""
-                i += 2
+            close_at, nl = text.find("*/", i), text.find("\n", i)
+            if nl >= 0 and (close_at < 0 or nl < close_at):
+                i = nl
+            elif close_at < 0:
+                i = n
             else:
-                i += 1
+                state = ""
+                i = close_at + 2
             continue
+        if state == "":
+            run = plain.match(text, i)
+            if run is not None:
+                m.append(run.group())
+                c.append(run.group())
+                i = run.end()
+                continue
+        elif state != "block":
+            key = state + quote
+            pat = inside.get(key)
+            if pat is None:
+                pat = inside[key] = _plain_run(quote + ("" if state == "triple" else "\\"))
+            run = pat.match(text, i)
+            if run is not None:
+                c.append(run.group())
+                i = run.end()
+                continue
         if state in ("str", "multi", "triple"):
             if ch == "\\" and state != "triple" and i + 1 < n and text[i + 1] != "\n":
                 c.append(text[i : i + 2])
@@ -172,8 +200,8 @@ def mask_source(text: str, lang: str) -> tuple[list[str], list[str]]:
             i += 1
             continue
         if text.startswith(line_comment, i):
-            while i < n and text[i] != "\n":
-                i += 1
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl
             continue
         if block and text.startswith("/*", i):
             state = "block"
@@ -269,7 +297,15 @@ def _blank_strings(text: str, lang: str) -> str:
     quotes = _QUOTES[lang]
     out: list[str] = []
     i, n = 0, len(text)
+    plain = re.compile(
+        "[^" + "".join("\\" + q for q in quotes + ("'" if lang == "rust" else "")) + "]+"
+    )
     while i < n:
+        run = plain.match(text, i)
+        if run is not None:
+            out.append(run.group())
+            i = run.end()
+            continue
         ch = text[i]
         if lang == "rust" and ch == "'":
             cm = _RUST_CHAR.match(text, i)
@@ -1106,6 +1142,46 @@ def _go_helper_calls(
     return (_go_call(helpers) if helpers else None), mine
 
 
+_GO_LEAVES = re.compile(
+    r"\breturn\b|\bgoto\b|\bpanic\s*\(|\bos\.Exit\b|\bGoexit\b|\.Skip(?:f|Now)?\b"
+)
+_HELPER_LINES = 150  # a helper longer than this is not read for the checks it makes
+
+
+def _go_helper_weights(
+    masked: list[str], code: list[str], helpers: frozenset[str]
+) -> dict[str, int]:
+    """How many checks one call of each of this file's assertion helpers makes (SPEC 5.4).
+
+    A call counts as the helper's own checks (its lines with an assertion; a call it makes to
+    another helper still counts as one) only when the body reads straight through: no `return`,
+    `goto`, `panic`, `os.Exit` or skip, no `bool` parameter that could switch a check off, and at
+    most `_HELPER_LINES` lines. Any other helper counts as one."""
+    bodies: dict[str, tuple[str, frozenset[str]]] = {}
+    for i, line in enumerate(code):
+        fm = _GO_FUNC.match(line)
+        if fm is None or fm.group(1) not in helpers or _GO_UNIT.match(line):
+            continue
+        end = _brace_end(masked, i)
+        if end - i > _HELPER_LINES:
+            continue
+        flags = frozenset(
+            n.strip()
+            for g in re.findall(r"((?:\w+\s*,\s*)*\w+)\s+bool\b", fm.group(2))
+            for n in g.split(",")
+        )
+        bodies[fm.group(1)] = ("\n".join([masked[i][fm.end() :], *masked[i + 1 : end + 1]]), flags)
+    if not bodies:
+        return {}
+    out: dict[str, int] = {}
+    for name, (body, flags) in bodies.items():
+        if _GO_LEAVES.search(body) or any(re.search(rf"\b{re.escape(f)}\b", body) for f in flags):
+            out[name] = 1
+        else:
+            out[name] = max(len(_ASSERTS["go"].findall(body)), 1)
+    return out
+
+
 def go_call_pattern(names: set[str] | frozenset[str]) -> re.Pattern[str]:
     """Matches a call to any of the Go functions `names`."""
     return _go_call(set(names))
@@ -1244,9 +1320,11 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
     src = _Src.build(lang, masked, code) if lang != "python-lines" else None
     spans = _find_spans(lang, raw, masked, code, src)
     helper_call: re.Pattern[str] | None = None
+    weights: dict[str, int] = {}
     analysis = FileAnalysis(path, lang)
     if lang == "go":
         helper_call, analysis.helpers = _go_helper_calls(masked, code, siblings)
+        weights = _go_helper_weights(masked, code, analysis.helpers)
     elif lang == "js" and src is not None:
         helper_call = _js_helper_calls(src, spans)
     owner: dict[int, _Span] = {}
@@ -1256,6 +1334,7 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
     for span in spans:
         dead = _dead_lines(src, span) if src is not None else {}
         lines = range(span.start, span.end + 1)
+        times: dict[int, int] = {}  # how often a line runs: the rows of a literal table loop
         const_hits = {
             k: len(_JS_CONST_EXPECT.findall(code[k])) if lang == "js" else 0 for k in lines
         }
@@ -1289,6 +1368,10 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
         if src is not None and lang == "go":
             lo, hi = src.starts[span.start], src.starts[span.end] + len(code[span.end])
             unit.table, unit.literals = go_unit(src, lo, hi)
+            if isinstance(unit.table, RowTable):
+                for blo, bhi, rows in unit.table.loops:
+                    for ln in range(src.line_of(blo), src.line_of(bhi) + 1):
+                        times[ln] = times.get(ln, 1) * rows
         elif src is not None and lang == "rust" and span.fn_line >= 0:
             unit.table, unit.literals = rust_unit(src, span.start, span.fn_line)
         unit.self_calls = selfeq.calls
@@ -1304,7 +1387,8 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
             )
             hits = len(_ASSERTS[lang].findall(masked[k])) + query
             if helper_call:
-                hits += len(helper_call.findall(masked[k]))
+                for hm in helper_call.finditer(masked[k]):
+                    hits += weights.get(hm.group(0).split("(")[0].strip(), 1)
             vac = const_hits[k] + selfeq.vacuous.get(k, 0)
             if k in dead:
                 if hits:
@@ -1312,13 +1396,14 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
                     unit.unreachable_line = unit.unreachable_line or k + 1
                 continue
             live.append(masked[k])
-            counted = max(hits - vac, 0)
+            once = max(hits - vac, 0)
+            counted = once * times.get(k, 1)
             unit.asserts += counted
             if vac and hits:
                 unit.vacuous += min(vac, hits)
                 unit.vacuous_line = unit.vacuous_line or k + 1
-            if counted > 0:
-                unit.assertion_forms.extend([digest("".join(code[k].split()))] * counted)
+            if once > 0:  # a loop's rows add to the count, not to the forms it vouches for
+                unit.assertion_forms.extend([digest("".join(code[k].split()))] * once)
         if unit.table is not None and unit.table.implicit and unit.asserts == 0:
             unit.asserts = 1  # a `test_case` row checks its `=>` value
         body_masked = "\n".join(live)

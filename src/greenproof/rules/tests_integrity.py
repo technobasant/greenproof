@@ -33,7 +33,7 @@ from greenproof.rules.tests_python import (
     lost_helpers,
     marker_display,
 )
-from greenproof.rules.tests_tables import MAX_MATCH, fits, match_rows
+from greenproof.rules.tests_tables import MAX_MATCH, fits, marker_excused, match_rows
 
 _RUST_TEST_ATTR = re.compile(r"#\[\s*(?:\w+::)*(?:test|rstest|test_case)\b")
 
@@ -370,6 +370,8 @@ def _marker_findings(sides: list[_Side], base_keys: set[str], cand_keys: set[str
             skip = m.rule == "tests.skipped"
             if skip and m.conditional and (fresh or s.base is None):
                 continue
+            if skip and marker_excused(s.base, s.cand, m):
+                continue  # a skip only the test's new table rows can reach (SPEC 5.3)
             out.append(_marker_finding(s.cand.path, m, warn=fresh and skip))
     return out
 
