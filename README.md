@@ -293,7 +293,7 @@ greenproof init --agents opencode
 writes `.opencode/plugins/greenproof.js` with the hook command filled in. The file is
 greenproof's: its first line says so and re-running `init` replaces it. A file at that path
 without that first line is never overwritten; `init` exits with code 4 and writes nothing.
-Or use the npm package `opencode-greenproof` (after it is published) in `opencode.json`:
+Or use the npm package [`opencode-greenproof`](https://www.npmjs.com/package/opencode-greenproof) in `opencode.json`:
 
 ```json
 { "plugins": ["opencode-greenproof"] }
