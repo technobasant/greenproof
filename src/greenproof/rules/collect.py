@@ -7,16 +7,18 @@ which `changeset.is_test_path` already decides, so only Python needs the configu
 
 from __future__ import annotations
 
+import ast
 import configparser
+import posixpath
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any
 
 from greenproof.changeset import ChangeSet, matches_glob
 from greenproof.rules import runner_config as rc
-from greenproof.rules.tests_model import Unit
+from greenproof.rules.tests_model import FileAnalysis, Unit
 
 DEFAULT_FILES = ("test_*.py", "*_test.py")
 DEFAULT_CLASSES = ("Test",)
@@ -87,3 +89,70 @@ def collection_from_base(changes: ChangeSet) -> Collection:
     except rc.Broken:
         return Collection()
     return _from_options(opts) if opts else Collection()
+
+
+_IGNORES = ("collect_ignore", "collect_ignore_glob")
+
+
+def _ignored(text: str) -> tuple[str, list[str]] | None:
+    """(`collect_ignore` or `collect_ignore_glob`, its entries) of a marker's text, or None when
+    the value is not a literal list or tuple of strings."""
+    name, _, value = text.partition(" = ")
+    if name not in _IGNORES:
+        return None
+    try:
+        parsed = ast.literal_eval(value)
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        return None
+    if isinstance(parsed, (list, tuple)) and all(isinstance(e, str) for e in parsed):
+        return name, list(parsed)
+    return None
+
+
+def _entry_live(name: str, entry: str, here: str, cfg: Collection, files: set[str]) -> bool:
+    """Whether one `collect_ignore` entry hides, or could hide, a collected test file."""
+    rel = posixpath.normpath(entry) if entry else "."
+    if name == "collect_ignore":
+        target = posixpath.normpath(posixpath.join(here, rel))
+        if target.startswith(".."):
+            return True
+        if target != "." and cfg.file_collected(target):
+            return True
+        prefix = "" if target == "." else target + "/"
+        return any(f.startswith(prefix) and cfg.file_collected(f) for f in files)
+    # pytest matches the glob against the full path of a file or a directory
+    pattern = posixpath.join(here, entry) if here != "." else entry
+    if not re.search(r"[*?\[]", entry):
+        return True  # a plain name in a glob list: no sound reading, count it
+    for f in files:
+        if not cfg.file_collected(f):
+            continue
+        parts = f.split("/")
+        paths = ["/".join(parts[: i + 1]) for i in range(len(parts))]
+        if any(fnmatchcase(p, pattern) for p in paths):
+            return True
+    return False  # it matches no test file, and no directory holding one
+
+
+def live_ignores(
+    analysis: FileAnalysis, cfg: Collection, listing: Callable[[], set[str]] | None
+) -> None:
+    """Drop the `collect_ignore` markers of a conftest.py that hide no test file.
+
+    A `collect_ignore = ["setup.py"]` skips nothing the runner would collect. An entry counts
+    when it is a collected test file, a directory holding one, or a glob matching one; an entry
+    that is not a literal string, or any entry when the tree listing is unknown, counts too, so
+    the check fails closed. A marker with no live entry is dropped."""
+    if listing is None or not any(m.kind in _IGNORES for m in analysis.markers):
+        return
+    files = listing()
+    here = posixpath.dirname(analysis.path) or "."
+    kept = []
+    for m in analysis.markers:
+        parsed = _ignored(m.text) if m.kind in _IGNORES else None
+        if parsed is not None:
+            name, entries = parsed
+            if not any(_entry_live(name, e, here, cfg, files) for e in entries):
+                continue
+        kept.append(m)
+    analysis.markers = kept

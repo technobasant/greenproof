@@ -15,7 +15,7 @@ from typing import Protocol
 
 from greenproof.rules._common import digest
 from greenproof.rules.tests_model import FileAnalysis, Fixture, Marker, Unit
-from greenproof.rules.tests_pyrows import row_gap
+from greenproof.rules.tests_pyrows import param_names, row_gap
 
 _MARK_SUFFIXES = ("mark.skip", "mark.skipif", "mark.xfail")
 _FULL_KINDS = {
@@ -547,9 +547,30 @@ def _is_literal(node: ast.AST) -> bool:
     return False
 
 
+_APPROX_TIGHT = 1e-6  # the loosest approx tolerance still credited as pinning a value
+
+
+def _approx_arg(node: ast.AST) -> ast.expr | None:
+    """The expected value of `approx(<value>)` when its tolerance is the default or no looser
+    than `_APPROX_TIGHT` (literal `rel=` and `abs=` only); None for anything else."""
+    if not (
+        isinstance(node, ast.Call)
+        and dotted(node.func).rsplit(".", 1)[-1] == "approx"
+        and len(node.args) == 1
+    ):
+        return None
+    for kw in node.keywords:
+        if kw.arg not in {"rel", "abs"}:
+            return None
+        tol = _number(kw.value)
+        if tol is None or not 0 <= tol <= _APPROX_TIGHT:
+            return None
+    return node.args[0]
+
+
 def _is_pinned(node: ast.AST) -> bool:
     """A literal an exact check can pin a value to: a constant, a negated number, a display of
-    literals, or `approx(<literal>)`."""
+    literals, or `approx(<literal>)` with a tight tolerance."""
     if isinstance(node, ast.Constant):
         return node.value is not Ellipsis
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
@@ -560,9 +581,27 @@ def _is_pinned(node: ast.AST) -> bool:
         return all(k is not None and _is_pinned(k) for k in node.keys) and all(
             _is_pinned(v) for v in node.values
         )
-    if isinstance(node, ast.Call) and dotted(node.func).endswith("approx") and node.args:
-        return _is_pinned(node.args[0])
-    return False
+    arg = _approx_arg(node)
+    return arg is not None and _is_pinned(arg)
+
+
+def _pinned_expr(node: ast.AST) -> bool:
+    """`_is_pinned`, or a value built from literals (`_constructed`)."""
+    return _is_pinned(node) or _constructed(node)
+
+
+def _constructed(node: ast.AST) -> bool:
+    """`QueryParams("a=1")`, `Decimal("1.5")`: a capitalised callable built from literals alone, a
+    value the test spells out. A call of a lower-case function is computed, not pinned."""
+    if not (isinstance(node, ast.Call) and (node.args or node.keywords)):
+        return False
+    name = dotted(node.func).rsplit(".", 1)[-1]
+    return (
+        name[:1].isupper()
+        and not name.isupper()
+        and all(not isinstance(a, ast.Starred) and _pinned_expr(a) for a in node.args)
+        and all(k.arg is not None and _pinned_expr(k.value) for k in node.keywords)
+    )
 
 
 def _literal_params(fn: _FuncDef) -> set[str]:
@@ -602,9 +641,9 @@ def _case_literal(case: ast.expr, index: int, width: int) -> bool:
             else (case.args[0] if case.args else case)
         )
     if width == 1:
-        return _is_pinned(case)
+        return _pinned_expr(case)
     if isinstance(case, (ast.Tuple, ast.List)) and len(case.elts) == width:
-        return _is_pinned(case.elts[index])
+        return _pinned_expr(case.elts[index])
     return False
 
 
@@ -627,6 +666,11 @@ class _Helpers(dict[str, _FuncDef]):
         super().__init__()
         self.scopes: dict[str, dict[str, _FuncDef]] = {}
         self.swallowers: set[str] = set()
+        # The file's own plain functions defined exactly once at module level, whose calls are
+        # read as if inlined (their checks pin values, their calls are subjects), and the
+        # module-level names bound once to a literal list or tuple (a table of rows).
+        self.unique: set[str] = set()
+        self.tables: dict[str, ast.expr] = {}
 
 
 def _handler_swallows(handler: ast.ExceptHandler) -> bool:
@@ -712,6 +756,7 @@ def _direct_defs(fn: _FuncDef) -> list[_FuncDef]:
 # How many helpers deep a test's call chain is followed (`check` -> `_check_fields` -> `_check_id`).
 # The stack in `_credit_helper` already stops cycles.
 _HELPER_DEPTH = 8
+_INLINE_DEPTH = 3  # how deep a helper call is read as inlined (pinned values, subjects, rows)
 
 
 class _Stats(ast.NodeVisitor):
@@ -799,7 +844,15 @@ class _Stats(ast.NodeVisitor):
     def _pinned_side(self, node: ast.expr) -> bool:
         if isinstance(node, ast.Name) and node.id in self.literal_params:
             return True
-        return _is_pinned(self.consts.inline(node))
+        if _constructed(node):  # spelled out here, not a local that was built earlier
+            return True
+        inlined = self.consts.inline(node)
+        if isinstance(inlined, ast.Name) and inlined.id in self.literal_params:
+            return True
+        arg = _approx_arg(inlined)
+        if arg is not None:
+            return self._pinned_side(arg)
+        return _is_pinned(inlined)
 
     def _pinned_check(self, sides: Sequence[ast.expr]) -> None:
         """Count an exact check one of whose sides is pinned to a literal."""
@@ -1124,8 +1177,17 @@ class _Stats(ast.NodeVisitor):
             (*self.stack, target),
             _Consts(self.helpers[target]),
         )
+        inlined = target in getattr(self.helpers, "unique", ()) and self.depth < _INLINE_DEPTH
+        if inlined:
+            sub.literal_params = self._literal_args(self.helpers[target], node)
         for stmt in self.helpers[target].body:
             sub.visit(stmt)
+        if inlined:
+            self.pinned += sub.pinned
+            for key, text in sub.exact.items():
+                self.exact.setdefault(key, text)
+            for key, text in sub.loose.items():
+                self.loose.setdefault(key, text)
         self.asserts += sub.asserts
         self.strong += sub.strong
         self.weak += sub.weak
@@ -1140,6 +1202,18 @@ class _Stats(ast.NodeVisitor):
             self.call_self[key] = self.call_self.get(key, 0) + count
         self.call_self_line = self.call_self_line or sub.call_self_line
         self.call_compared |= sub.call_compared
+
+    def _literal_args(self, helper: _FuncDef, call: ast.Call) -> set[str]:
+        """The parameters of `helper` bound, by this call, to a literal or a literal row value."""
+        args = helper.args
+        names = [a.arg for a in (*args.posonlyargs, *args.args)]
+        if any(isinstance(a, ast.Starred) for a in call.args) or any(
+            k.arg is None for k in call.keywords
+        ):
+            return set()
+        bound = dict(zip(names, call.args, strict=False))
+        bound.update({k.arg: k.value for k in call.keywords if k.arg})
+        return {name for name, value in bound.items() if self._pinned_side(value)}
 
     # -- swallowing ---------------------------------------------------------------------
     def _swallows(self, handler: ast.ExceptHandler) -> bool:
@@ -1197,6 +1271,80 @@ def _parametrize(fn: _FuncDef) -> tuple[int | None, bool, list[str]]:
         else:
             literal = False
     return (total if literal else None), literal, forms
+
+
+@dataclass(frozen=True)
+class _Fold:
+    """A unittest fold: `for <names> in <literal rows>:` around `with self.subTest(...)`, the
+    only place the test asserts."""
+
+    loop: ast.For
+    names: tuple[str, ...]
+    rows: tuple[ast.expr, ...]
+
+
+def _fold_targets(target: ast.expr) -> tuple[str, ...] | None:
+    if isinstance(target, ast.Name):
+        return (target.id,)
+    if isinstance(target, (ast.Tuple, ast.List)) and all(
+        isinstance(e, ast.Name) for e in target.elts
+    ):
+        names = tuple(e.id for e in target.elts if isinstance(e, ast.Name))
+        return names if len(set(names)) == len(names) else None
+    return None
+
+
+def _has_subtest(loop: ast.For) -> bool:
+    for stmt in loop.body:
+        if isinstance(stmt, (ast.With, ast.AsyncWith)):
+            for item in stmt.items:
+                ctx = item.context_expr
+                if isinstance(ctx, ast.Call) and dotted(ctx.func).rsplit(".", 1)[-1] == "subTest":
+                    return True
+    return False
+
+
+def _fold_loop(fn: _FuncDef, helpers: dict[str, _FuncDef]) -> _Fold | None:
+    """The `subTest` loop that folds a literal table of rows into `fn`, read like a parametrize
+    decorator: a top-level `for` over a literal list or tuple (or a module-level name bound once
+    to one) of literal rows, with no `else`, whose body holds a `with self.subTest(...)`, in a test
+    with no parametrize decorator, no other loop of this kind, and no assertion outside the loop
+    (those would run once, not once per row). The loop variables must not be rebound in the body."""
+    if isinstance(fn, ast.AsyncFunctionDef) or param_names(fn):
+        return None
+    loops = [s for s in fn.body if isinstance(s, ast.For) and _has_subtest(s)]
+    if len(loops) != 1 or loops[0].orelse:
+        return None
+    loop = loops[0]
+    names = _fold_targets(loop.target)
+    table: ast.expr | None = loop.iter
+    if isinstance(table, ast.Name):
+        table = getattr(helpers, "tables", {}).get(table.id)
+    if names is None or not isinstance(table, (ast.List, ast.Tuple)) or not table.elts:
+        return None
+    for row in table.elts:
+        if isinstance(row, ast.Starred) or not _is_pinned(row):
+            return None
+        if len(names) > 1 and not (
+            isinstance(row, (ast.Tuple, ast.List)) and len(row.elts) == len(names)
+        ):
+            return None
+    targets = {id(n) for n in ast.walk(loop.target)}
+    for node in ast.walk(loop):
+        if (
+            isinstance(node, ast.Name)
+            and not isinstance(node.ctx, ast.Load)
+            and node.id in names
+            and id(node) not in targets
+        ):
+            return None
+    outside = _Stats(helpers, consts=_Consts(fn))
+    for stmt in fn.body:
+        if stmt is not loop:
+            outside.visit(stmt)
+    if outside.asserts or outside.vacuous or outside.swallowed:
+        return None
+    return _Fold(loop, names, tuple(table.elts))
 
 
 def _marked(fn: _FuncDef) -> list[tuple[str, tuple[str, ...]]]:
@@ -1278,6 +1426,32 @@ def _subjects(fn: _FuncDef) -> set[str]:
     return out
 
 
+def _helper_subjects(fn: _FuncDef, helpers: Mapping[str, _FuncDef]) -> set[str]:
+    """The subjects of the file's own plain helpers `fn` calls, as if their bodies were inlined
+    (`_INLINE_DEPTH` deep): a test that asserts through `check(a, b)` still calls what `check`
+    calls. The helper's own name stays a subject of the caller."""
+    unique: AbstractSet[str] = getattr(helpers, "unique", set())
+    out: set[str] = set()
+    seen: set[str] = set()
+    level: list[_FuncDef] = [fn]
+    for _ in range(_INLINE_DEPTH):
+        nxt: list[_FuncDef] = []
+        for func in level:
+            for node in ast.walk(func):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in unique
+                    and node.func.id not in seen
+                ):
+                    seen.add(node.func.id)
+                    nxt.append(helpers[node.func.id])
+        for func in nxt:
+            out |= _subjects(func)
+        level = nxt
+    return out
+
+
 def _body_hash(fn: _FuncDef) -> str:
     body = list(fn.body)
     if (
@@ -1318,6 +1492,9 @@ def _unit(
     dropped = _prune(live)
     stats = _Stats(helpers, consts=_Consts(live))
     stats.literal_params = _literal_params(fn)
+    fold = _fold_loop(fn, helpers)
+    if fold is not None:
+        stats.literal_params |= set(fold.names)
     for stmt in live.body:
         stats.visit(stmt)
     swallowers: set[str] = getattr(helpers, "swallowers", set())
@@ -1328,7 +1505,9 @@ def _unit(
             stats.swallow_line = stats.swallow_line or dec.lineno
             break
     cases, literal, case_forms = _parametrize(fn)
-    gap, big = row_gap(fn)
+    if fold is not None:
+        cases, literal, case_forms = len(fold.rows), True, [digest(ast.dump(r)) for r in fold.rows]
+    gap, big = row_gap(fn, helpers, (set(fold.names), fold.loop) if fold else None)
     lost = _Stats(helpers)
     for stmt in dropped:
         lost.visit(stmt)
@@ -1351,7 +1530,7 @@ def _unit(
         row_big=big,
         param_marked=_marked(fn),
         mark_kinds=_mark_kinds(fn),
-        subjects=_subjects(live),
+        subjects=_subjects(live) | _helper_subjects(live, helpers),
         swallowed=stats.swallowed,
         swallow_line=stats.swallow_line,
         expected=stats.expected,
@@ -1566,7 +1745,11 @@ def _conftest_markers(path: str, tree: ast.Module) -> list[Marker]:
                     "collect_ignore",
                     "collect_ignore_glob",
                 }:
-                    out.append(Marker(scope, target.id, target.id, node.lineno, "tests.skipped"))
+                    value = node.value
+                    text = target.id
+                    if value is not None:  # the paths, for `collect.live_ignores`
+                        text = f"{target.id} = {ast.unparse(value)[:200]}"
+                    out.append(Marker(scope, target.id, text, node.lineno, "tests.skipped"))
     return out
 
 
@@ -1806,6 +1989,86 @@ def analyse_python(path: str, text: str, sources: Sources | None = None) -> File
         return None
 
 
+def _bound_once(tree: ast.Module) -> set[str]:
+    """The module-level names bound exactly once, by a plain `def` or assignment at the top of the
+    module: not rebound in an `if` or `try`, by a `del`, an import, a loop, `global` or `:=`."""
+    count: dict[str, int] = {}
+    stack: list[ast.AST] = list(tree.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            count[node.name] = count.get(node.name, 0) + 1
+            for sub in ast.walk(node):
+                if isinstance(sub, (ast.Global, ast.Nonlocal)):
+                    for name in sub.names:
+                        count[name] = count.get(name, 0) + 2
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                count[name] = count.get(name, 0) + 1
+        elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            count[node.id] = count.get(node.id, 0) + 1
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            count[node.name] = count.get(node.name, 0) + 1
+        stack.extend(ast.iter_child_nodes(node))
+    return {name for name, n in count.items() if n == 1}
+
+
+def _plain_helper(fn: _FuncDef) -> bool:
+    """A function whose call runs its body: not async, not a generator, not decorated."""
+    if isinstance(fn, ast.AsyncFunctionDef) or fn.decorator_list:
+        return False
+    stack: list[ast.AST] = list(fn.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.Yield, ast.YieldFrom)):
+            return False
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            stack.extend(ast.iter_child_nodes(node))
+    return True
+
+
+def _module_tables(helpers: _Helpers, tree: ast.Module) -> None:
+    """Fill `helpers.unique` and `helpers.tables` from the module's top level."""
+    once = _bound_once(tree)
+    handled: set[str] = set()  # names the module touches in a way that could change a table
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)) or (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and not isinstance(node.ctx, ast.Load)
+        ):
+            handled.add(node.value.id)
+        elif isinstance(node, ast.Call):
+            handled.update(a.id for a in node.args if isinstance(a, ast.Name))
+            handled.update(
+                a.value.id
+                for a in node.args
+                if isinstance(a, ast.Starred) and isinstance(a.value, ast.Name)
+            )
+            handled.update(k.value.id for k in node.keywords if isinstance(k.value, ast.Name))
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            if node.name in once and not node.name.startswith("test") and _plain_helper(node):
+                helpers.unique.add(node.name)
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if (
+                isinstance(target, ast.Name)
+                and target.id in once - handled
+                and isinstance(node.value, (ast.List, ast.Tuple))
+            ):
+                helpers.tables[target.id] = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id in once - handled
+            and isinstance(node.value, (ast.List, ast.Tuple))
+        ):
+            helpers.tables[node.target.id] = node.value
+
+
 def _module_helpers(
     path: str, tree: ast.Module, sources: Sources | None
 ) -> tuple[_Helpers, set[str]]:
@@ -1825,6 +2088,7 @@ def _module_helpers(
     if sources is not None:
         imports = _import_helpers(path, tree, sources, helpers)
     helpers.swallowers = {k for k, fn in helpers.items() if _fn_swallows(fn)}
+    _module_tables(helpers, tree)
     return helpers, imports
 
 

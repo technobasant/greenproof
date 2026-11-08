@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import BLOCK, WARN, Finding
 from greenproof.rules._common import CODE_SUFFIXES, finding, language_of, sev_finding
-from greenproof.rules.collect import Collection, collection_from_base
+from greenproof.rules.collect import Collection, collection_from_base, live_ignores
 from greenproof.rules.self_mocked import check_autouse_fixtures, check_self_mocked
 from greenproof.rules.tests_data import check_expected_data
 from greenproof.rules.tests_lines import analyse_lines, go_call_pattern
@@ -677,6 +677,7 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
         ):
             if analysis is not None and analysis.engine.startswith("python"):
                 analysis.collected = cfg.file_collected(real_path)
+                live_ignores(analysis, cfg, changes.listing(analysis is s.base))
     base_units = _collected(sides, cfg, base=True)
     cand_units = _collected(sides, cfg, base=False)
     pairing = pair_units(base_units, cand_units)
