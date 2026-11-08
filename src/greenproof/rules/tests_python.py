@@ -832,9 +832,12 @@ def _match_env_for(path: str, tree: ast.Module, sources: Sources | None) -> _Mat
     """The `_MatchEnv` of the test file `tree`, with the matchers it imports from test modules."""
     defs = set(_loose_defs(tree))
     if sources is not None:
+        read: dict[str, set[str]] = {}  # each module is read once, however often it is imported
 
         def add(local: str, found: tuple[str, ast.Module], only: str | None) -> bool:
-            theirs = _loose_defs(found[1])
+            theirs = read.get(found[0])
+            if theirs is None:
+                theirs = read[found[0]] = _loose_defs(found[1])
             if only is None:
                 defs.update(f"{local}.{n}" for n in theirs)
             elif only in theirs:
