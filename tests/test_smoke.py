@@ -267,3 +267,28 @@ def test_sigterm_terminates_the_started_group(tmp_path: Path, server: Server) ->
     assert proc.returncode == 128 + signal.SIGTERM
     time.sleep(0.2)
     assert not alive(server.pid())
+
+
+def test_terminate_group_does_not_hang_when_the_wait_lock_is_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A signal handler that raised inside Popen.wait or Popen.poll can leave this lock held.
+    import threading
+
+    from greenproof import runner
+
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    lock = getattr(proc, "_waitpid_lock", None)
+    if lock is None:
+        proc.kill()
+        proc.wait()
+        pytest.skip("this Python's Popen has no _waitpid_lock")
+    monkeypatch.setattr(smoke, "TERM_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(runner, "REAP_SECONDS", 0.2)
+    lock.acquire()
+    worker = threading.Thread(target=smoke.terminate_group, args=(proc,), daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    lock.release()
+    assert not worker.is_alive(), "terminate_group hung"
+    assert proc.wait(timeout=5) in (-signal.SIGTERM, -signal.SIGKILL)

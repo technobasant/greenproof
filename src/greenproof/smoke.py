@@ -23,7 +23,7 @@ from typing import Any
 
 from greenproof import gitops
 from greenproof.policy import Smoke
-from greenproof.runner import TAIL_LINES, run_command
+from greenproof.runner import TAIL_LINES, reap, run_command
 
 RULE = "smoke.failed"
 POLL_SECONDS = 0.5
@@ -99,7 +99,7 @@ def terminate_group(proc: subprocess.Popen[bytes]) -> None:
         time.sleep(0.05)
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(pgid, signal.SIGKILL)
-    proc.wait()
+    reap(proc)  # this runs after SIGINT and SIGTERM too, so the wait is bounded
 
 
 def _failure(message: str, tail: str) -> SmokeResult:

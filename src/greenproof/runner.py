@@ -20,6 +20,7 @@ from typing import Any
 TAIL_LINES = 200
 HOOK_TAIL_LINES = 40
 _TERM_GRACE_SECONDS = 3.0
+REAP_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -44,14 +45,31 @@ def _signal_group(pgid: int, sig: int) -> None:
         os.killpg(pgid, sig)
 
 
-def _kill_group(proc: subprocess.Popen[bytes]) -> None:
-    """SIGTERM the group, give the leader a moment, then SIGKILL whatever is left."""
+def reap(proc: subprocess.Popen[Any]) -> None:
+    """Wait for a killed process, but not forever.
+
+    A signal handler that raises inside `Popen.wait` or `Popen.poll` (greenproof's SIGINT and
+    SIGTERM handlers do) can leave the Popen's internal lock held: about one signal in a
+    hundred on CPython 3.11 to 3.14. After that no wait returns, so an unbounded one hangs.
+    The process is reaped when greenproof exits.
+    """
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=REAP_SECONDS)
+
+
+def _kill_group(proc: subprocess.Popen[bytes], *, interrupted: bool = False) -> None:
+    """SIGTERM the group, give the leader a moment, then SIGKILL whatever is left.
+
+    After an interruption the last wait is bounded (see `reap`)."""
     pgid = proc.pid
     _signal_group(pgid, signal.SIGTERM)
     with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=_TERM_GRACE_SECONDS)
     _signal_group(pgid, signal.SIGKILL)
-    proc.wait()
+    if interrupted:
+        reap(proc)
+    else:
+        proc.wait()
 
 
 def run_command(
@@ -94,7 +112,7 @@ def run_command(
             timed_out = True
             _kill_group(proc)
     except BaseException:
-        _kill_group(proc)
+        _kill_group(proc, interrupted=True)
         raise
     finally:
         # A background child that inherited the pipe can keep it open after the command
