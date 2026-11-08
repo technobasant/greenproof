@@ -43,7 +43,7 @@ def test_current_version_notes() -> None:
     lines = done.stdout.splitlines()
     assert lines[0].startswith(f"Install: `uvx greenproof@{__version__} --version` or ")
     assert f"https://pypi.org/project/greenproof/{__version__}/" in lines[0]
-    assert "### Added" in lines
+    assert [line for line in lines if line.startswith("### ")]  # the section's own headings
     assert not [line for line in lines if line.startswith("## [")]
     assert not [line for line in lines if LINK_REFERENCE.match(line)]
     assert lines[-1] == (

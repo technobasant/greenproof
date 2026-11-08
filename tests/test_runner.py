@@ -109,3 +109,51 @@ def test_interrupt_kills_the_group(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     with pytest.raises(KeyboardInterrupt):
         run_command("test", "echo $$ > leader.pid; sleep 30", tmp_path, 60)
     assert _wait_gone([int((tmp_path / "leader.pid").read_text())])
+
+
+def test_an_interrupt_that_leaves_the_wait_lock_held_does_not_hang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A signal handler that raises inside Popen.wait can leave the Popen's internal lock held
+    # (about one signal in a hundred); after that no wait on the process returns.
+    import signal
+    import subprocess
+    import threading
+
+    from greenproof import runner
+
+    probe = subprocess.Popen(["true"])
+    probe.wait()
+    if not hasattr(probe, "_waitpid_lock"):
+        pytest.skip("this Python's Popen has no _waitpid_lock")
+    monkeypatch.setattr(runner, "_TERM_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(runner, "REAP_SECONDS", 0.2)
+    original = subprocess.Popen.wait
+    held: dict[str, subprocess.Popen[bytes]] = {}
+
+    def wait(self: subprocess.Popen[bytes], timeout: float | None = None) -> int:
+        if not held:
+            time.sleep(0.5)  # let the command write its pid file
+            held["proc"] = self
+            self._waitpid_lock.acquire()  # type: ignore[attr-defined]  # what the race leaves
+            raise KeyboardInterrupt
+        return original(self, timeout=timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", wait)
+    raised = []
+
+    def call() -> None:
+        try:
+            run_command("test", "echo $$ > leader.pid; sleep 30", tmp_path, 60)
+        except KeyboardInterrupt:
+            raised.append(True)
+
+    worker = threading.Thread(target=call, daemon=True)
+    worker.start()
+    worker.join(timeout=20)
+    assert not worker.is_alive(), "run_command hung after the interrupt"
+    assert raised == [True]
+    proc = held["proc"]
+    proc._waitpid_lock.release()  # type: ignore[attr-defined]
+    # sh is killed by the signal, or exits 128 + 15 when its sleep dies first
+    assert original(proc, timeout=5) in (-signal.SIGTERM, -signal.SIGKILL, 128 + signal.SIGTERM)

@@ -5,6 +5,24 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-08
+
+### Fixed
+
+- An interrupted check no longer waits forever for the process it killed. When SIGINT or
+  SIGTERM arrives while a policy command or the smoke start command runs, greenproof's handler
+  raises inside `Popen.wait` or `Popen.poll`, and that leaves the Popen's internal lock held
+  about once in a hundred signals: 95 of 8,576 timed waits on CPython 3.11, 62 of 6,847 on 3.12
+  and 67 of 6,781 on 3.14. After that no wait on the process returns, so the unbounded wait
+  after SIGKILL hung. It is now bounded at two seconds (also when the `git cat-file` reader is
+  killed), and the process is reaped when greenproof exits. CI showed it as a 30-second timeout in
+  `test_sigint_removes_the_worktree_and_kills_the_command`.
+
+### Changed
+
+- CI, the release workflow, the GitHub Action and the workflow that `greenproof init --ci github`
+  writes use astral-sh/setup-uv 10.3.3.
+
 ## [0.3.0] - 2026-11-03
 
 Measured against 0.2.0 on the same inputs (MEASUREMENTS.md): of 684 tamper probes, 638 block
@@ -326,7 +344,8 @@ First release.
 - The test suite runs in parallel with `pytest-xdist` (`pytest -n auto`) in CI and in the
   documented gate.
 
-[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/technobasant/greenproof/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/technobasant/greenproof/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/technobasant/greenproof/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/technobasant/greenproof/releases/tag/v0.1.0

@@ -22,6 +22,7 @@ from types import FrameType
 from typing import Any
 
 from greenproof.errors import UsageError
+from greenproof.runner import reap
 
 SESSION_MARKER = "session-base"
 _FETCH_HINT = (
@@ -394,7 +395,7 @@ def _stop_process(proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait()
+        reap(proc)
 
 
 class BlobReader:
