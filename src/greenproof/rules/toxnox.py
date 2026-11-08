@@ -410,6 +410,7 @@ class _Scope:
                     values[node.target.id] = node.value
             stack.extend(ast.iter_child_nodes(node))
         self.total = total
+        self.dynamic = False
         self.values = {
             name: value
             for name, value in values.items()
@@ -418,6 +419,12 @@ class _Scope:
 
     def binds(self, name: str) -> bool:
         return self.total[name] > 0
+
+    def unknown(self) -> None:
+        """Nothing in this scope is known: the file sets names in a way the reader does not
+        follow (see `is_dynamic`)."""
+        self.values = {}
+        self.dynamic = True
 
 
 def _literal(value: ast.AST) -> list[str] | str | None:
@@ -448,8 +455,23 @@ def _changed_in_place(tree: ast.AST) -> set[str]:
 class _Lookup:
     """What a name stands for in a function: its own scope first, then the module's."""
 
-    def __init__(self, module: _Scope | None, local: _Scope | None, unsafe: set[str]) -> None:
+    def __init__(
+        self,
+        module: _Scope | None,
+        local: _Scope | None,
+        unsafe: set[str],
+        opaque: set[str] | None = None,
+    ) -> None:
         self.module, self.local, self.unsafe = module, local, unsafe
+        self.opaque = opaque or set()  # parameters of a helper that a call gave no literal for
+
+    def unread(self, name: str) -> bool:
+        """Whether a name is one whose value is not known and not empty: a parameter the call
+        gave no literal for, or a name of a module whose names the file sets dynamically."""
+        if name in self.opaque:
+            return True
+        local = self.local is not None and self.local.binds(name)
+        return not local and self.module is not None and self.module.dynamic
 
     def __call__(self, name: str) -> list[str] | str | None:
         scope = self.local if self.local is not None and self.local.binds(name) else self.module
@@ -479,8 +501,11 @@ def _starred_default(value: ast.AST, look: _Lookup | None = None) -> list[str]:
             return f.value.value.split()
     if (literal := _words(value)) is not None:
         return literal
-    if look is not None and isinstance(value, ast.Name) and isinstance(got := look(value.id), list):
-        return got
+    if look is not None and isinstance(value, ast.Name):
+        if isinstance(got := look(value.id), list):
+            return got
+        if look.unread(value.id):
+            return [_OPAQUE]
     if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or) and len(value.values) == 2:
         return _words(value.values[1]) or []
     if isinstance(value, ast.IfExp):
@@ -520,6 +545,78 @@ def _widened(call: ast.Call) -> bool:
     return False
 
 
+def _as_node(value: list[str] | str) -> ast.expr:
+    if isinstance(value, str):
+        return ast.Constant(value=value)
+    return ast.List(elts=[ast.Constant(value=w) for w in value], ctx=ast.Load())
+
+
+def _argument(node: ast.expr, look: _Lookup) -> ast.expr | None:
+    """What one argument of a call to a helper is, when it is a string, a list or tuple of
+    strings, or a name that stands for one: as a syntax node. None when it is not known."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node
+    if _words(node) is not None:
+        return node
+    if isinstance(node, ast.Name) and (got := look(node.id)) is not None:
+        return _as_node(got)
+    return None
+
+
+def _bind(
+    call: ast.Call, fn: ast.FunctionDef | ast.AsyncFunctionDef, look: _Lookup
+) -> dict[str, ast.expr | None]:
+    """The helper's parameters as a call binds them: positional by order, `*args` taking the
+    rest, keywords by name, the default otherwise. A parameter whose value is not a literal (a
+    variable, a computed value) is None, and every parameter is None when the call cannot be
+    matched to the signature (`*x`, `**kw`, a name twice, one too many)."""
+    a = fn.args
+    positional = [p.arg for p in (*a.posonlyargs, *a.args)]
+    params = [*positional, *(p.arg for p in a.kwonlyargs)]
+    if a.vararg:
+        params.append(a.vararg.arg)
+    if a.kwarg:
+        params.append(a.kwarg.arg)
+    unknown: dict[str, ast.expr | None] = dict.fromkeys(params)
+    if any(isinstance(x, ast.Starred) for x in call.args) or any(
+        k.arg is None for k in call.keywords
+    ):
+        return unknown
+    bound: dict[str, ast.expr | None] = {}
+    extra: list[ast.expr | None] = []
+    for i, arg in enumerate(call.args):
+        if i < len(positional):
+            bound[positional[i]] = _argument(arg, look)
+        elif a.vararg:
+            extra.append(_argument(arg, look))
+        else:
+            return unknown
+    keyword_only = {p.arg for p in a.kwonlyargs}
+    for kw in call.keywords:
+        if kw.arg in bound or not (kw.arg in positional or kw.arg in keyword_only):
+            return unknown  # given twice, or a name the helper has no parameter for
+        bound[str(kw.arg)] = _argument(kw.value, look)
+    defaults = dict(zip(positional[len(positional) - len(a.defaults) :], a.defaults, strict=True))
+    defaults.update((p.arg, d) for p, d in zip(a.kwonlyargs, a.kw_defaults, strict=True) if d)
+    out: dict[str, ast.expr | None] = {}
+    for name in [*positional, *(p.arg for p in a.kwonlyargs)]:
+        if name in bound:
+            out[name] = bound[name]
+        elif name in defaults:
+            default = defaults[name]
+            out[name] = default if _literal(default) is not None else None
+        else:
+            out[name] = None  # no value: the call is wrong
+    if a.vararg:
+        known = all(isinstance(e, ast.Constant) for e in extra)
+        out[a.vararg.arg] = (
+            ast.Tuple(elts=[e for e in extra if e], ctx=ast.Load()) if known else None
+        )
+    if a.kwarg:
+        out[a.kwarg.arg] = None
+    return out
+
+
 def _session_runs(
     fn: ast.FunctionDef | ast.AsyncFunctionDef,
     budget: list[int],
@@ -527,6 +624,7 @@ def _session_runs(
     unsafe: set[str] | None = None,
     helpers: Mapping[str, ast.FunctionDef | ast.AsyncFunctionDef] | None = None,
     depth: int = 0,
+    bound: Mapping[str, ast.expr | None] | None = None,
 ) -> tuple[list[str], list[str]]:
     """The `session.run` lines of a session, and those that go on whatever they exit with (in a
     `try` that swallows the failure, or with widened `success_codes`). `budget` counts the syntax
@@ -538,7 +636,15 @@ def _session_runs(
         params.append(fn.args.vararg.arg)
     if fn.args.kwarg:
         params.append(fn.args.kwarg.arg)
-    look = _Lookup(module, _Scope(fn.body, params, set()), unsafe or set())
+    scope = _Scope(fn.body, params, set())
+    opaque: set[str] = set()
+    for name, given in (bound or {}).items():
+        # a parameter the body does not bind again stands for what the call gave it
+        if given is not None and scope.total[name] == 1 and _literal(given) is not None:
+            scope.values[name] = given
+        else:
+            opaque.add(name)
+    look = _Lookup(module, scope, unsafe or set(), opaque)
     session = fn.args.args[0].arg if fn.args.args else None
     stack: list[tuple[ast.AST, bool]] = [(n, False) for n in reversed(fn.body)]
     while stack and budget[0] > 0:
@@ -566,7 +672,13 @@ def _session_runs(
             and node.args[0].id == session
         ):
             inner, inner_swallowed = _session_runs(
-                helpers[node.func.id], budget, module, unsafe, helpers, depth + 1
+                helpers[node.func.id],
+                budget,
+                module,
+                unsafe,
+                helpers,
+                depth + 1,
+                _bind(node, helpers[node.func.id], look),
             )
             lines.extend(inner)
             swallowed.extend(inner if guarded else inner_swallowed)
@@ -577,6 +689,23 @@ def _session_runs(
         else:
             stack.extend((n, guarded) for n in reversed(list(ast.iter_child_nodes(node))))
     return lines[:_MAX_LINES], swallowed[:_MAX_LINES]
+
+
+_DYNAMIC_NAMES = frozenset({"globals", "vars", "locals", "exec", "setattr", "__import__"})
+
+
+def is_dynamic(tree: ast.AST) -> bool:
+    """Whether the file can set module-level names in a way the reader does not follow: through
+    `globals()`, `vars()`, `exec`, `setattr`, a module's `__dict__`, or a star import (which
+    binds whatever the other file defines)."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _DYNAMIC_NAMES:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in ("__dict__", "__setattr__"):
+            return True
+        if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+            return True
+    return False
 
 
 def _declared(tree: ast.AST) -> set[str]:
@@ -599,6 +728,8 @@ def _nox_defaults(text: str) -> Defaults | None:
     source = ""  # what the options are set to, for a list that cannot be read
     unsafe = _changed_in_place(tree)
     module = _Scope(tree.body, (), {n for n in unsafe if n in _declared(tree)})
+    if is_dynamic(tree):
+        module.unknown()
     helpers = {
         n.name: n
         for n in tree.body

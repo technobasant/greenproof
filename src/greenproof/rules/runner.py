@@ -2947,7 +2947,7 @@ def _swallow_counts(
             keep = [
                 st
                 for ln, st in zip(lines[:-1], stripped[:-1], strict=True)
-                if not (swallows(st) and not _ignores_status(ln) and _line_checks(ln, ctx) == mine)
+                if not (swallows(st) and _twin_line(ln, mine, ctx))
             ]
             reduced = "\n".join([*keep, stripped[-1]])
             reduced = reduced if mode.bash else re.sub(r"\bpipefail\b", "no-pipefail", reduced)
@@ -4896,7 +4896,9 @@ def _read_rules(
     flags = variables.get(".SHELLFLAGS", "")
     found.errexit = bool(re.search(r"(?:^|\s)-[A-Za-z]*e|errexit", flags))
     found.variables = variables
-    found.flags_ignore = make_ignores(variables.get("MAKEFLAGS", ""))
+    found.flags_ignore = make_ignores(variables.get("MAKEFLAGS", "")) or make_ignores(
+        variables.get("MFLAGS", "")
+    )
     shell = variables.get("SHELL")
     found.shell = None if shell is None else head_text(shell).strip()
     # a recipe runs under `/bin/sh -c`: its pipelines keep the last stage's status unless SHELL
@@ -5185,24 +5187,195 @@ def _errexit_set(text: str) -> bool | None:
     return flip
 
 
+# Words that change what the rest of a one-shell recipe runs or whether it runs: they end the
+# shell, define or hide a command, change the directory, the environment or the shell's options.
 _SHELL_STATE = frozenset(
     {"cd", "pushd", "popd", "export", "unset", "source", ".", "eval", "exec", "trap", "alias"}
-    | {"umask", "shopt", "ulimit", "exit", "return"}
+    | {"umask", "shopt", "ulimit", "exit", "return", "declare", "typeset", "readonly", "local"}
+    | {"hash", "builtin", "command", "enable", "set", "kill", "let", "read", "mapfile"}
+    | {"readarray", "getopts", "wait", "break", "continue", "shift", "unalias", "bind", "fc"}
 )
+_SHELL_KEYWORDS = frozenset(
+    {"if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac"}
+    | {"select", "function", "coproc", "{", "}"}
+)
+_WRAPPERS = frozenset({"time", "nice", "nohup", "env", "stdbuf", "timeout"})
+# `name()` and `function name` define a command; the statement reader drops a definition, so the
+# raw text is looked at. A `case` is read by arm, so it is not trusted either.
+_FUNC_DEF = re.compile(
+    r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*(?:function\s+\S+|[^\s;&|(){}$`'\"=]+\s*\(\s*\))",
+    re.M,
+)
+_CASE_WORD = re.compile(r"(?:^|[;&|({])\s*case\b", re.M)
+_ASSIGN_WORD = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=")
+_SAFE_EXPANSION = re.compile(r"\$(?:\$?[A-Za-z_][A-Za-z0-9_]*|\$?\?|\{[A-Za-z_][A-Za-z0-9_]*\})")
+_UNSAFE_PARAM = re.compile(r"\$\{[^}]*[?=]")
+_SAFE_REDIRECTS = frozenset({">&2", "2>&1", "1>&2", "&>/dev/null", ">/dev/null"})
+
+
+def _command_word(words: list[str]) -> tuple[str, list[str]]:
+    """The command a statement runs, past its leading assignments and wrappers (`time`, `env`),
+    and the words after it. Empty when it only assigns."""
+    k = 0
+    while k < len(words):
+        if _ASSIGN_WORD.match(words[k]):
+            k += 1
+        elif words[k] in _WRAPPERS:
+            k += 1
+            while k < len(words) and (words[k].startswith("-") or _ASSIGN_WORD.match(words[k])):
+                k += 1
+        else:
+            break
+    return (words[k], words[k + 1 :]) if k < len(words) else ("", [])
+
+
+def _literal_words(words: Sequence[str]) -> bool:
+    """Whether the words of an `echo` or `printf` are literal: no command substitution, no
+    expansion that can stop the shell or assign (`${x:?}`, `${x:=y}`), no redirection but to
+    stderr, `/dev/null` or a duplicate of one stream."""
+    for w in words:
+        if w in _SAFE_REDIRECTS:
+            continue
+        if "`" in w or _UNSAFE_PARAM.search(w) or re.search(r"[<>]", w):
+            return False
+        if "$" in w and _SAFE_EXPANSION.sub("", w).count("$"):
+            return False
+    return True
+
+
+def _inert_statement(text: str) -> bool:
+    """Whether a statement cannot change what a later statement of the same shell runs, or end
+    the shell: a plain command, with or without a value in front of it (`CI=1 pytest`). A group,
+    a subshell, an assignment on its own, a shell builtin that changes the shell, a keyword that
+    opens a block, and `echo`/`printf` with anything but literal words are not."""
+    t = text.strip()
+    if not t or t[0] in "({":
+        return False
+    words = _tokens(t)
+    head, rest = _command_word(words)
+    if not head or head in _SHELL_STATE or head in _SHELL_KEYWORDS:
+        return False
+    if _UNSAFE_PARAM.search(t):
+        return False
+    if head == "printf" and "-v" in rest:
+        return False
+    return head not in ("echo", "printf") or _literal_words(rest)
+
+
+def _inert_recipe(stripped: Sequence[str]) -> bool:
+    """Whether every statement of a one-shell recipe is inert for command lookup and control flow
+    (see `_inert_statement`), and it defines no function and opens no `case`."""
+    text = "\n".join(stripped)
+    if _FUNC_DEF.search(text) or _CASE_WORD.search(text):
+        return False
+    return all(_inert_statement(seg.text) for seg in split_segments(text))
+
+
+def _pure_mask_line(line: str, ctx: _Ctx) -> bool:
+    """Whether what follows the first check on a recipe line is a no-op that cannot end the
+    script: `|| true`, `|| :`, `; true`, `|| echo ...` and `|| printf ...` with literal words.
+    Nothing nested: a group or a subshell is no mask, nor is `exit`."""
+    segs = split_segments(_RECIPE_PREFIX.sub("", line, count=1))
+    first = next((k for k, seg in enumerate(segs) if ctx.is_check(seg.text)), None)
+    if first is None:
+        return False
+    for seg in segs[first + 1 :]:
+        t = seg.text.strip()
+        if seg.bg or ctx.is_check(t) or t in ("true", ":"):
+            continue
+        head, rest = _command_word(_tokens(t))
+        if head not in ("echo", "printf") or not _inert_statement(t) or not _literal_words(rest):
+            return False
+    return True
+
+
+def _twin_line(line: str, mine: Any, ctx: _Ctx) -> bool:
+    """A recipe line the last line's check makes redundant: it runs the same check, its status
+    counts (no `-`), and what follows the check is a pure no-op mask."""
+    return (
+        not _ignores_status(line) and _line_checks(line, ctx) == mine and _pure_mask_line(line, ctx)
+    )
 
 
 def _last_checks(lines: Sequence[str], ctx: _Ctx) -> Any:
     """The checks of the last recipe line when it is one plain command that is not `-`-prefixed:
-    under `.ONESHELL` without `-e` its status is the recipe's. Empty when it is not."""
-    if len(lines) < 2 or _ignores_status(lines[-1]):
+    under `.ONESHELL` without `-e` its status is the recipe's. Empty when it is not. It also
+    holds only when the last line is the last top-level statement of the whole script (a
+    here-document or a group opened earlier can swallow it) and every statement before it is
+    inert (see `_inert_recipe`): a function, an assignment, `cd`, `exit` or `eval` in the recipe
+    can change what the last line runs, or end the script before it."""
+    if len(lines) < 2 or _ignores_status(lines[0]) or _ignores_status(lines[-1]):
         return None
-    if len(split_segments(_RECIPE_PREFIX.sub("", lines[-1], count=1))) != 1:
+    stripped = [_RECIPE_PREFIX.sub("", ln, count=1) for ln in lines]
+    own = split_segments(stripped[-1])
+    if len(own) != 1 or own[0].bg:
         return None
-    for ln in lines[:-1]:  # one shell: a line that changes it changes what the last line runs
-        for seg in split_segments(_RECIPE_PREFIX.sub("", ln, count=1)):
-            if (command_tokens(seg.text) or [""])[0] in _SHELL_STATE:
-                return None
+    top = split_segments("\n".join(stripped))
+    if not top or top[-1].bg or top[-1].sep in ("&&", "||") or top[-1].text != own[0].text:
+        return None
+    if not _inert_recipe(stripped):
+        return None
     return _line_checks(lines[-1], ctx) or None
+
+
+def _ignore_reason(old: _Targets, new: _Targets, name: str) -> str | None:
+    """Make newly told to go on whatever a recipe line exits with: `-i` or `--ignore-errors` in
+    `MAKEFLAGS` or `MFLAGS`, a bare `.IGNORE:`, or `.IGNORE:` naming a target the goal runs. With
+    it make exits 0 after any failing line. Held against the base's own: one that was there
+    before is no change."""
+    ran = {id(n) for n in _chain(new, name)}
+    names = {t for t, node in new.items() if id(node) in ran} | {name}
+    if new.flags_ignore and not old.flags_ignore:
+        how = "`MAKEFLAGS` now has `-i`"
+    elif new.ignore_all and not old.ignore_all:
+        how = "a bare `.IGNORE:` now applies to every target"
+    elif hit := sorted((new.ignore & names) - old.ignore):
+        how = f"`.IGNORE:` now names `{hit[0]}`"
+    else:
+        return None
+    return f"make now ignores a failing recipe line and exits 0 ({how})"
+
+
+_PATH_ASSIGN = re.compile(r"^(?:(?:export|declare|typeset|readonly)\s+(?:-\w+\s+)*)?PATH\+?=")
+_FUNC_NAME = re.compile(
+    r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*(?:function\s+([^\s;&|(){}$`'\"=]+)"
+    r"|([^\s;&|(){}$`'\"=]+)\s*\(\s*\))",
+    re.M,
+)
+
+
+def _redefined(lines: Sequence[str]) -> set[str]:
+    """What a recipe's own lines redefine for the lines after them in one shell: the names of its
+    functions, aliases and hash entries, and `PATH` when it sets it on a line of its own. In a
+    shell per line none of it reached the next line."""
+    text = "\n".join(_RECIPE_PREFIX.sub("", ln, count=1) for ln in lines)
+    names = {m[1] or m[2] for m in _FUNC_NAME.finditer(text)}
+    for seg in split_segments(text):
+        words = _tokens(seg.text.strip())
+        if words and words[0] in ("alias", "hash", "enable"):
+            names.update(w.partition("=")[0] for w in words[1:] if not w.startswith("-"))
+        elif _PATH_ASSIGN.match(seg.text.strip()):
+            names.add("PATH")
+    return names
+
+
+def _shadow_reason(old: _Targets, new: _Targets, new_name: str, old_name: str, ctx: _Ctx) -> Any:
+    """A `.ONESHELL` recipe that newly defines a function or alias named like a command a check
+    runs (the check runs the definition, not the tool: a block), or sets `PATH` (it may run
+    another tool: a warning). What the base's recipe defined is no change."""
+    if not new.oneshell:
+        return None
+    before = {n for node in _chain(old, old_name) for n in _redefined(node.lines)}
+    for node in _chain(new, new_name):
+        fresh = _redefined(node.lines) - before
+        if not fresh:
+            continue
+        for st in _statements(node.lines, False):
+            if ctx.is_check(st) and ((_plain_check(st) or ("",))[0] in fresh):
+                return f"it now defines `{_plain_check(st)[0]}` before the check that runs it"
+        if "PATH" in fresh and any(ctx.is_check(st) for st in _statements(node.lines, False)):
+            return _Warn("a line of the recipe now sets `PATH` for the check lines after it")
+    return None
 
 
 def _oneshell_reason(old: _Targets, new: _Targets, name: str, ctx: _Ctx) -> str | None:
@@ -5215,7 +5388,7 @@ def _oneshell_reason(old: _Targets, new: _Targets, name: str, ctx: _Ctx) -> str 
         errexit = False
         twin = _last_checks(node.lines, ctx)
         for line in node.lines[:-1]:
-            if twin and _line_checks(line, ctx) == twin and not _ignores_status(line):
+            if twin and _twin_line(line, twin, ctx):
                 continue  # the last line runs the same check, and its status is the target's
             for st in _statements([line], False):
                 if (flip := _errexit_set(st)) is not None:
@@ -5355,7 +5528,8 @@ def _make_reasons(
         )
         if why and not cand_lines and _effective(new, new_name):
             why = _SHADOW_WHY
-        why = why or _oneshell_reason(old, new, new_name, ctx)
+        why = why or _oneshell_reason(old, new, new_name, ctx) or _ignore_reason(old, new, new_name)
+        why = why or _shadow_reason(old, new, new_name, old_name, ctx)
         if why and partial() and not isinstance(why, _Warn) and _absence(why):
             why = _Warn(why)
         if why:
@@ -5499,6 +5673,7 @@ def expand_includes(
     notes: list[str] = []
     out: list[str] = []
     files = size = expanded = 0
+    included: dict[str, str] = {}  # each file an include line names, as the line spells it
 
     def named(arg: str, chain: tuple[str, ...]) -> list[str] | None:
         """`arg` with its variables put in, once for each way the conditionals above the line can
@@ -5596,6 +5771,7 @@ def expand_includes(
                 continue
             for tok in dict.fromkeys(t for a in args for t in a.split()):
                 path = posixpath.normpath(posixpath.join(directory, tok))
+                included.setdefault(path, f"{m[1]} {tok}")
                 if re.search(r"[*?\[%~]", tok) or tok.startswith("/") or path.startswith(".."):
                     notes.append(f"`{m[1]} {tok}` names a file that cannot be read here")
                 elif depth >= _MAX_INCLUDE_DEPTH:
@@ -5616,6 +5792,21 @@ def expand_includes(
                     walk(sub, depth + 1, (*chain, path))
 
     walk(text, 0, ())
+    if included:
+        # make rebuilds an included file that a rule makes, and reads the result: the file in the
+        # repository (or none) is not what make reads
+        built = {
+            posixpath.normpath(posixpath.join(directory, t))
+            for line in out
+            if not line.startswith((" ", "\t")) and (m := _RULE.match(line))
+            for t in m[1].split()
+            if not re.search(r"[$%*?\[]", t)
+        }
+        notes.extend(
+            f"`{spelled}` is rebuilt by a rule of the Makefile: what it sets was not read"
+            for path, spelled in included.items()
+            if path in built
+        )
     return "\n".join(out), notes
 
 
@@ -5840,10 +6031,17 @@ def _scope_nodes(body: Sequence[ast.AST]) -> Iterator[ast.AST]:
         stack.extend(reversed(list(ast.iter_child_nodes(node))))
 
 
-def _bind(body: Sequence[ast.AST], env: _Env, params: Collection[str] = ()) -> _Env:
+def _bind(
+    body: Sequence[ast.AST],
+    env: _Env,
+    params: Collection[str] = (),
+    given: Mapping[str, list[str]] | None = None,
+) -> _Env:
     """`env` extended with a scope's names: one that is assigned once, by a plain assignment, to
     something readable is bound to its words; a name that is anything else there (assigned
-    twice, extended with `+=` or `.append`, a loop variable, an argument) is unreadable."""
+    twice, extended with `+=` or `.append`, a loop variable, an argument) is unreadable. A
+    parameter in `given` (what a call hands a helper) is bound to those words when the body does
+    not bind it again or change it in place."""
     out = dict(env)
     for name in params:
         out[name] = None
@@ -5882,7 +6080,83 @@ def _bind(body: Sequence[ast.AST], env: _Env, params: Collection[str] = ()) -> _
         name = targets[0].id
         if stores[name] == 1 and name not in mutated and name not in params:
             out[name] = _resolve_words(node.value, out)
+    for name, words in (given or {}).items():
+        if name in params and not stores[name] and name not in mutated:
+            out[name] = words
     return out
+
+
+_MAX_HELPER_READS = 256  # calls of a helper whose body is read again with the call's arguments
+
+
+def _module_helpers(tree: ast.Module) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """The plain functions a module defines once and binds no other way."""
+    defs: Counter[str] = Counter()
+    found: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    for top in tree.body:
+        if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)) and not top.decorator_list:
+            found[top.name] = top
+    for node in _scope_nodes(tree.body):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defs[node.name] += 1
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            defs[node.id] += 1
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                defs[(alias.asname or alias.name).partition(".")[0]] += 1
+    return {n: f for n, f in found.items() if defs[n] == 1}
+
+
+def _helper_arguments(
+    call: ast.Call, fn: ast.FunctionDef | ast.AsyncFunctionDef, env: _Env, base: _Env
+) -> dict[str, list[str]]:
+    """The words a call hands a helper's parameters: positional by order, `*args` taking the
+    rest, keywords by name, the default for the others (read in the module's names). A parameter
+    whose argument cannot be read (a variable, `**kw`, a computed value) is left out, so that it
+    stays unreadable. When the call cannot be matched to the signature (`*x`, `**kw`, a name
+    given twice, too many arguments) nothing is bound."""
+    a = fn.args
+    positional = [p.arg for p in (*a.posonlyargs, *a.args)]
+    keyword_only = [p.arg for p in a.kwonlyargs]
+    if any(isinstance(x, ast.Starred) for x in call.args) or any(
+        k.arg is None for k in call.keywords
+    ):
+        return {}
+    given: dict[str, list[str]] = {}
+    unread: set[str] = set()
+    extra: list[list[str] | None] = []
+
+    def read(node: ast.expr, scope: _Env) -> list[str] | None:
+        # a string argument is one word, however many spaces it has
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node.value]
+        return _resolve_words(node, scope)
+
+    def put(name: str, value: list[str] | None) -> None:
+        if value is None:
+            unread.add(name)
+        else:
+            given[name] = value
+
+    for i, arg in enumerate(call.args):
+        if i < len(positional):
+            put(positional[i], read(arg, env))
+        elif a.vararg:
+            extra.append(read(arg, env))
+        else:
+            return {}
+    for kw in call.keywords:
+        if kw.arg in given or kw.arg in unread or kw.arg not in (*positional, *keyword_only):
+            return {}
+        put(str(kw.arg), read(kw.value, env))
+    defaults = dict(zip(positional[len(positional) - len(a.defaults) :], a.defaults, strict=True))
+    defaults.update((p.arg, d) for p, d in zip(a.kwonlyargs, a.kw_defaults, strict=True) if d)
+    for name, default in defaults.items():
+        if name not in given and name not in unread:
+            put(name, read(default, base))
+    if a.vararg and all(e is not None for e in extra):
+        given[a.vararg.arg] = [w for e in extra if e for w in e]
+    return given
 
 
 def _call_words(elts: Sequence[ast.expr], env: _Env) -> list[str]:
@@ -5899,24 +6173,48 @@ def _call_words(elts: Sequence[ast.expr], env: _Env) -> list[str]:
 
 
 def _python_pytest_arguments(tree: ast.Module) -> list[list[str]]:
+    """Each pytest command's words. A call of a module-level helper reads the helper's body again
+    with the call's arguments bound to its parameters (`_pytest(session, "-k", "smoke")` over
+    `session.run("pytest", *args)`), as many times as `_MAX_HELPER_READS` allows; the helper read
+    on its own keeps its parameters unreadable."""
     found: list[list[str]] = []
+    helpers = _module_helpers(tree)
+    module_env = _bind(tree.body, {})
+    if toxnox.is_dynamic(tree):  # `globals()["X"] = ...`, `from m import *`: no name is known
+        module_env = dict.fromkeys(module_env)
+    reads = [0]
+    active: list[str] = []
 
-    def visit(node: ast.AST, env: _Env) -> None:
+    def visit(node: ast.AST, env: _Env, given: Mapping[str, list[str]] | None = None) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             args = node.args
             names = [a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]]
             names += [a.arg for a in (args.vararg, args.kwarg) if a is not None]
             body = node.body if isinstance(node.body, list) else [node.body]
-            env = _bind(body, env, names)
+            env = _bind(body, env, names, given)
         elif isinstance(node, ast.ClassDef):
             env = _bind(node.body, env)
         if isinstance(node, (ast.Call, ast.List, ast.Tuple)):
             elts = node.args if isinstance(node, ast.Call) else node.elts
             found.extend(_after_pytest(_call_words(elts, env)))
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and (helper := helpers.get(node.func.id)) is not None
+            and node.func.id not in active
+            and len(active) < 3
+            and reads[0] < _MAX_HELPER_READS
+        ):
+            reads[0] += 1
+            bound = _helper_arguments(node, helper, env, module_env)
+            if bound:
+                active.append(node.func.id)
+                visit(helper, module_env, bound)
+                active.pop()
         for child in ast.iter_child_nodes(node):
             visit(child, env)
 
-    visit(tree, _bind(tree.body, {}))
+    visit(tree, module_env)
     return found
 
 
