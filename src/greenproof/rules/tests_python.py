@@ -63,6 +63,7 @@ _ORDER_OPS = (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.NotIn)
 _WRAPPERS = frozenset({"type", "len", "bool"})
 _FuncDef = ast.FunctionDef | ast.AsyncFunctionDef
 _CONDITIONAL = {"mark.skipif", "pytest.importorskip", "unittest.skipIf", "unittest.skipUnless"}
+_BUILTIN_NAMES = frozenset(dir(builtins))
 _KEEP_NAMES = set(dir(builtins)) | {"self", "cls", "pytest", "mock", "unittest"}
 _KEEP_ATTRS = {"raises", "warns", "approx", "mark", "parametrize", "skip", "skipif", "xfail"}
 _KEEP_ATTRS |= {"fail", "importorskip", "TestCase"}
@@ -554,11 +555,7 @@ _APPROX_TIGHT = 1e-6  # the loosest approx tolerance still credited as pinning a
 def _approx_arg(node: ast.AST) -> ast.expr | None:
     """The expected value of `approx(<value>)` when its tolerance is the default or no looser
     than `_APPROX_TIGHT` (literal `rel=` and `abs=` only); None for anything else."""
-    if not (
-        isinstance(node, ast.Call)
-        and dotted(node.func).rsplit(".", 1)[-1] == "approx"
-        and len(node.args) == 1
-    ):
+    if not (isinstance(node, ast.Call) and _is_approx(node.func) and len(node.args) == 1):
         return None
     for kw in node.keywords:
         if kw.arg not in {"rel", "abs"}:
@@ -591,13 +588,74 @@ def _pinned_expr(node: ast.AST) -> bool:
     return _is_pinned(node) or _constructed(node)
 
 
-_LOOSE_MODULES = frozenset({"dirty_equals", "hamcrest", "callee", "mock", "pytest_mock"})
+_LOOSE_MODULES = frozenset(
+    {"dirty_equals", "hamcrest", "callee", "mock", "pytest_mock", "testfixtures"}
+)
 _LOOSE_NAME = re.compile(r"(?:(?:Is|Has|Any|Contains|Matches|Like)[A-Z]|Any$)")
 _MOCKS = frozenset(
     {"Mock", "MagicMock", "AsyncMock", "NonCallableMock", "NonCallableMagicMock", "PropertyMock"}
 )
 # Local names bound by an import from a matcher or mock library, for the file being analysed.
 _loose_locals: ContextVar[frozenset[str]] = ContextVar("loose_locals", default=frozenset())
+
+
+# Names the file defines itself (a class, a function, an assignment): `approx` among them is not
+# pytest's.
+_defined_locals: ContextVar[frozenset[str]] = ContextVar("defined_locals", default=frozenset())
+
+
+def _is_approx(func: ast.AST) -> bool:
+    """`approx` or `pytest.approx`, not a function the file defines under that name."""
+    path = dotted(func)
+    return path.rsplit(".", 1)[-1] == "approx" and path.split(".")[0] not in _defined_locals.get()
+
+
+# Local names bound by an import from outside the test tree (None: not known, any name counts).
+_pin_locals: ContextVar[frozenset[str] | None] = ContextVar("pin_locals", default=None)
+_TEST_TREE = re.compile(r"(?:tests?|testing|test_utils|testutils|conftest|test_\w+|\w+_tests?)")
+
+
+def _test_tree_module(module: str, level: int, found: bool) -> bool:
+    """The module an import names is part of the test tree: relative, resolved to a test module,
+    a conftest, or named like a test module."""
+    return bool(level) or found or any(_TEST_TREE.fullmatch(seg) for seg in module.split("."))
+
+
+def _pin_imports(
+    path: str, tree: ast.Module, sources: Sources | None
+) -> tuple[frozenset[str], frozenset[str]]:
+    """The local names `tree` imports from outside the test tree and does not redefine: only a
+    class from there is one whose `==` the test does not control (`Decimal`, `QueryParams`). A
+    class defined in the test file, or imported from a conftest or a test module, may define an
+    `__eq__` that accepts anything."""
+    out: set[str] = set()
+    defined: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            found = sources is not None and _resolve_module(path, module, node.level, sources)
+            if _test_tree_module(module, node.level, bool(found)):
+                continue
+            for alias in node.names:
+                sub = (
+                    sources is not None
+                    and alias.name != "*"
+                    and _resolve_module(
+                        path, f"{module}.{alias.name}" if module else alias.name, 0, sources
+                    )
+                )
+                if alias.name != "*" and not sub:
+                    out.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                found = sources is not None and _resolve_module(path, alias.name, 0, sources)
+                if not _test_tree_module(alias.name, 0, bool(found)):
+                    out.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            defined.add(node.id)
+    return frozenset(out - defined), frozenset(defined)
 
 
 def _loose_module(module: str) -> bool:
@@ -636,6 +694,9 @@ def _constructed(node: ast.AST) -> bool:
         or path.split(".")[0] in _LOOSE_MODULES
     ):
         return False
+    outside = _pin_locals.get()
+    if outside is not None and path.split(".")[0] not in outside | _BUILTIN_NAMES:
+        return False  # a class the test file defines, or takes from a test module
     return (
         name[:1].isupper()
         and not name.isupper()
@@ -691,7 +752,7 @@ def _expected_of(node: ast.AST) -> ast.AST | None:
     """The literal on the expected side of `x == LIT`, `x == approx(LIT)` or None."""
     if _is_literal(node):
         return node
-    if isinstance(node, ast.Call) and dotted(node.func).endswith("approx") and node.args:
+    if isinstance(node, ast.Call) and _is_approx(node.func) and node.args:
         return node.args[0] if _is_literal(node.args[0]) else None
     return None
 
@@ -711,6 +772,60 @@ class _Helpers(dict[str, _FuncDef]):
         # module-level names bound once to a literal list or tuple (a table of rows).
         self.unique: set[str] = set()
         self.tables: dict[str, ast.expr] = {}
+        self.numbers: dict[str, float] = {}  # module-level names bound once to a number
+
+
+_STRAIGHT_STMTS = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Assert, ast.Pass)
+_LEAVES = frozenset({"skip", "skipTest", "xfail", "exit", "_exit", "importorskip"})
+_WRAPPING_WITH = frozenset({"raises", "warns", "subTest", "assertRaises", "assertWarns"})
+
+
+def _straight(body: Sequence[ast.stmt], last: bool = True) -> bool:
+    """Every statement of `body` runs, in order, on every call: no branch or loop, no early
+    `return`, `raise` or `yield`, no skip or exit call. A `with pytest.raises` (or `subTest`) block
+    whose body is itself straight is allowed, and a `return` as the last statement."""
+    for i, stmt in enumerate(body):
+        final = last and i == len(body) - 1
+        if isinstance(stmt, ast.Return):
+            if not final or (stmt.value is not None and _leaves(stmt.value)):
+                return False
+        elif isinstance(stmt, ast.Expr):
+            if _leaves(stmt.value):
+                return False
+        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+            if not all(
+                isinstance(it.context_expr, ast.Call)
+                and dotted(it.context_expr.func).rsplit(".", 1)[-1] in _WRAPPING_WITH
+                for it in stmt.items
+            ) or not _straight(stmt.body, last=False):
+                return False
+        elif isinstance(stmt, _STRAIGHT_STMTS):
+            if any(_leaves(c) for c in ast.iter_child_nodes(stmt) if isinstance(c, ast.expr)):
+                return False
+        else:
+            return False
+    return True
+
+
+def _leaves(node: ast.AST) -> bool:
+    """An expression that can end the call early: a skip, an exit, a yield or an await."""
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Yield, ast.YieldFrom, ast.Await)):
+            return True
+        if isinstance(n, ast.Call) and dotted(n.func).rsplit(".", 1)[-1] in _LEAVES:
+            return True
+    return False
+
+
+def _always_asserts(fn: _FuncDef) -> bool:
+    """The helper's assertions run on every call, so a test that calls it may be credited with
+    them as if they were written in the test (SPEC 5.7): a helper whose assert sits behind an
+    `if`, or after an early `return`, checks nothing on some calls."""
+    return not isinstance(fn, ast.AsyncFunctionDef) and _straight(fn.body)
+
+
+def _loaded_names(fn: _FuncDef) -> set[str]:
+    return {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
 
 
 def _handler_swallows(handler: ast.ExceptHandler) -> bool:
@@ -842,6 +957,10 @@ class _Stats(ast.NodeVisitor):
             set()
         )  # targets of a bare truthiness (or `is not None`) check
         self.first_line = 0
+        # Names the enclosing function reads: a nested def nothing reads never runs (None: all).
+        self.referenced: set[str] | None = None
+        # In a helper: set once a statement may end the call, so later asserts may not run.
+        self.stopped = False
         # (subject shape, expected number) -> (tightest band, subject source) over the exact and
         # tolerant numeric comparisons of the body (SPEC 5.4, exact checks loosened).
         self.numeric: dict[tuple[str, float], tuple[float, str]] = {}
@@ -979,11 +1098,7 @@ class _Stats(ast.NodeVisitor):
         expected = _number(node)
         if expected is not None:
             return expected, 0.0
-        if not (
-            isinstance(node, ast.Call)
-            and dotted(node.func).rsplit(".", 1)[-1] == "approx"
-            and len(node.args) == 1
-        ):
+        if not (isinstance(node, ast.Call) and _is_approx(node.func) and len(node.args) == 1):
             return None
         expected = _number(node.args[0])
         if expected is None:
@@ -992,10 +1107,12 @@ class _Stats(ast.NodeVisitor):
         for kw in node.keywords:
             if kw.arg not in {"rel", "abs"}:
                 continue
-            value = _number(self.consts.inline(kw.value))
-            if value is None:
-                return None
-            tol[kw.arg] = value
+            inlined = self.consts.inline(kw.value)
+            value = _number(inlined)
+            if value is None and isinstance(inlined, ast.Name):
+                value = getattr(self.helpers, "numbers", {}).get(inlined.id)
+            # A tolerance the file does not spell out may be as wide as it likes.
+            tol[kw.arg] = math.inf if value is None else value
         rel = tol.get("rel", 0.0 if "abs" in tol else 1e-6)
         return expected, max(rel * abs(expected), tol.get("abs", 1e-12))
 
@@ -1054,6 +1171,45 @@ class _Stats(ast.NodeVisitor):
         self.cur_form = digest(ast.dump(node))
         self.cur_line = getattr(node, "lineno", 0)
         self.forms.append(self.cur_form)
+
+    def visit(self, node: ast.AST) -> None:
+        if not self.stopped:
+            super().visit(node)
+
+    def _helper_leaves(self, node: ast.AST) -> bool:
+        """In a helper: `node` holds a statement that may end the call before the code after it."""
+        return self.depth > 0 and any(
+            isinstance(n, (ast.Return, ast.Raise, ast.Yield, ast.YieldFrom, ast.Await))
+            or (isinstance(n, ast.Call) and dotted(n.func).rsplit(".", 1)[-1] in _LEAVES)
+            for n in ast.walk(node)
+        )
+
+    def visit_If(self, node: ast.If) -> None:
+        if self.depth > 0:  # a helper's branch may not run: its asserts are not credited
+            if self._helper_leaves(node):
+                self.stopped = True
+            return
+        self.generic_visit(node)
+
+    def visit_Return(self, node: ast.Return) -> None:
+        self.generic_visit(node)
+        if self.depth > 0:
+            self.stopped = True
+
+    def visit_Raise(self, node: ast.Raise) -> None:
+        self.generic_visit(node)
+        if self.depth > 0:
+            self.stopped = True
+
+    def _nested(self, node: _FuncDef) -> None:
+        if self.referenced is None or node.name in self.referenced:
+            self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._nested(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._nested(node)
 
     def visit_Assert(self, node: ast.Assert) -> None:
         test = node.test
@@ -1217,7 +1373,12 @@ class _Stats(ast.NodeVisitor):
             (*self.stack, target),
             _Consts(self.helpers[target]),
         )
-        inlined = target in getattr(self.helpers, "unique", ()) and self.depth < _INLINE_DEPTH
+        sub.referenced = _loaded_names(self.helpers[target])
+        inlined = (
+            target in getattr(self.helpers, "unique", ())
+            and self.depth < _INLINE_DEPTH
+            and _always_asserts(self.helpers[target])
+        )
         if inlined:
             sub.literal_params = self._literal_args(self.helpers[target], node)
         for stmt in self.helpers[target].body:
@@ -1290,6 +1451,36 @@ class _Stats(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+class _Plain(ast.NodeTransformer):
+    """Numbers as floats, so `2` and `2.0` read as the same value of a row."""
+
+    def visit_Constant(self, node: ast.Constant) -> ast.AST:
+        if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            try:
+                return ast.Constant(value=float(node.value))
+            except OverflowError:
+                return node
+        return node
+
+
+def _row_key(row: ast.expr) -> str:
+    """A normalised form of the literal values of a table row: `pytest.param(2, 4, id="a")` and
+    `(2, 4)` are the same row, and so are `(2, 4)` and `(2.0, 4.0)`."""
+    node: ast.expr = row
+    if isinstance(row, ast.Call) and dotted(row.func).rsplit(".", 1)[-1] == "param":
+        node = (
+            row.args[0]
+            if len(row.args) == 1 and not isinstance(row.args[0], ast.Starred)
+            else ast.Tuple(elts=list(row.args), ctx=ast.Load())
+        )
+    return ast.dump(_Plain().visit(copy.deepcopy(node)))
+
+
+def _distinct(rows: Sequence[ast.expr]) -> int:
+    """How many different rows a table holds: a row repeated runs the same check again."""
+    return len({_row_key(r) for r in rows})
+
+
 def _parametrize(fn: _FuncDef) -> tuple[int | None, bool, list[str]]:
     """(cases, literal, case forms): the product of cases over stacked literal parametrize
     decorators, whether every decorator was literal, and the exact form of each case."""
@@ -1306,7 +1497,7 @@ def _parametrize(fn: _FuncDef) -> tuple[int | None, bool, list[str]]:
         if isinstance(values, (ast.List, ast.Tuple)) and not any(
             isinstance(e, ast.Starred) for e in values.elts
         ):
-            total = len(values.elts) * (total if total is not None else 1)
+            total = _distinct(values.elts) * (total if total is not None else 1)
             forms.extend(digest(ast.dump(e)) for e in values.elts)
         else:
             literal = False
@@ -1341,6 +1532,32 @@ def _has_subtest(loop: ast.For) -> bool:
                 ctx = item.context_expr
                 if isinstance(ctx, ast.Call) and dotted(ctx.func).rsplit(".", 1)[-1] == "subTest":
                     return True
+    return False
+
+
+def _leaves_row(loop: ast.For) -> bool:
+    """The body of the fold `loop` can end the row, or the loop, outside its `with subTest` block:
+    a `break`, `continue`, `return` or `raise` (or a skip call), so later rows may never run.
+    Inside the block the row path analysis (tests_pyrows) reads them."""
+    todo: list[tuple[ast.AST, bool]] = [(s, False) for s in loop.body]
+    while todo:
+        node, inner = todo.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(node, (ast.With, ast.AsyncWith)) and any(
+            isinstance(i.context_expr, ast.Call)
+            and dotted(i.context_expr.func).rsplit(".", 1)[-1] == "subTest"
+            for i in node.items
+        ):
+            continue
+        if isinstance(node, (ast.Return, ast.Raise, ast.Yield, ast.YieldFrom, ast.Await)) or (
+            isinstance(node, (ast.Break, ast.Continue)) and not inner
+        ):
+            return True
+        if isinstance(node, ast.Call) and dotted(node.func).rsplit(".", 1)[-1] in _LEAVES:
+            return True
+        deeper = inner or isinstance(node, (ast.For, ast.While, ast.AsyncFor))
+        todo.extend((c, deeper) for c in ast.iter_child_nodes(node))
     return False
 
 
@@ -1384,7 +1601,9 @@ def _fold_loop(fn: _FuncDef, helpers: dict[str, _FuncDef]) -> _Fold | None:
             outside.visit(stmt)
     if outside.asserts or outside.vacuous or outside.swallowed:
         return None
-    return _Fold(loop, names, tuple(table.elts))
+    # A loop that can stop early runs only its first row for certain: one case, not the table.
+    rows = table.elts[:1] if _leaves_row(loop) else table.elts
+    return _Fold(loop, names, tuple(rows))
 
 
 def _marked(fn: _FuncDef) -> list[tuple[str, tuple[str, ...]]]:
@@ -1531,6 +1750,7 @@ def _unit(
     live = copy.deepcopy(fn)
     dropped = _prune(live)
     stats = _Stats(helpers, consts=_Consts(live))
+    stats.referenced = _loaded_names(live)
     stats.literal_params = _literal_params(fn)
     fold = _fold_loop(fn, helpers)
     if fold is not None:
@@ -1546,7 +1766,8 @@ def _unit(
             break
     cases, literal, case_forms = _parametrize(fn)
     if fold is not None:
-        cases, literal, case_forms = len(fold.rows), True, [digest(ast.dump(r)) for r in fold.rows]
+        cases, literal = _distinct(fold.rows), True
+        case_forms = [digest(ast.dump(r)) for r in fold.rows]
     gap, big = row_gap(fn, helpers, (set(fold.names), fold.loop) if fold else None)
     lost = _Stats(helpers)
     for stmt in dropped:
@@ -2132,6 +2353,12 @@ def _module_tables(helpers: _Helpers, tree: ast.Module) -> None:
                 and isinstance(node.value, (ast.List, ast.Tuple))
             ):
                 helpers.tables[target.id] = node.value
+            elif (
+                isinstance(target, ast.Name)
+                and target.id in once
+                and (number := _number(node.value)) is not None
+            ):
+                helpers.numbers[target.id] = number
         elif (
             isinstance(node, ast.AnnAssign)
             and isinstance(node.target, ast.Name)
@@ -2170,6 +2397,9 @@ def _analyse_python(path: str, text: str, sources: Sources | None) -> FileAnalys
     except (SyntaxError, ValueError, RecursionError):
         return None
     token = _loose_locals.set(frozenset(_loose_imports(tree)))
+    outside, defined = _pin_imports(path, tree, sources)
+    pin_token = _pin_locals.set(outside)
+    def_token = _defined_locals.set(defined)
     try:
         helpers, imports = _module_helpers(path, tree, sources)
         loose = set(_loose_locals.get())
@@ -2181,6 +2411,8 @@ def _analyse_python(path: str, text: str, sources: Sources | None) -> FileAnalys
         _loose_locals.set(frozenset(loose))
         return _analysed(path, tree, helpers, imports)
     finally:
+        _defined_locals.reset(def_token)
+        _pin_locals.reset(pin_token)
         _loose_locals.reset(token)
 
 
