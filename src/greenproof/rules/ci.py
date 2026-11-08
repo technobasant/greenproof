@@ -1021,6 +1021,7 @@ class _World:
     base_flags: set[tuple[str, str]] = field(default_factory=set)
     base_has_tests: bool = False
     base_rewrites: list[tuple[str, tuple[str, ...]]] | None = None  # `sed -i` of base steps
+    base_tree: tuple[set[str], set[str], set[str]] | None = None  # files, their dirs, test dirs
     collection: Any = None  # the base revision's pytest collection rules, read when needed
     base_monorepo: bool = False  # a base step runs a monorepo task runner (nx, turbo, lerna ...)
     other_ci: bool = False
@@ -2056,15 +2057,87 @@ def _covered_path(path: str, by: str) -> bool:
     return bool(_GLOBBY & set(by)) and len(by) < 400 and _glob_regex(by).fullmatch(path) is not None
 
 
+# What a rewrite of tests may say and still only be a warning: words a test is made of. A
+# substitution that mentions one can skip, delete or weaken a test.
+_TEST_WORDS = re.compile(
+    r"assert|expect|skip|xfail|only|todo|\bx(?:it|test|describe)|raises|fail|fatal|Error\(?f"
+    r"|should|mark\.|t\.Run",
+    re.IGNORECASE,
+)
+_TEST_MATCHER = re.compile(r"\bto[A-Z]")  # `toBe`, `toEqual`: a jest matcher
+_SUB_FLAGS = re.compile(r"[gI0-9]*")
+
+
+def _sed_script(stmt: str) -> str | None:
+    """The one expression of a `sed` statement (`sed -i "s/a/b/" f`, `sed -i -e 's/a/b/' f`);
+    None for a second `-e`, a script file or any other command."""
+    toks = command_tokens(stmt)
+    if not toks or posixpath.basename(toks[0]) != "sed":
+        return None
+    rest = toks[1:]
+    if any(t in ("-f", "--file") or t.startswith("--file=") for t in rest):
+        return None
+    given = [i for i, t in enumerate(rest) if t == "-e" or t.startswith("--expression")]
+    if len(given) > 1 or any(re.fullmatch(r"-[a-zA-Z]*e[a-zA-Z]*", t) and t != "-e" for t in rest):
+        return None
+    if given:
+        t = rest[given[0]]
+        if "=" in t:
+            return t.partition("=")[2]
+        return rest[given[0] + 1] if given[0] + 1 < len(rest) else None
+    operands = [t for t in rest if not t.startswith("-")]
+    return operands[0] if operands else None
+
+
+def _substitution(script: str | None) -> tuple[str, str] | None:
+    """`(pattern, replacement)` of a script that is one `s` command: no address, flags only
+    from g, I and digits, nothing after them. None for anything else."""
+    if not script or len(script) < 4 or script[0] != "s":
+        return None
+    delim = script[1]
+    if delim.isalnum() or delim.isspace() or delim == "\\":
+        return None
+    parts: list[str] = []
+    cur: list[str] = []
+    i = 2
+    while i < len(script) and len(parts) < 2:
+        c = script[i]
+        if c == "\\":
+            cur.append(script[i : i + 2])
+            i += 2
+            continue
+        if c == "\n":
+            return None
+        if c == delim:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if len(parts) != 2 or not _SUB_FLAGS.fullmatch(script[i:]):
+        return None
+    return parts[0], parts[1]
+
+
+def _modest_rewrite(old: str, new: str) -> bool:
+    """Whether a rewrite of tests that changed from `old` to `new` is only a warning: each is one
+    plain `s` command and neither mentions a word a test is made of."""
+    a, b = _substitution(_sed_script(old)), _substitution(_sed_script(new))
+    if a is None or b is None:
+        return False
+    return not any(_TEST_WORDS.search(x) or _TEST_MATCHER.search(x) for x in (*a, *b))
+
+
 def _repeated_rewrite(world: _World, stmt: str, where: _Dir) -> str | None:
     """The base statement that already rewrote every file this `sed -i` statement edits (the
-    same files, or a glob over them): the edit changed, the set of files did not."""
+    same files, or a glob over them), when the edit changed and both are plain substitutions that
+    mention no test word (see `_modest_rewrite`); None otherwise."""
     words = _inplace_words(stmt, where.path)
     if not words:
         return None
     for old, targets in _base_rewrites(world):
         if all(any(_covered_path(w, t) for t in targets) for w in words):
-            return old
+            return old if _modest_rewrite(old, stmt) else None
     return None
 
 
@@ -2088,30 +2161,80 @@ def _decides_run(world: _World, path: str) -> bool:
     )
 
 
-def _plain_copy_over(world: _World, stmt: str, found: str, where: _Dir) -> str | None:
-    """The file a plain `cp`, `install`, `ln` or `rsync` (without `--delete`) overwrites in the
-    test tree when it is neither a test by the collection patterns nor a file that decides what
-    runs: a settings file, a fixture, a data file. None when it is anything else."""
+def _tree(world: _World) -> tuple[set[str], set[str], set[str]]:
+    """The tracked files of the base, every directory above one, and the directories that hold a
+    test file directly (the root left out): the test tree is below the last."""
+    if world.base_tree is None:
+        changes = world.changes
+        names = changes.list_base() if changes.list_base is not None else []
+        files = set(names)
+        dirs: set[str] = set()
+        for name in files:
+            parent = posixpath.dirname(name)
+            while parent and parent not in dirs:
+                dirs.add(parent)
+                parent = posixpath.dirname(parent)
+        tests = world.tests
+        holders: set[str] = set()
+        if tests is not None:
+            tests.selectable()  # builds the file list
+            holders = {posixpath.dirname(f) for f in tests.files} - {"", "."}
+            files |= tests.files
+        world.base_tree = (files, dirs, holders)
+    return world.base_tree
+
+
+def _why_of(copy: tuple[str, bool] | None) -> str:
+    return copy[0] if copy else ""
+
+
+def _copy_verdict(world: _World, stmt: str, where: _Dir) -> tuple[str, bool] | None:
+    """`(why, hard)` for a plain `cp`, `install`, `ln` or `rsync` (without `--delete`) whose one
+    destination is a path in the test tree. A file that is a test or decides what runs
+    (`conftest.py`, a runner config, a setup file) and a tracked file the tests read (a fixture,
+    golden or settings file) are hard: the copy changes what the tests check. A new file that is
+    neither is a warning. None for any other statement, or a destination that is not one path."""
     tests = world.tests
     toks = command_tokens(stmt)
-    if tests is None or not toks or any(">" in t or t == "|" for t in toks):
+    if tests is None or where.path is None or not toks or any(">" in t or t == "|" for t in toks):
         return None
     if posixpath.basename(toks[0]) not in _COPY_HEADS:
         return None
     if any(t.startswith(("--del", "--remove", "--target-dir")) or t == "-t" for t in toks):
         return None
-    if len([t for t in toks[1:] if not t.startswith("-")]) != 2:
+    operands = [t for t in toks[1:] if not t.startswith("-")]
+    if len(operands) != 2:
         return None  # several sources: the hit names only the first file they land on
-    if _GLOBBY & set(found) or "$" in found:
+    dest = operands[1]
+    if _GLOBBY & set(dest) or "$" in dest or dest.endswith("/") or dest in (".", ".."):
         return None
-    if where.path is not None:
-        resolved = tests._resolve(found, where.path)
-        paths = [resolved] if resolved is not None else []
-    else:
-        paths = tests._suffixed(found, True)
-    if not paths or any(p not in tests.files or _decides_run(world, p) for p in paths):
+    path = tests._resolve(dest, where.path)
+    if path is None:
         return None
-    return paths[0]
+    files, dirs, holders = _tree(world)
+    if path in tests.dirs and path not in dirs:
+        return None
+    parts = path.split("/")
+    below = any("/".join(parts[:k]) in holders for k in range(1, len(parts)))
+    if path not in files and path not in dirs and not below:
+        return None
+    if _decides_run(world, path):
+        return (
+            f"`{stmt[:80]}` writes `{path}` in the test tree: it is a test or decides what "
+            "runs, so the copy changes what the tests check",
+            True,
+        )
+    if path in files or path in dirs:
+        return (
+            f"`{stmt[:80]}` overwrites `{path}`, a tracked file of the test tree that the tests "
+            "may read: the copy can change what they check",
+            True,
+        )
+    return (
+        f"`{stmt[:80]}` adds `{path}` to the test tree: check that it does not change what the "
+        "tests check",
+        False,
+    )
 
 
 def _github_step_reasons(text: str, world: _World) -> list[Reason]:
@@ -2185,27 +2308,25 @@ def _github_step_reasons(text: str, world: _World) -> list[Reason]:
                         reported.add((at, _TOO_DEEP))
                         out.append(_block(at, _TOO_DEEP))
                     continue
-                if gone is not None:
-                    why = removal_reason(stmt[:80], gone)
+                copy = _copy_verdict(world, stmt, where)
+                if gone is not None or copy is not None:
+                    why = removal_reason(stmt[:80], gone) if gone is not None else _why_of(copy)
                     soft = False
-                    if getattr(gone, "how", "") == "rewrites":
-                        if old := _repeated_rewrite(world, stmt, where):
-                            why = (
-                                "a rewrite of tests the base already ran has changed: "
-                                f"was `{old[:120]}`, now `{stmt[:120]}`. Check that it does not "
-                                "skip or weaken a test"
-                            )
-                            soft = True
-                        elif over := _plain_copy_over(world, stmt, gone, where):
-                            why = (
-                                f"`{stmt[:80]}` overwrites `{over}` in the test tree: it is not a "
-                                "test or a file that decides what runs, so check that it does "
-                                "not change what the tests check"
-                            )
-                            soft = True
+                    hard = copy is not None and copy[1]
+                    if copy is not None:
+                        soft = gone is None and not hard  # a hit by the scan keeps its verdict
+                    elif getattr(gone, "how", "") == "rewrites" and (
+                        old := _repeated_rewrite(world, stmt, where)
+                    ):
+                        why = (
+                            "a rewrite of tests the base already ran has changed: "
+                            f"was `{old[:120]}`, now `{stmt[:120]}`. Check that it does not "
+                            "skip or weaken a test"
+                        )
+                        soft = True
                     if (at, why) not in reported:
                         reported.add((at, why))
-                        warns = soft or isinstance(why, _Warn)
+                        warns = not hard and (soft or isinstance(why, _Warn))
                         out.append(_warn(at, why) if warns else _block(at, why))
         for kind, stmt, at, why in _swallow_keys(wf, step, world):
             if remaining[(kind, stmt)] > 0:
