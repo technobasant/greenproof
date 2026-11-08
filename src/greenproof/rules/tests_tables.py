@@ -411,6 +411,12 @@ _GO_NAME_BRACE = re.compile(r"([A-Za-z_]\w*)\s*\{")
 _GO_TYPE = re.compile(r"(?:\[[^\]\n]*\]|[\w.*])+")
 _GO_LOG = re.compile(r"\b(?:t|b|tb)\.(?:Error|Errorf|Fatal|Fatalf|Log|Logf|Skip|Skipf)\s*\(")
 _GO_RUN = re.compile(r"\b(?:t|b|tb)\.Run\s*\(")
+# output that checks nothing, and statements that assign only to the blank identifier (`_ = row`,
+# which Go needs when a loop variable is otherwise unused)
+_GO_PRINT = re.compile(r"(?<![\w.])(?:(?:fmt|log)\.(?:Print|Println|Printf)|println|print)\s*\(")
+_GO_DISCARD = re.compile(
+    r"(?m)(?:^|(?<=[;{]))[ \t]*(?:var[ \t]+)?_(?:[ \t]*,[ \t]*_)*[ \t]*=(?!=)[^;\n]*"
+)
 _GO_ANY_EARLY = re.compile(r"\b(?:continue|break|return|goto)\b|\.Skip(?:Now|f)?\b")
 _GO_EARLY = re.compile(r"(?:^|[;\n])\s*(?:continue|break|return|goto)\b|\bt\.Skip(?:Now|f)?\s*\(")
 
@@ -849,9 +855,16 @@ def _loop_reads(
     extra: Sequence[tuple[int, int]] = (),
 ) -> tuple[set[str], bool]:
     """(the fields of the row that the loop [lo, hi) reads, whether the row goes on whole). A
-    message (`t.Error*`, `t.Log*`, `t.Skip*`), a `t.Run` name and the `extra` spans are left out:
-    a row value that only names or explains a check is not checked."""
-    blank = [*_call_ranges(src, _GO_LOG, lo, hi, None), *_run_name_ranges(src, lo, hi), *extra]
+    message (`t.Error*`, `t.Log*`, `t.Skip*`), printed output, an assignment to `_`, a `t.Run`
+    name and the `extra` spans are left out: a row value that only names, explains or discards a
+    check is not checked."""
+    blank = [
+        *_call_ranges(src, _GO_LOG, lo, hi, None),
+        *_call_ranges(src, _GO_PRINT, lo, hi, None),
+        *(m.span() for m in _GO_DISCARD.finditer(src.shadow, lo, hi)),
+        *_run_name_ranges(src, lo, hi),
+        *extra,
+    ]
     shown = _blank(src.shadow[lo:hi], lo, blank)
     reads: set[str] = set()
     whole = False
