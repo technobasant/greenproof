@@ -5,11 +5,123 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-09
+
+Measured against 0.3.1 on the same inputs (MEASUREMENTS.md): of 744 tamper probes, 693 block
+and 51 warn, and none passes (0.3.1: 687, 50 and 7); of 502 honest probes, 18 block that should
+not (0.3.1: 35). On real history, 66 of 698 test-touching commits block (0.3.1: 75), 12 of them
+false blocks (0.3.1: 21).
+
 ### Added
 
+- `tests.weakened`: a `for` loop over a literal list or tuple, and a `parametrize` over a
+  module-level name bound once to one, are compared by their distinct rows. Fewer distinct rows
+  than at the base blocks ("table rows reduced from N to M"), unless every base row is still
+  among the candidate's rows or the rows of new tests. A loop whose check no longer reads its
+  row blocks, and so does a table name that is bound again or changed in place
+  (`CASES.append(4)`). A table that cannot be read (passed to a call, built by `range`) warns,
+  "table rows could not be read", and only when the base's table could be read.
+- `tests.weakened`: rows count in the check total. A literal loop unrolled into fewer explicit
+  asserts blocks, `assert all(<check> for x in <table>)` counts one assert per row, repeated
+  rows count once (`[1, 1, 1]` is one case), and an assertion in a nested `def` that nothing
+  calls does not count.
+- `tests.weakened`: an expected value replaced by a matcher is a loose check on the other side
+  of `==` or `assertEqual`. `assert f(1) == 2` becoming `assert f(1) == ANY` blocks ("exact
+  check on `f(1)` loosened to `f(1) == ANY`"). Matchers read: `ANY` and `mock.ANY`, dirty-equals,
+  callee, testfixtures `Comparison`, a class whose only base is `object` and whose own `__eq__`
+  never reads its second parameter, and a function whose every return is such a value (to
+  depth 3). Only the top-level operand is judged.
+- `tests.weakened`: `pytest.approx` with a tolerance that is a name or cannot be resolved is
+  read as loosened. A name bound to a module-level number is resolved first.
+- `tests.weakened`: a same-file helper earns credit for its asserts only when it is unique at
+  module level, plain (not async, a generator or decorated) and straight (no branch, loop,
+  early return, `raise`, `yield`, `await`, skip or exit; `with raises/warns/subTest` is
+  allowed). Assertions behind an `if` or after a `return` are not credited, so a check moved
+  into such a helper blocks.
+- `tests.weakened`: a loop over a literal table whose body can leave the row outside its
+  `with self.subTest(...)` block (`break`, `continue`, `return`, `raise`, a skip) counts only
+  its first row, since later rows may never run.
+- `tests.skipped`: a test file moved or renamed onto a live `collect_ignore` or
+  `collect_ignore_glob` entry of a `conftest.py` blocks. Every write to the list is read, not
+  only the first assignment.
+- `runner.tampered`: a deleted root Makefile is followed, and a target that was in it and is
+  gone blocks. `-i` in `MAKEFLAGS` or `MFLAGS`, and `.IGNORE` bare or naming the target, block.
+  A command substitution in a check's arguments warns. An `include` of a `$(wildcard ...)` glob
+  that matches tracked files is read; an include that the Makefile itself rebuilds warns.
+- `runner.tampered`: nox commands held in a name bound once, or returned by one same-file
+  helper, are read, and a helper's literal arguments are bound. A name set through `globals()`,
+  `exec`, `setattr` or a star import is unknown and warns.
+- `runner.tampered`: a policy script that no longer runs a kind of check its base ran blocks,
+  even when other lines remain (`pytest` and `ruff check .` becoming `ruff check .`): "it no
+  longer runs `pytest`". The scripts it calls are read into it, to depth 4, 64 files per side
+  and 1 MiB per file. The lint kinds are one kind, and a call that cannot be read leaves the
+  script unjudged by kind. A script that a recipe of the base Makefile runs counts as run by the
+  policy command that runs the target.
+- `runner.tampered` and `ci.tampered`: npm `-w`/`--workspace` is package selection. `npm test`
+  or `npm test --workspaces` becoming `npm test -w web` blocks ("npm ran every package before
+  and now only `web`"), and widening passes. In a workflow step the selection is the step's own
+  (the words before `--`), and the root `test` script is no longer read in place of the package
+  the step selects.
+- `ci.tampered`: where errexit is off, a subshell or group around a check that ends in another
+  command (`( pytest; echo done )`) swallows the check, and so does one with `exit 0`,
+  `return 0` or `trap ... EXIT` (or `ERR`). `( pytest )` alone is honest, and so is
+  `( pytest; exit 0 )` under `set -e`. A GitHub `run:` step runs with errexit on, so these
+  apply to scripts and other CI files that run without it.
+- `ci.tampered`: a `cp`, `install`, `ln` or `rsync` into the test tree blocks when it lands on a
+  test file, on a file that decides the runner, or on a tracked file it would overwrite. It
+  warns for a new non-test file. A copy with several sources or a computed destination is not
+  read.
+- `ci.tampered`: `nx run-many` becoming `nx affected`, or `nx affected` added to a monorepo
+  test step, warns (0.3.0 did this in `runner.tampered` only).
 - The release workflow publishes the OpenCode plugin to npm as `opencode-greenproof` after PyPI
   accepts the release, with npm trusted publishing from the `npm` environment: no token is
-  stored, and a tag that does not match the package's version fails before anything is published.
+  stored, and a tag that does not match the package's version fails before anything is
+  published.
+
+### Changed
+
+- `tests.removed`: a test renamed while its body was edited is paired with its old self when
+  the match is unique and the bodies share most of their tokens (0.6 in the same file, 0.75
+  across files; a body of at least 10 tokens). Repeated leaf names are told apart by the
+  trailing parts of the qualified name, and names equal once case and punctuation are ignored
+  are paired. A paired test goes through the weakening comparison, so a rename that also drops
+  a check blocks as `tests.weakened`. Below the thresholds, or on a tie, it stays a removal and
+  blocks.
+- `tests.skipped`: a `collect_ignore` entry that hides only non-test files is no longer a skip.
+- `tests.weakened`: `pytest.approx` with the default tolerance, or a literal `rel` or `abs` of
+  1e-6 or less, counts as a pinned value, and so does a value built by a class imported from
+  outside the test tree (`QueryParams('a=1')`). A class defined in the test tree earns no
+  credit.
+- `tests.weakened` (Go): a drop in the line count of checks warns instead of blocking when the
+  credited count is at least the base's and every number or string literal of the removed
+  checks is still present ("by line; helper checks or table rows give N against M"). The
+  credit is a helper's checks that run on every path, and a loop over a literal table of
+  distinct rows times the loop's live checks that read the row. A row that is only assigned to
+  `_`, printed or logged is not read. Rust and JS loops that replace separate checks still
+  block.
+- `tests.skipped` (Go): a conditional `t.Skip` that only new table rows reach is excused only
+  inside a `t.Run` closure, on a field the checks never read, and only when every base row is
+  still present and unchanged.
+- The line-level flow reader for Go, Rust and JS also reads Rust `let ... else`, labelled
+  `break` and `continue`, `goto`, and `switch` fallthrough when deciding whether a check runs.
+- `runner.tampered`: more than 32 different pytest runs (was 8) are needed before the runs are
+  no longer compared one by one.
+- `runner.tampered`: a package-filter rename or glob (`web` to `app-*`) passes when it still
+  selects every package the old filter selected, read from the `package.json` names in the
+  tree, and warns when it does not.
+- `runner.tampered`: a masked check line in a recipe (`-pytest`, `|| true`) is credited when
+  another line of the target runs the same check unmasked. Under `.ONESHELL` this holds only
+  when the mask is a pure no-op (`true`, `:`, `echo` or `printf` of literal words) and every
+  statement of the recipe is plain; a `PATH=` line only warns.
+- Scripts and actions are read up to 1 MiB (was 64 KiB), for `ci.tampered` and for the scripts a
+  policy command runs. A step's reading budget is 32 files and 2 MiB (was 512 KiB). Past a cap,
+  a change to what the file runs warns.
+
+### Fixed
+
+- A quoted `;`, `}`, `)` or `|` in a CI command is an argument, not a terminator, so a group
+  around a check no longer turns `tests;` or `}` into a selection.
+- A Makefile `include` guarded by a wildcard test of its own file no longer warns.
 
 ## [0.3.1] - 2026-11-08
 
@@ -350,7 +462,8 @@ First release.
 - The test suite runs in parallel with `pytest-xdist` (`pytest -n auto`) in CI and in the
   documented gate.
 
-[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/technobasant/greenproof/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/technobasant/greenproof/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/technobasant/greenproof/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/technobasant/greenproof/compare/v0.1.0...v0.2.0

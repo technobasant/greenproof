@@ -1,0 +1,6 @@
+repo: replay/click
+commits scanned: 34
+blocked: 0 (0.0%)
+blocked commits per rule:
+check duration ms: median 308, p95 868
+process wall time ms: median 1390, p95 1890

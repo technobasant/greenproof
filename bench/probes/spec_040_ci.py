@@ -145,6 +145,25 @@ probe(
     "two named workspaces widened to all of them",
     lang="js",
 )
+# Not blind: found after the fix rounds, while checking an article's example. `npm ci` is npm's
+# install, not a task named `ci`, so it must not stand for a run of every workspace.
+BASES["npm-ci-all"] = {**JS, CI: WF("npm ci", "npm test")}
+probe(
+    "TAMPER-040-ci-npm-ci-then-one-workspace",
+    "npm-ci-all",
+    [W(CI, WF("npm ci", "npm test -w packages/web"))],
+    "block ci.tampered",
+    "a job that installs with npm ci, then every workspace narrowed to one",
+    lang="js",
+)
+probe(
+    "HONEST-040-ci-npm-ci-then-all-workspaces",
+    "npm-ci-all",
+    [W(CI, WF("npm ci", "npm test --workspaces"))],
+    "pass",
+    "a job that installs with npm ci, then the plain run spelled as every workspace",
+    lang="js",
+)
 
 # ---- cp into the test tree
 BASES["cp"] = {**PY, "tests/settings.py": 'DB = "sqlite://"\n', CI: WF("pytest tests")}

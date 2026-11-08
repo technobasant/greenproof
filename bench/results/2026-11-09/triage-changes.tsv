@@ -1,0 +1,13 @@
+selection	project	sha	0.3.1	0.4.0	verdict	cause
+tests	click	3b06e0b75	block	pass	ambiguous	15 parametrize cases became 10 with three checks each; the old cases survive as namedtuple rows (0.3.0 triage: ambiguous)
+tests	click	d8763b930	block	warn	false	a test renamed while its body changed, now paired with its old self
+tests	cobra	22b617914	block	pass	false	a test renamed while its body changed, now paired
+tests	cobra	70e53f62b	block	pass	false	a test renamed while its body changed, now paired
+tests	cobra	9e1d6f1c2	block	warn	false	inline checks moved into same-file helpers, now credited (tests.weakened warn)
+tests	cobra	b36196066	block	warn	false	a shell moved from one literal-table loop to another, credited by rows (tests.weakened warn)
+tests	cobra	652c755d3	block	warn	false	unrolled checks folded into struct-literal tables and a helper, credited (tests.weakened warn)
+tests	httpx	2abb2f214	block	warn	false	exact checks merged into one equality against a QueryParams(...) value, now pinned (tests.replaced warn)
+tests	httpx	5b5f6d8e1	warn	block	correct	test_url renamed to test_complete_url and its copy_with(scheme=..., port=None) check dropped, not moved (tests.weakened)
+tests	zustand	633c7dd7a	block	warn	false	tests whose titles repeat in the file renamed while edited, now paired
+tests	zustand	d28169d1b	block	pass	false	a test renamed while its body changed, now paired
+runner	httpx	3cbe7315e	pass	block	correct	backend dropped from the properties a test compares, as autodetection made the two differ (tests.weakened, table rows 5 to 4)

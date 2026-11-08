@@ -1,7 +1,12 @@
 # Measurements
 
-The first section compares 0.3.0 with 0.2.0 on the same inputs. It was measured on
-2026-11-03 at commit `1c59c8c`, whose code is the 0.3.0 release, and its raw results are in
+The first section compares 0.4.0 with 0.3.1 on the same inputs. It was measured on
+2026-11-08 and 2026-11-09 at commit `efd4437`, whose code is the 0.4.0 release apart from the
+version number (two probes for `npm ci` were added in the release commit), and its raw results are in
+[`bench/results/2026-11-09/`](bench/results/2026-11-09/).
+
+The second compares 0.3.0 with 0.2.0. It was measured on 2026-11-03 at commit `1c59c8c`,
+whose code is the 0.3.0 release, and its raw results are in
 [`bench/results/2026-11-03/`](bench/results/2026-11-03/).
 
 The sections after it are the 0.2.0 measurements. Everything there except the agent runs,
@@ -9,6 +14,87 @@ which are dated in their own section, was measured on 2026-11-01 at commit `0b4b
 Apple M5 (10 cores) running macOS, with Python 3.13 and uv 0.13.5. Their raw results are in
 [`bench/results/2026-11-01/`](bench/results/2026-11-01/), and the commands to reproduce
 them are at the end.
+
+## 0.4.0 against 0.3.1
+
+0.4.0 was built to close the limits that the 0.3.x documentation listed. Both builds were run on
+the same inputs. Other work ran on the machine at the same time, so check times were not
+measured again; exit codes and findings do not depend on the load.
+
+| what | 0.3.1 | 0.4.0 |
+|---|---|---|
+| Benchmark: tamper cases reported as expected | 67 of 67 | 67 of 67 |
+| Benchmark: control cases blocked | 0 of 40 (5 warn) | 0 of 40 (5 warn) |
+| Probes, tamper: blocked, warned, passed | 687, 50 and 7 of 744 | 693, 51 and 0 of 744 |
+| Probes, honest: blocked that should not | 35 of 502 | 18 of 502 |
+| Real history, test-touching commits blocked | 75 of 698 (21 false) | 66 of 698 (12 false) |
+| Real history, runner-touching commits blocked | 18 of 394 | 19 of 394 |
+| Test suite | 3,595 tests (0.3.0) | 4,472 tests, 93% coverage |
+
+**Benchmark.** The 107 cases of `bench/run.py` give the same verdicts on both builds. One
+tamper case, LN2, now blocks as `tests.weakened` instead of `tests.replaced`, because the
+renamed test is paired with its old self.
+
+**Probes.** [`bench/probes/`](bench/probes/) now holds 1,246 probes in 30 files: the 1,134 of
+0.3.0 and 112 written for 0.4.0 (`spec_040_*.py`). 110 were written from the documented limits
+before any fix, each a tamper aimed at a limit or the honest change beside it. On them 0.3.1
+handles 49 of 60 tampers as expected and lets 6 through, and 20 of 50 honest changes; 0.4.0
+handles 59 and 32. The other two cover an `npm ci` step beside a narrowed npm workspace
+selection, a bug found after the fix rounds; 0.3.1 lets that tamper through. On 0.4.0 no tamper
+probe passes. 743 of the 744 are reported as expected; the one that is not,
+`TAMPER-040-run-computed-if-k`, warns where it should block (a `-k smoke` that a Makefile
+`$(if $(CI),...)` adds only in CI; make functions are not evaluated). Of the 502 honest
+probes, 401 pass, 81 warn and 20 block. Two of the blocks are the same as on 0.3.0 and are not counted as misses: a feature
+deleted with its tests, written to block until the change is accepted, and a
+`testing.Short()` skip added inside a Go table test, whose probe expects a warning and accepts
+a block. The other 18 are false blocks, against 35 on 0.3.1:
+
+- Python: a fold into an imported helper, a loop fold, two merges of exact checks into one
+  dict or constructor equality, and a test moved to a renamed file;
+- JS: a rename with a body change, a repeated title renamed, and a test moved to a renamed file;
+- Go: a helper with a loop, two skips that only a new row reaches, a rename with a body change,
+  and a test moved to a renamed file;
+- Rust: a fold of `match` arms;
+- runner and CI: a twin check inside `ifndef`, a shell root computed at run time, a `cp` of
+  settings into the test tree, and an edited `sed -i` of the tests.
+
+Each is in SPEC's "Known limits (0.4.0)". The verdict of every probe on each build is in
+`probes-0.3.1.tsv` and `probes-0.4.0.tsv`.
+
+**Real history.** The same 698 test-touching and 394 runner-touching commits of click, httpx,
+zustand and cobra were replayed on both builds, as described below. 10 test-touching blocks
+cleared and one is new:
+
+- **Cleared, false on 0.3.1 (9):** five tests renamed while their bodies changed, now paired
+  (click `d8763b930`, cobra `22b617914`, `70e53f62b`, zustand `633c7dd7a`, `d28169d1b`); three
+  Go checks moved into same-file helpers or literal-table loops, now credited and warned on
+  (cobra `9e1d6f1c2`, `b36196066`, `652c755d3`); and exact checks merged into one equality
+  against a `QueryParams(...)` value (httpx `2abb2f214`).
+- **Cleared, ambiguous on 0.3.1 (1):** click `3b06e0b75`, where 15 parametrize cases became 10
+  with three checks each.
+- **New (1):** httpx `5b5f6d8e1` renames `test_url` to `test_complete_url` and drops its
+  `copy_with(scheme=..., port=None)` check, which no other test makes. The block is correct;
+  0.3.1 only warned that the test was replaced.
+
+The triage of the 66 blocks is 46 correct, 12 false and 8 ambiguous, against 45, 21 and 9 on
+0.3.1. The 12 false blocks left: Go checks in a helper or loop that 0.4.0 does not credit
+(cobra `4cafa37bc`, `2da4a54c5`); exact checks merged into one larger equality (httpx
+`354c4cac1`, `883cf8ca6`); tests moved to another file or rewritten wholesale (httpx
+`cca62060c`, cobra `65c8acb22`, zustand `e247220ec`); the checked subject written differently
+(httpx `7947b5607`, `8dc9b6bd5`); a CI workflow deleted while another runs the same steps
+through a package script alias (zustand `2367abb18`); a `t.Skip` that only a new row reaches,
+beside an edited base row (cobra `df12a0a24`); and an existing `sed -i` rewrite of the tests
+edited (zustand `350d9ec6b`).
+
+Runner-touching commits: one new block, httpx `3cbe7315e`, which drops `backend` from the
+properties a test compares because autodetection made the two differ; it is correct. One
+commit, cobra `adbc88139`, went from no finding to a `runner.tampered` warning. The commits
+and verdicts are in `triage-changes.tsv`, and the per-commit results of both builds in
+`replay-*-0.3.1.tsv` and `replay-*-0.4.0.tsv`.
+
+**Test suite.** 4,472 tests: 4,468 passed and 4 were skipped (actionlint, zizmor and jest not
+installed, and a speed-ratio test that does not run under coverage). Line and branch coverage is
+93%. ruff and mypy (strict) pass.
 
 ## 0.3.0 against 0.2.0
 
