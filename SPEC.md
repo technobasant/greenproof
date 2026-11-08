@@ -240,9 +240,10 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
 - the test's **effective check count** drops. It is the number of reachable, non-vacuous
   assertions (`assert` statements, `self.assert*` calls, `pytest.raises`/`pytest.warns`
   contexts, `assert_*` calls on mocks) times the test's parametrize cases (the product
-  over stacked `parametrize` decorators whose argvalues are a literal list or tuple; when
-  either side has a non-literal argvalues, both sides are compared without the case
-  factor). Repeated cases count once (`[1, 1, 1]` is one case; `pytest.param(2, 4, id=...)`
+  over stacked `parametrize` decorators whose argvalues are a literal list or tuple, or a
+  module-level name bound once to one; when either side has other argvalues, both sides are
+  compared without the case factor, and a table either side cannot read leaves the plain
+  counts on both sides). Repeated cases count once (`[1, 1, 1]` is one case; `pytest.param(2, 4, id=...)`
   equals `(2, 4)` and `2` equals `2.0`). A `for` loop over a literal list or tuple (written in
   place, or a module-level or local name bound once) and a `parametrize` over a module-level
   name of that kind are compared by their distinct rows. A loop whose check reads its row adds
@@ -471,6 +472,13 @@ string contents blanked, so brackets inside strings do not count:
   helpers, unchanged same-directory test files that call them are re-analysed as if they
   had changed, so a helper that loses its checks weakens its callers. A helper without an
   assertion earns nothing.
+- **Go table and helper credit (0.4.0).** When a Go test's line count of checks drops, the
+  credited count is taken: a helper's checks proven to run on every path, and a loop over a
+  literal table of distinct rows times the loop's live checks that read the row. If it is at
+  least the base's and every number or string literal of the removed checks is still present,
+  the drop is a `warn` ("by line; helper checks or table rows give N against M"), else it
+  blocks. A row that is only assigned to `_` (`_ = c`), printed or logged is not read by a
+  check.
 - **Rust char literals.** A Rust character literal (`'}'`, `'"'`, `'\n'`, `'\''`, matched
   by `'(?:\\.|[^\\'])'`) is masked like a string, so its brace or quote is not code. A lifetime
   (`'a`) is left alone.
@@ -876,9 +884,10 @@ statements after it.
   when it lands on a test file, a file that decides the runner, or a tracked file it would
   overwrite, and warns for a new non-test file. A copy with several sources or a computed
   destination is not read.
-- A subshell or group around a check swallows its status where errexit is off, and a subshell
-  with `exit 0`, `return 0` or `trap ... EXIT` (or `ERR`) is a swallow; under `set -e`,
-  `( pytest; exit 0 )` is honest. A quoted `;`, `}`, `)` or `|` is an argument.
+- Where errexit is off, a subshell or group around a check that ends in another command
+  (`( pytest; echo done )`) swallows the check's status, and so does one with `exit 0`,
+  `return 0` or `trap ... EXIT` (or `ERR`); `( pytest )` alone is honest, and so is
+  `( pytest; exit 0 )` under `set -e`. A quoted `;`, `}`, `)` or `|` is an argument.
 - `nx affected` added to a monorepo test step warns.
 - A statement a step adds that removes the project's tests (`rm`, `find -delete`, `git rm`, ...,
   judged by the runner rule's `removes`, against the base's statements) blocks.
@@ -961,7 +970,10 @@ Python tests
   the same as a weakened check, and a parametrize unrolled into separate tests is not credited.
 - A same-file helper is credited only when it is unique at module level, plain and straight, is
   inlined to depth 3 and is called with literal arguments for the values it checks. A helper
-  whose checks sit behind an `if`, or after a return, earns no credit.
+  whose checks sit behind an `if`, or after a return, earns no credit. An exact check moved
+  into a helper that checks loosely (`assert got is not None` for `assert add(2, 2) == 4`) is a
+  `warn`, "a strong assertion was replaced by a weaker one", not a block: the loosened-check
+  rule does not follow helpers.
 - A `parametrize` decorator whose assertion ignores the row values is not flagged. A `for`
   loop that ignores its rows blocks.
 - Literal row counts apply only to literal lists and tuples bound once and never mutated.
@@ -976,6 +988,8 @@ Python tests
   `__eq__`, and an `__eq__` that reads the other operand but ignores it, are not judged.
   Resolution stops at depth 3. Matcher libraries other than dirty-equals, callee, mock and
   testfixtures are not known.
+- `collect_ignore` and `collect_ignore_glob` are read only when a conftest assigns or extends
+  them by name; one set through `globals()` or another indirect write is not seen.
 
 Test identity
 - A test renamed while its body changed is paired only when the match is unique and the bodies
@@ -992,7 +1006,8 @@ Go, Rust and JS tests
   the base's and every number or string literal of the removed checks is still present; then
   it warns, and a person reads it. Only Go earns this credit. A Rust or JS loop that replaces
   separate checks blocks.
-- A Go loop check whose row is read only by another statement (`_ = c`) still earns the warning.
+- A Go loop row that is only assigned to `_`, printed or logged does not count as read by a
+  check, but a row passed whole to any other call (`noop(c)`) does, and earns the warning.
   A table with identical rows, a table whose address is taken and a helper whose checks are not
   proven to run on every path earn no credit.
 - A helper is read at its own check lines only when it reads straight through; a return, skip,
