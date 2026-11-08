@@ -379,6 +379,8 @@ _WORD_AT = re.compile(r"\s*([A-Za-z_$][\w$]*)")
 _CASE = re.compile(r"(?:case\b|default\s*:)")
 _RUN_HEAD = re.compile(r"\s*\w+\.Run\s*\(")
 _FUNC_LIT = re.compile(r"\bfunc\s*\([^()]*\)\s*(?:[\w.*\[\]]+\s*)?\{")
+_LET = re.compile(r"let\b")
+_FALL = re.compile(r"fallthrough\b")
 _NO_CONT = frozenset(",+-*/%&|=?:<>([.!^~")
 _NO_START = frozenset(".?:+*/%&|,=)<>^")
 MAX_NODES = 20_000
@@ -631,6 +633,10 @@ class _Parser:
                 break
             j += 1
         j = min(j, b)
+        if self.lang == "rust":
+            le = self.let_else(i, j, depth)
+            if le is not None:
+                return le, j + 1
         if self.lang == "go":
             m = _RUN_HEAD.match(s, i, j)
             if m:
@@ -641,6 +647,29 @@ class _Parser:
                     inner = self.block(f.end(), self.pair[f.end() - 1], depth + 1)
                     return ("RUN", inner), j + 1
         return ("S", i, j), j + 1
+
+    def let_else(self, i: int, j: int, depth: int) -> tuple[Any, ...] | None:
+        """A Rust `let PATTERN = EXPR else { .. };` is an `if` whose `else` runs when the pattern
+        does not match: the block (a `return`, `continue`, `break` or a panic) is read as a branch
+        on `PATTERN = EXPR`, so a row that leaves there is a row that leaves before asserting."""
+        s = self.s
+        if not _LET.match(s, i, j):
+            return None
+        k = i
+        while k < j:
+            c = s[k]
+            if c in "([":
+                k = self.pair.get(k, j) + 1
+                continue
+            if c == "{":
+                before = s[i:k].rstrip()
+                if before.endswith("else") and k in self.pair and self.pair[k] < j:
+                    els = self.block(k + 1, self.pair[k], depth + 1)
+                    return ("IF", i, k, [], els)
+                k = self.pair.get(k, j) + 1
+                continue
+            k += 1
+        return None
 
     def line_ends(self, j: int, start: int, b: int) -> bool:
         s = self.s
@@ -686,6 +715,11 @@ _STMT_EXIT = {
     "js": re.compile(r"(return|continue|break)\b"),
     "go": re.compile(r"(return|continue|break|goto)\b|(\w+\.Skip(?:f|Now)?)\s*\("),
     "rust": re.compile(r"(return|continue|break)\b"),
+}
+_LABEL = {
+    "js": re.compile(r"\s+[A-Za-z_$][\w$]*\s*;?\s*\Z"),
+    "go": re.compile(r"\s+[A-Za-z_]\w*\s*;?\s*\Z"),
+    "rust": re.compile(r"\s+'[A-Za-z_]\w*\s*;?\s*\Z"),
 }
 _STMT_FAIL = {
     "js": re.compile(r"throw\b|(?:assert|expect)\s*\.\s*fail\b|fail\s*\("),
@@ -749,6 +783,10 @@ class _Eval:
         self.class_: dict[int, tuple[bool, str]] = {}
         self.ctx: list[str] = ["row"] if loop_scan else []
         self.sinks: list[list[_St]] = []
+        # per nested loop: where its `continue` and `break` paths end (state, whether a
+        # row-dependent condition led there, that condition) and the guard depth at its start
+        self.lsinks: list[list[tuple[_St, bool, str]]] = []
+        self.lentry: list[int] = []
         self.uniform = 0
 
     # -- regions
@@ -843,8 +881,17 @@ class _Eval:
             return st
         if kind == "LOOP":
             self.ctx.append("loop")
+            sink: list[tuple[_St, bool, str]] = []
+            self.lsinks.append(sink)
+            self.lentry.append(len(guards))
             end = self.nodes(node[1], st, guards, rescue)
+            self.lentry.pop()
+            self.lsinks.pop()
             self.ctx.pop()
+            # a `continue` or `break` of this loop ends the iteration where it stands: the path
+            # that left before asserting is one of the ways the loop finishes
+            for left, dep, cond in sink:
+                end = join_states(end, left, dep, cond, "if")
             return st if not (end.u or end.a) else end
         if kind == "IF":
             return self.if_(node, st, guards, rescue)
@@ -919,7 +966,8 @@ class _Eval:
         self.sinks.append(sink)
         self.ctx.append("sw")
         head = self.s[ha:hb]
-        for ca, cb, body in cases:
+        carry = _DEAD  # the state a case that falls through hands to the next one
+        for n, (ca, cb, body) in enumerate(cases):
             has_default = has_default or ca < 0 or self.irrefutable(ca, cb)
             label = head if ca < 0 else head + " " + self.s[ca:cb]
             dep = mentions(self.names, label) or bool(_MARKER.search(label))
@@ -933,9 +981,15 @@ class _Eval:
             inner = [*guards, (shown, not mentions(self.names, label))] if dep else guards
             if not dep:
                 self.uniform += 1
-            end = self.nodes(body, st, inner, rescue)
+            # a case is entered from the switch or by falling through from the one above
+            enter = st if carry == _DEAD else join_states(st, carry, True, shown, "switch")
+            end = self.nodes(body, enter, inner, rescue)
             if not dep:
                 self.uniform -= 1
+            carry = _DEAD
+            if n + 1 < len(cases) and self.falls_through(body, end):
+                carry = end
+                continue
             out.append((end, shown, dep))
         self.ctx.pop()
         self.sinks.pop()
@@ -948,6 +1002,15 @@ class _Eval:
         for end in sink:
             res = self.join(res, end, any_dep, "", "switch")
         return res
+
+    def falls_through(self, body: Sequence[tuple[Any, ...]], end: _St) -> bool:
+        """A case runs on into the next one: Go ends it with `fallthrough`; in JS and TS a case
+        whose end is reachable (no `break`, `return` or `throw` on that path) does."""
+        if self.lang == "js":
+            return end != _DEAD
+        if self.lang == "go" and body and body[-1][0] == "S":
+            return _FALL.match(self.s, body[-1][1], body[-1][2]) is not None
+        return False
 
     def irrefutable(self, ca: int, cb: int) -> bool:
         """A Rust `match` arm that takes every value: `_` or a bare binding, with no guard."""
@@ -964,14 +1027,23 @@ class _Eval:
         if not m:
             return st
         if word in ("continue", "break", "goto"):
+            # `goto L`, `continue L` and `break L` may leave any enclosing loop, the row's own
+            # included: read as leaving the row, whatever loop they are inside
+            labelled = word == "goto" or _LABEL[lang].match(s, m.end(), b) is not None
             for c in reversed(self.ctx):
+                if labelled:
+                    break
                 if c == "sw" and word == "break":
                     self.sinks[-1].append(st)
                     return _DEAD
                 if c == "sw":
                     continue
+                if c == "loop":
+                    dep = len(guards) > self.lentry[-1]
+                    self.lsinks[-1].append((st, dep, guards[-1][0] if guards else ""))
+                    return _DEAD
                 if c != "row":
-                    return _DEAD  # about a nested loop or a closure of its own
+                    return _DEAD  # a closure of its own
                 break
             else:
                 return _DEAD

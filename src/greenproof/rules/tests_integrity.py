@@ -33,7 +33,7 @@ from greenproof.rules.tests_python import (
     lost_helpers,
     marker_display,
 )
-from greenproof.rules.tests_tables import MAX_MATCH, fits, match_rows
+from greenproof.rules.tests_tables import MAX_MATCH, fits, marker_excused, match_rows
 
 _RUST_TEST_ATTR = re.compile(r"#\[\s*(?:\w+::)*(?:test|rstest|test_case)\b")
 
@@ -461,7 +461,13 @@ def _weak_reasons(b: Unit, c: Unit, count_drop_allowed: bool, added: _Added) -> 
                 )
             )
     elif count_drop_allowed and c.asserts < b.asserts:
-        out.append((f"assertions dropped from {b.asserts} to {c.asserts}", c.line, BLOCK))
+        if c.credited >= b.credited:  # helper bodies or table rows make up the lines (SPEC 5.4)
+            note = f"; helper checks or table rows give {c.credited} against {b.credited}"
+            out.append(
+                (f"assertions dropped from {b.asserts} to {c.asserts} by line{note}", c.line, WARN)
+            )
+        else:
+            out.append((f"assertions dropped from {b.asserts} to {c.asserts}", c.line, BLOCK))
     replaced = [line for expr, line in c.self_calls if expr in b.compared]
     base_replaced = sum(1 for expr, _ in b.self_calls if expr in b.compared)
     if c.vacuous + len(replaced) > b.vacuous + base_replaced:
@@ -580,6 +586,8 @@ def _marker_findings(sides: list[_Side], base_keys: set[str], cand_keys: set[str
             skip = m.rule == "tests.skipped"
             if skip and m.conditional and (fresh or s.base is None):
                 continue
+            if skip and marker_excused(s.base, s.cand, m):
+                continue  # a skip only the test's new table rows can reach (SPEC 5.3)
             out.append(_marker_finding(s.cand.path, m, warn=fresh and skip))
     return out
 

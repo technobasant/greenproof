@@ -66,6 +66,10 @@ class Unit:
     body_hash: str
     engine: str  # "python" (AST), "python-lines", "js", "go", "rust"
     asserts: int = 0
+    # JS, Go, Rust: the checks with each same-file helper call at what its body checks and each
+    # literal-table loop at its distinct rows. It never lowers a block; it only turns a drop of
+    # `asserts` into a warning when the candidate's is no lower than the base's (SPEC 5.4).
+    credited: int = 0
     strong: int = 0
     weak: int = 0
     broad_raises: int = 0
