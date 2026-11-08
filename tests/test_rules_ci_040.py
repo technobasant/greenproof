@@ -541,25 +541,6 @@ def test_a_rewrite_whose_base_form_has_a_test_word_blocks_when_it_changes(tmp_pa
     assert verdict(found) == "block"
 
 
-@pytest.mark.parametrize(
-    ("script", "expected"),
-    [
-        ("s/a/b/", ("a", "b")),
-        ("s|a/b|c|g", ("a/b", "c")),
-        ("s/a\\/b/c/2", ("a\\/b", "c")),
-        ("1s/a/b/", None),
-        ("s/a/b/;p", None),
-        ("s/a/b/w x", None),
-        ("s/a/b", None),
-        ("d", None),
-    ],
-)
-def test_one_substitution_is_read_as_its_pattern_and_replacement(script, expected) -> None:
-    from greenproof.rules import ci
-
-    assert ci._substitution(script) == expected
-
-
 # ---- fix round: groups where errexit is ignored -------------------------------------------------
 @pytest.mark.parametrize(
     "new_run",

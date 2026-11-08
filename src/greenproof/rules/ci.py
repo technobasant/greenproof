@@ -2058,41 +2058,6 @@ def _covered_path(path: str, by: str) -> bool:
     return bool(_GLOBBY & set(by)) and len(by) < 400 and _glob_regex(by).fullmatch(path) is not None
 
 
-# Kept for tests/test_rules_ci_040.py::test_one_substitution_is_read_as_its_pattern_and_replacement;
-# nothing in the rule reads it any more (a changed rewrite always blocks).
-_SUB_FLAGS = re.compile(r"[gI0-9]*")
-
-
-def _substitution(script: str | None) -> tuple[str, str] | None:
-    """`(pattern, replacement)` of a script that is one `s` command: no address, flags only
-    from g, I and digits, nothing after them. None for anything else."""
-    if not script or len(script) < 4 or script[0] != "s":
-        return None
-    delim = script[1]
-    if delim.isalnum() or delim.isspace() or delim == "\\":
-        return None
-    parts: list[str] = []
-    cur: list[str] = []
-    i = 2
-    while i < len(script) and len(parts) < 2:
-        c = script[i]
-        if c == "\\":
-            cur.append(script[i : i + 2])
-            i += 2
-            continue
-        if c == "\n":
-            return None
-        if c == delim:
-            parts.append("".join(cur))
-            cur = []
-        else:
-            cur.append(c)
-        i += 1
-    if len(parts) != 2 or not _SUB_FLAGS.fullmatch(script[i:]):
-        return None
-    return parts[0], parts[1]
-
-
 def _repeated_rewrite(world: _World, stmt: str, where: _Dir, base_path: str | None) -> str | None:
     """The base statement, in the workflow this one replaces, that already rewrote every file
     this `sed -i` or `perl -i` statement edits (the same files, or a glob over them): the rewrite
