@@ -488,6 +488,51 @@ def test_a_changed_rewrite_that_is_not_a_plain_substitution_blocks(
     assert verdict(found) == "block", [(f.severity, f.message) for f in found]
 
 
+# ---- integration: the substitution swaps a name or a path, nothing that can delete or inject code
+@pytest.mark.parametrize(
+    "new_sed",
+    [
+        'sed -i "s|zustand/vanilla|../src/vanilla|" tests/*.py',
+        'sed -i "s/old\\.mod/new\\.mod/" tests/*.py',  # an escaped dot is a dot
+        'sed -i "s/src\\/old/src\\/new/" tests/*.py',  # an escaped delimiter
+        'sed -i -E "s|old|@scope/new-name|" tests/*.py',  # a scoped package
+    ],
+)
+def test_a_name_or_path_swap_warns(tmp_path: Path, new_sed: str) -> None:
+    found = sub(tmp_path, new_sed)
+    assert verdict(found) == "warn", [(f.severity, f.message) for f in found]
+
+
+@pytest.mark.parametrize(
+    "new_sed",
+    [
+        'sed -i "s/^import/process.exit(0);import/" tests/*.py',  # injects code
+        'sed -i "s/import/process.exit(0);import/" tests/*.py',
+        'sed -i "s/old/os._exit/" tests/*.py',  # `old(0)` becomes `os._exit(0)`
+        'sed -i "s/check_all/return/" tests/*.py',  # `check_all(x)` becomes `return(x)`
+        'sed -i "s/is_valid/True/" tests/*.py',
+        'sed -i "s/verify_all//" tests/*.py',  # `verify_all(x)` becomes `(x)`
+        'sed -i "s/.*//" tests/*.py',  # empties every line
+        'sed -i "s/.//g" tests/*.py',
+        'sed -i "s/..//g" tests/*.py',
+        'sed -i "s/old/new # /" tests/*.py',
+        'sed -i "s/old/&/" tests/*.py',
+        'sed -i -E "s/(old)/\\1/" tests/*.py',
+        'sed -i "s/ == / != /" tests/*.py',
+        'sed -i "s/old/new;/" tests/*.py',
+        'sed -n -i "s/old/new/" tests/*.py',  # -n writes nothing back: every file empty
+        'sed -ni "s/old/new/" tests/*.py',
+        'sed --quiet -i "s/old/new/" tests/*.py',
+        'sed -z -i "s/old/new/" tests/*.py',
+        "sed -i -f fix.sed tests/*.py",
+        "sed -i --file=fix.sed tests/*.py",
+    ],
+)
+def test_a_substitution_that_can_delete_or_inject_code_blocks(tmp_path: Path, new_sed: str) -> None:
+    found = sub(tmp_path, new_sed)
+    assert verdict(found) == "block", [(f.severity, f.message) for f in found]
+
+
 def test_a_rewrite_whose_base_form_has_a_test_word_blocks_when_it_changes(tmp_path: Path) -> None:
     base = 'sed -i "s/old/skip/" tests/*.py'
     found = run(

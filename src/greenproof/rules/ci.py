@@ -2066,6 +2066,19 @@ _TEST_WORDS = re.compile(
 )
 _TEST_MATCHER = re.compile(r"\bto[A-Z]")  # `toBe`, `toEqual`: a jest matcher
 _SUB_FLAGS = re.compile(r"[gI0-9]*")
+# Options of a plain in-place rewrite: `-i` with or without a backup suffix, extended regexps.
+_SED_OPTION = re.compile(r"-i.*|--in-place(?:=.*)?|-[Ers]|--regexp-extended|--separate|--")
+# A pattern or replacement that is a name or a path, once `\.` and an escaped delimiter are read
+# as the plain character. Anything else (`^`, `*`, `&`, `(`, `;`, quotes, spaces) can delete,
+# comment out or inject code.
+_LITERAL = re.compile(r"[A-Za-z0-9_./@-]+")
+# Words that, put in place of a name, end or skip a test: `check(x)` becoming `return(x)`.
+_CODE_WORDS = re.compile(
+    r"(?<![A-Za-z0-9_])(?:return|exit|_exit|quit|abort|kill|process|sys|os|pass|continue|break"
+    r"|yield|throw|raise|panic|goto|lambda|not|and|or|true|false|none|null|nil|undefined)"
+    r"(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 
 
 def _sed_script(stmt: str) -> str | None:
@@ -2075,11 +2088,13 @@ def _sed_script(stmt: str) -> str | None:
     if not toks or posixpath.basename(toks[0]) != "sed":
         return None
     rest = toks[1:]
-    if any(t in ("-f", "--file") or t.startswith("--file=") for t in rest):
-        return None
     given = [i for i, t in enumerate(rest) if t == "-e" or t.startswith("--expression")]
-    if len(given) > 1 or any(re.fullmatch(r"-[a-zA-Z]*e[a-zA-Z]*", t) and t != "-e" for t in rest):
+    if len(given) > 1:
         return None
+    script_at = given[0] + 1 if given and "=" not in rest[given[0]] else -1
+    for i, t in enumerate(rest):  # an option it does not know (`-n` empties the file) is not read
+        if t.startswith("-") and i != script_at and i not in given and not _SED_OPTION.fullmatch(t):
+            return None
     if given:
         t = rest[given[0]]
         if "=" in t:
@@ -2119,13 +2134,28 @@ def _substitution(script: str | None) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
+def _literal(text: str, delim: str) -> str | None:
+    """`text` of an `s` command with `\\.` and an escaped delimiter read as the plain character;
+    None when what is left is not a name or a path (see `_LITERAL`)."""
+    plain = text.replace("\\" + delim, delim).replace("\\.", ".")
+    return plain if _LITERAL.fullmatch(plain) else None
+
+
 def _modest_rewrite(old: str, new: str) -> bool:
     """Whether a rewrite of tests that changed from `old` to `new` is only a warning: each is one
-    plain `s` command and neither mentions a word a test is made of."""
-    a, b = _substitution(_sed_script(old)), _substitution(_sed_script(new))
-    if a is None or b is None:
+    plain `s` command, neither mentions a word a test is made of, and the new one swaps a name or
+    a path for another (two or more name characters in the pattern, a replacement that is not
+    empty and puts no word in place that ends or skips a test)."""
+    script = _sed_script(new)
+    a, b = _substitution(_sed_script(old)), _substitution(script)
+    if a is None or b is None or script is None:
         return False
-    return not any(_TEST_WORDS.search(x) or _TEST_MATCHER.search(x) for x in (*a, *b))
+    if any(_TEST_WORDS.search(x) or _TEST_MATCHER.search(x) for x in (*a, *b)):
+        return False
+    pattern, replacement = _literal(b[0], script[1]), _literal(b[1], script[1])
+    if pattern is None or replacement is None or len(re.findall(r"[A-Za-z0-9_]", pattern)) < 2:
+        return False
+    return not _CODE_WORDS.search(replacement)
 
 
 def _repeated_rewrite(world: _World, stmt: str, where: _Dir) -> str | None:
