@@ -3590,6 +3590,9 @@ def _monorepo_scope(tokens: Sequence[str]) -> tuple[str, dict[str, _Dim]] | None
         args = list(tokens[i + 1 :])
         if "--" in args:
             args = args[: args.index("--")]
+        command = _skip_opts(args, _PKG_VALUE_OPTS)[:1]
+        if command and command[0] in _NON_CHECK_SUBCOMMANDS.get(tool, ()):
+            return None  # `npm ci` installs packages; it is not a task named `ci`
         head = args[:3]
         if (
             tool == "yarn" and args[:1] == ["workspace"] and len(args) > 2
