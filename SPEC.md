@@ -242,10 +242,24 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   contexts, `assert_*` calls on mocks) times the test's parametrize cases (the product
   over stacked `parametrize` decorators whose argvalues are a literal list or tuple; when
   either side has a non-literal argvalues, both sides are compared without the case
-  factor). Turning six asserts into one assert over six cases is not a drop. There is no
+  factor). Repeated cases count once (`[1, 1, 1]` is one case; `pytest.param(2, 4, id=...)`
+  equals `(2, 4)` and `2` equals `2.0`). A `for` loop over a literal list or tuple (written in
+  place, or a module-level or local name bound once) and a `parametrize` over a module-level
+  name of that kind are compared by their distinct rows. A loop whose check reads its row adds
+  one run of its asserts per row, and `assert all(<check> for x in <table>)` counts one per
+  row. An assertion in a nested `def` that nothing calls does not count. Turning six asserts
+  into one assert over six cases is not a drop. There is no
   finding when every distinct exact assertion form (5.7) of the base test still appears in
   the candidate test or among the assertions the change adds: dropping a duplicated
   assertion, or moving one into another test, is not weakening;
+- the **distinct rows** of a literal table reduced. A table is a literal list or tuple, written
+  in a `for` loop or bound once to a name (module level, or the top of the test body), or the
+  argvalues a `parametrize` takes from a module-level name. Fewer distinct rows in the candidate
+  than in the base is `tests.weakened` (block), "table rows reduced from N to M", unless every
+  base row is among the candidate's rows or the rows of new tests. A loop whose check no longer
+  reads its row, and a table name that is bound again or changed in place (`CASES.append(4)`),
+  block. A table that cannot be read (passed to a call, or built by `range`) is a `warn`,
+  "table rows could not be read", and only when the base's table could be read;
 - `assert a == b` / `assertEqual` / `assertIn` / `assertRaises(SpecificError)` replaced by
   a truthiness or existence check (`assert a`, `assert a is not None`, `assertTrue`,
   `assertIsNotNone`) or by a broader exception (`Exception`, `BaseException`);
@@ -327,7 +341,13 @@ Python (AST, matched by qualified test name `path::Class::test_name`):
   `assert total() == 100` → `assert total()`, → `assert total() > 0`, →
   `assert isinstance(total(), int)` and `assert rows == [a, b]` → `assert len(rows) == 2`.
   Any other comparison on `X` replaced by a truthiness check on `X` alone
-  (`assert x < 5` → `assert x`) is also `tests.weakened` (block). When the new assertion
+  (`assert x < 5` → `assert x`) is also `tests.weakened` (block). A **matcher** on one side of a
+  top-level `==` or `assertEqual` makes the check a loose check on the other side: `ANY` and
+  `mock.ANY`, dirty-equals and callee names, testfixtures `Comparison` classes, a class whose
+  only base is `object` and whose own `__eq__` never reads its second parameter, and a function
+  whose every return is such a value (followed to depth 3; matchers imported from test modules
+  are read once per module). So `assert f(1) == 2` becoming `assert f(1) == ANY` blocks ("exact
+  check on `f(1)` loosened to `f(1) == ANY`"). Only the top-level operand is judged. When the new assertion
   is a different expression (`assert f(x) == 1` → `assert is_one(x)`) it is a `warn` for a
   strong check replaced by a different one, because that is often a legitimate refactor.
 - a check-count drop made only of **loose checks** (every base assertion missing from the
@@ -361,7 +381,11 @@ Python also treats these as weakening:
   module (`from helpers import f`, `from tests.helpers import f`, `from .helpers import f`,
   `import helpers` with `helpers.f()`) gets the same helper credit as a helper in the test's
   own file: the helper's own assertions count, and a helper that only does `return a == b`
-  still counts as no check. Credit follows helper calls up to 8 levels deep (`check_order`
+  still counts as no check. In the test's own file a helper counts only when it is unique at
+  module level, plain (not async, a generator or decorated) and straight: no branch, loop,
+  early return, `raise`, `yield`, `await`, skip or exit, though `with raises/warns/subTest` is
+  allowed. A literal argument binds the helper's parameter, and an assertion behind an `if` or
+  after a `return` is not credited. Credit follows helper calls up to 8 levels deep (`check_order`
   calls `_check_fields`, which calls `_check_total` and `_check_id`); a cycle is cut where it
   closes. The module is resolved against the test file's directory, the repository root and
   the test roots, and read at the same revision as the test file. A module outside the test
@@ -513,7 +537,10 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   already have it; `coverage run -m pytest` is not a marker flag, and `*session.posargs` is
   not a selection. Arguments are read through starred list or tuple literals
   (`*["-k", "x"]`), `*"-k x".split()` and names bound once to such lists, `+` joins included
-  (a name assigned twice, mutated, or shadowed by a parameter is unreadable). A starred
+  (a name assigned twice, mutated, or shadowed by a parameter is unreadable). A nox command held
+  in a name bound once, or returned by one same-file helper, is read, and a helper's call
+  arguments are read when they are literals (`*x` or `**kw` makes it unreadable). A name set
+  through `globals()`, `exec`, `setattr` or a star import is unknown and warns. A starred
   argument other than `session.posargs` that cannot be read, and is new or changed, is a
   `warn`. The `commands` of each tox environment (`tox.ini`, `setup.cfg`, `pyproject.toml`,
   `tox.toml`) and the `session.run` calls of each nox session are judged as well: a `-` prefix on
@@ -537,8 +564,9 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   nx `run-many` `--projects`/`-p` and `--exclude`, lerna `--scope`/`--ignore`, and yarn
   `workspaces foreach` `--include`/`--exclude`. A filter added where the base had none, or one
   that leaves out a package the base ran, blocks; a dropped or widened filter passes; a rename
-  or a glob (`web` to `app-*`) warns. In `runner.tampered`, `nx run-many` becoming
-  `nx affected` warns. A command that names exact test files covering every file the base path
+  or a glob (`web` to `app-*`) passes when it still selects every package the old filter
+  selected, read from the `package.json` names in the tree, and warns when it does not. In
+  `runner.tampered` and in `ci.tampered`, `nx run-many` becoming `nx affected` warns. A command that names exact test files covering every file the base path
   selected (`pytest .` to `pytest test_shop.py` when that is the only test file) is a `warn` in
   any directory, saying that test files added later will not run; fewer files, or a test file
   added in the same change, blocks;
@@ -550,7 +578,7 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   Each pytest run is judged on its own, from the config's `addopts`, then `PYTEST_ADDOPTS`, then
   the run's own flags (a command-line `-o` beats `addopts`). Runs are followed through `make`
   (`-C` included), `npm run` and shell scripts. A flag moved between `addopts` and the command
-  line passes, and one dropped from a command line blocks. With more than 8 different runs the
+  line passes, and one dropped from a command line blocks. With more than 32 different runs the
   runs are not compared one by one: the configuration alone is judged and a change to the runs
   warns;
 - `-p no:<plugin>` in `addopts` is judged by the plugin: harmless ones (`cacheprovider`,
@@ -649,6 +677,7 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `jest.config.*`/`vitest.config.*` (`testPathIgnorePatterns`,
   `exclude`, `coverageThreshold` lowered, `passWithNoTests`); `tsconfig*.json` (`strict`
   or `noImplicitAny` set false, `skipLibCheck` is ignored);
+<!-- F7: policy scripts, npm workspaces in CI -->
 - `Makefile`/`justfile` targets referenced by the base policy's commands (all targets are
   read, `define ... endef` bodies are not targets; a recipe emptied while gaining
   prerequisites, or either side has prerequisites, is judged by the recipes of those
@@ -658,8 +687,14 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   does not define is left as written. Recipes are read in the directory they run
   in (`cd dir && ...`, `make -C dir`), target-specific variables are read in one pass, and a
   Makefile that is only partly read still judges the goal's recipe. With `SHELL` set to bash,
-  `set -o pipefail` keeps a pipeline's status; a recipe line that masks a check is credited when
-  another line of the target runs the same check unmasked; a touched line with `$(call ...)` or
+  `set -o pipefail` keeps a pipeline's status; a recipe line that masks a check (`-pytest`, or a
+  `|| true` mask) is credited when another line of the target runs the same check unmasked, but
+  under `.ONESHELL` only when the mask is a pure no-op (`true`, `:`, or `echo`/`printf` of
+  literal words) and every statement of the recipe is plain; a `PATH=` line only warns. Make
+  ignore flags (`-i` in `MAKEFLAGS` or `MFLAGS`, `.IGNORE` bare or naming the target) block.
+  A deleted root Makefile is followed (a removed target blocks). An `include` of a literal
+  path, or of a `$(wildcard ...)` glob that matches tracked files, is read; an include that the
+  Makefile itself rebuilds warns. A command substitution in a check's arguments warns. A touched line with `$(call ...)` or
   `$(eval ...)` is a `warn`, once per target. A target that is not in `.PHONY` (continuations
   included), has no `FORCE` prerequisite and is named like a file or directory beside the
   Makefile in the candidate tree never runs its recipe: it counts as running nothing. A `-`
@@ -686,8 +721,7 @@ Structural diff (parse TOML/JSON/INI with stdlib; YAML by line heuristics) of:
   `--grep` and their relatives, by runner) is shared with `ci.tampered`; a flag before the
   runner (`python -m pytest`) does not count. In `runner.tampered` the flags belong to their
   tool: `-k` narrows only pytest, `-t` narrows jest and vitest but is mocha's timeout, mocha
-  narrows with `-g`, `--grep`, `-f`, `--fgrep` and `--only`, and `make -k` narrows nothing. Detection is linear in the script: 8000 checks
-  and 2000 `exit 0` lines are read in under 3 seconds;
+  narrows with `-g`, `--grep`, `-f`, `--fgrep` and `--only`, and `make -k` narrows nothing. Detection is linear in the script;
 - a file a base policy command runs (`sh scripts/test.sh`, `python scripts/run_tests.py`,
   `./ci/check`), and the files those run, one level deep: deleted, emptied, replaced by a
   no-op, given a swallow, a new selection flag or an unconditional `exit 0` before its
@@ -820,10 +854,10 @@ file (its path or old path) is one a GitHub workflow step reads on either side: 
 `run:` or by a step of the action it uses. Each workflow that reaches such a file is judged as
 if touched, with its own text unchanged on both sides, and the finding names the changed file.
 A commit that changes no file of that shape, and no workflow, never reads the CI files.
-Scripts and actions over 64 KiB are not read.
+Scripts and actions over 1 MiB are not read.
 
-*Nested reading.* A step is read as a tree. Each step has a budget of 32 files and 512 KiB, each
-file at most 64 KiB, and the depth is 4. A cap that cuts the candidate side is a `warn` naming
+*Nested reading.* A step is read as a tree. Each step has a budget of 32 files and 2 MiB, each
+file at most 1 MiB, and the depth is 4. A cap that cuts the candidate side is a `warn` naming
 where the reader stopped, and a workflow with a cut expansion is judged when a changed file was
 reached by no workflow. The same expansion is used to find the workflows a changed file reaches.
 Paths resolve from the step's `working-directory`, else the job's or the workflow's default; an
@@ -837,6 +871,15 @@ statements after it.
   not. `-C`, `-f` and command-line variables (`SHELL`, `.SHELLFLAGS`) are read.
 - `npm test|start|run|run-script X`, `pnpm [run] X`, `yarn [run] X`, `bun run X`: the package.json
   script with `preX` and `postX`, found from `--prefix`, `-C`, `--dir` or the step's directory.
+- A changed `sed -i` or `perl -i` rewrite of test files that the base already rewrote blocks,
+  even when it only swaps a name. A `cp`, `install`, `ln` or `rsync` into the test tree blocks
+  when it lands on a test file, a file that decides the runner, or a tracked file it would
+  overwrite, and warns for a new non-test file. A copy with several sources or a computed
+  destination is not read.
+- A subshell or group around a check swallows its status where errexit is off, and a subshell
+  with `exit 0`, `return 0` or `trap ... EXIT` (or `ERR`) is a swallow; under `set -e`,
+  `( pytest; exit 0 )` is honest. A quoted `;`, `}`, `)` or `|` is an argument.
+- `nx affected` added to a monorepo test step warns.
 - A statement a step adds that removes the project's tests (`rm`, `find -delete`, `git rm`, ...,
   judged by the runner rule's `removes`, against the base's statements) blocks.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD` set in `env:` or inline is a `warn`.
@@ -852,9 +895,9 @@ exit 0` swallows the check, and `exit $rc` (or `exit "$rc"`) keeps it. The shell
 time linear in its input.
 
 *Known limits.* Flow-style `steps: [...]`, a `runs-on` computed by `fromJSON`, a `make`
-and `always() && false` are not read. Expansion stops at depth 4, 32 files or 512 KiB per step
-(a `warn`); GitLab CI and CircleCI scripts are not followed; a Makefile `include` whose path uses `$(shell ...)`,
-`$(wildcard ...)` or an unset variable, and `npm -w`/`--workspace` are not read (monorepo filters of turbo, pnpm, nx
+and `always() && false` are not read. Expansion stops at depth 4, 32 files or 2 MiB per step
+(a `warn`); GitLab CI and CircleCI scripts are not followed; a Makefile `include` whose path uses `$(shell ...)`
+or an unset variable, and `npm -w`/`--workspace` are not read (monorepo filters of turbo, pnpm, nx
 `run-many`, lerna and yarn are: see `runner.tampered` above); `cd` is not scoped, so a
 subshell's `cd` carries on; a `working-directory` expression resolves from the repo root; a make
 target or script with content the rule cannot classify stays opaque.
@@ -907,7 +950,109 @@ it from a loosening without the linter's changelog). Coverage floors moved from 
 options into a `codecov` block are read as lowered (httpx `46402dd59`: the rule does not read
 `codecov.yml`).
 
+#### Known limits (0.4.0)
+
+0.4.0 closes most of the 0.3.0 list below it. What is still a limit:
+
+Python tests
+- A check that moves to a different subject is not credited as a rewrite (`stream.content_type`
+  to `headers["Content-Type"]`, parsed parts to raw bytes, `encode_request(...)` to
+  `httpx.Request(...)`); it blocks as weakened. An API change that alters expected values reads
+  the same as a weakened check, and a parametrize unrolled into separate tests is not credited.
+- A same-file helper is credited only when it is unique at module level, plain and straight, is
+  inlined to depth 3 and is called with literal arguments for the values it checks. A helper
+  whose checks sit behind an `if`, or after a return, earns no credit.
+- A `parametrize` decorator whose assertion ignores the row values is not flagged. A `for`
+  loop that ignores its rows blocks.
+- Literal row counts apply only to literal lists and tuples bound once and never mutated.
+  Anything else (a `range`, a comprehension, a table passed to a call, mutated, or bound
+  twice) falls back to plain counts, and warns when the base's table was readable.
+- `pytest.approx` counts as a pinned value only with the default tolerance or a literal `rel`
+  or `abs` of 1e-6 or less. A constructor-built value counts only for a class imported from
+  outside the test tree.
+- Matchers are judged only as the top-level operand of `==` or `assertEqual`; one nested in a
+  tuple or a list (`(ANY, 2)`) is not. A class counts as a matcher only when `object` is its
+  only base and it has its own `__eq__`. An inherited, metaclass or dynamically assigned
+  `__eq__`, and an `__eq__` that reads the other operand but ignores it, are not judged.
+  Resolution stops at depth 3. Matcher libraries other than dirty-equals, callee, mock and
+  testfixtures are not known.
+
+Test identity
+- A test renamed while its body changed is paired only when the match is unique and the bodies
+  share most of their tokens (0.6 in the same file, 0.75 across files). Below that, or when two
+  candidates tie, it stays a removal and blocks.
+- Tests moved to another file and heavily rewritten, or suites replaced wholesale, are not
+  paired (httpx `cca62060c`, cobra `65c8acb22`, zustand `e247220ec`); they read as removals.
+- A rename that also drops a check blocks as weakened, even when upstream accepted it (httpx
+  `5b5f6d8e1`).
+
+Go, Rust and JS tests
+- The count of checks stays by line: one per check line, one per helper call. A drop in it
+  blocks unless the credited count (Go helper bodies, distinct literal-table rows) is at least
+  the base's and every number or string literal of the removed checks is still present; then
+  it warns, and a person reads it. Only Go earns this credit. A Rust or JS loop that replaces
+  separate checks blocks.
+- A Go loop check whose row is read only by another statement (`_ = c`) still earns the warning.
+  A table with identical rows, a table whose address is taken and a helper whose checks are not
+  proven to run on every path earn no credit.
+- A helper is read at its own check lines only when it reads straight through; a return, skip,
+  panic, goto or bool parameter makes it count 1, as does a helper that only calls helpers. A
+  table loop with an early exit counts 1, except a loop whose only exits are row-conditional
+  skips, which counts the distinct rows that cannot reach the skip.
+- A skip that only new rows reach is excused only inside a `t.Run` closure, on a field the
+  checks never read, and only when every base row is still present, unchanged, among the rows
+  that run. An edited base row beside a new skipped row blocks (cobra `df12a0a24`).
+- Rust match arms are not read as rows. Code after an unconditional `continue` in a nested loop
+  is read as reachable. Not read: a single `#[case]` with `#[ignore]`, JS `it.each` skipped
+  rows, Rust `?`, a malformed Go or Rust `for`.
+- A fold body past the flow budget (100,000 characters, 2,000 exits, 5,000 regions, nesting
+  200) keeps the warn and says its body is too large to check.
+
+Makefiles
+- A twin check inside an `ifndef` or another conditional is not credited: `V=1`, `make -e` or
+  the environment can flip it, so every branch is read.
+- Under `.ONESHELL` a twin is credited only for a pure no-op mask, and a function, a lone
+  assignment, a group, a subshell, `cd`, `exit`, `eval`, `set` or `trap` in the recipe voids it.
+- `$(if)` and other make functions, and command substitution in a check's arguments, are not
+  evaluated; a new one warns. An `include $(wildcard ...)` glob that matches no tracked file is
+  unread and warns; so do `$(shell ...)`, `$(realpath ...)` and unset variables in an include
+  path, more than 16 included files, more than 64 variable-path readings and macros nested past
+  depth 16. A guarded include of an untracked file (such as `.env`) is not read.
+- `set -o pipefail` is honoured only when `SHELL` is bash. The CI path sees the union of
+  conditional branches and warns past 32 conditional worlds. `.PHONY +=` is read as a variable
+  assignment, as GNU make does.
+
+Config and selection
+- More than 32 different pytest runs: the runs are not compared one by one and a change to them
+  warns. Runs are followed to depth 4, 400 statements and 8 Makefiles; a run built from a
+  computed variable or command substitution is not resolved.
+- A noxfile command held in a name is read only when the name is bound once to a literal, or
+  through one same-file helper. Names set through `globals()`, `exec`, `setattr` or a star
+  import are unknown.
+- Package filters are resolved only from `package.json` names in the tree. Graph syntax
+  (`...web`), path filters and nx project filters are not read as supersets, so a change to them
+  warns.
+- Budgets, each a warning when passed: 20,000 tox command lines per file, 200,000 nox syntax
+  nodes per noxfile, 200,000 filter comparisons per dimension.
+
+Shell and CI
+- Scripts, action files and policy scripts are read up to 1 MiB. Past that, a change to what
+  they run warns that it was not read.
+- A changed `sed -i` or `perl -i` rewrite of tests the base already rewrote always blocks, even
+  when it only swaps a name, as in 0.3.1. A rewrite with a variable path (`tests/$F`) is not
+  seen.
+- A copy into the test tree with several sources or a computed destination is not read.
+- `npm test --no-workspaces` after a plain `npm test` blocks, because `.npmrc` is not read.
+- A group or subshell in a place where errexit is off is read as one status, its last
+  command's. Past 32 levels a group is cut at its brackets and its `&&` and `||` are not read,
+  except that a check beside `|| true` or `exit 0` blocks. A statement nested more than 128
+  levels (512 for the test scan) is not read: it blocks, or warns if no check is in it.
+- Very deeply nested input in readers other than the shell reader can hit Python's recursion
+  limit. That exits 5 (internal), which fails closed.
+
 #### Known limits (0.3.0)
+
+Where this list and the 0.4.0 list above differ, the 0.4.0 list is current.
 
 Table folds
 - A fold body past the flow budget (100,000 characters, 2,000 exits, 5,000 regions, nesting
@@ -974,7 +1119,15 @@ unique among the still-unpaired tests of that file on both sides (a test moved b
 classes or describe blocks, or a describe title edited); 3. same qualified name in
 another file; 4. same normalised body hash; 5. same *structural* hash (identifiers
 alpha-renamed; constants, operators and assertion shapes kept) when the match is
-one-to-one within the change set.
+one-to-one within the change set. Three more passes run in the same order. Pass 2b, after
+pass 2, tells repeated leaf names apart by the trailing segments of the qualified name (at
+least 2 shared, a single best match both ways, no tie). Pass 2c pairs names that are equal once
+case and punctuation are ignored, when unique in their file. Pass 6, after pass 5, pairs a test renamed with an
+edited body by token similarity: at least 0.6 in the same file, at least 0.75 across
+files, a margin of 0.05, and each the other's single best. The body must be at least 10 tokens;
+a base body inside a candidate more than twice its size needs 0.9 containment and at least 2
+literals. The work is capped at 40,000 comparisons and 4,000 tokens per body. A pair made this
+way goes through the normal weakening comparison, so a rename that also drops a check blocks.
 
 Line engines hash a test with its own name (the Go or Rust function name, the JS/TS
 title literal) replaced by a placeholder, so a pure rename pairs in pass 4. Their
@@ -990,7 +1143,10 @@ runner's collection patterns (pytest `python_files`/`python_classes`/`python_fun
 read from the base revision's pytest config, else `test_*.py`/`*_test.py`, `Test*`,
 `test*`; Jest/Vitest `*.test.*`, `*.spec.*`, `__tests__/`; Go `*_test.go`), and the
 module or class is not disabled by `__test__ = False`. A test file renamed to a path
-the runner does not collect is `tests.deleted` even when its content is unchanged.
+the runner does not collect is `tests.deleted` even when its content is unchanged. For
+`collect_ignore` in a `conftest.py`, every write to it is read and only an entry that hides a
+test file counts; a test moved or renamed onto a live entry blocks, and an entry that hides
+only non-tests is not a skip.
 
 A base test left unpaired is **covered**, and produces no finding, when every one of its
 assertions appears among the assertions the change **adds**: all assertions of collected
@@ -1024,7 +1180,10 @@ a rewrite, when all of these hold:
 - the new tests pin at least as many values as the removed tests. A **pinned check** is
   an exact check whose other side, after inlining single-assignment locals, is a literal
   (a constant, a negated number, a tuple, list, set or dict display of literals, or
-  `approx(<literal>)`) or a parametrize argument whose cases are all literals; it counts
+  `approx(<literal>)` with the default tolerance or a literal `rel` or `abs` of 1e-6 or less),
+  a capitalised call built from pinned literals on a class imported from outside the test tree
+  (`Decimal("1.5")`; not a matcher-shaped name, a mock, or a class defined in the test file or a
+  test module), or a parametrize argument whose cases are all literals; it counts
   once per parametrize case, like effective checks (5.4). An expected value computed from
   the inputs (`refund(x) == x - 1`) or by calling code is not pinned. A rewrite may change
   the expected values (the requirement may have changed); it may not stop pinning them.
