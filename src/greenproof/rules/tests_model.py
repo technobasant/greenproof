@@ -70,6 +70,12 @@ class Unit:
     # literal-table loop at its distinct rows. It never lowers a block; it only turns a drop of
     # `asserts` into a warning when the candidate's is no lower than the base's (SPEC 5.4).
     credited: int = 0
+    # Go: the sorted literals of the test outside messages and names (table rows and the bodies
+    # of the helpers it calls included), and those of its check lines and table rows. A credit
+    # turns a drop into a warning only when every literal of the base's checks is still among
+    # the candidate's (SPEC 5.4).
+    credit_lits: tuple[str, ...] = ()
+    check_lits: tuple[str, ...] = ()
     strong: int = 0
     weak: int = 0
     broad_raises: int = 0

@@ -157,10 +157,13 @@ def loop(rows: str, body: str = "") -> str:
     )
 
 
-def test_literal_loop_is_credited_a_check_per_row(tmp_path: Path) -> None:
+def test_literal_loop_is_credited_a_check_per_row_but_must_keep_the_base_literals(
+    tmp_path: Path,
+) -> None:
     cand = loop('[]string{"a", "b", "c"}')
     assert (unit("go", cand).asserts, unit("go", cand).credited) == (1, 3)
-    assert weak(change(tmp_path, PLAIN, cand)) == {"warn"}
+    # the expected "A", "B" and "C" are now computed by `strings.ToUpper`: no credit
+    assert weak(change(tmp_path, PLAIN, cand)) == {"block"}
 
 
 def test_literal_loop_with_fewer_rows_still_blocks(tmp_path: Path) -> None:
@@ -614,36 +617,36 @@ def test_table_that_repeats_one_case_with_other_spacing_blocks(tmp_path: Path) -
     assert weak(change(tmp_path, BASE2, table_loop("{1, 2, 3}, { 1,2,3 }"))) == {"block"}
 
 
-def test_table_with_other_values_only_warns(tmp_path: Path) -> None:
-    assert weak(change(tmp_path, BASE2, table_loop("{0, 0, 0}, {5, 5, 10}"))) == {"warn"}
+def test_table_with_other_values_blocks(tmp_path: Path) -> None:
+    assert weak(change(tmp_path, BASE2, table_loop("{0, 0, 0}, {5, 5, 10}"))) == {"block"}
 
 
 def test_table_of_the_same_cases_only_warns(tmp_path: Path) -> None:
     assert weak(change(tmp_path, BASE2, table_loop("{1, 2, 3}, {2, 2, 4}"))) == {"warn"}
 
 
-def test_table_whose_check_ignores_the_row_only_warns(tmp_path: Path) -> None:
+def test_table_whose_check_ignores_the_row_blocks(tmp_path: Path) -> None:
     cand = table_loop("{1, 2, 3}, {2, 2, 4}", "Add(1, 2) != 3")
-    assert weak(change(tmp_path, BASE2, cand)) == {"warn"}
+    assert weak(change(tmp_path, BASE2, cand)) == {"block"}
 
 
-def test_new_helper_with_a_trivial_second_check_only_warns(tmp_path: Path) -> None:
+def test_new_helper_with_a_trivial_second_check_blocks(tmp_path: Path) -> None:
     helper = (
         'func check(t *testing.T, got, want int) {\n\tif got != want { t.Errorf("x") }\n'
         '\tif got < -1000000 { t.Errorf("y") }\n}\n'
     )
     cand = go("func TestAdd(t *testing.T) {\n\tcheck(t, Add(1, 2), 3)\n}", helper)
-    assert weak(change(tmp_path, BASE2, cand)) == {"warn"}
+    assert weak(change(tmp_path, BASE2, cand)) == {"block"}
 
 
-def test_helper_with_checks_switched_by_a_string_mode_only_warns(tmp_path: Path) -> None:
+def test_helper_with_checks_switched_by_a_string_mode_blocks(tmp_path: Path) -> None:
     helper = (
         "func check(t *testing.T, got, want int, mode string) {\n"
         '\tif mode == "strict" && got != want { t.Errorf("x") }\n'
         '\tif mode == "never" && got != want { t.Errorf("y") }\n}\n'
     )
     cand = go('func TestAdd(t *testing.T) {\n\tcheck(t, Add(1, 2), 3, "strict")\n}', helper)
-    assert weak(change(tmp_path, BASE2, cand)) == {"warn"}
+    assert weak(change(tmp_path, BASE2, cand)) == {"block"}
 
 
 def test_a_split_test_cannot_borrow_rows_of_a_new_test(tmp_path: Path) -> None:
@@ -673,7 +676,9 @@ def test_raw_count_is_unchanged_by_helpers_and_rows() -> None:
     assert unit("go", go(CALLER, HELPER)).asserts == 1
 
 
-def test_a_table_with_a_skipped_new_row_is_credited_for_the_rows_that_run(tmp_path: Path) -> None:
+def test_a_skipped_new_row_outside_a_subtest_blocks(tmp_path: Path) -> None:
+    # `t.Skip` outside a `t.Run` closure ends the whole test, so only a skip in the closure is
+    # excused (a row order is not relied on)
     def loop_of(rows: str, skip: bool) -> str:
         guard = '\t\tif tt.skip { t.Skip("later") }\n' if skip else ""
         return go(
@@ -689,7 +694,4 @@ def test_a_table_with_a_skipped_new_row_is_credited_for_the_rows_that_run(tmp_pa
         True,
     )
     found = change(tmp_path, old, new)
-    assert not {f.severity for f in found if f.rule in ("tests.skipped", "tests.weakened")} - {
-        "warn"
-    }
-    assert "tests.skipped" not in rule_ids(found)
+    assert "block" in {f.severity for f in found if f.rule in ("tests.skipped", "tests.weakened")}
