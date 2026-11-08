@@ -1386,9 +1386,11 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
                 and not _read_by_expect(masked, k, span.end)
             )
             hits = len(_ASSERTS[lang].findall(masked[k])) + query
+            weighed = hits  # the same line with each helper call at the checks its body makes
             if helper_call:
                 for hm in helper_call.finditer(masked[k]):
-                    hits += weights.get(hm.group(0).split("(")[0].strip(), 1)
+                    hits += 1
+                    weighed += weights.get(hm.group(0).split("(")[0].strip(), 1)
             vac = const_hits[k] + selfeq.vacuous.get(k, 0)
             if k in dead:
                 if hits:
@@ -1397,15 +1399,16 @@ def analyse_lines(path: str, text: str, lang: str, siblings: Sequence[str] = ())
                 continue
             live.append(masked[k])
             once = max(hits - vac, 0)
-            counted = once * times.get(k, 1)
-            unit.asserts += counted
+            unit.asserts += once
+            unit.credited += max(weighed - vac, 0) * times.get(k, 1)
             if vac and hits:
                 unit.vacuous += min(vac, hits)
                 unit.vacuous_line = unit.vacuous_line or k + 1
-            if once > 0:  # a loop's rows add to the count, not to the forms it vouches for
+            if once > 0:
                 unit.assertion_forms.extend([digest("".join(code[k].split()))] * once)
         if unit.table is not None and unit.table.implicit and unit.asserts == 0:
             unit.asserts = 1  # a `test_case` row checks its `=>` value
+            unit.credited = max(unit.credited, 1)
         body_masked = "\n".join(live)
         if lang == "js":
             unit.strong = len(_JS_STRONG.findall(body_masked))

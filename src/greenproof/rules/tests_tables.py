@@ -515,7 +515,7 @@ def go_unit(src: _Src, a: int, b: int) -> tuple[Table | None, tuple[str, ...]]:
     ran: dict[int, bool] = {}
     inline: list[tuple[int, int, list[str], list[str]]] = []
     loops: list[tuple[int, int, list[str]]] = []  # body start, body end, row variables
-    counted: list[tuple[int, int, int, str | None]] = []  # loops whose body runs once per row
+    counted: list[tuple[int, int, list[str], str | None]] = []  # loops over a literal table
     why = ""
     for m in _GO_RANGE.finditer(s, a, b):
         p = m.end()
@@ -546,9 +546,9 @@ def go_unit(src: _Src, a: int, b: int) -> tuple[Table | None, tuple[str, ...]]:
                 "the loop starts by leaving" if leaves else "the loop never reads its row"
             )
         loops.append((brace + 1, end, [v for v in (m.group(2),) if v and v != "_"]))
-        if fed and not leaves and _GO_ANY_EARLY.search(body) is None and not _GO_RUN.search(body):
-            rows = len(decls[name][3]) if name else len(inline[-1][2])
-            counted.append((brace + 1, end, rows, name))
+        if fed and not leaves and not _GO_RUN.search(body):
+            elems = decls[name][3] if name else inline[-1][2]
+            counted.append((brace + 1, end, elems, name))
     for name, (_start, _open, end, _elems, _f) in decls.items():
         rest = s[end + 1 : b]
         pat = (
@@ -579,7 +579,12 @@ def go_unit(src: _Src, a: int, b: int) -> tuple[Table | None, tuple[str, ...]]:
         one = tables[0] if len(tables) == 1 else None
         owner = next((n for n, d in decls.items() if one and d[0] == one[0]), None)
         skips = _go_row_skips(src, a, b, one, owner, loops)
-        spans = tuple((lo, hi, n) for lo, hi, n, _ in counted)
+        fields_ = tuple(one[3]) if one else ()
+        spans = tuple(
+            (lo, hi, n)
+            for lo, hi, elems_, _ in counted
+            if (n := _loop_rows(src, lo, hi, elems_, fields_, skips)) is not None
+        )
     else:
         table = _table("go", elems, False, False, why or "the table is never ranged over")
         skips, spans = (), ()
@@ -714,11 +719,10 @@ def row_skip_excused(base: Unit | None, cand: Unit, line: int) -> bool:
 
     The skip must read `if row.field == literal { t.Skip() }` (or `!=`, or a bare bool field)
     inside the loop over the test's one literal table. It is excused only when every row of both
-    tables is read, no row that can satisfy the condition is a base row with the field added (a
-    keyed row that leaves the field out holds its zero value, so it cannot), and the rows that
-    cannot are at least as many as the base rows: every base row still runs. Anything unclear (a
-    row that is not a keyed or positional literal, a value that is not a literal) is not
-    excused."""
+    tables is read, and every base row, with the field left out, appears one to one among the
+    candidate rows that cannot satisfy the condition (a keyed row that leaves the field out holds
+    its zero value, so it cannot): every base row still runs, unchanged. Anything unclear (a row
+    that is not a keyed or positional literal, a value that is not a literal) is not excused."""
     ct = cand.table
     bt = base.table if base is not None else None
     if not isinstance(ct, RowTable) or not isinstance(bt, RowTable) or not bt.elems:
@@ -726,19 +730,17 @@ def row_skip_excused(base: Unit | None, cand: Unit, line: int) -> bool:
     skip = next((k for k in ct.skips if k.line == line), None)
     if skip is None or skip.field not in ct.fields:
         return False
-    base_keys = {_sans(e, bt.fields, skip.field) for e in bt.elems}
+    base_keys = Counter(_sans(e, bt.fields, skip.field) for e in bt.elems)
     if None in base_keys:
         return False
-    free = 0
+    free: Counter[tuple[tuple[str, str], ...] | None] = Counter()
     for e in ct.elems:
-        if _sans(e, ct.fields, skip.field) is None:
+        key = _sans(e, ct.fields, skip.field)
+        if key is None:
             return False  # a row that is not a literal could be anything
-        value = _row_value(e, ct.fields, skip.field, skip.kind)
-        if not _may_match(value, skip):
-            free += 1
-        elif _sans(e, ct.fields, skip.field) in base_keys:
-            return False
-    return free >= len(bt.elems)
+        if not _may_match(_row_value(e, ct.fields, skip.field, skip.kind), skip):
+            free[key] += 1
+    return not base_keys - free  # every base row still runs, one to one, beside the skip
 
 
 def marker_excused(base: FileAnalysis | None, cand: FileAnalysis, marker: Marker) -> bool:
@@ -749,6 +751,33 @@ def marker_excused(base: FileAnalysis | None, cand: FileAnalysis, marker: Marker
     old = next((u for u in base.units if u.key == marker.scope), None)
     new = next((u for u in cand.units if u.key == marker.scope), None)
     return old is not None and new is not None and row_skip_excused(old, new, marker.line)
+
+
+def _loop_rows(
+    src: _Src,
+    lo: int,
+    hi: int,
+    elems: Sequence[str],
+    fields: Sequence[str],
+    skips: Sequence[RowSkip],
+) -> int | None:
+    """How many distinct rows (by their text, whitespace aside) run the body of the loop [lo, hi)
+    through to its checks: None when it can leave early in any way but a row-conditional skip, and
+    then only the rows that cannot satisfy such a skip's condition."""
+    body = src.shadow[lo:hi]
+    if _GO_ANY_EARLY.search(_GO_ROWSKIP.sub(" ", body)) is not None:
+        return None
+    first, last = src.line_of(lo) + 1, src.line_of(hi) + 1
+    here = [k for k in skips if first <= k.line <= last]
+    rows: set[str] = set()
+    for e in elems:
+        if here:
+            if any(_sans(e, fields, k.field) is None for k in here):
+                continue
+            if any(_may_match(_row_value(e, fields, k.field, k.kind), k) for k in here):
+                continue
+        rows.add("".join(e.split()))
+    return len(rows)
 
 
 def _go_row_skips(

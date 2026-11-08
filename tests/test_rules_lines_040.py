@@ -34,6 +34,11 @@ def unit(lang: str, text: str, index: int = 0):
     return analyse_lines("t", text, lang).units[index]
 
 
+def weak(found) -> set[str]:
+    """The severities of the tests.weakened findings."""
+    return {f.severity for f in found if f.rule == "tests.weakened"}
+
+
 def go(body: str, head: str = "") -> str:
     return f'package calc\n\nimport "testing"\n\n{head}\n{body}\n'
 
@@ -73,32 +78,33 @@ CALLER = """func TestA(t *testing.T) {
 }"""
 
 
-def test_same_file_helper_counts_its_checks(tmp_path: Path) -> None:
-    assert unit("go", go(CALLER, HELPER)).asserts == 3
-    assert "tests.weakened" not in rule_ids(change(tmp_path, INLINE, go(CALLER, HELPER)))
+def test_same_file_helper_is_credited_but_the_count_stays_by_line(tmp_path: Path) -> None:
+    u = unit("go", go(CALLER, HELPER))
+    assert (u.asserts, u.credited) == (1, 3)
+    assert weak(change(tmp_path, INLINE, go(CALLER, HELPER))) == {"warn"}
 
 
 def test_helper_missing_a_check_still_blocks(tmp_path: Path) -> None:
     short = HELPER.replace('\tif len(got) != 1 {\n\t\tt.Errorf("len %d", len(got))\n\t}\n', "")
-    assert unit("go", go(CALLER, short)).asserts == 2
-    assert "tests.weakened" in rule_ids(change(tmp_path, INLINE, go(CALLER, short)))
+    assert unit("go", go(CALLER, short)).credited == 2
+    assert weak(change(tmp_path, INLINE, go(CALLER, short))) == {"block"}
 
 
 def test_helper_without_checks_is_not_credited(tmp_path: Path) -> None:
     bare = "func check(t *testing.T, got string, err error) {\n\tt.Helper()\n}\n"
-    assert unit("go", go(CALLER, bare)).asserts == 0
-    assert "tests.weakened" in rule_ids(change(tmp_path, INLINE, go(CALLER, bare)))
+    assert unit("go", go(CALLER, bare)).credited == 0
+    assert weak(change(tmp_path, INLINE, go(CALLER, bare))) == {"block"}
 
 
 def test_helper_that_returns_before_its_checks_counts_one(tmp_path: Path) -> None:
     early = HELPER.replace("\tt.Helper()\n", '\tt.Helper()\n\tif got == "" {\n\t\treturn\n\t}\n')
-    assert unit("go", go(CALLER, early)).asserts == 1
-    assert "tests.weakened" in rule_ids(change(tmp_path, INLINE, go(CALLER, early)))
+    assert unit("go", go(CALLER, early)).credited == 1
+    assert weak(change(tmp_path, INLINE, go(CALLER, early))) == {"block"}
 
 
 def test_helper_skipping_before_its_checks_counts_one() -> None:
     skipping = HELPER.replace("\tt.Helper()\n", '\tt.Helper()\n\tt.Skip("later")\n')
-    assert unit("go", go(CALLER, skipping)).asserts == 1
+    assert unit("go", go(CALLER, skipping)).credited == 1
 
 
 def test_helper_with_a_switch_parameter_counts_one() -> None:
@@ -106,20 +112,20 @@ def test_helper_with_a_switch_parameter_counts_one() -> None:
         "if len(got) != 1 {", "if strict && len(got) != 1 {"
     )
     caller = CALLER.replace("check(t, got, err)", "check(t, got, err, false)")
-    assert unit("go", go(caller, flagged)).asserts == 1
+    assert unit("go", go(caller, flagged)).credited == 1
 
 
 def test_helper_in_another_file_is_not_followed(tmp_path: Path) -> None:
     repo = make(tmp_path, {GO_PATH: INLINE, OTHER: go(HELPER)})
     repo.write(GO_PATH, go(CALLER))
-    assert "tests.weakened" in rule_ids(static_findings(repo))
+    assert weak(static_findings(repo)) == {"block"}
 
 
 def test_helper_calling_a_helper_counts_once() -> None:
     inner = 'func inner(t *testing.T, got string) {\n\tif got != "y" {\n\t\tt.Errorf("x")\n\t}\n}\n'
     outer = "func outer(t *testing.T, got string) {\n\tinner(t, got)\n\tinner(t, got)\n}\n"
     caller = 'func TestA(t *testing.T) {\n\touter(t, Run("x"))\n}'
-    assert unit("go", go(caller, inner + outer)).asserts == 1
+    assert unit("go", go(caller, inner + outer)).credited == 1
 
 
 # --------------------------------------------------------------- B1: literal-table loops
@@ -151,28 +157,34 @@ def loop(rows: str, body: str = "") -> str:
     )
 
 
-def test_literal_loop_counts_a_check_per_row(tmp_path: Path) -> None:
+def test_literal_loop_is_credited_a_check_per_row(tmp_path: Path) -> None:
     cand = loop('[]string{"a", "b", "c"}')
-    assert unit("go", cand).asserts == 3
-    assert "tests.weakened" not in rule_ids(change(tmp_path, PLAIN, cand))
+    assert (unit("go", cand).asserts, unit("go", cand).credited) == (1, 3)
+    assert weak(change(tmp_path, PLAIN, cand)) == {"warn"}
 
 
 def test_literal_loop_with_fewer_rows_still_blocks(tmp_path: Path) -> None:
     cand = loop('[]string{"a", "b"}')
-    assert unit("go", cand).asserts == 2
-    assert "tests.weakened" in rule_ids(change(tmp_path, PLAIN, cand))
+    assert unit("go", cand).credited == 2
+    assert weak(change(tmp_path, PLAIN, cand)) == {"block"}
+
+
+def test_loop_over_repeated_rows_counts_each_row_once(tmp_path: Path) -> None:
+    cand = loop('[]string{"a", "a", "a"}')
+    assert unit("go", cand).credited == 1
+    assert weak(change(tmp_path, PLAIN, cand)) == {"block"}
 
 
 def test_empty_literal_loop_counts_nothing(tmp_path: Path) -> None:
     cand = loop("[]string{}")
-    assert unit("go", cand).asserts == 0
-    assert "tests.weakened" in rule_ids(change(tmp_path, PLAIN, cand))
+    assert unit("go", cand).credited == 0
+    assert weak(change(tmp_path, PLAIN, cand)) == {"block"}
 
 
 def test_computed_slice_loop_counts_one(tmp_path: Path) -> None:
     cand = loop("names()")
-    assert unit("go", cand).asserts == 1
-    assert "tests.weakened" in rule_ids(change(tmp_path, PLAIN, cand))
+    assert unit("go", cand).credited == 1
+    assert weak(change(tmp_path, PLAIN, cand)) == {"block"}
 
 
 def test_loop_that_can_leave_counts_one() -> None:
@@ -180,7 +192,7 @@ def test_loop_that_can_leave_counts_one() -> None:
         '\t\tif s == "a" {\n\t\t\tcontinue\n\t\t}\n',
         '\t\tif s == "b" {\n\t\t\tbreak\n\t\t}\n',
     ):
-        assert unit("go", loop('[]string{"a", "b", "c"}', leave)).asserts == 1
+        assert unit("go", loop('[]string{"a", "b", "c"}', leave)).credited == 1
 
 
 def test_loop_that_never_reads_its_row_counts_one() -> None:
@@ -193,7 +205,7 @@ def test_loop_that_never_reads_its_row_counts_one() -> None:
 	}
 }"""
     )
-    assert unit("go", cand).asserts == 1
+    assert unit("go", cand).credited == 1
 
 
 def test_appended_table_loop_counts_one() -> None:
@@ -208,7 +220,7 @@ def test_appended_table_loop_counts_one() -> None:
 	}
 }"""
     )
-    assert unit("go", cand).asserts == 1
+    assert unit("go", cand).credited == 1
 
 
 # ------------------------------------------------------------------- B2: new-row skips
@@ -310,6 +322,21 @@ def test_skip_in_an_unread_row_still_blocks(tmp_path: Path) -> None:
     rows = '\t\t{name: "a", in: 1, want: 2},\n\t\t{name: "b", in: 2, want: 3},\n'
     odd = "\t\tmakeRow(),\n"
     cand = table("\t\tskip string\n", NEW_ROW + odd, SKIP_NE, rows)
+    assert skipped(change(tmp_path, BASE_TABLE, cand)) == ["tests.skipped"]
+
+
+def test_skip_that_changes_a_base_row_and_adds_a_row_still_blocks(tmp_path: Path) -> None:
+    rows = (
+        '\t\t{name: "a", in: 1, want: 99, skip: "later"},\n\t\t{name: "b", in: 2, want: 3},\n'
+        '\t\t{name: "c", in: 3, want: 4},\n'
+    )
+    cand = table("\t\tskip string\n", "", SKIP_NE, rows)
+    assert skipped(change(tmp_path, BASE_TABLE, cand)) == ["tests.skipped"]
+
+
+def test_skip_that_edits_a_base_row_beside_a_new_skipped_row_still_blocks(tmp_path: Path) -> None:
+    rows = '\t\t{name: "a", in: 1, want: 9},\n\t\t{name: "b", in: 2, want: 3},\n'
+    cand = table("\t\tskip string\n", NEW_ROW, SKIP_NE, rows)
     assert skipped(change(tmp_path, BASE_TABLE, cand)) == ["tests.skipped"]
 
 
@@ -556,3 +583,113 @@ def test_loop_rows_do_not_stand_in_for_a_removed_test_with_other_values(tmp_path
     )
     other = '\t\t{"positive", 1, 2, 3},\n\t\t{"other", 5, 5, 10},\n'
     assert blocked(verdict(tmp_path, GO_PATH, GO_BASE, _go(GO_STRUCT % other, loop)))
+
+
+# ------------------------------------------------ credit only turns a block into a warning
+
+BASE2 = go(
+    """func TestAdd(t *testing.T) {
+	if Add(1, 2) != 3 { t.Errorf("1+2") }
+	if Add(2, 2) != 4 { t.Errorf("2+2") }
+}"""
+)
+ROWS = "[]struct{ a, b, w int }"
+
+
+def table_loop(rows: str, check: str = "Add(tt.a, tt.b) != tt.w") -> str:
+    return go(
+        f"""func TestAdd(t *testing.T) {{
+	for _, tt := range {ROWS}{{{rows}}} {{
+		if {check} {{ t.Errorf("x %d", tt.w) }}
+	}}
+}}"""
+    )
+
+
+def test_table_that_repeats_one_case_blocks(tmp_path: Path) -> None:
+    assert weak(change(tmp_path, BASE2, table_loop("{1, 2, 3}, {1, 2, 3}"))) == {"block"}
+
+
+def test_table_that_repeats_one_case_with_other_spacing_blocks(tmp_path: Path) -> None:
+    assert weak(change(tmp_path, BASE2, table_loop("{1, 2, 3}, { 1,2,3 }"))) == {"block"}
+
+
+def test_table_with_other_values_only_warns(tmp_path: Path) -> None:
+    assert weak(change(tmp_path, BASE2, table_loop("{0, 0, 0}, {5, 5, 10}"))) == {"warn"}
+
+
+def test_table_of_the_same_cases_only_warns(tmp_path: Path) -> None:
+    assert weak(change(tmp_path, BASE2, table_loop("{1, 2, 3}, {2, 2, 4}"))) == {"warn"}
+
+
+def test_table_whose_check_ignores_the_row_only_warns(tmp_path: Path) -> None:
+    cand = table_loop("{1, 2, 3}, {2, 2, 4}", "Add(1, 2) != 3")
+    assert weak(change(tmp_path, BASE2, cand)) == {"warn"}
+
+
+def test_new_helper_with_a_trivial_second_check_only_warns(tmp_path: Path) -> None:
+    helper = (
+        'func check(t *testing.T, got, want int) {\n\tif got != want { t.Errorf("x") }\n'
+        '\tif got < -1000000 { t.Errorf("y") }\n}\n'
+    )
+    cand = go("func TestAdd(t *testing.T) {\n\tcheck(t, Add(1, 2), 3)\n}", helper)
+    assert weak(change(tmp_path, BASE2, cand)) == {"warn"}
+
+
+def test_helper_with_checks_switched_by_a_string_mode_only_warns(tmp_path: Path) -> None:
+    helper = (
+        "func check(t *testing.T, got, want int, mode string) {\n"
+        '\tif mode == "strict" && got != want { t.Errorf("x") }\n'
+        '\tif mode == "never" && got != want { t.Errorf("y") }\n}\n'
+    )
+    cand = go('func TestAdd(t *testing.T) {\n\tcheck(t, Add(1, 2), 3, "strict")\n}', helper)
+    assert weak(change(tmp_path, BASE2, cand)) == {"warn"}
+
+
+def test_a_split_test_cannot_borrow_rows_of_a_new_test(tmp_path: Path) -> None:
+    old = go(
+        """func TestAdd(t *testing.T) {
+	if Add(1, 2) != 3 { t.Errorf("1+2") }
+	if Add(2, 2) != 4 { t.Errorf("2+2") }
+	if Add(3, 2) != 5 { t.Errorf("3+2") }
+}"""
+    )
+    new = go(
+        """func TestAdd(t *testing.T) {
+	if Add(1, 2) != 3 { t.Errorf("1+2") }
+}
+
+func TestAdd2(t *testing.T) {
+	for _, tt := range []struct{ a int }{{1}, {2}, {3}} {
+		if Add(1, 2) != 3 { t.Errorf("x %d", tt.a) }
+	}
+}"""
+    )
+    assert weak(change(tmp_path, old, new)) == {"block"}
+
+
+def test_raw_count_is_unchanged_by_helpers_and_rows() -> None:
+    assert unit("go", table_loop("{1, 2, 3}, {2, 2, 4}")).asserts == 1
+    assert unit("go", go(CALLER, HELPER)).asserts == 1
+
+
+def test_a_table_with_a_skipped_new_row_is_credited_for_the_rows_that_run(tmp_path: Path) -> None:
+    def loop_of(rows: str, skip: bool) -> str:
+        guard = '\t\tif tt.skip { t.Skip("later") }\n' if skip else ""
+        return go(
+            "func TestAdd(t *testing.T) {\n\tfor _, tt := range []struct {\n\t\ta, b, w int\n"
+            + ("\t\tskip bool\n" if skip else "")
+            + f"\t}}{{\n{rows}\t}} {{\n{guard}"
+            + '\t\tif Add(tt.a, tt.b) != tt.w { t.Errorf("x") }\n\t}\n}'
+        )
+
+    old = loop_of("\t\t{a: 1, b: 2, w: 3},\n\t\t{a: 2, b: 2, w: 4},\n", False)
+    new = loop_of(
+        "\t\t{a: 1, b: 2, w: 3},\n\t\t{a: 2, b: 2, w: 4},\n\t\t{a: 7, b: 1, w: 9, skip: true},\n",
+        True,
+    )
+    found = change(tmp_path, old, new)
+    assert not {f.severity for f in found if f.rule in ("tests.skipped", "tests.weakened")} - {
+        "warn"
+    }
+    assert "tests.skipped" not in rule_ids(found)
