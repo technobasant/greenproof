@@ -1790,8 +1790,52 @@ def _param_columns(dec: ast.Call) -> tuple[str, ...]:
     return ("?",)
 
 
+def _all_tables(
+    live: _FuncDef,
+    tables: Mapping[str, ast.expr],
+    altered: AbstractSet[str],
+    bound: AbstractSet[str],
+) -> list[RowTab]:
+    """`assert all(<check> for <names> in <table>)` (or `self.assertTrue(all(...))`): one
+    assertion that checks every row of the table, read like a loop of one assert."""
+    out: list[RowTab] = []
+    for node in sorted(_own_nodes(live), key=lambda n: getattr(n, "lineno", 0)):
+        test: ast.expr | None = None
+        if isinstance(node, ast.Assert):
+            test = node.test
+        elif (
+            isinstance(node, ast.Call)
+            and dotted(node.func).rsplit(".", 1)[-1] == "assertTrue"
+            and node.args
+        ):
+            test = node.args[0]
+        if not (
+            isinstance(test, ast.Call)
+            and dotted(test.func) == "all"
+            and len(test.args) == 1
+            and isinstance(test.args[0], (ast.GeneratorExp, ast.ListComp))
+            and len(test.args[0].generators) == 1
+        ):
+            continue
+        comp = test.args[0]
+        gen = comp.generators[0]
+        names = tuple(dict.fromkeys(_stores(gen.target)))
+        if gen.ifs or gen.is_async or not names:
+            continue
+        rows, why, name, keys = _table_rows(gen.iter, tables, altered, bound)
+        reads = _mentions(comp.elt, set(names))
+        out.append(RowTab("loop", names, "all", rows, reads, why, name, keys, asserts=1))
+        if len(out) >= _MAX_TABLES:
+            break
+    return out
+
+
 def _row_tables(
-    fn: _FuncDef, live: _FuncDef, helpers: dict[str, _FuncDef], forms: Sequence[str]
+    fn: _FuncDef,
+    live: _FuncDef,
+    helpers: dict[str, _FuncDef],
+    forms: Sequence[str],
+    fold: _Fold | None = None,
 ) -> tuple[RowTab, ...]:
     """The literal tables that drive the test's checks: each `for` loop whose body asserts, read
     from a literal list or tuple or a module-level name bound once to one, and each parametrize
@@ -1824,9 +1868,25 @@ def _row_tables(
         # a loop that can stop early runs only its first row for certain
         rows, why, name, keys = _table_rows(loop.iter, tables, altered, bound, _leaves_row(loop))
         reads = _row_reads(loop.body, _taint(loop.body, names), helpers, 0)
-        out.append(
-            RowTab("loop", names, digest("\n".join(inner.forms)), rows, reads, why, name, keys)
+        counted = fold is not None and (loop.lineno, loop.col_offset) == (
+            fold.loop.lineno,
+            fold.loop.col_offset,
         )
+        out.append(
+            RowTab(
+                "loop",
+                names,
+                digest("\n".join(inner.forms)),
+                rows,
+                reads,
+                why,
+                name,
+                keys,
+                asserts=inner.asserts,
+                counted=counted,
+            )
+        )
+    out.extend(_all_tables(live, tables, altered, bound))
     sig = digest("\n".join(forms))
     for dec in fn.decorator_list:
         if not (isinstance(dec, ast.Call) and dotted(dec.func).endswith("mark.parametrize")):
@@ -2026,7 +2086,7 @@ def _unit(
         param_forms=case_forms,
         row_gap=gap,
         row_big=big,
-        row_tabs=_row_tables(fn, live, helpers, stats.forms),
+        row_tabs=_row_tables(fn, live, helpers, stats.forms, fold),
         param_marked=_marked(fn),
         mark_kinds=_mark_kinds(fn),
         subjects=_subjects(live) | _helper_subjects(live, helpers),

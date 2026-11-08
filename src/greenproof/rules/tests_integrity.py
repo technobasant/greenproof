@@ -377,12 +377,37 @@ def _covered(unit: Unit, universe: set[str]) -> bool:
 _Reason = tuple[str, int, str]  # text, line, severity
 
 
+def _row_extras(u: Unit, both_literal: bool) -> int | None:
+    """The checks a unit's literal row tables add beyond the one pass over its assertions: each
+    loop that reads its rows adds (rows - 1) times the assertions of its body, and, unless the
+    literal parametrize cases are counted already, the parametrize tables multiply the whole
+    test. None when a table cannot be read."""
+    extra = 0
+    cases = 1
+    for t in u.row_tabs:
+        if t.rows is None:
+            return None
+        if t.kind == "loop":
+            if not (both_literal and t.counted):
+                extra += (_effective_rows(t) - 1) * t.asserts
+        elif not both_literal:
+            cases *= t.rows
+    return extra + u.asserts * (cases - 1)
+
+
 def _effective(b: Unit, c: Unit) -> tuple[int, int]:
-    """Effective check counts (assertions x parametrize cases); without the case factor when
-    either side has a non-literal argvalues (SPEC 5.4)."""
-    if b.param_literal and c.param_literal:
-        return b.asserts * (b.param_cases or 1), c.asserts * (c.param_cases or 1)
-    return b.asserts, c.asserts
+    """Effective check counts (assertions x parametrize cases, and the rows of the loops that
+    read them); without the case factor when either side has a non-literal argvalues (SPEC 5.4).
+    A table either side cannot read leaves the plain counts on both sides."""
+    both = b.param_literal and c.param_literal
+    if both:
+        before, after = b.asserts * (b.param_cases or 1), c.asserts * (c.param_cases or 1)
+    else:
+        before, after = b.asserts, c.asserts
+    extra_b, extra_c = _row_extras(b, both), _row_extras(c, both)
+    if extra_b is not None and extra_c is not None:
+        before, after = before + extra_b, after + extra_c
+    return before, after
 
 
 def _added_cases(pairing: _Pairing) -> set[str]:

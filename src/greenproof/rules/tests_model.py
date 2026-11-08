@@ -73,6 +73,8 @@ class RowTab:
     name: str = ""  # the module-level name the table is read through, else ""
     keys: tuple[str, ...] = ()
     literal: bool = True  # a parametrize whose argvalues are a literal (the case count covers it)
+    asserts: int = 0  # the assertions the loop body counts (once, not per row)
+    counted: bool = False  # the loop is the accepted fold whose rows `param_cases` already counts
 
 
 @dataclass

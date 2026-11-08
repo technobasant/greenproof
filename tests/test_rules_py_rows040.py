@@ -119,6 +119,26 @@ TAMPERS = {
         f"{H}def test_v():\n    for a in [1]:\n        for n, w in [(2, 4)]:\n"
         "            assert square(n) == w + a - a\n",
     ),
+    "loop_to_one_assert": (loop(L3), f"{H}def test_v():\n    assert square(2) == 4\n"),
+    "loop_to_two_asserts": (
+        loop(L3),
+        f"{H}def test_v():\n    assert square(2) == 4\n    assert square(3) == 9\n",
+    ),
+    "name_loop_to_one_assert": (
+        name_loop(CASES3),
+        f"{H}def test_v():\n    assert square(2) == 4\n",
+    ),
+    "name_param_to_one_assert": (PARAM3, f"{H}def test_v():\n    assert square(2) == 4\n"),
+    "loop_to_all_over_one_row": (
+        loop(L3),
+        f"{H}def test_v():\n    assert all(square(n) == w for n, w in [(2, 4)])\n",
+    ),
+    "loop_with_two_asserts_to_one": (
+        f"{H}def test_v():\n    for n, w in {L3}:\n        assert square(n) == w\n"
+        "        assert square(n) > 0\n",
+        f"{H}def test_v():\n    assert square(2) == 4\n    assert square(3) == 9\n"
+        "    assert square(4) == 16\n    assert square(2) > 0\n",
+    ),
     "loop_stops_early": (
         loop(L3),
         f"{H}def test_v():\n    for n, w in {L3}:\n        assert square(n) == w\n        break\n",
@@ -193,6 +213,25 @@ HONEST = {
     "fold_unchanged_plus_new_check": (
         fold(L3),
         fold(L3, pre="        self.assertTrue(callable(square))\n"),
+    ),
+    "loop_unrolled": (
+        loop(L3),
+        f"{H}def test_v():\n    assert square(2) == 4\n    assert square(3) == 9\n"
+        "    assert square(4) == 16\n",
+    ),
+    "loop_to_all_same_rows": (
+        loop(L3),
+        f"{H}def test_v():\n    assert all(square(n) == w for n, w in {L3})\n",
+    ),
+    "name_param_unrolled": (
+        PARAM3,
+        f"{H}def test_v():\n    assert square(2) == 4\n    assert square(3) == 9\n"
+        "    assert square(4) == 16\n",
+    ),
+    "unreadable_table_both_sides_keeps_plain_counts": (
+        f"{H}def make():\n    return {L3}\n\n\n" + loop("make()"),
+        f"{H}def make():\n    return {L3}\n\n\n"
+        + loop("make()", assert_line="assert square(n) == w, n"),
     ),
     "other_table_added": (
         loop(L3),
