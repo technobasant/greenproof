@@ -18,7 +18,12 @@ from dataclasses import dataclass, field
 from greenproof.changeset import ChangedFile, ChangeSet
 from greenproof.findings import BLOCK, WARN, Finding
 from greenproof.rules._common import CODE_SUFFIXES, finding, language_of, sev_finding
-from greenproof.rules.collect import Collection, collection_from_base, live_ignores
+from greenproof.rules.collect import (
+    Collection,
+    collection_from_base,
+    live_ignores,
+    unchanged_conftests,
+)
 from greenproof.rules.self_mocked import check_autouse_fixtures, check_self_mocked
 from greenproof.rules.tests_data import check_expected_data
 from greenproof.rules.tests_lines import analyse_lines, go_call_pattern
@@ -888,6 +893,14 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
     known = {s.file.path for s in sides} | {s.file.old_path for s in sides if s.file.old_path}
     rescan = _Rescan(changes, cfg, base_src, cand_src, known)
     sides.extend(_dependents(rescan, sides))
+    for f in unchanged_conftests(changes, known):  # an ignore entry may now hide a moved test
+        sides.append(
+            _Side(
+                analyse_python(f.path, f.old_text or "", base_src),
+                analyse_python(f.path, f.new_text or "", cand_src),
+                f,
+            )
+        )
     for s in sides:
         for analysis, real_path in (
             (s.base, s.file.old_path or s.file.path),
@@ -895,7 +908,12 @@ def check_tests(changes: ChangeSet) -> list[Finding]:
         ):
             if analysis is not None and analysis.engine.startswith("python"):
                 analysis.collected = cfg.file_collected(real_path)
-                live_ignores(analysis, cfg, changes.listing(analysis is s.base))
+                live_ignores(
+                    analysis,
+                    cfg,
+                    changes.listing(analysis is s.base),
+                    None if analysis is s.base else changes.listing(True),
+                )
     base_units = _collected(sides, cfg, base=True)
     cand_units = _collected(sides, cfg, base=False)
     pairing = pair_units(base_units, cand_units, _text_reader(sides))

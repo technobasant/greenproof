@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any
 
-from greenproof.changeset import ChangeSet, matches_glob
+from greenproof.changeset import ChangedFile, ChangeSet, matches_glob
 from greenproof.rules import runner_config as rc
 from greenproof.rules.tests_model import FileAnalysis, Marker, Unit
 
@@ -144,8 +144,55 @@ def _entry_live(name: str, entry: str, here: str, cfg: Collection, files: set[st
     return False  # it matches no test file, and no directory holding one
 
 
+def _hidden(name: str, entry: str, here: str, cfg: Collection, files: set[str]) -> set[str]:
+    """The collected test files of `files` that one `collect_ignore` entry hides: the file itself,
+    the files under a directory it names, or those a glob matches (a file or a parent directory).
+    An entry that points above the repository root hides none we can see."""
+    target = _target(name, entry, here)
+    if target.startswith(".."):
+        return set()
+    out: set[str] = set()
+    for f in files:
+        if not cfg.file_collected(f):
+            continue
+        if name == "collect_ignore":
+            if target == "." or f == target or f.startswith(target + "/"):
+                out.add(f)
+            continue
+        parts = f.split("/")
+        if any(fnmatchcase("/".join(parts[: i + 1]), target) for i in range(len(parts))):
+            out.add(f)
+    return out
+
+
+MAX_CONFTESTS = 20  # unchanged conftest.py files read for a new or moved test file
+
+
+def unchanged_conftests(changes: ChangeSet, known: set[str]) -> list[ChangedFile]:
+    """The conftest.py files that name `collect_ignore` and did not change, when the change adds,
+    renames or moves a test file: an entry already in them may hide that file (SPEC 5.7). Each is
+    returned as a file whose old and new text are the same, so the markers of both revisions are
+    compared like those of a changed conftest."""
+    if not any(f.is_test and f.status in ("A", "R") for f in changes.files):
+        return []
+    lister = changes.listing(False)
+    if lister is None:
+        return []
+    out: list[ChangedFile] = []
+    for path in sorted(p for p in lister() if posixpath.basename(p) == "conftest.py"):
+        if path in known or len(out) >= MAX_CONFTESTS:
+            continue
+        old, new = changes.base_text(path), changes.cand_text(path)
+        if old is not None and old == new and "collect_ignore" in old:
+            out.append(ChangedFile(path, "M", None, old.encode(), new.encode(), True, True))
+    return out
+
+
 def live_ignores(
-    analysis: FileAnalysis, cfg: Collection, listing: Callable[[], set[str]] | None
+    analysis: FileAnalysis,
+    cfg: Collection,
+    listing: Callable[[], set[str]] | None,
+    base_listing: Callable[[], set[str]] | None = None,
 ) -> None:
     """Replace the `collect_ignore` markers of a conftest.py by one marker per live entry.
 
@@ -154,10 +201,15 @@ def live_ignores(
     or a glob matching one; with the tree listing unknown every entry counts. Each live entry is
     a marker of its own, its kind naming the resolved path, so the base and the candidate are
     compared entry by entry: a newly hidden file is a new marker, a removed or reordered entry
-    is not. A value that is not a literal list of strings stays one marker, which fails closed."""
+    is not. A value that is not a literal list of strings stays one marker, which fails closed.
+
+    For the candidate, `base_listing` gives the files at the base: an entry that hides a test file
+    the candidate has and the base's files did not (a test moved into an ignored directory, or
+    renamed onto an entry that matched nothing) is a new marker too, named after the file."""
     if not any(m.kind in _IGNORES for m in analysis.markers):
         return
     files = listing() if listing is not None else None
+    before = base_listing() if base_listing is not None and files is not None else None
     here = posixpath.dirname(analysis.path) or "."
     kept = []
     seen: set[tuple[str, str]] = set()
@@ -170,6 +222,12 @@ def live_ignores(
         for entry in entries:
             if _entry_live(name, entry, here, cfg, files):
                 kind = f"{name}:{_target(name, entry, here)}"
+                if before is not None and files is not None:
+                    fresh = _hidden(name, entry, here, cfg, files) - _hidden(
+                        name, entry, here, cfg, before
+                    )
+                    if fresh:
+                        kind += f" (also hides {min(fresh)})"
                 if (m.scope, kind) in seen:
                     continue  # the same entry twice hides nothing more
                 seen.add((m.scope, kind))
