@@ -18,7 +18,8 @@ from greenproof.registry import RULES
 POLICY_FILE = ".greenproof.toml"
 CHECK_IDS = ("static", "commands", "revert", "smoke")
 MODES = ("hook", "local", "ci")
-# Run in this order. `setup` is only used for --isolate and revert worktrees.
+# Run in this order. `setup` runs first in ci mode, in --isolate worktrees and in revert
+# worktrees, never in the working tree in local or hook mode.
 COMMAND_NAMES = ("lint", "typecheck", "test", "build")
 _COMMAND_KEYS = ("setup", *COMMAND_NAMES, "timeout")
 DEFAULT_TIMEOUT = 900

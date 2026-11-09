@@ -44,13 +44,13 @@ Windows support (best effort only).
 ## 3. Commands
 
 ```
-greenproof init   [--yes] [--agents auto|none|claude,cursor,codex,gemini] [--ci github|none]
+greenproof init   [--yes] [--agents auto|none|claude,cursor,codex,gemini,opencode] [--ci github|none]
                   [--no-verify] [--hook-command CMD]
-greenproof check  [--base REF] [--mode local|hook|ci] [--hook claude|cursor|codex|gemini]
+greenproof check  [--base REF] [--mode local|hook|ci] [--hook claude|cursor|codex|gemini|opencode]
                   [--checks static,commands,revert,smoke] [--json PATH] [--markdown PATH]
                   [--github-annotations] [--github-accept] [--allow-policy-change]
                   [--no-cache] [--isolate]
-greenproof session-start [--hook claude|cursor|codex|gemini]
+greenproof session-start [--hook claude|cursor|codex|gemini|opencode]
 greenproof accept FINGERPRINT... [--reason TEXT] | --list | --revoke FINGERPRINT
 greenproof explain RULE_ID
 greenproof --version
@@ -150,7 +150,7 @@ non-zero outcome to the agent's blocking protocol (section 6).
 version = 1
 
 [commands]            # run in order; empty or missing entries are skipped
-setup = "uv sync --frozen"      # only used for --isolate / revert worktrees
+setup = "uv sync --frozen"      # runs in ci mode, --isolate worktrees and revert worktrees
 lint = "uv run ruff check ."
 typecheck = "uv run mypy src"
 test = "uv run pytest -q"
@@ -1082,63 +1082,81 @@ Shell and CI
 
 #### Known limits (0.3.0)
 
-Where this list and the 0.4.0 list above differ, the 0.4.0 list is current.
+Where this list and the 0.4.0 list above differ, the 0.4.0 list is current. Each item below is
+marked "closed in 0.4.0" (with what closed it), "narrowed in 0.4.0" or left as it was, still
+open.
 
 Table folds
 - A fold body past the flow budget (100,000 characters, 2,000 exits, 5,000 regions, nesting
-  200) keeps the warn and says its body is too large to check.
-- Not credited, so the fold blocks as in 0.2.0: `pytest.approx` as the pinned value, asserts in
-  a module helper, unittest `subTest` loops, Rust match arms as rows.
-- Not read: Rust `let-else`, a single `#[case]` with `#[ignore]`, JS `it.each` skipped rows,
-  switch fallthrough, nested-loop `break`/`continue`, Rust `?`, a malformed Go or Rust `for`.
+  200) keeps the warn and says its body is too large to check (still open).
+- Not credited, so the fold blocks as in 0.2.0: `pytest.approx` as the pinned value (closed in
+  0.4.0: a default or tight literal tolerance is a pinned value), asserts in a module helper
+  (narrowed in 0.4.0: a same-file helper that is unique, plain and straight is credited),
+  unittest `subTest` loops (closed in 0.4.0: a loop over a literal table is counted by its
+  rows), Rust match arms as rows (still open).
+- Not read: Rust `let-else` (closed in 0.4.0), a single `#[case]` with `#[ignore]` (open), JS
+  `it.each` skipped rows (open), switch fallthrough (closed in 0.4.0), nested-loop
+  `break`/`continue` (closed in 0.4.0 for labelled ones; see the 0.4.0 list for the rest),
+  Rust `?` (open), a malformed Go or Rust `for` (open).
 
 Makefiles
-- A twin inside a true `ifndef` is not credited (0.2.0 blocks it too), nor is a `.ONESHELL`
-  last-line twin.
-- `set -o pipefail` is honoured only when `SHELL` is bash.
-- A target with thousands of recipe commands costs about 1 ms per command (linear).
-- The CI path sees the union of conditional branches, and warns past 32 conditional worlds.
-- A deleted root Makefile is not followed.
+- A twin inside a true `ifndef` is not credited (0.2.0 blocks it too; still open), nor is a
+  `.ONESHELL` last-line twin (narrowed in 0.4.0: credited when the mask is a pure no-op).
+- `set -o pipefail` is honoured only when `SHELL` is bash (still open).
+- A target with thousands of recipe commands costs about 1 ms per command (linear; still open).
+- The CI path sees the union of conditional branches, and warns past 32 conditional worlds
+  (still open).
+- A deleted root Makefile is not followed (closed in 0.4.0: it is followed, and a target that
+  was in it and is gone blocks).
 - An `include` whose path uses `$(shell ...)`, `$(wildcard ...)`, `$(realpath ...)` or an unset
   variable warns; so do more than 16 included files, more than 64 variable-path readings, and
-  macros nested past depth 16. `$(call)` of a recursively expanded (`=`) variable warns.
+  macros nested past depth 16 (still open; 0.4.0 reads an `include $(wildcard ...)` glob that
+  matches tracked files). `$(call)` of a recursively expanded (`=`) variable warns (still open).
 - `include .env` inside `ifneq (,$(wildcard ./.env))` is read as the world where the file is
-  absent, so it warns (exit 0).
-- A Makefile of 3,000 double-colon rules takes about 5 s of CPU (linear).
-- `.PHONY +=` is a variable assignment in GNU make, so it is read as one.
+  absent, so it warns (exit 0). Closed in 0.4.0: an include guarded by a wildcard test of its
+  own file no longer warns.
+- A Makefile of 3,000 double-colon rules takes about 5 s of CPU (linear; still open).
+- `.PHONY +=` is a variable assignment in GNU make, so it is read as one (unchanged).
 
 Config
 - More than 8 different pytest runs: the runs are not compared one by one (the configuration
-  alone is judged) and a change to them warns.
+  alone is judged) and a change to them warns. Narrowed in 0.4.0: the limit is 32.
 - Runs are followed to depth 4, 400 statements and 8 Makefiles; a run built from a computed
-  variable or command substitution is not resolved.
+  variable or command substitution is not resolved (still open).
 - A `conftest.py` `collect_ignore` of `setup.py` blocks through `tests.skipped` (0.2.0 too).
+  Closed in 0.4.0: an entry that hides only non-test files is no longer a skip.
 
 Selection
 - `nx run-many` becoming `nx affected` in a workflow step passes silently; in `runner.tampered`
-  it warns. `npm -w`/`--workspace` is not read as selection.
+  it warns. `npm -w`/`--workspace` is not read as selection. Closed in 0.4.0: `ci.tampered`
+  warns for `nx affected`, and `npm -w` is read as selection in both rules.
 - Budgets, each a warning when passed: 20,000 tox command lines per file, 200,000 nox syntax
-  nodes per noxfile, 200,000 filter comparisons per dimension.
-- A filter rename or glob only warns.
+  nodes per noxfile, 200,000 filter comparisons per dimension (still open).
+- A filter rename or glob only warns. Narrowed in 0.4.0: it passes when it still selects every
+  package the old filter did (read from the `package.json` names in the tree).
 - A nox `session.run` whose command is a variable, or a call to another function, is
   unreadable; it warns only if a check kind was lost. Other `.run(` calls in a session count as
-  unreadable runs.
+  unreadable runs. Narrowed in 0.4.0: a name bound once, or one same-file helper, is read.
 
 Shell and CI
 - `ci.tampered` reads a script or action file up to 64 KiB; `runner.tampered` reads a policy
   script up to 200,000 characters. A check, or the `exit $rc` that keeps its status, past the
   cut is not seen, so the step blocks as if the check were removed or swallowed, next to a
-  warning that the script was read only up to a point.
+  warning that the script was read only up to a point. Closed in 0.4.0: both read up to 1 MiB,
+  and past the cap a change to what the file runs warns.
 - A step that copies a file into the test tree (`cp ci/settings.py tests/settings.py`) blocks as
-  a test rewrite, even when the file is a settings file or a fixture.
+  a test rewrite, even when the file is a settings file or a fixture. Narrowed in 0.4.0: it
+  blocks when it lands on a test file, a runner file or a tracked file, and warns for a new
+  non-test file.
 - A CI step that already rewrote tests, edited (a `sed -i` expression changed), is read as a
-  new rewrite and blocks, though the base rewrote the same files.
+  new rewrite and blocks, though the base rewrote the same files (still open).
 - `pytest | tee out.log` blocks as a swallowed check under the default `run:` shell, which
-  has no `pipefail` (0.2.0 passed it).
+  has no `pipefail` (0.2.0 passed it; still open).
 - A single line nested about 400 `{ ... }` deep takes over 2 s of CPU (cost grows with depth
-  times size). On a very large Go test file (about 165 kB) the masking pass takes about 1 s.
+  times size). On a very large Go test file (about 165 kB) the masking pass takes about 1 s
+  (still open).
 - Very deeply nested input in some readers can hit Python's recursion limit. That exits 5
-  (internal), which fails closed.
+  (internal), which fails closed (still open).
 
 ### 5.7 Test identity and covered removals
 
@@ -1235,7 +1253,9 @@ assertion. Each of these blocks the fold: an assertion inside a `try`/`except` o
 that swallows the failure; `assert a or b` where `a` depends on a row; a `skip`, `skipif` or
 `xfail` row mark of a kind the folded tests did not already carry. These pass: a Python `case _`
 or a Rust catch-all arm that closes a `match`; `expect(() => f(row)).toThrow()` and `.rejects.*`
-as assertions; a kept `xfail` row. The message says which condition failed.
+as assertions; a kept `xfail` row. The message says which condition failed. A Python
+`parametrize` decorator whose body ignores the row values (5.6, Known limits) is not told from
+a fold that reads them: it keeps the warn.
 
 **Absorbing tests.** A paired test in the same file whose effective check count (5.4)
 grew is an absorbing test: removed tests were often folded into it (two tests merged into
@@ -1468,10 +1488,19 @@ Writes the session marker and gives the agent its instructions:
 
 ### 6.4 Hook configuration written by `init`
 
-The hook command is `greenproof` when it is on PATH at init time, else
+The hook command is `greenproof` when an installed one is on PATH at init time, else
 `uvx greenproof@<version>`; `--hook-command CMD` overrides it (for example
-`uv run greenproof`). Hook timeout = policy timeout × runnable commands + 60 seconds, at
-most 3600. An entry is greenproof's when its command matches
+`uv run greenproof`). The search walks the entries of PATH and skips the scripts directory of
+the virtual environment init is running in (`sys.prefix` differs from `sys.base_prefix`: what
+`uvx`, `pipx run` and a project venv active only in this shell use), because the agent's
+process does not have that directory. The entry is compared, not the file it points to, so the
+symlink `pipx install` and `uv tool install` leave in `~/.local/bin` counts. When the command
+falls back to `uvx`, the summary says so in its next steps (and how to install greenproof, or
+to pass `--hook-command`). A uv config with `exclude-newer` keeps `uvx greenproof@<version>`
+from resolving until that release is older than the window, so uvx hooks fail open meanwhile;
+`uv tool install greenproof`, `pipx install greenproof` or
+`exclude-newer-package = { greenproof = false }` avoids it. Hook timeout = policy timeout ×
+runnable commands + 60 seconds, at most 3600. An entry is greenproof's when its command matches
 `greenproof(@\S+)?\s+(check\s+--hook|session-start)`, so `uvx greenproof@0.1.0 check --hook
 claude` and `uv run greenproof session-start` are recognised; a `--hook-command` that does
 not contain `greenproof` (a wrapper script) is not, and re-running `init` adds a second
@@ -1534,9 +1563,10 @@ when the greenproof executable is missing. The README says so; CI is the backsto
 - **Workflow from `init --ci github`**: `.github/workflows/greenproof.yml`, independent of
   the action so that it needs no release SHA of greenproof. `on: pull_request`;
   `permissions: {contents: read, pull-requests: read}`; checkout with `fetch-depth: 0` and
-  `persist-credentials: false`; toolchain steps for the detected stacks (section 7);
-  setup-uv; `uvx greenproof@<version> check --mode ci --github-annotations --github-accept
-  --markdown "$GITHUB_STEP_SUMMARY" --json greenproof.json` with `GITHUB_TOKEN` in `env`;
+  `persist-credentials: false`; toolchain steps for the detected stacks (section 7); the
+  install steps of 7.7 when the policy has no `setup`; setup-uv; `uvx greenproof@<version>
+  check --mode ci --github-annotations --github-accept --markdown "$GITHUB_STEP_SUMMARY"
+  --json greenproof.json` with `GITHUB_TOKEN` in `env` (and `PYTHONPATH: src`, see 7.7);
   upload-artifact with `if: always()`. An existing workflow file is kept unless `--yes`.
 - Every third-party action is pinned to a full commit SHA with the release tag in a
   comment. The pins live in one module, `pins.py`, and a test keeps `action.yml` in step
@@ -1792,7 +1822,10 @@ its output.
      npm with a lockfile → `npm ci`; pnpm → `pnpm install --frozen-lockfile`; yarn →
      `yarn install --immutable` when `.yarnrc.yml` exists, else
      `yarn install --frozen-lockfile`; bun → `bun install --frozen-lockfile`; Go →
-     `go mod download`; Rust → `cargo fetch`.
+     `go mod download`; Rust → `cargo fetch`. A plain-pip Python project without
+     `requirements.txt` and npm without a lockfile get no `setup`: `setup` also runs in
+     `--isolate` and revert worktrees, where `pip install -e .` would point the user's own
+     environment at a temporary directory. The workflow installs for them (7.7).
    - When several stacks fill one slot, the commands are joined with ` && ` in the order
      Python, Node, Go, Rust. A make/just target replaces the language-derived command for
      its slot.
@@ -1810,8 +1843,9 @@ its output.
    file: hand-written tables such as `[rules]` and `[smoke]` are not carried over.
 5. **AGENTS.md**: a section between `<!-- greenproof:begin -->` and `<!-- greenproof:end -->`
    with the heading `## Verify`, the commands, "Before you say a task is done, run
-   `greenproof check`." (with `--hook-command C`, "run `C check`"), the fix-the-code rule and "Never run `greenproof accept`". Create
-   the file when it is missing, append the section when there are no markers, replace
+   `<hook command> check`." (the hook command of 6.4: `greenproof`, `uvx greenproof@<version>`
+   or the `--hook-command` value), the fix-the-code rule and "Never run `greenproof accept`".
+   Create the file when it is missing, append the section when there are no markers, replace
    between the markers otherwise. A begin marker without an end marker (or the reverse) →
    exit 4, nothing written; the user fixes the markers by hand. **CLAUDE.md**: when it exists and has no `@AGENTS.md`
    line, add one inside its own marker pair at the end (so Claude Code, which
@@ -1829,7 +1863,22 @@ its output.
    `node-version: lts/*`) plus `corepack enable` for pnpm and yarn; bun →
    oven-sh/setup-bun; Go → actions/setup-go (`go-version-file: go.mod`); Rust → nothing
    (the runner image ships rustup). Dependencies install through `setup`, which greenproof
-   runs in ci mode, so the workflow has no install step of its own.
+   runs in ci mode, so when the policy has a `setup` command the workflow has no install step.
+   When it has none, the workflow gets the install steps init could not propose as `setup`,
+   placed after the toolchain steps:
+   - A plain-pip Python project (no `uv.lock`, no `poetry.lock`) gets an "Install Python
+     dependencies" step running `python -m pip install` with: `-e ".[X]"` for the first of the
+     extras `test`, `tests`, `testing`, `dev` that `[project.optional-dependencies]` defines,
+     else `-e .` when there is a `[project]` table, a `setup.py` or a `setup.cfg`; `-r FILE` for
+     each of `requirements.txt`, `requirements-dev.txt`, `requirements-test.txt`,
+     `requirements-tests.txt`, `dev-requirements.txt` and `test-requirements.txt` that exists;
+     and each of `pytest`, `ruff`, `mypy` and `pyright` that a policy command runs as
+     `python -m <tool>`. No step when that list is empty.
+   - npm with no `package-lock.json` or `npm-shrinkwrap.json` gets an "Install npm
+     dependencies" step running `npm install`.
+   - When there is a `src/` directory and the install includes an editable (`-e`) package, the
+     run step sets `PYTHONPATH: src`, so the revert check's base worktree imports its own
+     `src/` and not the editable install of the checkout.
 8. **Summary**: each file `created`, `updated`, `unchanged` (the new content equals the file)
    or `kept` (an existing policy or workflow left alone without `--yes`), the verification
    results and next steps. Exit 0 even when a command was red; 4 outside a git repository or

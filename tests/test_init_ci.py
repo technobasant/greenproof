@@ -299,3 +299,141 @@ def test_generated_workflow_is_adoption_for_check_in_ci_mode(tmp_path: Path, run
     result = run(repo.path, "check", "--mode", "ci", "--checks", "static", "--json", str(out))
     assert result.code == 0, result.out
     assert "ci.tampered" not in out.read_text()
+
+
+# ---- install step for plain-pip Python and npm without a lockfile ---------------------------
+
+PYTEST_CFG = "[tool.pytest.ini_options]\ntestpaths = ['tests']\n"
+PIP_EXTRA = (
+    "[project]\nname = 'x'\n[project.optional-dependencies]\ntest = ['pytest']\n" + PYTEST_CFG
+)
+
+
+def _step_named(doc: dict[str, Any], name: str) -> dict[str, Any] | None:
+    return next((s for s in steps(doc) if s.get("name") == name), None)
+
+
+def _install(doc: dict[str, Any]) -> str | None:
+    step = _step_named(doc, "Install Python dependencies")
+    return step["run"] if step else None
+
+
+def test_pip_project_with_a_test_extra_installs_it_editable(tmp_path: Path, run) -> None:
+    text, doc = generate(tmp_path, run, {"pyproject.toml": PIP_EXTRA})
+    assert _install(doc) == 'python -m pip install -e ".[test]" pytest'
+    assert '          python -m pip install -e ".[test]" pytest\n' in text
+    names = [s.get("name") for s in steps(doc)]
+    assert names.index("Install Python dependencies") < names.index("Run greenproof")
+    assert used(doc)[:2] == ["actions/checkout", "actions/setup-python"]  # toolchain comes first
+
+
+def test_extra_names_are_taken_in_the_documented_order(tmp_path: Path, run) -> None:
+    body = "[project]\nname = 'x'\n[project.optional-dependencies]\ndev = ['a']\ntesting = ['b']\n"
+    _, doc = generate(tmp_path, run, {"pyproject.toml": body + PYTEST_CFG})
+    assert _install(doc) == 'python -m pip install -e ".[testing]" pytest'
+
+
+def test_pip_project_without_an_extra_installs_the_package(tmp_path: Path, run) -> None:
+    body = "[project]\nname = 'x'\n" + PYTEST_CFG
+    _, doc = generate(tmp_path, run, {"pyproject.toml": body})
+    assert _install(doc) == "python -m pip install -e . pytest"
+
+
+def test_setup_py_only_project(tmp_path: Path, run) -> None:
+    files = {"setup.py": "from setuptools import setup\nsetup()\n", "pytest.ini": "[pytest]\n"}
+    _, doc = generate(tmp_path, run, files)
+    assert _install(doc) == "python -m pip install -e . pytest"
+
+
+def test_requirements_dev_file_is_installed(tmp_path: Path, run) -> None:
+    files = {"pyproject.toml": PYTEST_CFG, "requirements-dev.txt": "pytest\n"}
+    _, doc = generate(tmp_path, run, files)
+    assert _install(doc) == "python -m pip install -r requirements-dev.txt pytest"
+
+
+def test_requirements_txt_is_included_when_the_policy_has_no_setup(tmp_path: Path, run) -> None:
+    repo = fixture_repo(tmp_path, {"pyproject.toml": PYTEST_CFG, "requirements.txt": "x\n"})
+    (repo.path / ".greenproof.toml").write_text(
+        'version = 1\n\n[commands]\ntest = "python -m pytest -q"\n'
+    )
+    result = run(repo.path, "init", "--no-verify", "--agents", "none", "--ci", "github")
+    assert result.code == 0, result.err
+    doc = yaml.safe_load((repo.path / WORKFLOW).read_text())
+    assert _install(doc) == "python -m pip install -r requirements.txt pytest"
+
+
+def test_tools_are_added_once_each_from_the_policy_commands(tmp_path: Path, run) -> None:
+    body = PYTEST_CFG + "[tool.ruff]\n[tool.mypy]\n"
+    _, doc = generate(tmp_path, run, {"pyproject.toml": body})
+    assert _install(doc) == "python -m pip install ruff mypy pytest"
+
+
+def test_no_parts_means_no_step(tmp_path: Path, run) -> None:
+    _, doc = generate(tmp_path, run, {"pyproject.toml": ""})
+    assert _step_named(doc, "Install Python dependencies") is None
+
+
+def test_a_policy_with_setup_gets_no_install_step(tmp_path: Path, run) -> None:
+    repo = fixture_repo(tmp_path, {"pyproject.toml": PIP_EXTRA})
+    (repo.path / ".greenproof.toml").write_text(
+        'version = 1\n\n[commands]\nsetup = "python -m pip install -e ."\n'
+        'test = "python -m pytest -q"\n'
+    )
+    run(repo.path, "init", "--no-verify", "--agents", "none", "--ci", "github")
+    doc = yaml.safe_load((repo.path / WORKFLOW).read_text())
+    assert _install(doc) is None
+
+
+@pytest.mark.parametrize("lock", ["uv.lock", "poetry.lock"])
+def test_uv_and_poetry_get_no_install_step_and_no_pythonpath(
+    tmp_path: Path, run, lock: str
+) -> None:
+    files = {"pyproject.toml": PIP_EXTRA, lock: "", "src/pkg/__init__.py": ""}
+    text, doc = generate(tmp_path, run, files)
+    assert _install(doc) is None
+    assert "PYTHONPATH" not in text
+
+
+def test_npm_without_a_lockfile_runs_npm_install(tmp_path: Path, run) -> None:
+    _, doc = generate(tmp_path, run, {"package.json": "{}"})
+    step = _step_named(doc, "Install npm dependencies")
+    assert step is not None and step["run"] == "npm install"
+    names = [s.get("name") for s in steps(doc)]
+    assert names.index("Install npm dependencies") < names.index("Run greenproof")
+
+
+@pytest.mark.parametrize("lock", ["package-lock.json", "npm-shrinkwrap.json"])
+def test_npm_with_a_lockfile_is_unchanged(tmp_path: Path, run, lock: str) -> None:
+    _, doc = generate(tmp_path, run, {"package.json": "{}", lock: "{}"})
+    assert _step_named(doc, "Install npm dependencies") is None
+
+
+@pytest.mark.parametrize("lock", ["pnpm-lock.yaml", "yarn.lock", "bun.lock"])
+def test_other_node_managers_get_no_npm_install(tmp_path: Path, run, lock: str) -> None:
+    _, doc = generate(tmp_path, run, {"package.json": "{}", lock: ""})
+    assert _step_named(doc, "Install npm dependencies") is None
+
+
+def test_src_layout_with_an_editable_install_sets_pythonpath(tmp_path: Path, run) -> None:
+    text, doc = generate(tmp_path, run, {"pyproject.toml": PIP_EXTRA, "src/pkg/__init__.py": ""})
+    run_step = _step_named(doc, "Run greenproof")
+    assert run_step is not None
+    assert run_step["env"] == {
+        "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "PYTHONPATH": "src",
+    }
+    assert "# The revert check's base worktree must import its own src/" in text
+
+
+def test_flat_layout_has_no_pythonpath(tmp_path: Path, run) -> None:
+    text, doc = generate(tmp_path, run, {"pyproject.toml": PIP_EXTRA, "pkg/__init__.py": ""})
+    assert "PYTHONPATH" not in text
+    assert _step_named(doc, "Run greenproof")["env"] == {  # type: ignore[index]
+        "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"
+    }
+
+
+def test_src_dir_without_an_editable_install_has_no_pythonpath(tmp_path: Path, run) -> None:
+    files = {"pyproject.toml": PYTEST_CFG, "src/pkg/__init__.py": ""}
+    text, _ = generate(tmp_path, run, files)
+    assert "PYTHONPATH" not in text

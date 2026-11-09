@@ -249,6 +249,11 @@ Median time per case is 370 ms. The full run takes 43 s of check time.
 
 ## Real history
 
+*This section, including its triage, remaining false blocks and warnings, describes the
+0.2.0 replay, run on 2026-11-01 at commit `0b4b3c4` (70 of 698 commits blocked, 20 of them
+false; raw results in `bench/results/2026-11-01/`). For the current numbers, 66 blocked and 12
+false on 0.4.0, see "0.4.0 against 0.3.1" at the top.*
+
 `bench/replay.py` replays a project's history. For each of the last 200 first-parent,
 non-merge commits that touch a test file, it checks out the parent in a temporary clone,
 commits it as the base, sets the tree to the commit and runs the static checks (`--checks
@@ -302,30 +307,37 @@ expect a higher false-block rate than 20 of 698.
 
 ### Remaining false blocks
 
-These are known limits. Each is a pattern that line-level and syntax-tree heuristics
-misread.
+These are the false blocks of the 0.2.0 replay. They are known limits: each is a pattern that
+line-level and syntax-tree heuristics misread. Where 0.4.0 no longer blocks a commit, it is
+marked; the 0.4.0 replay is in `bench/results/2026-11-09/`.
 
-- **Checks moved into a helper or a loop (Go).** A call to a same-file assertion helper,
-  or a loop body, counts as one check, however many it runs. Helpers in other files are
-  not followed. cobra `4cafa37bc`, `9e1d6f1c2`, `652c755d3`, `b36196066`, `2da4a54c5`.
+- **Checks moved into a helper or a loop (Go).** On 0.2.0 a call to a same-file assertion
+  helper, or a loop body, counted as one check, however many it runs. Helpers in other files
+  are not followed. cobra `4cafa37bc`, `9e1d6f1c2`, `652c755d3`, `b36196066`, `2da4a54c5`.
+  0.4.0 no longer blocks `9e1d6f1c2`, `652c755d3` and `b36196066`: a same-file helper whose
+  checks run on every path, and a loop over a literal table, are credited, and the commit
+  warns. `4cafa37bc` and `2da4a54c5` still block.
 - **Several exact checks merged into one larger equality.** The count drops while the
-  check gets stronger. An expected value built by a constructor
-  (`== QueryParams("a=456")`) is not counted as pinned. httpx `354c4cac1`, `883cf8ca6`,
-  `2abb2f214`.
-- **A test renamed while its body also changed.** Renames pair by name, unchanged body or
-  body shape. A rename together with an edit pairs by none of them. click `d8763b930`,
-  zustand `d28169d1b`, `633c7dd7a` (titles that repeat in the file), cobra `22b617914`,
-  `70e53f62b`.
+  check gets stronger. On 0.2.0 an expected value built by a constructor
+  (`== QueryParams("a=456")`) was not counted as pinned. httpx `354c4cac1`, `883cf8ca6`,
+  `2abb2f214`. 0.4.0 no longer blocks `2abb2f214` (a constructor of a class imported from
+  outside the test tree counts as pinned, and the commit warns); the other two still block.
+- **A test renamed while its body also changed.** On 0.2.0 renames paired by name, unchanged
+  body or body shape, and a rename together with an edit paired by none of them. click
+  `d8763b930`, zustand `d28169d1b`, `633c7dd7a` (titles that repeat in the file), cobra
+  `22b617914`, `70e53f62b`. 0.4.0 no longer blocks any of the five: it pairs a renamed test
+  with its old self by token similarity.
 - **Tests moved to another file or a suite rewritten.** Absorbing works within one file.
   httpx `cca62060c`, cobra `65c8acb22`, zustand `e247220ec` (part of that commit is a
-  correct block).
+  correct block). All three still block on 0.4.0.
 - **The checked subject written differently.** `headers == ...` became
   `request.headers == ...`. A parametrize case was split into its own test with changed
-  expected values. httpx `7947b5607`, `8dc9b6bd5`.
+  expected values. httpx `7947b5607`, `8dc9b6bd5`. Both still block on 0.4.0.
 - **CI judged per workflow file.** A workflow deleted while new workflows run the same
-  steps through a package script alias. zustand `2367abb18`.
+  steps through a package script alias. zustand `2367abb18`. Still blocks on 0.4.0.
 - **A conditional `t.Skip` (Go)** that only applies to a newly added table row is read as a
-  skip of the whole test. cobra `df12a0a24`.
+  skip of the whole test. cobra `df12a0a24`. Still blocks on 0.4.0 (an edited base row sits
+  beside the new skipped row).
 
 ### Warnings
 

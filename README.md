@@ -45,11 +45,14 @@ greenproof check
 ```
 
 `init` looks at the repository, proposes the commands it can find evidence for, runs each
-once, and writes `.greenproof.toml` and an `AGENTS.md` section. It never prompts and never
-commits. This is its real output on a small Python project with a pytest suite:
+once, and writes `.greenproof.toml` and an `AGENTS.md` section. When a `CLAUDE.md` exists it
+also adds an `@AGENTS.md` import to it, between greenproof's markers, unless the file already
+has that line. It never prompts and never commits. This is its real output on a small Python
+project with a pytest suite, with greenproof installed (`pipx install greenproof`), so the
+AGENTS.md line says `greenproof check`:
 
 ```text
-greenproof init: /private/tmp/gp-qs.hDCjbU
+greenproof init: /private/var/folders/qz/tmp.BCkiyAaLi0
 
 detected: python (pip)
 
@@ -57,7 +60,7 @@ detected: python (pip)
   created  AGENTS.md
 
 verification:
-  pass     test: python -m pytest -q (1.0s)
+  pass     test: python -m pytest -q (0.4s)
 
 next steps:
   - review the files above and commit them; `greenproof check` runs the gate
@@ -86,16 +89,18 @@ checks = ["static", "commands", "revert"]
 After committing those files, `greenproof check` on the unchanged tree:
 
 ```text
-greenproof: pass (base HEAD 5c02ccdcd, mode local)
-  PASS  test  python -m pytest -q (0.6s)
+greenproof: pass (base HEAD 918debdb3, mode local)
+  note: on the default branch with no upstream: only uncommitted changes are checked; pass --base REF to include commits
+  PASS  test  python -m pytest -q (0.2s)
 verdict: pass (exit 0)
 ```
 
 Break the code so a test fails, and the same command reports it and exits 2:
 
 ```text
-greenproof: not done (base HEAD 5c02ccdcd, mode local)
-  FAIL  test  python -m pytest -q (exit 1, 0.9s)
+greenproof: not done (base HEAD 918debdb3, mode local)
+  note: on the default branch with no upstream: only uncommitted changes are checked; pass --base REF to include commits
+  FAIL  test  python -m pytest -q (exit 1, 0.4s)
         last lines:
         F                                                                        [100%]
         =================================== FAILURES ===================================
@@ -109,15 +114,16 @@ greenproof: not done (base HEAD 5c02ccdcd, mode local)
         tests/test_shop.py:5: AssertionError
         =========================== short test summary info ============================
         FAILED tests/test_shop.py::test_total - assert 101 == 100
-        1 failed in 0.03s
+        1 failed in 0.02s
 verdict: fail (exit 2)
 ```
 
 Fix the code and it passes again:
 
 ```text
-greenproof: pass (base HEAD 5c02ccdcd, mode local)
-  PASS  test  python -m pytest -q (1.4s)
+greenproof: pass (base HEAD 918debdb3, mode local)
+  note: on the default branch with no upstream: only uncommitted changes are checked; pass --base REF to include commits
+  PASS  test  python -m pytest -q (0.2s)
 verdict: pass (exit 0)
 ```
 
@@ -125,10 +131,11 @@ Skipping a test is a different outcome. With `@pytest.mark.skip` added to `test_
 suite stays green, and greenproof blocks the change anyway, with exit 1:
 
 ```text
-greenproof: not done (base HEAD 279a57333, mode local)
+greenproof: not done (base HEAD 918debdb3, mode local)
+  note: on the default branch with no upstream: only uncommitted changes are checked; pass --base REF to include commits
   BLOCK tests.skipped  tests/test_shop.py:5  `@pytest.mark.skip` added to test_total  [fp ca84db22c653]
         hint: Fix the code so test_total passes instead of skipping it; if the test is wrong, say so.
-  PASS  test  python -m pytest -q (1.0s)
+  PASS  test  python -m pytest -q (0.3s)
 verdict: fail (exit 1)
 ```
 
@@ -163,8 +170,9 @@ verdict: fail (exit 1)
    under the policy `timeout`, killing the whole process group on timeout. The environment
    is inherited, plus `GREENPROOF=1`.
 6. **Revert.** When the change touches both test files and non-test source, it builds the
-   base tree with the candidate's test files laid over it and runs only the added or changed
-   tests there. If they all pass without the source change, they do not exercise it, and
+   base tree with the candidate's test files laid over it, checks it out in a temporary
+   worktree, runs `setup` there, then runs only the added or changed tests. If they all pass
+   without the source change, they do not exercise it, and
    `revert.passes_without_change` is reported. It supports pytest, jest, vitest and
    `go test`; for any other runner it is skipped with a note and never fails.
 7. **Smoke.** When the policy has a `[smoke]` table, it starts `smoke.start` in its own
@@ -214,7 +222,7 @@ example `"tests.expected_changed" = "off"`.
 | `policy.changed` | block | the candidate's `.greenproof.toml` differs from the base's |
 | `tests.deleted` | block | a test file is deleted, or renamed to a path that is not a test file or that the runner does not collect |
 | `tests.removed` | block | a test that exists at the base is gone and its assertions appear in no collected test of the candidate |
-| `tests.replaced` | block | in one file a test was removed and a different one added, and the removed test is not covered; `warn` when the new tests are at least as strong. Folding tests into one table-driven test (a parametrized Python test, `it.each`, a Go table, Rust `#[case]`) stays a `warn` only when the table runs, no row leaves early and the row values reach an assertion; an assertion inside a `try`/`catch` that swallows the failure, `assert a or b` with `a` depending on a row, and a skip, skipif or xfail row mark the folded tests did not carry block it |
+| `tests.replaced` | block | in one file a test was removed and a different one added, and the removed test is not covered; `warn` when the new tests are at least as strong. Folding tests into one table-driven test (a parametrized Python test, `it.each`, a Go table, Rust `#[case]`) stays a `warn` only when the table runs, no row leaves early and the row values reach an assertion (a Python `parametrize` whose body ignores its row values is not caught and still warns); an assertion inside a `try`/`catch` that swallows the failure, `assert a or b` with `a` depending on a row, and a skip, skipif or xfail row mark the folded tests did not carry block it |
 | `tests.skipped` | block | a skip, xfail, ignore or todo marker is added to an existing test, or at module, class or conftest scope; `warn` for an unconditional skip on a brand-new test |
 | `tests.focused` | block | a focus marker is added (`it.only`, `fit`, `describe.only`, `test.only`) |
 | `tests.weakened` | block | a test checks less than before: fewer assertions, a weaker assertion, a wider tolerance, fewer parametrize cases, a vacuous or unreachable assertion, or one wrapped in a swallowing `try/except` |
@@ -254,9 +262,19 @@ was superseded by Antigravity CLI, and an open upstream issue reports its `After
 hooks not firing. `--agents none` installs nothing. `--hook-command CMD` sets how the hooks
 invoke greenproof, for example `uv run greenproof`.
 
-When greenproof is not on PATH at `init` time, the hook command is `uvx greenproof@<version>`,
-which needs `uv` on the PATH of the agent's process. Without it the hook cannot start, and a
-hook that cannot start fails open (see below).
+By default `init` looks on PATH for an installed `greenproof`, skipping the scripts directory
+of the virtual environment it is running in (what `uvx`, `pipx run` and a project venv use),
+because the agent's process does not have that directory. A `pipx install` or `uv tool install`
+symlink in `~/.local/bin` counts. If one is found, the hooks and the AGENTS.md line call
+`greenproof`. If not, they call `uvx greenproof@<version>` and `init` says so in its next
+steps. That needs `uv` on the PATH of the agent's process; without it the hook cannot start,
+and a hook that cannot start fails open (see below). The AGENTS.md line, "run `<command>
+check`", always uses the same command as the hooks.
+
+If your uv config sets `exclude-newer` (for example `"3 days"`), `uvx greenproof@<version>`
+does not resolve until that release is older than the window, so `uvx` hooks fail open in the
+meantime. Install greenproof with `uv tool install greenproof` or `pipx install greenproof`,
+or exempt it with `exclude-newer-package = { greenproof = false }` in `uv.toml`.
 
 Installing the gate twice is safe. A plugin and the hooks `init` writes, or user and project
 settings, can both run for one stop, in parallel. greenproof serialises them with a lock in
@@ -282,7 +300,8 @@ PATH of the OpenCode process; without either the check cannot start and fails op
   session cannot be read, the session start is skipped with a warning and the gate on stop
   still works.
 - Every failure (a missing executable, an error exit, invalid output, a timeout after 3600
-  seconds) fails open with a `greenproof could not run: ...` warning.
+  seconds for the check or 120 seconds for session start) fails open with a
+  `greenproof could not run: ...` warning.
 
 Two ways to install it:
 
@@ -347,7 +366,8 @@ window, or have a team admin import this repository as a team marketplace.
 
 The plugin does not read your policy, so its Stop hook has a one-hour timeout. Add the
 policy with `uvx greenproof@<version> init --agents none`, which writes `.greenproof.toml`
-and the AGENTS.md section and no hooks. With both the plugin and `init` hooks installed,
+and the AGENTS.md section (and the `@AGENTS.md` import in an existing `CLAUDE.md`) and no
+hooks. With both the plugin and `init` hooks installed,
 greenproof makes one decision per stop.
 
 ## CI
@@ -385,7 +405,17 @@ toolchain for the stacks it detected, and runs
 workflow file is kept unless `--yes` is given. Actions in the generated file are pinned to
 full commit SHAs.
 
-In CI mode `setup` runs first, so the workflow needs no install step of its own.
+In CI mode `setup` runs first when the policy has one. When it has none, `init` adds the
+install step to the workflow: for a plain-pip Python project (no uv or poetry), an
+"Install Python dependencies" step running `python -m pip install` with the package
+(`-e ".[test]"`, or the `tests`, `testing` or `dev` extra, else `-e .`), `-r` for
+`requirements.txt` and the development and test requirements files, and the pytest, ruff, mypy
+or pyright the policy runs; for npm without a lockfile, `npm install`. If the project has a
+`src/` directory and the install is editable, the run step also sets `PYTHONPATH: src`, so the
+revert check's base worktree imports its own `src/` and not the editable install of the
+checkout. `init` does not propose these as `setup`, because `setup` also runs in `--isolate`
+and revert worktrees. For a policy you wrote by hand without `setup`, add `setup` or your own
+install step.
 
 ### pre-commit
 
@@ -429,8 +459,10 @@ timeout = 60
 checks = ["static", "commands", "revert", "smoke"]
 ```
 
-`start`, `ready_url` and at least one probe are required for the check to run. Without them
-it is skipped with a note.
+`start`, `ready_url` and at least one probe are required for the check to run. With no
+`[smoke]` table it is skipped with a note. A table that sets some of the three keys but not
+all is a policy error (exit 4). A table that sets all three but leaves one empty (`start = ""`,
+`probes = []`) is skipped with a note that names what is missing.
 
 `greenproof init --yes` rewrites the whole policy file from what it detects. Tables written
 by hand, such as `[smoke]` and `[rules]`, are not carried over, so keep them in version
@@ -445,8 +477,9 @@ greenproof reports patterns, not proofs. Read these before relying on it.
   strength and skip markers. They see less.
 - **Some rules are Python only.** `code.hardcoded` works on Python syntax trees only, and
   so do the finest `tests.weakened` checks (an exact check loosened, a vacuous assertion).
-- **Known limits in 0.4.0.** SPEC 5.6, "Known limits (0.4.0)", lists them by area, and the
-  0.3.0 list below it stays for what 0.4.0 did not touch. The main ones: with more than 32
+- **Known limits in 0.4.0.** SPEC 5.6, "Known limits (0.4.0)", lists them by area. The 0.3.0
+  list below it is kept, with each item marked closed, narrowed or still open in 0.4.0. The
+  main ones: with more than 32
   different pytest runs on the policy path the runs are not compared one by one (the configuration alone is judged, with a warning); a check that moves
   to a different subject blocks as weakened; and among the line-level engines only Go credits
   a table loop or helper that replaces separate checks (it warns), while a Rust or JS loop

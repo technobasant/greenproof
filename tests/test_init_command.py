@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -58,15 +59,17 @@ def statuses(out: str) -> dict[str, str]:
 # ---- AGENTS.md and CLAUDE.md -------------------------------------------------------------
 
 
-def test_agents_md_is_created_with_the_section(tmp_path: Path, run) -> None:
+def test_agents_md_is_created_with_the_section(tmp_path: Path, run, controlled_path) -> None:
+    controlled_path()  # an installed greenproof on PATH, so the section says `greenproof check`
     repo = fixture_repo(tmp_path, UV_PROJECT)
     assert run(repo.path, "init", "--no-verify", "--agents", "none").code == 0
     assert (repo.path / "AGENTS.md").read_text() == AGENTS_SECTION
 
 
 def test_agents_md_section_is_appended_and_then_replaced_between_markers(
-    tmp_path: Path, run
+    tmp_path: Path, run, controlled_path
 ) -> None:
+    controlled_path()
     repo = fixture_repo(tmp_path, {**UV_PROJECT, "AGENTS.md": "# Project\n\nBe kind.\n"})
     run(repo.path, "init", "--no-verify", "--agents", "none")
     text = (repo.path / "AGENTS.md").read_text()
@@ -615,3 +618,137 @@ def test_opencode_render_rejects_an_empty_command_and_a_damaged_template(monkeyp
     monkeypatch.setattr(opencode, "template", lambda: "// something else\n" + text)
     with pytest.raises(RuntimeError, match="COMMAND or owner line"):
         opencode.render(None, "greenproof", 60)
+
+
+# ---- which greenproof the hooks call -------------------------------------------------------
+
+
+def _bin_with_greenproof(base: Path, name: str) -> Path:
+    bin_dir = base / name
+    bin_dir.mkdir()
+    script = bin_dir / "greenproof"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+    return bin_dir
+
+
+def test_a_venv_scripts_dir_is_skipped(tmp_path: Path) -> None:
+    from greenproof.init.command import _installed_on_path
+
+    scripts = _bin_with_greenproof(tmp_path, "venv-bin")
+    assert _installed_on_path(str(scripts), str(scripts), True) is False
+    assert _installed_on_path(str(scripts), str(scripts), False) is True  # not a venv: counts
+    assert _installed_on_path(str(scripts), str(tmp_path / "other"), True) is True
+
+
+def test_the_scripts_dir_is_matched_by_directory_not_by_spelling(tmp_path: Path) -> None:
+    from greenproof.init.command import _installed_on_path
+
+    scripts = _bin_with_greenproof(tmp_path, "venv-bin")
+    (tmp_path / "alias").symlink_to(scripts)
+    assert _installed_on_path(str(tmp_path / "alias"), str(scripts), True) is False
+
+
+def test_a_symlink_into_a_venv_in_another_dir_still_counts(tmp_path: Path) -> None:
+    from greenproof.init.command import _installed_on_path
+
+    scripts = _bin_with_greenproof(tmp_path, "venv-bin")
+    local_bin = tmp_path / "local-bin"
+    local_bin.mkdir()
+    (local_bin / "greenproof").symlink_to(scripts / "greenproof")
+    path = os.pathsep.join([str(scripts), str(local_bin)])
+    assert _installed_on_path(path, str(scripts), True) is True
+
+
+def test_path_entries_that_are_missing_or_empty_are_ignored(tmp_path: Path) -> None:
+    from greenproof.init.command import _installed_on_path
+
+    path = os.pathsep.join(["", str(tmp_path / "missing")])
+    assert _installed_on_path(path, str(tmp_path / "also-missing"), True) is False
+
+
+def _pretend_venv(monkeypatch: pytest.MonkeyPatch, scripts: Path | None, in_venv: bool) -> None:
+    from greenproof.init import command
+
+    monkeypatch.setattr(command, "_in_virtualenv", lambda: in_venv)
+    monkeypatch.setattr(
+        command.sysconfig, "get_path", lambda name, *a, **k: str(scripts) if scripts else ""
+    )
+
+
+def test_init_in_a_venv_falls_back_to_uvx_and_says_so(
+    tmp_path: Path, run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+
+    scripts = _bin_with_greenproof(tmp_path, "venv-bin")
+    for tool in ("git", "sh"):
+        found = shutil.which(tool)
+        if found:
+            (scripts / tool).symlink_to(found)
+    monkeypatch.setenv("PATH", str(scripts))
+    _pretend_venv(monkeypatch, scripts, True)
+    repo = fixture_repo(tmp_path, UV_PROJECT)
+    result = run(repo.path, "init", "--no-verify", "--agents", "claude")
+    assert result.code == 0, result.err
+    command = f"uvx greenproof@{__version__}"
+    stop = json.loads((repo.path / ".claude/settings.json").read_text())["hooks"]["Stop"]
+    assert stop[0]["hooks"][0]["command"] == f"{command} check --hook claude"
+    assert f"run `{command} check`." in (repo.path / "AGENTS.md").read_text()
+    assert f"hooks and AGENTS.md call `{command}`" in result.out
+    assert "uv tool install greenproof" in result.out and "--hook-command" in result.out
+
+
+def test_init_outside_a_venv_counts_the_scripts_dir(
+    tmp_path: Path, run, controlled_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controlled_path()
+    scripts = Path(os.environ["PATH"].split(os.pathsep)[0])
+    _pretend_venv(monkeypatch, scripts, False)
+    repo = fixture_repo(tmp_path, UV_PROJECT)
+    result = run(repo.path, "init", "--no-verify", "--agents", "claude")
+    stop = json.loads((repo.path / ".claude/settings.json").read_text())["hooks"]["Stop"]
+    assert stop[0]["hooks"][0]["command"] == "greenproof check --hook claude"
+    assert "run `greenproof check`." in (repo.path / "AGENTS.md").read_text()
+    assert "hooks and AGENTS.md call" not in result.out
+
+
+def test_override_wins_in_a_venv_and_gets_no_note(
+    tmp_path: Path, run, controlled_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controlled_path()
+    scripts = Path(os.environ["PATH"].split(os.pathsep)[0])
+    _pretend_venv(monkeypatch, scripts, True)
+    repo = fixture_repo(tmp_path, UV_PROJECT)
+    result = run(
+        repo.path,
+        "init",
+        "--no-verify",
+        "--agents",
+        "claude",
+        "--hook-command",
+        "uv run greenproof",
+    )
+    stop = json.loads((repo.path / ".claude/settings.json").read_text())["hooks"]["Stop"]
+    assert stop[0]["hooks"][0]["command"] == "uv run greenproof check --hook claude"
+    assert "run `uv run greenproof check`." in (repo.path / "AGENTS.md").read_text()
+    assert "hooks and AGENTS.md call" not in result.out
+
+
+def test_the_uvx_note_without_agents_names_only_agents_md(
+    tmp_path: Path, run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+
+    scripts = _bin_with_greenproof(tmp_path, "venv-bin")
+    for tool in ("git", "sh"):
+        found = shutil.which(tool)
+        if found:
+            (scripts / tool).symlink_to(found)
+    monkeypatch.setenv("PATH", str(scripts))
+    _pretend_venv(monkeypatch, scripts, True)
+    repo = fixture_repo(tmp_path, UV_PROJECT)
+    result = run(repo.path, "init", "--no-verify", "--agents", "none")
+    assert result.code == 0, result.err
+    assert f"AGENTS.md calls `uvx greenproof@{__version__}`" in result.out
+    assert "hooks and AGENTS.md" not in result.out

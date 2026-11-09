@@ -5,6 +5,48 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-09
+
+### Fixed
+
+- `init` no longer writes hooks that point at an ephemeral environment. Run as
+  `uvx greenproof init` (or `pipx run`, or from a project venv that is only active in the
+  current shell), it found its own copy of `greenproof` on PATH and wrote the bare command into
+  the hook files; the agent's PATH does not have that copy, so the hook failed open. The
+  scripts directory of a virtual environment the running interpreter is in is now skipped when
+  looking for an installed `greenproof`; a `pipx install` or `uv tool install` symlink in
+  `~/.local/bin` still counts. When none is found the hooks use `uvx greenproof@X` as before,
+  and the summary says so and how to install it.
+- The AGENTS.md section named the command to run as bare `greenproof check` whenever
+  `--hook-command` was not given, even when the hooks used `uvx greenproof@X`. It now names the
+  command the hooks use.
+- The workflow written by `init --ci github` installed nothing for a plain-pip Python project
+  (a pyproject, `setup.py` or `setup.cfg` without `requirements.txt`) or for npm without a
+  lockfile, so `python -m pytest` ran without pytest or the package, and `npm test` without
+  `node_modules`. When the policy has no `setup` command it now adds a `python -m pip install`
+  step (the package with its `test`, `tests`, `testing` or `dev` extra, the requirements files
+  for development and test, and the pytest, ruff, mypy or pyright the policy runs) and an
+  `npm install` step. The step is in the workflow only: `setup` also runs in `--isolate`
+  worktrees, where `pip install -e .` would point your own environment at a temporary directory.
+  For a project with a `src/` directory the run step also sets `PYTHONPATH: src`, so the revert
+  check's base worktree imports its own `src/` and not the editable install of the checkout.
+
+### Changed
+
+- Documentation only, no behaviour beyond the fixes above. README and SPEC describe the new hook
+  command rule, the AGENTS.md command and the CI install step, `PYTHONPATH: src` included, and
+  that `init` adds an `@AGENTS.md` import to an existing `CLAUDE.md`. They also correct the
+  smoke key rule (some keys but not all is a policy error, exit 4), the OpenCode timeouts
+  (3600 s for the check, 120 s for session start), the claim that a Python `parametrize` fold
+  is blocked when its body ignores the row values (it warns), where `setup` runs (ci mode,
+  `--isolate` and revert worktrees), and the `opencode` choices of `--agents` and `--hook`.
+  The README quick-start output is re-run on 0.4.1.
+- README notes that a uv `exclude-newer` setting keeps `uvx greenproof@X` from resolving for
+  new releases, so `uvx` hooks fail open until the release ages past the window.
+- SPEC marks each item of "Known limits (0.3.0)" as closed, narrowed or still open in 0.4.0.
+  MEASUREMENTS labels the 0.2.0 real-history section and marks the false blocks 0.4.0 no
+  longer blocks.
+
 ## [0.4.0] - 2026-11-09
 
 Measured against 0.3.1 on the same inputs (MEASUREMENTS.md): of 744 tamper probes, 693 block
@@ -462,7 +504,8 @@ First release.
 - The test suite runs in parallel with `pytest-xdist` (`pytest -n auto`) in CI and in the
   documented gate.
 
-[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/technobasant/greenproof/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/technobasant/greenproof/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/technobasant/greenproof/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/technobasant/greenproof/compare/v0.2.0...v0.3.0

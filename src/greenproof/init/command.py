@@ -6,7 +6,10 @@ prompts, commits, or touches git configuration.
 
 from __future__ import annotations
 
+import os
 import shutil
+import sys
+import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,12 +105,53 @@ def parse_agents(spec: str, root: Path) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def resolve_hook_command(override: str | None) -> str:
+def _same_dir(a: str, b: str) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return False
+
+
+def _installed_on_path(path_env: str, scripts_dir: str | None, in_venv: bool) -> bool:
+    """Is there a `greenproof` on PATH that an agent's hook would also find?
+
+    Inside a virtual environment (what `uvx` and `pipx run` run in, or a project venv that is only
+    active in this shell) the environment's own scripts directory is not counted: a hook runs
+    with the agent's PATH, which does not have it. The entry itself is compared, not the
+    executable it points at, so the symlink that `pipx install` and `uv tool install` put in
+    ~/.local/bin still counts.
+    """
+    for entry in path_env.split(os.pathsep):
+        if not entry:
+            continue
+        if in_venv and scripts_dir and _same_dir(entry, scripts_dir):
+            continue
+        if shutil.which("greenproof", path=entry):
+            return True
+    return False
+
+
+def _in_virtualenv() -> bool:
+    return sys.prefix != sys.base_prefix
+
+
+def _resolve_hook_command(override: str | None) -> tuple[str, bool]:
+    """The hook command, and whether it is the pinned `uvx` fallback."""
     if override is not None:
         if not override.strip():
             raise UsageError("--hook-command: expected a command")
-        return override.strip()
-    return "greenproof" if shutil.which("greenproof") else f"uvx greenproof@{__version__}"
+        return override.strip(), False
+    if _installed_on_path(
+        os.environ.get("PATH", ""),
+        sysconfig.get_path("scripts"),
+        _in_virtualenv(),
+    ):
+        return "greenproof", False
+    return f"uvx greenproof@{__version__}", True
+
+
+def resolve_hook_command(override: str | None) -> str:
+    return _resolve_hook_command(override)[0]
 
 
 def _plan_policy(
@@ -183,15 +227,13 @@ def run_init(options: InitOptions) -> str:
     det = detect(root)
     commands = propose(root, det)
     agents = parse_agents(options.agents, root)
-    hook_command = resolve_hook_command(options.hook_command)
+    hook_command, uvx_fallback = _resolve_hook_command(options.hook_command)
 
     policy_plan, policy = _plan_policy(root, commands, options.yes)
     planned = [policy_plan]
     runnable = policy.runnable_commands()
 
-    section = agents_md.render_section(
-        runnable, hook_command if options.hook_command is not None else None
-    )
+    section = agents_md.render_section(runnable, hook_command)
     agents_existing = _read(root, "AGENTS.md")
     planned.append(
         _plan(root, "AGENTS.md", agents_md.upsert_section(agents_existing, section, "AGENTS.md"))
@@ -202,6 +244,13 @@ def run_init(options: InitOptions) -> str:
 
     timeout = hook_timeout(policy.timeout, len(runnable))
     notes: list[str] = []
+    if uvx_fallback:
+        callers = "hooks and AGENTS.md call" if agents else "AGENTS.md calls"
+        notes.append(
+            f"{callers} `{hook_command}`: no installed greenproof outside this "
+            "environment was found on PATH; install it with `uv tool install greenproof` or "
+            "`pipx install greenproof` and re-run init, or pass --hook-command"
+        )
     for name in agents:
         adapter = ADAPTERS[name]
         planned.append(
@@ -217,7 +266,7 @@ def run_init(options: InitOptions) -> str:
             notes.append(opencode_adapter.NOTE)
 
     if options.ci == "github":
-        workflow = ci_github.render_workflow(root, det, __version__)
+        workflow = ci_github.render_workflow(root, det, __version__, policy)
         planned.append(
             _plan(root, ci_github.WORKFLOW_PATH, workflow, keep_existing=not options.yes)
         )

@@ -12,7 +12,8 @@ CLAUDE_IMPORT = "@AGENTS.md"
 
 
 def render_section(commands: Sequence[tuple[str, str]], check_command: str | None = None) -> str:
-    """`check_command` is the `--hook-command` value; without it the text says `greenproof`."""
+    """`check_command` is the resolved hook command (`greenproof`, `uvx greenproof@X` or the
+    `--hook-command` value); without it the text says `greenproof`."""
     lines = [BEGIN, "## Verify", ""]
     if commands:
         lines.append("greenproof runs these commands (from `.greenproof.toml`):")
