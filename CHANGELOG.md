@@ -5,6 +5,53 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-12
+
+Milestone M6 (SPEC section 15): six more agents on the hook protocol. All six are
+experimental: the files follow each vendor's documentation as read on 2026-11-12 and none has
+completed a real-CLI block-and-release run yet. Real payloads were captured from Claude Code
+2.1.322 (no `timestamp` key, which the Copilot rule below relies on) and Antigravity CLI 1.0.8,
+which sends `terminationReason: "NO_TOOL_CALL"` for a normal stop where its documents say
+`model_stop`; both values run the gate.
+
+### Added
+
+- `check --hook` and `session-start --hook` accept `copilot`, `qwen`, `droid`, `antigravity`,
+  `openhands` and `auggie`. Each reads its CLI's own payload (session id, start directory, and
+  where there is one the field that marks a stop that is not the model finishing, which is
+  skipped) and answers in that CLI's output format; the same state, replay and release rules apply.
+- `init --agents` writes the hook files for them: `.github/hooks/greenproof.json`,
+  `.qwen/settings.json`, `.factory/hooks.json`, `.agents/hooks.json`, `.openhands/hooks.json`
+  and `.augment/settings.json`. Merging, ownership and exit 4 on an unusable file work as for
+  the other agents. Timeouts use each CLI's unit: seconds for Qwen (capped at 999, because Qwen
+  reads 1000 or more as milliseconds), Droid, Antigravity and OpenHands, `timeoutSec` for
+  Copilot, milliseconds for Auggie. Droid's file is keyed directly by event name, and
+  Antigravity's greenproof entry is the key `greenproof`.
+- Experimental adapters print a warning when named, and Qwen Code and Droid print a note about
+  approving or reviewing the hooks. `--agents auto` never installs an experimental adapter. It
+  now also detects Copilot (`.github/hooks/` or `.github/copilot-instructions.md`), Qwen
+  (`.qwen/`) and Droid (`.factory/`), but only for an adapter that is not experimental, so
+  none of them is picked yet.
+- `scripts/e2e/capture_payload.py`, a hook command that appends its stdin, arguments and the
+  `*_PROJECT_DIR` and `*_SESSION_ID` environment variables to the file named by
+  `GREENPROOF_CAPTURE`, for recording real payloads before an adapter is marked supported. It is
+  not part of the wheel.
+- README: the agents that have no hook that can block a stop (Cline, Roo Code, Windsurf, Zed,
+  Warp, Aider, Continue, Kiro, Devin, Jules), which rely on AGENTS.md and CI, and Goose, Junie,
+  Amp and Kilo Code as planned.
+
+### Changed
+
+- Under `--hook claude`, a payload with a `timestamp` key is Copilot's (Copilot CLI and VS Code
+  also run the hooks in `.claude/settings.json`, and treat exit 2 from a stop hook as a
+  warning). When a `.github/hooks/*.json` file holds a greenproof `--hook copilot` entry for the
+  event, the Claude hook defers: exit 0, no output, no state written. Otherwise it answers in
+  Copilot's format.
+- `hooks.py` keeps one table of per-agent protocols instead of per-agent branches; the output
+  for Claude Code, Cursor, Codex CLI, Gemini CLI and OpenCode is unchanged. `init` takes the
+  notes and warnings it prints from attributes of each adapter module.
+- README: the Gemini CLI row points to Antigravity CLI, its successor.
+
 ## [0.4.1] - 2026-11-09
 
 ### Fixed
@@ -504,7 +551,8 @@ First release.
 - The test suite runs in parallel with `pytest-xdist` (`pytest -n auto`) in CI and in the
   documented gate.
 
-[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/technobasant/greenproof/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/technobasant/greenproof/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/technobasant/greenproof/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/technobasant/greenproof/compare/v0.3.0...v0.3.1

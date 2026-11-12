@@ -14,6 +14,8 @@ from typing import Any
 from greenproof.errors import UsageError
 
 _OWNED = re.compile(r"greenproof(?:@\S+)?\s+(?:check\s+--hook\b|session-start\b)")
+WRAPPED = "hooks."  # the path an event has in a file with a `hooks` wrapper, for error messages
+UNWRAPPED = ""
 
 
 def is_greenproof_command(command: Any) -> bool:
@@ -46,19 +48,37 @@ def hooks_table(data: dict[str, Any], label: str) -> dict[str, Any]:
     return table
 
 
-def _event_list(table: dict[str, Any], event: str, label: str) -> list[Any]:
+def unwrapped_events(data: dict[str, Any]) -> dict[str, Any]:
+    """The event table of a file keyed directly by event name, with no `hooks` wrapper (Droid's
+    `.factory/hooks.json`). A `hooks` key there is an ordinary event name and is left alone.
+    Pass `prefix=UNWRAPPED` to the setters so errors name the event as the file does."""
+    return data
+
+
+def _event_list(table: dict[str, Any], event: str, label: str, prefix: str) -> list[Any]:
     existing = table.get(event, [])
     if not isinstance(existing, list):
-        raise UsageError(f"{label}: `hooks.{event}` must be an array. Nothing was written.")
+        raise UsageError(f"{label}: `{prefix}{event}` must be an array. Nothing was written.")
     return existing
 
 
-def set_grouped_event(table: dict[str, Any], event: str, group: dict[str, Any], label: str) -> None:
+def set_named_entry(data: dict[str, Any], name: str, entry: dict[str, Any], label: str) -> None:
+    """A file that maps a hook name to its events (Antigravity's `.agents/hooks.json`): replace
+    the entry greenproof owns, in place, and leave every other key. An existing entry that is
+    not an object is not ours to replace: exit 4."""
+    if name in data and not isinstance(data[name], dict):
+        raise UsageError(f"{label}: `{name}` must be an object. Nothing was written.")
+    data[name] = entry
+
+
+def set_grouped_event(
+    table: dict[str, Any], event: str, group: dict[str, Any], label: str, *, prefix: str = WRAPPED
+) -> None:
     """Claude-style event: a list of groups, each with a `hooks` list of handlers. Drops
     greenproof's handlers (and any group left empty) and puts `group` where the first one was."""
     result: list[Any] = []
     insert_at: int | None = None
-    for item in _event_list(table, event, label):
+    for item in _event_list(table, event, label, prefix):
         handlers = item.get("hooks") if isinstance(item, dict) else None
         if not isinstance(handlers, list):
             result.append(item)
@@ -79,11 +99,13 @@ def set_grouped_event(table: dict[str, Any], event: str, group: dict[str, Any], 
     table[event] = result
 
 
-def set_flat_event(table: dict[str, Any], event: str, entry: dict[str, Any], label: str) -> None:
+def set_flat_event(
+    table: dict[str, Any], event: str, entry: dict[str, Any], label: str, *, prefix: str = WRAPPED
+) -> None:
     """Cursor-style event: a flat list of handlers."""
     result: list[Any] = []
     insert_at: int | None = None
-    for item in _event_list(table, event, label):
+    for item in _event_list(table, event, label, prefix):
         if isinstance(item, dict) and is_greenproof_command(item.get("command")):
             if insert_at is None:
                 insert_at = len(result)

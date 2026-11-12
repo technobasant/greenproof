@@ -12,6 +12,14 @@ Vendor documents the output formats were verified against (fetched 2026-11-01):
 - Codex CLI: https://developers.openai.com/codex/hooks, schemas in `openai/codex` under
   `codex-rs/hooks/schema/generated`
 - Gemini CLI: https://geminicli.com/docs/hooks/reference/
+Added in M6 (SPEC 15; vendor documents read 2026-11-12):
+- GitHub Copilot: https://docs.github.com/en/copilot/reference/hooks-reference
+- Qwen Code: https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/
+- Droid: https://docs.factory.com/reference/hooks-reference and
+  https://docs.factory.com/cli/configuration/hooks-guide
+- Antigravity: https://antigravity.google/docs/hooks/
+- OpenHands: https://docs.openhands.dev/openhands/usage/customization/hooks
+- Auggie: https://docs.augmentcode.com/cli/hooks and /cli/hooks-examples
 """
 
 from __future__ import annotations
@@ -20,9 +28,10 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Any
@@ -32,7 +41,6 @@ from greenproof.errors import GreenproofError
 from greenproof.policy import POLICY_FILE, parse_policy
 from greenproof.report import Report, error_report
 
-HOOK_AGENTS = ("claude", "cursor", "codex", "gemini", "opencode")
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_CONSECUTIVE_BLOCKS = 8
 STATE_FILE = "hook-state.json"
@@ -45,6 +53,16 @@ RELEASE_LAST_LINE = "run `greenproof check` for the full report"
 RELEASE_ITEMS = 5
 MESSAGE_ITEMS = 20
 KEEP_MARKER_SOURCES = ("resume", "compact", "fork")
+DEFER_NOTE = "deferred to the Copilot hook"
+COPILOT_HOOKS_DIR = Path(".github") / "hooks"
+COPILOT_STOP_EVENT = "agentStop"
+COPILOT_START_EVENT = "sessionStart"
+# Copilot's handlers name the command in `command` (init writes it), or in the per-shell
+# `bash` and `powershell` fields; any of them running greenproof's Copilot hook counts.
+_COPILOT_COMMAND_FIELDS = ("command", "bash", "powershell")
+_COPILOT_OWNED = re.compile(
+    r"greenproof(?:@\S+)?\s+(?:check|session-start)\b[^\n]*?--hook(?:\s+|=)copilot\b"
+)
 
 AGENT_TRAILER = (
     "Fix the code, not the check. Do not delete, skip or weaken tests, or edit CI or test\n"
@@ -59,9 +77,10 @@ class Payload:
 
     session_id: str = ""
     start_dir: Path | None = None
-    status: str | None = None  # cursor only
+    status: str | None = None  # the value of the agent's skip field, for agents that have one
     source: str | None = None  # session start only
     fingerprint: str | None = None  # None for an empty payload (SPEC 6.1)
+    copilot_format: bool = False  # claude only: a `timestamp` key means Copilot sent it (15.3)
 
 
 @dataclass
@@ -70,6 +89,159 @@ class HookResult:
     stdout: str = ""
     stderr: str = ""
     report: Report | None = None
+
+
+# --- per-agent protocols (SPEC 6.1, 6.3, 15.1, 15.2) -----------------------------------
+
+
+def _json_line(obj: dict[str, Any]) -> str:
+    return json.dumps(obj) + "\n"
+
+
+def _none() -> HookResult:
+    return HookResult()
+
+
+def _empty_object() -> HookResult:
+    return HookResult(stdout=_json_line({}))
+
+
+def _decision(decision: str) -> HookResult:
+    return HookResult(stdout=_json_line({"decision": decision}))
+
+
+def _block_stderr(message: str) -> HookResult:
+    return HookResult(exit_code=2, stderr=message + "\n")
+
+
+def _decision_block(decision: str) -> Callable[[str], HookResult]:
+    """`{"decision": decision, "reason": message}`, the shape most agents block with."""
+
+    def render(message: str) -> HookResult:
+        return HookResult(stdout=_json_line({"decision": decision, "reason": message}))
+
+    return render
+
+
+def _block_followup(message: str) -> HookResult:
+    return HookResult(stdout=_json_line({"followup_message": message}))
+
+
+def _block_hook_specific(message: str) -> HookResult:
+    inner = {"hookEventName": "Stop", "decision": "block", "reason": message}
+    return HookResult(stdout=_json_line({"hookSpecificOutput": inner}))
+
+
+def _release_stop_reason(note: str) -> HookResult:
+    return HookResult(stdout=_json_line({"continue": False, "stopReason": note}))
+
+
+def _release_note_on_stderr(stdout: str = "") -> Callable[[str], HookResult]:
+    """A release for an agent with no documented way to show the user a note: the note goes
+    to stderr (15.2), with `stdout` as the protocol output."""
+
+    def render(note: str) -> HookResult:
+        return HookResult(stdout=stdout, stderr=note + "\n")
+
+    return render
+
+
+def _session_hook_specific(context: str) -> str:
+    return _json_line(
+        {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
+    )
+
+
+def _session_additional_context(context: str) -> str:
+    return _json_line({"additionalContext": context})
+
+
+def _session_cursor(context: str) -> str:
+    return _json_line({"additional_context": context})
+
+
+def _session_none(_context: str) -> str:
+    return ""
+
+
+@dataclass(frozen=True)
+class Protocol:
+    """Everything that differs between agents: how the payload is read and what is printed.
+    The defaults are Claude Code's and Codex's shape (6.1 table); an agent lists its changes."""
+
+    render_pass: Callable[[], HookResult]
+    render_block: Callable[[str], HookResult]
+    render_release: Callable[[str], HookResult]
+    session_keys: tuple[str, ...] = ("session_id",)  # tried in order
+    # Tried in order. A key ending in "[0]" holds a list and means its first element; any
+    # other key holds a string.
+    start_dir_keys: tuple[str, ...] = ("cwd",)
+    # The payload field that says why the agent stopped, and the values that still run the
+    # gate; any other value skips (exit 0, the pass output, no state).
+    skip_field: str | None = None
+    proceed_values: tuple[str, ...] = ()
+    # `source` values of a session start that keep a still-valid marker (6.3).
+    keep_marker_sources: tuple[str, ...] = KEEP_MARKER_SOURCES
+    render_session_start: Callable[[str], str] = _session_hook_specific
+
+
+AGENT_PROTOCOLS: dict[str, Protocol] = {
+    "claude": Protocol(_none, _block_stderr, _release_stop_reason),
+    "cursor": Protocol(
+        _empty_object,
+        _block_followup,
+        lambda _note: _empty_object(),
+        session_keys=("conversation_id",),
+        start_dir_keys=("workspace_roots[0]",),
+        skip_field="status",
+        proceed_values=("completed",),
+        keep_marker_sources=(),
+        render_session_start=_session_cursor,
+    ),
+    "codex": Protocol(_none, _decision_block("block"), _release_stop_reason),
+    "gemini": Protocol(_none, _decision_block("deny"), _release_stop_reason),
+    "opencode": Protocol(_none, _decision_block("block"), _release_stop_reason),
+    "copilot": Protocol(
+        _none,
+        _decision_block("block"),
+        _release_note_on_stderr(_json_line({"decision": "allow"})),
+        session_keys=("sessionId", "session_id"),
+        render_session_start=_session_additional_context,
+    ),
+    "qwen": Protocol(_none, _decision_block("block"), _release_stop_reason),
+    "droid": Protocol(_none, _decision_block("block"), _release_stop_reason),
+    "antigravity": Protocol(
+        lambda: _decision("stop"),
+        _decision_block("continue"),
+        _release_note_on_stderr(_json_line({"decision": "stop"})),
+        session_keys=("conversationId",),
+        start_dir_keys=("workspacePaths[0]",),
+        skip_field="terminationReason",
+        # The docs name `model_stop`; agy 1.0.8 sends `NO_TOOL_CALL` for a normal stop (15.1).
+        proceed_values=("model_stop", "NO_TOOL_CALL"),
+        keep_marker_sources=(),
+        render_session_start=_session_none,
+    ),
+    "openhands": Protocol(
+        _none,
+        _decision_block("deny"),
+        _release_note_on_stderr(),
+        start_dir_keys=("working_dir", "cwd"),
+        keep_marker_sources=(),
+    ),
+    "auggie": Protocol(
+        _none,
+        _block_hook_specific,
+        _release_note_on_stderr(),
+        session_keys=("conversation_id",),
+        start_dir_keys=("workspace_roots[0]",),
+        skip_field="agent_stop_cause",
+        proceed_values=("end_turn",),
+        keep_marker_sources=(),
+        render_session_start=_session_none,
+    ),
+}
+HOOK_AGENTS = tuple(AGENT_PROTOCOLS)
 
 
 # --- payload ---------------------------------------------------------------------------
@@ -105,49 +277,58 @@ def payload_fingerprint(raw: dict[str, Any]) -> str | None:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def _first_text(raw: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    """The first non-empty string among `keys`; "key[0]" reads the first element of a list."""
+    for key in keys:
+        if key.endswith("[0]"):
+            value = raw.get(key[:-3])
+            value = value[0] if isinstance(value, list) and value else None
+        else:
+            value = raw.get(key)
+        text = _text(value)
+        if text is not None:
+            return text
+    return None
+
+
 def parse_payload(agent: str, raw: dict[str, Any]) -> Payload:
-    """Session id, start directory and fingerprint per agent (SPEC 6.1 table)."""
-    if agent == "cursor":
-        roots = raw.get("workspace_roots")
-        first = roots[0] if isinstance(roots, list) and roots else None
-        session = _text(raw.get("conversation_id"))
-        start = _text(first)
-    else:
-        session = _text(raw.get("session_id"))
-        start = _text(raw.get("cwd"))
+    """Session id, start directory, skip status and fingerprint per agent (SPEC 6.1, 15.1)."""
+    protocol = AGENT_PROTOCOLS[agent]
+    start = _first_text(raw, protocol.start_dir_keys)
     return Payload(
-        session_id=session or "",
+        session_id=_first_text(raw, protocol.session_keys) or "",
         start_dir=Path(start) if start else None,
-        status=_text(raw.get("status")) if agent == "cursor" else None,
+        status=_text(raw.get(protocol.skip_field)) if protocol.skip_field else None,
         source=_text(raw.get("source")),
         fingerprint=payload_fingerprint(raw),
+        copilot_format=agent == "claude" and "timestamp" in raw,
+    )
+
+
+def skips(agent: str, payload: Payload) -> bool:
+    """The agent stopped for a reason other than finishing its turn (a user abort, an error):
+    nothing runs and nothing is recorded."""
+    protocol = AGENT_PROTOCOLS[agent]
+    return (
+        protocol.skip_field is not None
+        and payload.status is not None
+        and payload.status not in protocol.proceed_values
     )
 
 
 # --- protocol output -------------------------------------------------------------------
 
 
-def _json_line(obj: dict[str, Any]) -> str:
-    return json.dumps(obj) + "\n"
-
-
 def protocol_pass(agent: str) -> HookResult:
-    return HookResult(stdout=_json_line({}) if agent == "cursor" else "")
+    return AGENT_PROTOCOLS[agent].render_pass()
 
 
 def protocol_block(agent: str, message: str) -> HookResult:
-    if agent == "claude":
-        return HookResult(exit_code=2, stderr=message + "\n")
-    if agent == "cursor":
-        return HookResult(stdout=_json_line({"followup_message": message}))
-    decision = "deny" if agent == "gemini" else "block"
-    return HookResult(stdout=_json_line({"decision": decision, "reason": message}))
+    return AGENT_PROTOCOLS[agent].render_block(message)
 
 
 def protocol_release(agent: str, note: str) -> HookResult:
-    if agent == "cursor":
-        return HookResult(stdout=_json_line({}))
-    return HookResult(stdout=_json_line({"continue": False, "stopReason": note}))
+    return AGENT_PROTOCOLS[agent].render_release(note)
 
 
 # --- messages --------------------------------------------------------------------------
@@ -393,9 +574,46 @@ def _replay(agent: str, repo: Path, state: HookState) -> HookResult:
     return result
 
 
+def _runs_copilot_gate(handler: Any) -> bool:
+    """Whether a Copilot hook handler runs greenproof's `--hook copilot` command."""
+    if not isinstance(handler, dict):
+        return False
+    if any(
+        isinstance(handler.get(field), str) and _COPILOT_OWNED.search(handler[field])
+        for field in _COPILOT_COMMAND_FIELDS
+    ):
+        return True
+    nested = handler.get("hooks")
+    return isinstance(nested, list) and any(_runs_copilot_gate(item) for item in nested)
+
+
+def copilot_hook_installed(repo: Path, event: str) -> bool:
+    """Whether any `.github/hooks/*.json` in the repository runs greenproof's `--hook copilot`
+    for `event` (SPEC 15.3). Unreadable or malformed files do not count."""
+    try:
+        paths = sorted((repo / COPILOT_HOOKS_DIR).glob("*.json"))
+    except OSError:
+        return False
+    for path in paths:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        table = data.get("hooks") if isinstance(data, dict) else None
+        handlers = table.get(event) if isinstance(table, dict) else None
+        if isinstance(handlers, list) and any(_runs_copilot_gate(h) for h in handlers):
+            return True
+    return False
+
+
 def run_hook(agent: str, payload: Payload, opts: pipeline.CheckOptions) -> HookResult:
     """The whole hook flow: nothing-to-verify, release rules, check, protocol output."""
-    if agent == "cursor" and payload.status is not None and payload.status != "completed":
+    # Copilot also runs the Claude Code hooks, and sends its own payload to them (15.3): the
+    # claude hook then speaks copilot's protocol, or defers when the copilot hook is installed.
+    claude_for_copilot = agent == "claude" and payload.copilot_format
+    if claude_for_copilot:
+        agent = "copilot"
+    if skips(agent, payload):
         return protocol_pass(agent)  # the user aborted or the turn errored: nothing runs
 
     start = payload.start_dir
@@ -411,6 +629,11 @@ def run_hook(agent: str, payload: Payload, opts: pipeline.CheckOptions) -> HookR
         result = protocol_release(agent, release_note(report))
         result.report = report
         return result
+
+    if claude_for_copilot and copilot_hook_installed(repo, COPILOT_STOP_EVENT):
+        # The copilot hook decides this stop; two hooks with different payloads cannot be
+        # paired by 6.2's replay. Nothing is read, run or recorded.
+        return HookResult(report=Report(version=__version__, mode="hook", notes=[DEFER_NOTE]))
 
     # Duplicate hooks for one stop (a plugin and `init`'s hooks) run in parallel: everything
     # from here to the state write is one decision, taken by one hook at a time.
@@ -565,11 +788,7 @@ def session_context(repo: Path) -> str:
 
 
 def session_start_output(agent: str, context: str) -> str:
-    if agent == "cursor":
-        return _json_line({"additional_context": context})
-    return _json_line(
-        {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
-    )
+    return AGENT_PROTOCOLS[agent].render_session_start(context)
 
 
 def run_session_start(agent: str, payload: Payload, cwd: Path) -> str:
@@ -577,9 +796,12 @@ def run_session_start(agent: str, payload: Payload, cwd: Path) -> str:
     caller turns them into exit 0 with one line on stderr (session start never blocks)."""
     start = payload.start_dir
     repo = gitops.find_repo(start if start is not None and start.is_dir() else cwd)
+    if agent == "claude" and payload.copilot_format:  # Copilot reading Claude's settings (15.3)
+        if copilot_hook_installed(repo, COPILOT_START_EVENT):
+            return ""  # the copilot hook starts this session: no marker, no output
+        agent = "copilot"
     keep = (
-        agent != "cursor"
-        and payload.source in KEEP_MARKER_SOURCES
+        payload.source in AGENT_PROTOCOLS[agent].keep_marker_sources
         and gitops.read_session_marker(repo) is not None
     )
     if not keep:

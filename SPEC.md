@@ -2203,3 +2203,163 @@ with the plugin loaded through `--plugin-dir` blocks a requested test skip and r
 the next stop; with the plugin and `init` hooks both installed, one stop gives one
 decision. Then the maintainer bumps to 0.2.0 with `scripts/bump_version.py`, tags, and
 publishes.
+
+## 15. M6: more agents (0.5.0)
+
+Adds six agents to the hook protocol (6.1-6.4) and documents the agents that cannot be
+gated by a hook. The rules, the pipeline, CI mode and the plugins are unchanged. Vendor
+documents were read on 2026-11-12; each adapter module cites its own, as in 6.
+
+**Status rule.** An adapter is `supported` only after a real-CLI end-to-end run (a block on
+a requested test skip, then a release on the next unchanged stop) is recorded in
+MEASUREMENTS.md. Until then it is `experimental`: `--agents auto` never installs it, `init`
+installs it only when named and prints its warning, and the README says so. The maintainer
+flips the flag; the implementation ships every new adapter with `EXPERIMENTAL = True`
+except where this section says otherwise, and the flip is one line per adapter.
+
+### 15.1 The six adapters
+
+Fold these rows into the tables of 6.1, 6.3 and 6.4. "Skip" means: exit 0 with the pass
+output, nothing runs, no state is written (as Cursor's `status` today).
+
+| agent | file `init` writes | stop event | session id | start dir | skip when |
+|---|---|---|---|---|---|
+| copilot | `.github/hooks/greenproof.json` | `agentStop` | `sessionId`, else `session_id` | `cwd` | never |
+| qwen | `.qwen/settings.json` | `Stop` | `session_id` | `cwd` | never |
+| droid | `.factory/hooks.json` | `Stop` | `session_id` | `cwd` | never |
+| antigravity | `.agents/hooks.json` | `Stop` | `conversationId` | `workspacePaths[0]` | `terminationReason` present and neither `model_stop` nor `NO_TOOL_CALL` |
+| openhands | `.openhands/hooks.json` | `Stop` | `session_id` | `working_dir`, else `cwd` | never |
+| auggie | `.augment/settings.json` | `Stop` | `conversation_id` | `workspace_roots[0]` | `agent_stop_cause` present and not `end_turn` |
+
+Protocol output (always exit 0 unless stated):
+
+| agent | pass | block | release | session-start stdout |
+|---|---|---|---|---|
+| copilot | nothing | `{"decision": "block", "reason": msg}` | `{"decision": "allow"}`, note on stderr | `{"additionalContext": text}` |
+| qwen | nothing | `{"decision": "block", "reason": msg}` | `{"continue": false, "stopReason": note}` | `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}` |
+| droid | nothing | `{"decision": "block", "reason": msg}` | `{"continue": false, "stopReason": note}` | as qwen |
+| antigravity | `{"decision": "stop"}` | `{"decision": "continue", "reason": msg}` | `{"decision": "stop"}`, note on stderr | nothing (marker only; its `injectSteps` schema is not documented) |
+| openhands | nothing | `{"decision": "deny", "reason": msg}` | nothing, note on stderr | as qwen |
+| auggie | nothing | `{"hookSpecificOutput": {"hookEventName": "Stop", "decision": "block", "reason": msg}}` | nothing, note on stderr | nothing (Auggie does not add SessionStart output to the context) |
+
+Antigravity's documents name `model_stop` for a normal stop; agy 1.0.8 sends `NO_TOOL_CALL`
+(captured 2026-11-12, with `executionNum`, `fullyIdle`, `error`, `transcriptPath` and
+`artifactDirectoryPath`). Both values run the gate. Under `agy -p` the SessionStart hook
+wrote greenproof's marker in one run and did not run a capture hook in another; the
+interactive e2e settles it.
+
+Session-start `source`: copilot sends `startup`, `resume` or `new`; qwen and droid send
+`startup`, `resume`, `clear` or `compact`. `resume` and `compact` keep the marker (6.3);
+antigravity, openhands and auggie send no documented source and always write a new one.
+
+Hook entries `init` writes (timeout = 6.4's hook timeout; unit per agent):
+
+- **copilot** — `{"version": 1, "hooks": {"agentStop": [H], "sessionStart": [S]}}`,
+  handlers flat (Cursor-style, `set_flat_event`), each `{"type": "command", "command":
+  CMD, "timeoutSec": T}` (seconds; `command` is Copilot's cross-platform field, so the
+  ownership pattern of 6.4 applies unchanged). No matcher (neither event takes one).
+  Verified: https://docs.github.com/en/copilot/reference/hooks-reference. Status:
+  experimental until the e2e run; copilot is in `--agents auto` once supported (see 15.4).
+- **qwen** — Claude-style grouped events under `hooks`: `Stop` with one group and no
+  matcher; `SessionStart` with matcher `startup|resume|clear|compact`. Handler
+  `{"type": "command", "command": CMD, "timeout": T}` in **seconds, capped at 999**: Qwen
+  reads a value of 1000 or more as milliseconds. Verified:
+  https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/. `init` note: "Qwen
+  Code runs project hooks only after you approve them or trust the folder."
+- **droid** — `.factory/hooks.json` is keyed **directly by event name** (no `hooks`
+  wrapper; that wrapper is only for `settings.json`): `{"Stop": [group], "SessionStart":
+  [group with matcher startup|resume|clear|compact]}`, handlers as qwen, timeout in
+  seconds. A `hooks` key in that file is an ordinary event key to leave alone. Verified:
+  https://docs.factory.com/reference/hooks-reference and
+  https://docs.factory.com/cli/configuration/hooks-guide. `init` note: "Droid snapshots
+  hooks at startup: restart it and review the hooks in /hooks."
+- **antigravity** — `.agents/hooks.json` maps a hook name to its events; greenproof owns
+  the key `greenproof`: `{"greenproof": {"Stop": [{"type": "command", "command": CMD,
+  "timeout": T}], "SessionStart": [{"type": "command", "command": CMD2}]}}` (seconds).
+  Re-running replaces the `greenproof` key and keeps every other key. A `greenproof` key
+  that is not an object → exit 4, nothing written. Verified:
+  https://antigravity.google/docs/hooks/ (no Stop config example there: the e2e run settles
+  the shape). Global hooks live in `~/.gemini/config/hooks.json`; `init` writes only the
+  workspace file. Experimental. The Gemini CLI row in the README points to this adapter.
+- **openhands** — Claude-style grouped events under `hooks` (OpenHands accepts the
+  wrapper and PascalCase keys): `Stop` and `SessionStart`, each with matcher `"*"`,
+  seconds. Verified: https://docs.openhands.dev/openhands/usage/customization/hooks (the
+  Stop payload fields are not listed there; the e2e run settles them). Experimental.
+- **auggie** — Claude-style grouped events under `hooks`, `Stop` and `SessionStart`
+  without matchers, timeout in **milliseconds** (as gemini). Verified:
+  https://docs.augmentcode.com/cli/hooks and /cli/hooks-examples. The reference says Stop
+  output is only logged while the "require tests" example blocks a stop with the output
+  above; the e2e run settles it. Experimental.
+
+### 15.2 Code shape
+
+- `hooks.py`: replace the per-agent `if` chains with one table, `AGENT_PROTOCOLS: dict[str,
+  Protocol]`, a frozen dataclass per agent holding: session-id keys (tried in order),
+  start-dir keys (a list value means its first element), the skip field and the value that
+  does not skip, and the pass/block/release/session-start renderers. The five existing
+  agents move into the table with byte-identical output (existing tests must pass
+  unchanged). `HOOK_AGENTS` is the table's keys in the order claude, cursor, codex,
+  gemini, opencode, copilot, qwen, droid, antigravity, openhands, auggie.
+- A release that has no documented way to show a note writes the note to stderr. stderr
+  is never used for anything else in hook mode except Claude's block (6.1).
+- `init/hooks/<agent>.py`, one module per new agent, registered in `ADAPTERS`; shared
+  helpers stay in `_common.py` (add a helper for droid's unwrapped map and antigravity's
+  named entry rather than special-casing in callers). `init/command.py`: notes and
+  warnings come from module attributes (`NOTE`, `WARNING`, `EXPERIMENTAL`) instead of the
+  `if name == ...` chain.
+
+### 15.3 Copilot also runs the Claude Code hooks
+
+Copilot CLI and VS Code read the repository's `.claude/settings.json` too, and pick the
+payload format by event name: a `Stop` entry there gets the snake_case format
+(`hook_event_name`, `session_id`, `timestamp`, `cwd`, `stop_reason`, ...). Copilot
+treats exit 2 from a stop hook as a warning, so greenproof's Claude block does not block
+under Copilot, and a repository with both files runs two greenproof hooks per stop whose
+payloads differ (so 6.2's replay cannot pair them; the second would hit rule 2 and
+release). Therefore, under `--hook claude` (check and session-start):
+
+- A payload with a `timestamp` key is Copilot's (Claude Code sends none; the e2e capture
+  in 15.5 confirms both sides).
+- If any `.github/hooks/*.json` in the repository holds a greenproof `--hook copilot`
+  entry for the event, the Claude hook **defers**: exit 0, no output, no state or marker
+  written; with `--json`/`--markdown` the report notes "deferred to the Copilot hook".
+- Otherwise it runs as `copilot`: copilot's protocol output, the session id read from
+  `session_id`, state shared as usual.
+
+### 15.4 Agents that cannot be gated by a hook
+
+README gets a table (as of 2026-11-12) of agents with no stop hook that can block:
+Cline (`afterRun` is observe-only), Roo Code, Windsurf Cascade (`post_cascade_response` is
+fire-and-forget), Zed, Warp, Aider, Continue, Kiro (Agent Stop blocking not documented),
+Devin and Jules. For each: it reads AGENTS.md (which `init` writes; mark the ones whose
+AGENTS.md support is not documented), and the CI check on its pull requests is the gate.
+Name Goose, Junie, Amp and Kilo Code as planned (they have blocking hooks in a new format
+or plugin runtime). No code changes for these.
+
+`--agents auto` additions, only for adapters with `EXPERIMENTAL = False`: copilot when
+`.github/hooks/` or `.github/copilot-instructions.md` exists; qwen when `.qwen/` exists;
+droid when `.factory/` exists. Implement the detection now, gated on the flag, with tests
+that flip the flag.
+
+### 15.5 Verification
+
+- AGENTS.md's five checks pass; existing hook tests pass unchanged.
+- Tests per new agent: payload parsing (both copilot id keys; list-valued dirs; skip
+  values), each protocol output, session start (marker kept/rewritten per source),
+  `init` writing a fresh file, merging into an existing one without touching foreign
+  entries, idempotent re-run, a malformed file → exit 4 with nothing written, timeout
+  units (qwen capped at 999, auggie in ms), and the copilot defer rule of 15.3 both ways
+  (copilot file present → defer; absent → copilot protocol) for check and session-start.
+- A concurrency test as M5a's: claude (Copilot-format payload) and copilot hooks run in
+  parallel against a failing tree with the copilot file present → exactly one block in
+  the state and the copilot hook blocks.
+- `scripts/e2e/capture_payload.py`: a hook command that appends its stdin, argv and the
+  env vars named `*_PROJECT_DIR`/`*_SESSION_ID` as one JSON line to a file given by
+  `GREENPROOF_CAPTURE` and exits 0 with no output. The maintainer uses it to capture real
+  payloads from each CLI before the status flips; it ships in `scripts/`, not the wheel.
+- The real-CLI e2e runs are the maintainer's (they need logins): Claude Code (regression,
+  plus capture), Antigravity (`agy`), Copilot CLI, then any of Qwen, Droid, OpenHands and
+  Auggie the maintainer can run.
+
+Out of scope for M6: plugins or marketplace entries for the new agents; Goose, Junie, Amp,
+Kilo Code; publishing anything.
