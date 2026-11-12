@@ -7,7 +7,10 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 Milestone M6 (SPEC section 15): six more agents on the hook protocol. All six are
 experimental: the files follow each vendor's documentation as read on 2026-11-12 and none has
-been run against its real CLI yet.
+completed a real-CLI block-and-release run yet. Real payloads were captured from Claude Code
+2.1.322 (no `timestamp` key, which the Copilot rule below relies on) and Antigravity CLI 1.0.8,
+which sends `terminationReason: "NO_TOOL_CALL"` for a normal stop where its documents say
+`model_stop`; both values run the gate.
 
 ### Added
 
