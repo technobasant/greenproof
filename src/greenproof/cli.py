@@ -76,8 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         metavar="auto|none|LIST",
         help=(
-            "agents to install hooks for: auto, none or a list of "
-            "claude,cursor,codex,gemini,opencode"
+            "agents to install hooks for: auto, none or a list of claude,cursor,codex,gemini,"
+            "opencode,copilot,qwen,droid,antigravity,openhands,auggie"
         ),
     )
     init.add_argument("--ci", choices=("github", "none"), default="none")

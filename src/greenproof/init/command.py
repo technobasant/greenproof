@@ -18,9 +18,6 @@ from greenproof.errors import UsageError
 from greenproof.init import agents_md, ci_github, write_policy
 from greenproof.init.detect import Detection, ProposedCommand, detect, propose
 from greenproof.init.hooks import ADAPTERS, hook_timeout
-from greenproof.init.hooks import codex as codex_adapter
-from greenproof.init.hooks import gemini as gemini_adapter
-from greenproof.init.hooks import opencode as opencode_adapter
 from greenproof.policy import POLICY_FILE, Policy, parse_policy
 from greenproof.runner import HOOK_TAIL_LINES, run_command
 
@@ -76,24 +73,29 @@ def _plan(root: Path, rel: str, new_text: str, keep_existing: bool = False) -> P
     return Planned(rel, "updated", new_text)
 
 
+def _auto_agents(root: Path) -> list[str]:
+    """What the repository shows. Only adapters that are not experimental are ever chosen."""
+    github = root / ".github"
+    shown = {
+        "claude": (root / ".claude").is_dir() or (root / "CLAUDE.md").is_file(),
+        "cursor": (root / ".cursor").is_dir(),
+        "codex": (root / ".codex").is_dir(),
+        "opencode": (root / ".opencode").is_dir()
+        or any((root / name).is_file() for name in ("opencode.json", "opencode.jsonc")),
+        "copilot": (github / "hooks").is_dir() or (github / "copilot-instructions.md").is_file(),
+        "qwen": (root / ".qwen").is_dir(),
+        "droid": (root / ".factory").is_dir(),
+    }
+    return [name for name, found in shown.items() if found and ADAPTERS[name].EXPERIMENTAL is False]
+
+
 def parse_agents(spec: str, root: Path) -> list[str]:
     """The agents to install hooks for: `auto` (what the repository shows), `none`, or a list."""
     value = spec.strip().lower()
     if value == NO_AGENTS:
         return []
     if value == AUTO_AGENTS:
-        chosen = []
-        if (root / ".claude").is_dir() or (root / "CLAUDE.md").is_file():
-            chosen.append("claude")
-        if (root / ".cursor").is_dir():
-            chosen.append("cursor")
-        if (root / ".codex").is_dir():
-            chosen.append("codex")
-        if (root / ".opencode").is_dir() or any(
-            (root / name).is_file() for name in ("opencode.json", "opencode.jsonc")
-        ):
-            chosen.append("opencode")
-        return chosen
+        return _auto_agents(root)
     names = [n.strip() for n in value.split(",") if n.strip()]
     if not names:
         raise UsageError("--agents: expected auto, none or a comma-separated list")
@@ -258,12 +260,10 @@ def run_init(options: InitOptions) -> str:
                 root, adapter.PATH, adapter.render(_read(root, adapter.PATH), hook_command, timeout)
             )
         )
-        if name == "gemini":
-            notes.append(f"warning: {gemini_adapter.WARNING}")
-        if name == "codex":
-            notes.append(codex_adapter.NOTE)
-        if name == "opencode":
-            notes.append(opencode_adapter.NOTE)
+        if warning := getattr(adapter, "WARNING", None):
+            notes.append(f"warning: {warning}")
+        if note := getattr(adapter, "NOTE", None):
+            notes.append(note)
 
     if options.ci == "github":
         workflow = ci_github.render_workflow(root, det, __version__, policy)
