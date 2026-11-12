@@ -66,7 +66,7 @@ def payload(agent: str, repo: Repo, session: str = "s1", **extra: Any) -> dict[s
         base = {
             "conversationId": session,
             "workspacePaths": [path],
-            "terminationReason": "model_stop",
+            "terminationReason": "NO_TOOL_CALL",  # what agy 1.0.8 sends for a normal stop
         }
     elif agent == "auggie":
         base = {
@@ -195,7 +195,11 @@ def test_a_timestamp_key_marks_a_copilot_payload_for_the_claude_hook_only() -> N
 @pytest.mark.parametrize(
     ("agent", "field", "skipping"),
     [
-        ("antigravity", "terminationReason", ["user_cancel", "error", "max_steps"]),
+        (
+            "antigravity",
+            "terminationReason",
+            ["user_cancel", "error", "max_steps", "MAX_STEPS_EXCEEDED", "ERROR", "no_tool_call"],
+        ),
         ("auggie", "agent_stop_cause", ["cancelled", "error", "max_turns"]),
     ],
 )
@@ -224,6 +228,14 @@ def test_a_missing_or_proceeding_stop_value_still_runs_the_gate(
     assert "FAILED boom" in block_message(agent, fire(agent, missing))
     repo.write("app.py", "x = 2\n")
     assert "FAILED boom" in block_message(agent, fire(agent, payload(agent, repo)))
+
+
+def test_antigravity_runs_the_gate_on_both_normal_stop_values(tmp_path: Path, fire) -> None:
+    repo = failing_repo(tmp_path)
+    for value in ("NO_TOOL_CALL", "model_stop"):
+        repo.write("app.py", f"x = {value!r}\n")
+        body = payload("antigravity", repo, terminationReason=value)
+        assert "FAILED boom" in block_message("antigravity", fire("antigravity", body))
 
 
 @pytest.mark.parametrize("agent", ["copilot", "qwen", "droid", "openhands"])

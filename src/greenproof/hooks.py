@@ -176,10 +176,10 @@ class Protocol:
     # Tried in order. A key ending in "[0]" holds a list and means its first element; any
     # other key holds a string.
     start_dir_keys: tuple[str, ...] = ("cwd",)
-    # The payload field that says why the agent stopped, and the one value that still runs
-    # the gate; any other value skips (exit 0, the pass output, no state).
+    # The payload field that says why the agent stopped, and the values that still run the
+    # gate; any other value skips (exit 0, the pass output, no state).
     skip_field: str | None = None
-    proceed_value: str | None = None
+    proceed_values: tuple[str, ...] = ()
     # `source` values of a session start that keep a still-valid marker (6.3).
     keep_marker_sources: tuple[str, ...] = KEEP_MARKER_SOURCES
     render_session_start: Callable[[str], str] = _session_hook_specific
@@ -194,7 +194,7 @@ AGENT_PROTOCOLS: dict[str, Protocol] = {
         session_keys=("conversation_id",),
         start_dir_keys=("workspace_roots[0]",),
         skip_field="status",
-        proceed_value="completed",
+        proceed_values=("completed",),
         keep_marker_sources=(),
         render_session_start=_session_cursor,
     ),
@@ -217,7 +217,8 @@ AGENT_PROTOCOLS: dict[str, Protocol] = {
         session_keys=("conversationId",),
         start_dir_keys=("workspacePaths[0]",),
         skip_field="terminationReason",
-        proceed_value="model_stop",
+        # The docs name `model_stop`; agy 1.0.8 sends `NO_TOOL_CALL` for a normal stop (15.1).
+        proceed_values=("model_stop", "NO_TOOL_CALL"),
         keep_marker_sources=(),
         render_session_start=_session_none,
     ),
@@ -235,7 +236,7 @@ AGENT_PROTOCOLS: dict[str, Protocol] = {
         session_keys=("conversation_id",),
         start_dir_keys=("workspace_roots[0]",),
         skip_field="agent_stop_cause",
-        proceed_value="end_turn",
+        proceed_values=("end_turn",),
         keep_marker_sources=(),
         render_session_start=_session_none,
     ),
@@ -311,7 +312,7 @@ def skips(agent: str, payload: Payload) -> bool:
     return (
         protocol.skip_field is not None
         and payload.status is not None
-        and payload.status != protocol.proceed_value
+        and payload.status not in protocol.proceed_values
     )
 
 

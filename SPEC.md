@@ -2227,7 +2227,7 @@ output, nothing runs, no state is written (as Cursor's `status` today).
 | copilot | `.github/hooks/greenproof.json` | `agentStop` | `sessionId`, else `session_id` | `cwd` | never |
 | qwen | `.qwen/settings.json` | `Stop` | `session_id` | `cwd` | never |
 | droid | `.factory/hooks.json` | `Stop` | `session_id` | `cwd` | never |
-| antigravity | `.agents/hooks.json` | `Stop` | `conversationId` | `workspacePaths[0]` | `terminationReason` present and not `model_stop` |
+| antigravity | `.agents/hooks.json` | `Stop` | `conversationId` | `workspacePaths[0]` | `terminationReason` present and neither `model_stop` nor `NO_TOOL_CALL` |
 | openhands | `.openhands/hooks.json` | `Stop` | `session_id` | `working_dir`, else `cwd` | never |
 | auggie | `.augment/settings.json` | `Stop` | `conversation_id` | `workspace_roots[0]` | `agent_stop_cause` present and not `end_turn` |
 
@@ -2241,6 +2241,11 @@ Protocol output (always exit 0 unless stated):
 | antigravity | `{"decision": "stop"}` | `{"decision": "continue", "reason": msg}` | `{"decision": "stop"}`, note on stderr | nothing (marker only; its `injectSteps` schema is not documented) |
 | openhands | nothing | `{"decision": "deny", "reason": msg}` | nothing, note on stderr | as qwen |
 | auggie | nothing | `{"hookSpecificOutput": {"hookEventName": "Stop", "decision": "block", "reason": msg}}` | nothing, note on stderr | nothing (Auggie does not add SessionStart output to the context) |
+
+Antigravity's documents name `model_stop` for a normal stop; agy 1.0.8 sends `NO_TOOL_CALL`
+(captured 2026-11-12, with `executionNum`, `fullyIdle`, `error`, `transcriptPath` and
+`artifactDirectoryPath`; its SessionStart hook did not fire under `agy -p`). Both values run
+the gate.
 
 Session-start `source`: copilot sends `startup`, `resume` or `new`; qwen and droid send
 `startup`, `resume`, `clear` or `compact`. `resume` and `compact` keep the marker (6.3);
