@@ -1,6 +1,6 @@
 {
   "name": "opencode-greenproof",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Done gate for OpenCode 2.x: when the agent stops, greenproof runs your checks and blocks deleted, skipped or weakened tests.",
   "type": "module",
   "main": "./index.js",

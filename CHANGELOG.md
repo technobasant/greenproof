@@ -5,6 +5,8 @@ and the format of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-12
+
 Milestone M6 (SPEC section 15): six more agents on the hook protocol. All six are
 experimental: the files follow each vendor's documentation as read on 2026-11-12 and none has
 completed a real-CLI block-and-release run yet. Real payloads were captured from Claude Code
@@ -549,7 +551,8 @@ First release.
 - The test suite runs in parallel with `pytest-xdist` (`pytest -n auto`) in CI and in the
   documented gate.
 
-[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/technobasant/greenproof/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/technobasant/greenproof/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/technobasant/greenproof/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/technobasant/greenproof/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/technobasant/greenproof/compare/v0.3.0...v0.3.1
