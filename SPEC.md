@@ -2244,8 +2244,9 @@ Protocol output (always exit 0 unless stated):
 
 Antigravity's documents name `model_stop` for a normal stop; agy 1.0.8 sends `NO_TOOL_CALL`
 (captured 2026-11-12, with `executionNum`, `fullyIdle`, `error`, `transcriptPath` and
-`artifactDirectoryPath`; its SessionStart hook did not fire under `agy -p`). Both values run
-the gate.
+`artifactDirectoryPath`). Both values run the gate. Under `agy -p` the SessionStart hook
+wrote greenproof's marker in one run and did not run a capture hook in another; the
+interactive e2e settles it.
 
 Session-start `source`: copilot sends `startup`, `resume` or `new`; qwen and droid send
 `startup`, `resume`, `clear` or `compact`. `resume` and `compact` keep the marker (6.3);
