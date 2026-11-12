@@ -4,9 +4,38 @@ from __future__ import annotations
 
 from types import ModuleType
 
-from greenproof.init.hooks import claude, codex, cursor, gemini, opencode
+from greenproof.init.hooks import (
+    antigravity,
+    auggie,
+    claude,
+    codex,
+    copilot,
+    cursor,
+    droid,
+    gemini,
+    opencode,
+    openhands,
+    qwen,
+)
 
-ADAPTERS: dict[str, ModuleType] = {m.NAME: m for m in (claude, cursor, codex, gemini, opencode)}
+# The order of `hooks.HOOK_AGENTS`; each module has NAME, PATH, EXPERIMENTAL and render(), and
+# optionally WARNING (init prints it as "warning: ...") and NOTE.
+ADAPTERS: dict[str, ModuleType] = {
+    m.NAME: m
+    for m in (
+        claude,
+        cursor,
+        codex,
+        gemini,
+        opencode,
+        copilot,
+        qwen,
+        droid,
+        antigravity,
+        openhands,
+        auggie,
+    )
+}
 MAX_TIMEOUT = 3600
 TIMEOUT_MARGIN = 60
 
